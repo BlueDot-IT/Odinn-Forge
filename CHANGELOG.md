@@ -6,6 +6,50 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## Unreleased
 
+## [0.4.0](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0-beta.3...v0.4.0) (2026-07-25)
+
+### Added
+
+* overhaul the daily-use console with clearer Projects, Sessions, Goals,
+  automatic Memory, Activity, Cron Jobs, Tasks, package management, and
+  dedicated Labs pages
+* add a structured configuration editor for providers, authentication,
+  permissions, web and browser safety, experimental features, automatic
+  improvements, runtime behavior, Proof, and memory
+* add durable maintainer review evidence while keeping repository automation
+  proposal-only
+
+### Fixed
+
+* send ChatGPT and Codex OAuth system guidance through the expected
+  `instructions` field
+* patch the high-severity `brace-expansion` advisory in the locked dependency
+  tree
+
+### Security
+
+* harden configuration writes against stale edits, unsafe state paths,
+  symbolic links, hard links, oversized requests, and concurrent saves
+* keep hosted-provider destinations and credentials isolated from
+  tenant-controlled configuration
+* preserve explicit approvals, loopback-only local defaults, owner-only state,
+  and disabled-by-default third-party packages and experimental features
+
+### Validation
+
+* verify real OpenAI OAuth and OpenRouter API-key inference from the published
+  beta.3 artifact without exposing credentials in configuration, diagnostics,
+  audit output, or release evidence
+* pass Linux, macOS, and Windows CI, package integrity, integration, inference,
+  security, and install-smoke coverage on the stable code line
+
+### Documentation
+
+* replace internal release jargon with a plain-language README for everyday
+  users and small business owners
+* consolidate active operator, security, capability-boundary, release, and UAT
+  documentation under evergreen names
+
 ## [0.4.0-beta.3](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0-beta.2...v0.4.0-beta.3) (2026-07-23)
 
 ### Validation
