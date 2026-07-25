@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -123,12 +123,14 @@ for (const extension of ["zip", "tar.gz"]) {
     if (version !== pkg.version) throw new Error(`installed ${basename(archive)} reported version ${version}`);
 
     run(cli, ["onboard", "--state", state], workspace, { INIT_CWD: workspace });
+    const inputFile = join(workspace, "compiled-smoke-input.json");
+    await writeFile(inputFile, `${JSON.stringify({ text: "ODINN_COMPILED_INSTALL_OK" })}\n`);
     const tool = run(cli, [
       "run",
       "--tool",
       "text.echo",
-      "--input-json",
-      JSON.stringify({ text: "ODINN_COMPILED_INSTALL_OK" }),
+      "--input-file",
+      inputFile,
       "--state",
       state
     ], workspace, { INIT_CWD: workspace });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,12 +62,14 @@ test("production package runs without pnpm or a source checkout", async () => {
     await mkdir(workspace, { recursive: true });
     assert.equal(run(cli, ["--version"], workspace).trim(), pkg.version);
     run(cli, ["onboard", "--state", state], workspace);
+    const inputFile = join(workspace, "compiled-release-input.json");
+    await writeFile(inputFile, `${JSON.stringify({ text: "ODINN_COMPILED_TEST_OK" })}\n`);
     const tool = run(cli, [
       "run",
       "--tool",
       "text.echo",
-      "--input-json",
-      JSON.stringify({ text: "ODINN_COMPILED_TEST_OK" }),
+      "--input-file",
+      inputFile,
       "--state",
       state
     ], workspace);

@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
@@ -7087,7 +7087,7 @@ function invocationRoot() {
   return resolve(process.env.INIT_CWD ?? process.cwd());
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isGatewayEntrypoint()) {
   const host = process.env.ODINN_HOST ?? "127.0.0.1";
   assertLoopbackHost(host);
   const port = Number.parseInt(process.env.ODINN_PORT ?? "18790", 10);
@@ -7107,6 +7107,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   server.listen(port, host, () => {
     console.log(JSON.stringify({ ok: true, host, port: (server.address() as any).port, stateDir }, null, 2));
   });
+}
+
+function isGatewayEntrypoint() {
+  if (!process.argv[1]) return false;
+  const modulePath = fileURLToPath(import.meta.url);
+  if (compiledRuntime) {
+    return basename(process.argv[1]) === "server.js" && basename(modulePath) === "server.js";
+  }
+  try {
+    return realpathSync(resolve(process.argv[1])) === realpathSync(modulePath);
+  } catch {
+    return resolve(process.argv[1]) === modulePath;
+  }
 }
 
 function assertLoopbackHost(host: any) {

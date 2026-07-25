@@ -2,15 +2,31 @@
 import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
+import { realpathSync } from "node:fs";
 import { chmod, lstat, readFile, realpath, readdir, rename, writeFile } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { ensureSecureStateDirectory } from "@odinn/store-file";
 import { createGatewayServer } from "./server.ts";
 
 const scrypt: any = promisify(scryptCallback);
-const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+declare const __ODINN_COMPILED__: boolean | undefined;
+const compiledRuntime = typeof __ODINN_COMPILED__ !== "undefined";
+const isMain = isHostEntrypoint();
+
+function isHostEntrypoint() {
+  if (!process.argv[1]) return false;
+  const modulePath = fileURLToPath(import.meta.url);
+  if (compiledRuntime) {
+    return basename(process.argv[1]) === "host.js" && basename(modulePath) === "host.js";
+  }
+  try {
+    return realpathSync(resolve(process.argv[1])) === realpathSync(modulePath);
+  } catch {
+    return resolve(process.argv[1]) === modulePath;
+  }
+}
 
 export async function hashPassword(password: any, salt: any = randomBytes(16).toString("base64url")) {
   if (String(password).length < 12) throw new Error("gateway host passwords require at least 12 characters");
