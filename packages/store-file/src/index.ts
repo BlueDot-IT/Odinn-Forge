@@ -7,7 +7,7 @@ export const STORE_SCHEMA_VERSION = 1;
 
 type Integrity = { keyId: string; previous: string | null; signature: string };
 type Keyring = { schemaVersion: number; current: string; keys: Record<string, string> };
-type StoredRecord = JsonObject & { schemaVersion: number; at?: string; type?: string };
+export type StoredRecord = JsonObject & { schemaVersion: number; at?: string; type?: string };
 type Job = JsonObject & { id: string; status: string; payload: JsonObject; createdAt: string; updatedAt: string; attempts: number; timeoutMs: number; retrySafe: boolean };
 type JobState = { schemaVersion: number; jobs: Record<string, Job> };
 type MutableResult<T> = T | Promise<T>;
