@@ -1,15 +1,12 @@
-# Ódinn Forge Beta 3 Stabilization Plan
+# Ódinn Forge Stabilization Plan
 
-Target release line: `0.3.0-beta.N`
-
-Beta 3 is a stabilization release. It should increase confidence in the
-existing runtime without adding another major experimental subsystem. The
-base version remains `0.3.0`; only the beta suffix advances.
+This plan increases confidence in the existing runtime without adding another
+major experimental subsystem.
 
 ## Objective
 
-Make the current beta easier to trust, operate, diagnose, recover, and roll
-back across Linux, macOS, and Windows.
+Make Ódinn easier to trust, operate, diagnose, recover, and roll back across
+Linux, macOS, and Windows.
 
 The release is successful when a new operator can install a verified package,
 configure a provider, run the normal local workflow, survive common failures,
@@ -22,12 +19,11 @@ inspect what happened, and roll back without guessing.
 - No claim that remote browser or provider mutations are deterministically
   reversible.
 - No broadening of default capabilities, network access, or approval policy.
-- No change to the `0.3.0` base version.
 - No automatic activation of extensions, skills, agents, or experimental flags.
 
 ## Workstreams
 
-### 1. Beta surface and safety claims
+### 1. Surface and safety claims
 
 Create one operator-facing matrix that classifies every surface as:
 
@@ -36,8 +32,8 @@ Create one operator-facing matrix that classifies every surface as:
 - provider- or platform-dependent;
 - explicitly unsupported.
 
-Use the same terminology in `README.md`, `docs/public-beta.md`,
-`docs/P0-BETA-GATES.md`, CLI help, and the console. Keep the following claims
+Use the same terminology in `README.md`, `docs/user-guide.md`,
+`docs/runtime-ledger.md`, CLI help, and the console. Keep the following claims
 prominent:
 
 - forked workers are crash containment, not a security sandbox;
@@ -157,7 +153,7 @@ Do not add features to the default policy while doing this work.
 
 ## Exit gates
 
-Beta 3 cannot ship until all gates pass:
+The work is not complete until all gates pass:
 
 - `pnpm format:check`
 - `pnpm lint`
@@ -179,7 +175,7 @@ Beta 3 cannot ship until all gates pass:
 
 ## Order of operations
 
-1. Freeze the current beta surface and write the claim matrix.
+1. Freeze the current surface and write the claim matrix.
 2. Add diagnostics and dangerous-feature confirmation summaries.
 3. Build the packaged release-candidate soak.
 4. Harden runtime-state and artifact boundaries.
@@ -202,6 +198,6 @@ Stop the release and investigate if any of these occur:
 
 ## Release principle
 
-Beta 3 should make Ódinn boring in the best possible way: fewer surprises,
+Ódinn should be boring in the best possible way: fewer surprises,
 clearer boundaries, recoverable failures, and evidence that survives contact
 with a real machine.

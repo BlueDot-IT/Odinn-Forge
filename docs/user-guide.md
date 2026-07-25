@@ -1,8 +1,14 @@
-# Public beta guide
+# User guide
 
-Ódinn Forge's public beta is for real users running a local-first personal agent on a machine they control. Expect rough edges, incomplete provider-specific behavior, and breaking changes between beta releases. Do not use it as a safety-critical service or as a hostile-code sandbox.
+Ódinn Forge is a local-first personal agent for a machine you control. This
+guide covers the supported local workflow, installation, privacy boundary,
+diagnostics, and bug reporting. Do not use it as a safety-critical service or
+as a hostile-code sandbox.
 
-Use the [Beta 3 surface matrix](BETA-3-SURFACE-MATRIX.md) as the operator-facing source for the four classifications: **verified local behavior**, **experimental and disabled by default**, **provider- or platform-dependent**, and **explicitly unsupported**.
+Use the [surface matrix](surface-matrix.md) as the operator-facing source for
+the four classifications: **verified local behavior**, **experimental and
+disabled by default**, **provider- or platform-dependent**, and **explicitly
+unsupported**.
 
 The three hard limits are:
 
@@ -10,7 +16,7 @@ The three hard limits are:
 - Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
 - External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
-## Supported beta boundary
+## Supported boundary
 
 - Linux, macOS, or Windows with Node.js 24 or newer and Corepack.
 - One local operator using the loopback gateway at `127.0.0.1`.
@@ -19,15 +25,20 @@ The three hard limits are:
 - Experimental Proof, Rewind, Sentinel, Capsules, Darwin, Capability, and Counterfactual features remain disabled until individually enabled.
 - Automatic improvements runs by default and is limited to reversible, allowlisted reliability tuning.
 
-The TLS multi-user host is available to experienced operators, but remote hosting is application-level tenant isolation, not hostile-user OS isolation. It is not the default public-beta path. Do not expose the single-user gateway to a network.
+The TLS multi-user host is available to experienced operators, but remote
+hosting is application-level tenant isolation, not hostile-user OS isolation.
+It is not the default path. Do not expose the single-user gateway to a network.
 
 ## Install a verified release
 
-Download the newest prerelease from the repository's Releases page. Release assets include ZIP and tar.gz source archives, `SHA256SUMS.txt`, an SPDX SBOM, and a release manifest. GitHub also exposes build-provenance attestations for the workflow-built assets.
+Download the current release from the repository's Releases page. Release
+assets include ZIP and tar.gz source archives, `SHA256SUMS.txt`, an SPDX SBOM,
+and a release manifest. GitHub also exposes build-provenance attestations for
+the workflow-built assets.
 
 ### Linux and macOS
 
-Replace `<tag>` with the exact prerelease tag shown on the Releases page:
+Replace `<tag>` with the exact release tag shown on the Releases page:
 
 ```bash
 tag=<tag>
@@ -108,6 +119,6 @@ Include the operating system, Node.js version, Odinn Forge version, provider nam
 
 Use the repository's bug-report form for ordinary defects. Suspected vulnerabilities must use GitHub private vulnerability reporting as described in `SECURITY.md`; never disclose an unpatched security issue in a public ticket.
 
-## Beta feedback
+## Feedback
 
 Useful reports describe an actual workflow: what you tried, whether onboarding succeeded, where the interface became confusing, which provider or tool was involved, and whether restart or rollback recovered cleanly. Feature requests should explain the outcome needed rather than prescribing a large architecture from the void.

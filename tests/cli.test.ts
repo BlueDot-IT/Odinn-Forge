@@ -8,7 +8,7 @@ import test from "node:test";
 
 const root = new URL("..", import.meta.url).pathname;
 
-test("CLI advanced help exposes documented beta safety controls", () => {
+test("CLI advanced help exposes documented safety controls", () => {
   const help = spawnSync("node", ["apps/cli/src/cli.ts", "help", "--all"], {
     cwd: root,
     encoding: "utf8"
@@ -24,13 +24,8 @@ test("CLI advanced help exposes documented beta safety controls", () => {
     "--constraints <json>",
     "--show-token",
     "improve rollback --improvement <id>",
-    "verified local behavior",
-    "experimental and disabled by default",
-    "provider- or platform-dependent",
-    "explicitly unsupported",
-    "forked workers are crash containment, not a security sandbox",
-    "remote hosting is application-level tenant isolation, not hostile-user OS isolation",
-    "external effects and nondeterministic provider behavior are outside full replay/rollback guarantees"
+    "Safety: experimental features are disabled by default",
+    "docs/surface-matrix.md"
   ]) {
     assert.match(help.stdout, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
@@ -271,7 +266,7 @@ test("CLI resolves filtered pnpm relative paths from the invocation root", async
   assert.equal(result.steps[1].result.output.text, "ODINN_PLAN_OK");
 });
 
-test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
+test("CLI onboarding and TUI expose a local entrypoint", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-onboard-"));
   const onboard = spawnSync("node", ["apps/cli/src/cli.ts", "onboard", "--state", state], {
     cwd: root,
@@ -776,7 +771,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
     "--state",
     state,
     "--title",
-    "Beta session"
+    "Planning session"
   ], {
     cwd: root,
     encoding: "utf8"
@@ -829,7 +824,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
     "--session",
     session.id,
     "--title",
-    "Renamed beta session"
+    "Renamed planning session"
   ], { cwd: root, encoding: "utf8" });
   assert.equal(renameSession.status, 0, renameSession.stderr || renameSession.stdout);
   assert.equal(JSON.parse(renameSession.stdout).type, "session.renamed");
@@ -853,7 +848,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
     "--state",
     state,
     "--title",
-    "Reach beta"
+    "Reach launch"
   ], {
     cwd: root,
     encoding: "utf8"
@@ -895,7 +890,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
     "--title",
     "Add install smoke",
     "--rationale",
-    "Beta needs installed-command proof."
+    "The installed command path needs proof."
   ], {
     cwd: root,
     encoding: "utf8"

@@ -497,7 +497,7 @@ test("gateway exposes sessions, goals, and improvement proposals", async () => {
     const sessions = await getJson(`${base}/sessions`);
     assert.equal(sessions.sessions.some((entry: any) => entry.id === session.id), false);
 
-    const goal = await postJson(`${base}/goals`, { title: "Reach beta" });
+    const goal = await postJson(`${base}/goals`, { title: "Reach launch" });
     assert.equal(goal.type, "goal.created");
 
     const update = await postJson(`${base}/goals/${encodeURIComponent(goal.id)}/updates`, {
@@ -511,7 +511,7 @@ test("gateway exposes sessions, goals, and improvement proposals", async () => {
 
     const improvement = await postJson(`${base}/improvements`, {
       title: "Add install smoke",
-      rationale: "Beta needs installed-command proof."
+      rationale: "The installed command path needs proof."
     });
     assert.equal(improvement.type, "improvement.proposed");
 

@@ -620,7 +620,7 @@ test("memory compacts session context into an L0 summary", async () => {
     registry
   });
   await runTask({
-    task: { id: "run_compact_message", tool: "session.message", input: { sessionId: session.output.id, role: "user", content: "We decided to keep the beta local-first." }, actor: "test" },
+    task: { id: "run_compact_message", tool: "session.message", input: { sessionId: session.output.id, role: "user", content: "We decided to keep the project local-first." }, actor: "test" },
     auditStore,
     registry
   });
@@ -726,7 +726,7 @@ test("kernel records sessions, goals, and self-improvement proposals", async () 
   const { auditStore, registry } = await fixture();
 
   const session = await runTask({
-    task: { id: "run_session_create", tool: "session.create", input: { title: "Beta test" }, actor: "test" },
+    task: { id: "run_session_create", tool: "session.create", input: { title: "Project test" }, actor: "test" },
     auditStore,
     registry
   });
@@ -752,7 +752,7 @@ test("kernel records sessions, goals, and self-improvement proposals", async () 
   assert.equal(sessionDetail.output.messages[0].content, "Build out Odinn Forge.");
 
   const renamed = await runTask({
-    task: { id: "run_session_rename", tool: "session.rename", input: { sessionId: session.output.id, title: "Renamed beta chat" }, actor: "test" },
+    task: { id: "run_session_rename", tool: "session.rename", input: { sessionId: session.output.id, title: "Renamed project chat" }, actor: "test" },
     auditStore,
     registry
   });
@@ -762,7 +762,7 @@ test("kernel records sessions, goals, and self-improvement proposals", async () 
     auditStore,
     registry
   });
-  assert.equal(renamedDetail.output.session.title, "Renamed beta chat");
+  assert.equal(renamedDetail.output.session.title, "Renamed project chat");
 
   const deleted = await runTask({
     task: { id: "run_session_delete", tool: "session.delete", input: { sessionId: session.output.id }, actor: "test" },
@@ -786,7 +786,7 @@ test("kernel records sessions, goals, and self-improvement proposals", async () 
   );
 
   const goal = await runTask({
-    task: { id: "run_goal_create", tool: "goal.create", input: { title: "Reach beta" }, actor: "test" },
+    task: { id: "run_goal_create", tool: "goal.create", input: { title: "Reach launch" }, actor: "test" },
     auditStore,
     registry
   });
@@ -814,7 +814,7 @@ test("kernel records sessions, goals, and self-improvement proposals", async () 
       tool: "improve.propose",
       input: {
         title: "Add install smoke test",
-        rationale: "Beta should prove the installed command path.",
+        rationale: "The installed command path should be proven.",
         target: "release"
       },
       actor: "test"

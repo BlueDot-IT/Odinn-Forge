@@ -26,4 +26,4 @@ odinn proof show <run-id>
 
 The authenticated gateway exposes the same path through `POST /proof`, `GET /proof/<run-id>`, and `GET /runtime/runs/<run-id>/verify`; it uses the same operator-owned exact allowlist.
 
-HTTP proof is loopback-only by default to prevent untrusted contracts from becoming an SSRF primitive. External verification requires an explicit runtime integration decision; it is not enabled by the beta gateway.
+HTTP proof is loopback-only by default to prevent untrusted contracts from becoming an SSRF primitive. External verification requires an explicit runtime integration decision; it is not enabled by the gateway.

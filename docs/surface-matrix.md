@@ -1,9 +1,9 @@
-# Beta 3 surface matrix
+# Surface matrix
 
-This is the operator-facing classification for the Ódinn Forge Beta 3
-surface. The classification labels are normative and are reused by the
-[README](../README.md), [public beta guide](public-beta.md),
-[P0 beta gates](P0-BETA-GATES.md), and [operator console guide](operator-console.md).
+This is the operator-facing classification for Ódinn Forge surfaces. The
+classification labels are normative and are reused by the [README](../README.md),
+[user guide](user-guide.md), [runtime ledger](runtime-ledger.md), and [operator
+console guide](operator-console.md).
 
 | Surface | Classification | Operator claim and boundary |
 | --- | --- | --- |
