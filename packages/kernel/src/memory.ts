@@ -296,7 +296,7 @@ function normalizeMemoryPrefix(value: any) {
     .replace(/^memory:\/\//, "")
     .replace(/\\/g, "/")
     .split("/")
-    .map((segment: any) => segment.trim().replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+|-+$/g, ""))
+    .map((segment: any) => trimEdgeHyphens(segment.trim().replace(/[^a-zA-Z0-9._-]/g, "-")))
     .filter(Boolean)
     .join("/");
 }
@@ -332,7 +332,7 @@ function memoryTokens(value: any) {
     .toLowerCase()
     .replace(/[^a-z0-9_\s-]/g, " ")
     .split(/\s+/)
-    .map((token: any) => token.replace(/^-+|-+$/g, ""))
+    .map((token: any) => trimEdgeHyphens(token))
     .filter((token: any) => token.length > 1 && !MEMORY_STOPWORDS.has(token))));
 }
 
@@ -590,6 +590,14 @@ function resolveMemoryScope(records: any[], input: any = {}) {
   if (!session) throw new Error(`memory session not found: ${scope.scopeId}`);
   if (scope.projectId && scope.projectId !== session.projectId) throw new Error("memory projectId must match the selected session's project");
   return { ...scope, sessionId: scope.scopeId, projectId: session.projectId };
+}
+
+function trimEdgeHyphens(value: string) {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value[start] === "-") start += 1;
+  while (end > start && value[end - 1] === "-") end -= 1;
+  return value.slice(start, end);
 }
 
 function prefixedId(prefix: string) {
