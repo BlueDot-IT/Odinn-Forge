@@ -6,20 +6,59 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## Unreleased
 
+## [1.0.0-rc.1](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0...v1.0.0-rc.1) (2026-07-25)
+
 ### Added
 
+* publish the v1 compatibility policy for the supported local, single-user
+  workflow and clearly separate stable, experimental, provider-dependent,
+  platform-dependent, internal, and unsupported behavior
+* add safe user-facing update, rollback, backup, restore, uninstall, state
+  status, and migration dry-run commands
+* add a per-store schema registry, deterministic migration planner,
+  backup-before-migration, crash recovery, future-schema refusal, and
+  downgrade compatibility checks
+* define first-class, compatible, experimental, and custom AI provider support
+  labels for onboarding, diagnostics, and documentation
 * build ZIP and tar.gz releases from compiled JavaScript with source maps and
   the pruned `playwright-core` runtime dependency
-* add a compiled-release verification command that checks archive equivalence,
-  production SBOM coverage, release identity, launchers, clean installation,
-  gateway diagnostics, and persisted-state reopen
 
 ### Changed
 
 * remove pnpm, Corepack, workspace installation, and TypeScript execution from
   the normal release installation path
+* separate provider transport, public web policy, isolated browser execution,
+  approvals, memory, workspace records, and bounded self-improvement from the
+  central kernel entry module
+* rewrite the README and normal installation guidance for everyday users,
+  business owners, and independent professionals
 * run the existing restart, recovery, audit, upgrade, and rollback soak against
   the assembled production archive
+
+### Security
+
+* require verified release identity and checksums before updates, reject unsafe
+  archive paths and links, and preserve the current installation after a failed
+  update or health check
+* validate migration and restore input as untrusted data, keep temporary and
+  backup files owner-only, reject state-root escapes, and fail closed on
+  unknown schemas
+* preserve private-network blocking, DNS pinning, redirect validation,
+  isolated browser data, browser mutation approval, and uncertain-outcome
+  recovery through the kernel decomposition
+* replace polynomial memory-normalization expressions with linear-time scans
+  after CodeQL identified denial-of-service risk
+
+### Validation
+
+* verify compiled archives install and run without pnpm or a source checkout
+  on Linux, macOS, and Windows
+* cover clean install, pre-v1 upgrade, migration failure and recovery, update,
+  compatible and incompatible rollback, backup, restore, uninstall, audit
+  integrity, and release-content equivalence
+* generate and verify SHA-256 checksums, production SBOMs, release manifests,
+  commit-bound provenance, and clean-install smoke evidence for the exact
+  release archives
 
 ## [0.4.0](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0-beta.3...v0.4.0) (2026-07-25)
 
