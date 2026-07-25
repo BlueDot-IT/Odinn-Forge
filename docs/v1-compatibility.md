@@ -4,9 +4,7 @@ This document defines the compatibility promise for Odinn Forge v1. It is the
 authoritative source for deciding whether a surface is stable, experimental,
 provider-dependent, platform-dependent, internal, or unsupported.
 
-The policy becomes effective with `v1.0.0`. During the pre-v1 release cycle it
-defines the frozen target; it does not claim that unfinished v1 packaging,
-migration, or lifecycle work is already complete.
+This policy is effective for the `v1.x` release line.
 
 ## Boundary terms
 

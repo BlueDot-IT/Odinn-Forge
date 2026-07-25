@@ -3210,10 +3210,10 @@ function renderTui({ state, workspaceRoot, tools, allowedCapabilities, runs }: a
     "",
     "Commands",
     "--------",
-    "Run smoke : pnpm --filter @odinn/cli start -- plan --file examples/local-smoke.plan.json",
-    "Remember  : pnpm odinn memory remember --text 'A useful fact.'",
-    "Watch TUI : pnpm --filter @odinn/cli start -- tui --watch",
-    "GUI       : pnpm --filter @odinn/gateway start"
+    `Run smoke : ${odinnCommand()} plan --file examples/local-smoke.plan.json`,
+    `Remember  : ${odinnCommand()} memory remember --text 'A useful fact.'`,
+    `Watch TUI : ${odinnCommand()} tui --watch`,
+    `Console   : ${odinnCommand()} start`
   ].join("\n");
 }
 

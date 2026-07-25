@@ -1,9 +1,7 @@
 # Surface matrix
 
 This matrix applies the terms from the authoritative
-[v1 compatibility policy](v1-compatibility.md). During the pre-v1 release cycle
-it describes the frozen target, not evidence that unfinished v1 work is already
-complete.
+[v1 compatibility policy](v1-compatibility.md).
 
 | Surface | Classification | Boundary |
 | --- | --- | --- |

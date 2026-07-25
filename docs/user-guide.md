@@ -19,9 +19,7 @@ The three hard limits are:
 
 ## Supported boundary
 
-The current 0.x release line is pre-v1. This section describes the frozen v1
-target. Compiled packaging, state migrations, and lifecycle commands are
-implemented; the compatibility promise becomes effective with `v1.0.0`.
+Odinn Forge v1 supports this local, single-user workflow:
 
 - Linux, macOS, or Windows with Node.js 24 or newer.
 - One local operator using the loopback gateway at `127.0.0.1`.

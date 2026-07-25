@@ -22,7 +22,7 @@ body:
     attributes:
       label: Odinn Forge version
       description: Run `odinn doctor` or provide the release tag.
-      placeholder: v0.4.0
+      placeholder: v1.0.0
     validations:
       required: true
   - type: input
