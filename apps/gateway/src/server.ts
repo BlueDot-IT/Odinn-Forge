@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
@@ -1747,17 +1747,25 @@ function image(response: any, status: any, body: any, contentType: any) {
 }
 
 async function summarizeProviders(config: any, state: any) {
-  return Promise.all(Object.entries(config.providers ?? {}).map(async ([name, provider]: any) => ({
-    name,
-    type: provider.type ?? "openai-compatible",
-    baseUrl: provider.baseUrl,
-    authMode: provider.auth?.mode ?? "api-key",
-    apiKeyEnv: provider.apiKeyEnv ?? "",
-    models: provider.models ?? [],
-    configured: provider.auth?.mode === "oauth"
-      ? await oauthTokenExists(provider, state)
-      : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv])
-  })));
+  return Promise.all(Object.entries(config.providers ?? {}).map(async ([name, provider]: any) => {
+    const support = providerSupport(name);
+    return {
+      name,
+      displayName: support.displayName,
+      supportTier: support.supportTier,
+      locallyTested: support.locallyTested,
+      genericCompatibilityMode: support.genericCompatibilityMode,
+      modelAvailability: support.modelAvailability,
+      type: provider.type ?? "openai-compatible",
+      baseUrl: provider.baseUrl,
+      authMode: provider.auth?.mode ?? "api-key",
+      apiKeyEnv: provider.apiKeyEnv ?? "",
+      models: provider.models ?? [],
+      configured: provider.auth?.mode === "oauth"
+        ? await oauthTokenExists(provider, state)
+        : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv])
+    };
+  }));
 }
 
 async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor }: any) {
@@ -1788,13 +1796,20 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
     version,
     commit: commit || "unknown",
     platform: { os: process.platform, arch: process.arch, node: process.version },
-    providerMode: await Promise.all(Object.entries(normalized.providers ?? {}).map(async ([name, provider]: any) => ({
-      name,
-      type: provider.type ?? "openai-compatible",
-      authMode: provider.auth?.mode ?? "api-key",
-      configured: provider.auth?.mode === "oauth" ? await oauthTokenExists(provider, state) : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv]),
-      models: provider.models ?? []
-    }))),
+    providerMode: await Promise.all(Object.entries(normalized.providers ?? {}).map(async ([name, provider]: any) => {
+      const support = providerSupport(name);
+      return {
+        name,
+        displayName: support.displayName,
+        supportTier: support.supportTier,
+        locallyTested: support.locallyTested,
+        genericCompatibilityMode: support.genericCompatibilityMode,
+        type: provider.type ?? "openai-compatible",
+        authMode: provider.auth?.mode ?? "api-key",
+        configured: provider.auth?.mode === "oauth" ? await oauthTokenExists(provider, state) : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv]),
+        models: provider.models ?? []
+      };
+    })),
     experimental: featureFlags,
     audit,
     approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
@@ -4956,7 +4971,19 @@ function renderConsoleHtml(version = "development") {
       const configured = provider.configured && (provider.models || []).length > 0;
       const status = configured ? "Ready" : provider.configured ? "Choose a model" : "Connect account";
       const connection = provider.name === "ollama" || provider.name === "lmstudio" ? "On this computer" : "Connected service";
-      return '<div class="provider-card"><div class="provider-head"><strong>' + escapeHtml(friendlyStatus(provider.name)) + '</strong><span class="chip ' + (configured ? "ok" : "warn") + '">' + status + '</span></div><div class="chip-row"><span class="chip">' + escapeHtml(connection) + '</span><span class="chip">' + escapeHtml((provider.models || []).length + " model" + ((provider.models || []).length === 1 ? "" : "s")) + '</span></div><div class="muted">' + escapeHtml(configured ? "Available for chat and automatic improvements." : "Finish setup to use this provider.") + '</div></div>';
+      const support = provider.supportTier === "first-class"
+        ? "First-class support"
+        : provider.supportTier === "compatible"
+          ? "Compatibility preset"
+          : provider.supportTier === "experimental"
+            ? "Experimental"
+            : "Custom compatibility mode";
+      const boundary = provider.genericCompatibilityMode
+        ? " Uses the shared OpenAI-compatible connection; the external service is not live-tested by Odinn."
+        : provider.modelAvailability === "provider-dependent"
+          ? " Models and service availability are controlled by the provider."
+          : " Model availability depends on the local server.";
+      return '<div class="provider-card"><div class="provider-head"><strong>' + escapeHtml(provider.displayName || friendlyStatus(provider.name)) + '</strong><span class="chip ' + (configured ? "ok" : "warn") + '">' + status + '</span></div><div class="chip-row"><span class="chip">' + escapeHtml(support) + '</span><span class="chip">' + escapeHtml(connection) + '</span><span class="chip">' + escapeHtml((provider.models || []).length + " model" + ((provider.models || []).length === 1 ? "" : "s")) + '</span></div><div class="muted">' + escapeHtml((configured ? "Available for chat and automatic improvements." : "Finish setup to use this provider.") + boundary) + '</div></div>';
     }
 
     function providerReady(status = state.status) {

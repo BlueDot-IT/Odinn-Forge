@@ -298,6 +298,9 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     assert.match(script, /\$\(["']provider-cta["']\)/u);
     const providerCopy = section(script, /function renderChatMessages\s*\(/u, /async function createChat\s*\(/u);
     assert.match(script, /providers[\s\S]{0,240}configured/u, "Chat readiness must use configured provider state");
+    assert.match(script, /First-class support/u, "provider cards must show the first-class support boundary");
+    assert.match(script, /Compatibility preset/u, "provider cards must distinguish compatibility presets");
+    assert.match(script, /Custom compatibility mode/u, "provider cards must label custom endpoints");
     assert.doesNotMatch(providerCopy, /const configured = state\.status\?\.models\?\.length/u);
     assert.doesNotMatch(html, /id="(?:health|copy-status|quick-smoke|chat-smoke)"/u);
     assertIds(html, ["task-page-size", "task-prev", "task-next", "task-select-page", "task-rerun-selected", "task-cancel-selected"]);

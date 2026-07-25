@@ -67,6 +67,12 @@ or headless setup, pass explicit provider flags such as
 `odinn onboard --provider openai --auth api-key`. Run
 `odinn onboard --verify --non-interactive` for a standalone capability check.
 
+OpenAI / ChatGPT, OpenRouter, and Ollama are the first-class v1 provider paths.
+Other built-in connections are labeled as compatibility presets or
+experimental paths during onboarding and in the console. An endpoint you add
+yourself is labeled custom compatibility mode. See
+[AI provider support](provider-support.md) for what each label promises.
+
 On macOS, use `shasum -a 256 -c` instead of `sha256sum -c` when GNU coreutils is unavailable.
 
 ### Windows PowerShell

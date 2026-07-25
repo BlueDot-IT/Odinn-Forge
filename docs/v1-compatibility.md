@@ -158,6 +158,14 @@ contracts for first-class providers and the generic OpenAI-compatible adapter
 are stable. Provider presets and support tiers live outside the kernel entry
 module.
 
+The first-class v1 provider paths are OpenAI / ChatGPT, OpenRouter, and Ollama.
+Compatibility presets use the stable shared adapter but do not receive a
+continuous live-service guarantee. Specialized paths labeled Experimental are
+outside the stable provider promise. Arbitrary OpenAI-compatible endpoints are
+supported through Custom compatibility mode. The current classifications are
+listed in [AI provider support](provider-support.md) and exposed by
+`odinn config provider catalog`.
+
 Live model availability, pricing, quotas, rate limits, service behavior, OAuth
 availability, and provider-specific output remain provider-dependent. Local
 model installation, CLI adapters, and host acceleration may also be

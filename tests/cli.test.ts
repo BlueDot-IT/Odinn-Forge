@@ -488,6 +488,8 @@ test("CLI doctor reports safe diagnostics without state paths or credentials", a
   assert.equal(report.command, "doctor");
   assert.equal(report.commit, "test-commit");
   assert.equal(report.providerMode[0].configured, false);
+  assert.equal(report.providerMode[0].supportTier, "custom");
+  assert.equal(report.providerMode[0].genericCompatibilityMode, true);
   assert.equal(report.state.secretsExcludedFromDiagnostics, true);
   assert.doesNotMatch(doctor.stdout, new RegExp(state.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(doctor.stdout, /ODINN_DOCTOR_SECRET/);
@@ -595,17 +597,21 @@ test("CLI exposes URL-free presets for hosted and local providers", async () => 
   const providers = JSON.parse(catalog.stdout);
   const byName = new Map(providers.map((provider: any) => [provider.name, provider]));
   assert.ok(byName.size >= 30);
-  assert.deepEqual(byName.get("groq"), {
-    name: "groq",
-    auth: "api-key",
-    baseUrl: "https://api.groq.com/openai/v1",
-    apiKeyEnv: "GROQ_API_KEY",
-    models: ["llama-3.3-70b-versatile"],
-    transport: "openai-chat-completions"
-  });
+  assert.equal(byName.get("groq").displayName, "Groq");
+  assert.equal(byName.get("groq").supportTier, "compatible");
+  assert.equal(byName.get("groq").genericCompatibilityMode, true);
+  assert.equal(byName.get("groq").auth, "api-key");
+  assert.equal(byName.get("groq").baseUrl, "https://api.groq.com/openai/v1");
+  assert.equal(byName.get("groq").apiKeyEnv, "GROQ_API_KEY");
+  assert.deepEqual(byName.get("groq").models, ["llama-3.3-70b-versatile"]);
+  assert.equal(byName.get("groq").transport, "openai-chat-completions");
   assert.equal(byName.get("ollama").baseUrl, "http://127.0.0.1:11434/v1");
   assert.deepEqual(byName.get("ollama").models, []);
+  assert.equal(byName.get("ollama").supportTier, "first-class");
+  assert.equal(byName.get("ollama").locallyTested, true);
   assert.equal(byName.get("openai").auth, "oauth or api-key");
+  assert.equal(byName.get("openrouter").supportTier, "first-class");
+  assert.equal(byName.get("github-copilot").supportTier, "experimental");
 });
 
 test("CLI wires provider-specific OAuth and Antigravity auth modes", async () => {
