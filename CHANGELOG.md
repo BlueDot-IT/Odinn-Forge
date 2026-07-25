@@ -6,6 +6,20 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## Unreleased
 
+## [1.0.0](https://github.com/jason-allen-oneal/Odinn/compare/v1.0.0-rc.1...v1.0.0) (2026-07-25)
+
+### Changed
+
+* promote the verified v1 release-candidate artifact structure and supported
+  local, single-user compatibility contract to the stable release
+* keep the release-candidate state schemas and runtime behavior unchanged so
+  updating from `v1.0.0-rc.1` does not require a state migration
+
+### Validation
+
+* publish the same compiled archive layout verified by the release-candidate
+  build, soak, migration, lifecycle, audit, and clean-install checks
+
 ## [1.0.0-rc.1](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0...v1.0.0-rc.1) (2026-07-25)
 
 ### Added
