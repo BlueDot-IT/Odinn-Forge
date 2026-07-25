@@ -1,8 +1,8 @@
 {
   "name": "odinn",
-  "version": "0.4.0",
+  "version": "1.0.0-rc.1",
   "private": true,
-  "description": "Ódinn Forge cross-platform personal AI agent runtime",
+  "description": "Local AI assistant with memory, audited tools, and user-controlled actions",
   "type": "module",
   "bin": {
     "odinn": "./apps/cli/src/cli.ts"
