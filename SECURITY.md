@@ -62,6 +62,30 @@ Private-network access can expose local services and metadata endpoints. Disabli
 
 The web tools follow redirects through the same URL policy and enforce blocked/allowed domains at each hop. `web.fetch` resolves DNS, rejects private/link-local/metadata ranges, and pins the validated address into the request so validation and connection do not use separate DNS answers. Browser navigation and post-action snapshots are checked against the same network and domain rules. Workspace reads resolve real paths and reject escaping symlinks. Ódinn does not expose file upload or download tools.
 
+### Update, migration, and backup safety
+
+Remote lifecycle resources require HTTPS. `odinn update` requires checksum
+metadata, verifies the release manifest, archive digest, package identity,
+version, and commit, and rejects archive traversal and linked files before
+installation. Versions are immutable and the active pointer changes
+atomically. State migrations validate all stores, create a protected backup,
+operate on a staging tree, verify audit integrity, and fail closed on unknown
+future schemas.
+
+Normal `odinn backup` output excludes OAuth tokens, gateway tokens, browser
+profiles and cookies, capability signing keys, and multi-user password records.
+It uses SQLite's backup API for the runtime database and checksums every
+included file. Restore validates the manifest and every checksum, rejects
+unsafe links and future schemas, creates a protected pre-restore backup, and
+activates verified state atomically. `odinn uninstall` preserves state unless
+state removal is explicitly confirmed and refuses ambiguous paths or unexpected
+installation contents.
+
+Migration and failed-update recovery use internal full snapshots so the
+previous installation can be restored exactly. Those snapshots remain local,
+use owner-only directory and file permissions, and are not the normal export
+format.
+
 ### Experimental runtime controls
 
 Proof, Sentinel, Rewind, Capsules, Darwin, Capability Tokens, and Counterfactual are disabled by default. Enable them one at a time and review the feature documentation:

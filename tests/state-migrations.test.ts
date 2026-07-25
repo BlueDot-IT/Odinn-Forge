@@ -72,7 +72,7 @@ test("release-candidate and empty state need no migration", async () => {
   }
 });
 
-test("release-candidate SQLite state migrates transactionally and raises the rollback floor", async () => {
+test("release-candidate SQLite state migrates transactionally and preserves its compatible rollback floor", async () => {
   const candidate = await fixture("release-candidate");
   const databasePath = join(candidate.state, "db", "odinn.sqlite");
   try {
@@ -81,13 +81,13 @@ test("release-candidate SQLite state migrates transactionally and raises the rol
     database.close();
     const plan = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3"]);
-    assert.equal(plan.rollbackCompatible, false);
+    assert.equal(plan.rollbackCompatible, true);
     const report = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(report?.backupLocation);
     assert.equal(inspectExistingSqliteSchema(databasePath), 3);
     assert.equal(inspectExistingSqliteSchema(join(report.backupLocation!, "db", "odinn.sqlite")), 2);
     const manifest = JSON.parse(await readFile(join(candidate.state, "state-schema.json"), "utf8"));
-    assert.equal(manifest.minimumApplicationVersion, "1.0.0");
+    assert.equal(manifest.minimumApplicationVersion, "1.0.0-rc.1");
     assert.equal(manifest.applicationVersion, "1.0.0");
     assert.equal(manifest.storeVersions.runtimeDatabase, 3);
   } finally {

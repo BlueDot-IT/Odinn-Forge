@@ -4,6 +4,7 @@ import { lstat, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const releaseDir = join(root, "dist", "release");
@@ -24,6 +25,10 @@ if (!Array.isArray(manifest.artifacts)
   || !manifest.artifacts.includes(`${expectedRoot}.zip`)
   || !manifest.artifacts.includes(`${expectedRoot}.tar.gz`)) {
   throw new Error("release manifest must name both production archives");
+}
+if (JSON.stringify(manifest.stateSchemas) !== JSON.stringify(targetStateSchemaVersions())
+  || manifest.minimumApplicationVersionForTargetState !== STATE_SCHEMA_MINIMUM_APPLICATION_VERSION) {
+  throw new Error("release manifest state compatibility metadata is missing or inconsistent");
 }
 
 const sums = (await readFile(join(releaseDir, "SHA256SUMS.txt"), "utf8"))
@@ -158,7 +163,9 @@ for (const extension of ["zip", "tar.gz"]) {
     if (releaseInfo.commit !== manifest.commit
       || releaseInfo.version !== manifest.version
       || releaseInfo.distribution !== "compiled"
-      || releaseInfo.runtimeSha256 !== manifest.runtimeSha256) {
+      || releaseInfo.runtimeSha256 !== manifest.runtimeSha256
+      || JSON.stringify(releaseInfo.stateSchemas) !== JSON.stringify(manifest.stateSchemas)
+      || releaseInfo.minimumApplicationVersionForTargetState !== manifest.minimumApplicationVersionForTargetState) {
       throw new Error(`archive release identity mismatch in ${basename(archive)}`);
     }
 

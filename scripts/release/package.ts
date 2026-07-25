@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { chmod, cp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const dist = join(root, "dist");
@@ -118,6 +119,7 @@ const productionPackage = {
 await writeFile(join(packageRoot, "package.json"), `${JSON.stringify(productionPackage, null, 2)}\n`);
 
 const runtimeSha256 = createHash("sha256").update(await readFile(compiledInfoPath)).digest("hex");
+const stateSchemas = targetStateSchemaVersions();
 const releaseInfo = {
   schemaVersion: 2,
   name: pkg.name,
@@ -125,7 +127,9 @@ const releaseInfo = {
   commit,
   distribution: "compiled",
   node: ">=24.0.0",
-  runtimeSha256
+  runtimeSha256,
+  stateSchemas,
+  minimumApplicationVersionForTargetState: STATE_SCHEMA_MINIMUM_APPLICATION_VERSION
 };
 await writeFile(join(packageRoot, "release-info.json"), `${JSON.stringify(releaseInfo, null, 2)}\n`);
 
@@ -228,6 +232,8 @@ const manifest = {
   sbom: "odinn.spdx.json",
   provenance: "release-provenance.json",
   runtimeDependencies: productionPackage.dependencies,
+  stateSchemas,
+  minimumApplicationVersionForTargetState: STATE_SCHEMA_MINIMUM_APPLICATION_VERSION,
   runtimeStateExcluded: [
     ".odinn/",
     "OAuth credentials",
