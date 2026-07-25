@@ -20,10 +20,10 @@ The three hard limits are:
 ## Supported boundary
 
 The current 0.x release line is pre-v1. This section describes the frozen v1
-target; release evidence determines which unfinished packaging, migration, and
-lifecycle work is available before `v1.0.0`.
+target. Compiled packaging, state migrations, and lifecycle commands are
+implemented; the compatibility promise becomes effective with `v1.0.0`.
 
-- Linux, macOS, or Windows with Node.js 24 or newer and Corepack.
+- Linux, macOS, or Windows with Node.js 24 or newer.
 - One local operator using the loopback gateway at `127.0.0.1`.
 - Public web reading, an isolated browser profile, scoped durable memory, audited tools, projects, sessions, goals, and cron jobs. The console can register and inspect declarative Agent SDK packages and build integrity-checked Skill SDK packages; both install disabled, and registration and discovery do not execute or activate them.
 - Explicit approval for browser mutations and other external side effects.
@@ -90,8 +90,65 @@ odinn.cmd start
 ```
 
 The installer keeps immutable version directories and a previous-version
-pointer. The v1 lifecycle commands will expose update and compatibility-aware
-rollback without requiring internal scripts.
+pointer.
+
+## Updates, backups, restore, and uninstall
+
+Check before changing anything:
+
+```bash
+odinn update check
+odinn state status
+```
+
+`odinn update check` reports the installed and available release identities,
+download size, migration requirement, and rollback compatibility without
+changing application files or state. `odinn update` requires SHA-256 metadata,
+verifies the release and package identities, rejects unsafe archive paths,
+installs into an immutable version directory, checks migration compatibility,
+switches atomically, and runs a health check. A failed switch restores the
+previous application and any pre-update state snapshot.
+
+Use these commands for local state:
+
+```bash
+odinn backup
+odinn backup --output <directory>
+odinn restore --input <directory> --confirm
+odinn state migrate --dry-run
+```
+
+Normal backups include configuration, projects, sessions, goals, memory, jobs,
+cron definitions, audit records and verification keys, approval and browser
+recovery journals, registries, schema versions, and application identity.
+OAuth tokens, gateway tokens, browser profiles and cookies, capability signing
+keys, and multi-user password records are excluded. Every included file is
+checksummed. Restore validates the manifest and checksums, rejects future
+schemas and unsafe links, creates a protected backup of current state, verifies
+a staging tree, and switches it atomically.
+
+Internal migration and failed-update recovery snapshots are complete so Odinn
+can restore the previous installation exactly. They stay local with owner-only
+permissions and are separate from normal user-created backups.
+
+Application rollback is separate from state restore:
+
+```bash
+odinn rollback
+```
+
+Rollback refuses an older application when the current state requires a newer
+reader and points to a matching recovery backup when one was created.
+
+Uninstall preserves state by default:
+
+```bash
+odinn uninstall
+odinn uninstall --remove-state --confirm
+```
+
+Use `--force` only for deliberate non-interactive state removal. Odinn rejects
+ambiguous paths and unexpected files in a custom installation prefix.
 
 ## Privacy and external services
 
@@ -106,6 +163,7 @@ Capture the smallest safe reproduction:
 ```bash
 odinn doctor
 odinn status
+odinn state status
 odinn audit verify
 odinn runs
 ```

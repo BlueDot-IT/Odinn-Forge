@@ -74,6 +74,24 @@ test("production package runs without pnpm or a source checkout", async () => {
       state
     ], workspace);
     assert.match(tool, /ODINN_COMPILED_TEST_OK/);
+    const lifecycleHelp = run(cli, ["help", "--all"], workspace);
+    for (const command of ["odinn update check", "odinn rollback", "odinn backup", "odinn restore", "odinn uninstall", "odinn state status"]) {
+      assert.match(lifecycleHelp, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    }
+    const stateStatus = JSON.parse(run(cli, ["state", "status", "--state", state], workspace));
+    assert.equal(stateStatus.ok, true);
+    assert.equal(stateStatus.pendingMigration, false);
+
+    const marker = join(state, "lifecycle-marker.txt");
+    const backup = join(temporary, "backup");
+    await writeFile(marker, "before backup\n");
+    const backupResult = JSON.parse(run(cli, ["backup", "--output", backup, "--state", state], workspace));
+    assert.equal(backupResult.ok, true);
+    await writeFile(marker, "after backup\n");
+    const restoreResult = JSON.parse(run(cli, ["restore", "--input", backup, "--confirm", "--state", state], workspace));
+    assert.equal(restoreResult.ok, true);
+    assert.equal(await readFile(marker, "utf8"), "before backup\n");
+    assert.match(run(cli, ["runs", "--state", state], workspace), /text\.echo/u);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

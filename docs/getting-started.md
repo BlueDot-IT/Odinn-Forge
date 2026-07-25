@@ -56,6 +56,9 @@ odinn onboard --verify --non-interactive # real AI response test
 odinn sessions      # chat sessions
 odinn runs          # recent audited runs
 odinn audit verify  # verify the audit chain
+odinn state status  # state health and migration status
+odinn update check  # check for a verified release
+odinn backup        # create a checksummed backup without credentials
 odinn help --all    # advanced runtime commands
 ```
 

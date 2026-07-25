@@ -5,7 +5,7 @@ import { AUDIT_SCHEMA_VERSION } from "@odinn/protocol";
 import { FileAuditStore } from "@odinn/store-file";
 import { inspectExistingSqliteSchema } from "@odinn/store-sqlite";
 import { STATE_MIGRATIONS, type StateMigrationDefinition, type StateMigrationResult } from "./migrations/index.ts";
-import { STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
+import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
 import { withStateMutationLock } from "../state-mutation.ts";
 
 const MARKER_SCHEMA_VERSION = 1;
@@ -301,7 +301,7 @@ async function applyStateMigrationPlanUnlocked(
     applicationVersion: plan.applicationVersion,
     applicationCommit: plan.applicationCommit,
     minimumApplicationVersion: plan.rollbackCompatible
-      ? String(options.previousCompatibleApplicationVersion || "0.4.0")
+      ? String(options.previousCompatibleApplicationVersion || STATE_SCHEMA_MINIMUM_APPLICATION_VERSION)
       : plan.applicationVersion,
     targetVersions: plan.targetVersions
   };
@@ -533,7 +533,7 @@ async function refreshHostMetadata(
     throw new Error("state compatibility manifest was not created by the migration plan");
   }
   const minimumApplicationVersion = plan.rollbackCompatible
-    ? String(existing.value.minimumApplicationVersion || options.previousCompatibleApplicationVersion || "0.4.0")
+    ? String(existing.value.minimumApplicationVersion || options.previousCompatibleApplicationVersion || STATE_SCHEMA_MINIMUM_APPLICATION_VERSION)
     : plan.applicationVersion;
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporary, `${JSON.stringify({

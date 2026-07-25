@@ -6,8 +6,10 @@ import { createServer } from "node:http";
 import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
-import { closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { fileURLToPath } from "node:url";
+import { closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
+import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
 import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
 import { decideGatewayAction, openBrowser, probeGateway } from "./onboarding/runtime.ts";
@@ -213,6 +215,27 @@ async function main() {
     case "state":
       await stateCommand(args);
       break;
+    case "backup":
+      await stateCommand(["backup", ...args]);
+      break;
+    case "restore":
+      await stateCommand(["restore", ...args]);
+      break;
+    case "update":
+      await updateCommand(args);
+      break;
+    case "rollback":
+      await printJson(await rollbackApplication(lifecycleOptions(args)));
+      break;
+    case "uninstall":
+      await printJson(await uninstallApplication({
+        stateDir: stateDir(args),
+        prefix: option(args, "--prefix"),
+        removeState: hasFlag(args, "--remove-state"),
+        confirmed: hasFlag(args, "--confirm"),
+        force: hasFlag(args, "--force")
+      }));
+      break;
     case "extension":
     case "extensions":
     case "tool":
@@ -316,6 +339,8 @@ Common commands:
   odinn sessions                    List chats
   odinn runs                        Inspect recent work
   odinn doctor                      Diagnose the current setup
+  odinn update check                Check for a verified release
+  odinn backup                      Back up supported local state
 
 Help:
   odinn help --all                  Show every advanced command
@@ -326,7 +351,8 @@ Support: the local single-user workflow is the stable v1 target. Experimental fe
 function requiresStateCompatibilityCheck(currentCommand: string | undefined, currentArgs: string[]): boolean {
   if (!currentCommand || ["--version", "-V", "help", "--help", "-h"].includes(currentCommand)) return false;
   if (currentCommand === "config" && currentArgs[0] === "provider" && currentArgs[1] === "catalog") return false;
-  return !(currentCommand === "state" && ["migrate", "restore", "import"].includes(currentArgs[0]));
+  if (["update", "rollback", "restore", "uninstall"].includes(currentCommand)) return false;
+  return !(currentCommand === "state" && ["migrate", "restore", "import", "status"].includes(currentArgs[0]));
 }
 
 function applicationIdentity() {
@@ -341,6 +367,27 @@ function applicationIdentity() {
     applicationVersion: String(packageMetadata.version || "development"),
     applicationCommit: String(installMetadata.commit || process.env.ODINN_COMMIT || "unknown")
   };
+}
+
+function lifecycleOptions(commandArgs: string[]) {
+  return {
+    identity: applicationIdentity(),
+    stateDir: stateDir(commandArgs),
+    packageRoot: fileURLToPath(new URL(".", PACKAGE_FILE)),
+    prefix: option(commandArgs, "--prefix"),
+    manifest: option(commandArgs, "--manifest"),
+    checksums: option(commandArgs, "--checksums"),
+    artifact: option(commandArgs, "--artifact")
+  };
+}
+
+async function updateCommand(commandArgs: string[]) {
+  const [subcommand, ...rest] = commandArgs;
+  if (subcommand === "check") {
+    await printJson(await checkForUpdate(lifecycleOptions(rest)));
+    return;
+  }
+  await printJson(await updateApplication(lifecycleOptions(commandArgs)));
 }
 
 function usage() {
@@ -366,7 +413,14 @@ function usage() {
   odinn import openclaw|hermes [--source <path>] [--auth-only|--skills-only] [--dry-run] [--state .odinn]
   odinn state backup --output <directory> [--state .odinn]
   odinn state restore --input <directory> --confirm [--state .odinn]
+  odinn state status [--state .odinn]
   odinn state migrate --dry-run [--state .odinn]
+  odinn backup [--output <directory>] [--state .odinn]
+  odinn restore --input <directory> --confirm [--state .odinn]
+  odinn update check [--manifest <path-or-url>] [--state .odinn]
+  odinn update [--artifact <archive>] [--checksums <file>] [--manifest <path-or-url>] [--state .odinn]
+  odinn rollback [--state .odinn]
+  odinn uninstall [--remove-state --confirm|--force] [--state .odinn]
   odinn extension install --manifest <manifest.json> [--state .odinn]
   odinn extension list [--state .odinn]
   odinn extension enable --id <id> --grant <capability[,capability]> [--trust] [--allow-unsafe-sandbox] [--confirm-impact] [--state .odinn]
@@ -2597,22 +2651,23 @@ async function extensionCommand(args: any) {
 async function stateCommand(args: any) {
   const [subcommand, ...rest] = args;
   const state = stateDir(rest);
+  const identity = applicationIdentity();
+  if (subcommand === "status") {
+    await printJson(await stateLifecycleStatus(state));
+    return;
+  }
   if (subcommand === "migrate") {
     if (!hasFlag(rest, "--dry-run")) throw new Error("state migrate currently requires --dry-run; normal startup applies supported migrations after creating a backup");
-    await printJson(await planStateMigration(state, applicationIdentity()));
+    await printJson(await planStateMigration(state, identity));
     return;
   }
   if (subcommand === "backup" || subcommand === "export") {
-    const output = option(rest, "--output");
-    if (!output) throw new Error("state backup requires --output <directory>");
+    const output = option(rest, "--output", `${state}.backups/manual-${new Date().toISOString().replace(/[:.]/gu, "-")}`);
     const destination = resolveInvocationPath(output);
-    if (destination === state || destination.startsWith(`${state}/`) || destination.startsWith(`${state}\\`)) {
-      throw new Error("state backup destination must not be inside the active state directory");
-    }
-    await validateStateBackupTree(state, { requireManifest: false });
-    await cp(state, destination, { recursive: true, force: false, errorOnExist: true });
-    await writeFile(join(destination, "backup-manifest.json"), `${JSON.stringify({ schemaVersion: 1, source: state, createdAt: new Date().toISOString() }, null, 2)}\n`, { flag: "wx" });
-    await printJson({ ok: true, operation: "backup", source: state, destination });
+    await printJson(await createStateBackup(state, destination, {
+      applicationVersion: identity.applicationVersion,
+      applicationCommit: identity.applicationCommit
+    }));
     return;
   }
   if (subcommand === "restore" || subcommand === "import") {
@@ -2620,66 +2675,14 @@ async function stateCommand(args: any) {
     const input = option(rest, "--input");
     if (!input) throw new Error("state restore requires --input <directory>");
     const source = resolveInvocationPath(input);
-    await access(source);
-    await validateStateBackupTree(source, { requireManifest: true });
-    const parent = resolve(state, "..");
-    const staging = join(parent, `.${state.split(/[\\/]/).pop()}-restore-${process.pid}-${Date.now()}`);
-    await cp(source, staging, { recursive: true, force: false, errorOnExist: true });
-    const configPath = join(staging, "config.json");
-    try {
-      const config = JSON.parse(await readFile(configPath, "utf8"));
-      if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("config.json must contain an object");
-      await validateStateBackupTree(staging, { requireManifest: true });
-    } catch (error: any) { await rm(staging, { recursive: true, force: true }); throw new Error(`state restore source is invalid: ${error.message}`); }
-    const currentBackup = `${state}.before-restore-${Date.now()}`;
-    try {
-      await rename(state, currentBackup);
-      await rename(staging, state);
-      await secureStateTree(state);
-    } catch (error: any) {
-      await rm(staging, { recursive: true, force: true }).catch(() => undefined);
-      try { await access(state); } catch { await rename(currentBackup, state).catch(() => undefined); }
-      throw error;
-    }
-    await printJson({ ok: true, operation: "restore", source, destination: state, preRestoreBackup: currentBackup });
+    await inspectStateBackup(source);
+    await printJson(await restoreStateBackup(source, state, {
+      applicationVersion: identity.applicationVersion,
+      applicationCommit: identity.applicationCommit
+    }));
     return;
   }
-  throw new Error("state requires subcommand: backup, restore, or migrate --dry-run");
-}
-
-async function validateStateBackupTree(root: string, { requireManifest }: { requireManifest: boolean }) {
-  const rootStat = await lstat(root);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("state backup root must be a physical directory");
-  const walk = async (directory: string) => {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      const metadata = await lstat(path);
-      if (metadata.isSymbolicLink()) throw new Error(`state backup contains a symbolic link: ${relative(root, path)}`);
-      if (metadata.isDirectory()) {
-        await walk(path);
-        continue;
-      }
-      if (!metadata.isFile()) throw new Error(`state backup contains an unsupported file type: ${relative(root, path)}`);
-      if (metadata.nlink !== 1) throw new Error(`state backup contains a hard-linked file: ${relative(root, path)}`);
-    }
-  };
-  await walk(root);
-  if (requireManifest) {
-    const manifest = JSON.parse(await readFile(join(root, "backup-manifest.json"), "utf8"));
-    if (!manifest || manifest.schemaVersion !== 1 || typeof manifest.createdAt !== "string") throw new Error("backup-manifest.json is invalid or unsupported");
-  }
-}
-
-async function secureStateTree(root: any) {
-  await chmod(root, 0o700);
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) {
-      await secureStateTree(path);
-    } else if (entry.isFile()) {
-      await chmod(path, 0o600);
-    }
-  }
+  throw new Error("state requires subcommand: status, backup, restore, or migrate --dry-run");
 }
 
 async function session(args: any) {
