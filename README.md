@@ -13,8 +13,9 @@ quietly clicking buttons, changing accounts, or hiding what it did.
 
 **The current 0.x line is pre-v1.** The
 [v1 compatibility contract](docs/v1-compatibility.md) is frozen around the
-local single-user workflow. Packaging, migration, and lifecycle work must be
-completed before that promise becomes effective with `v1.0.0`.
+local single-user workflow. Compiled packaging, state migration, and lifecycle
+commands are implemented and being release-verified before that promise
+becomes effective with `v1.0.0`.
 
 ## What can I use it for?
 
@@ -110,6 +111,19 @@ To open Ódinn again later:
 odinn start
 ```
 
+To check releases and protect local state:
+
+```bash
+odinn update check
+odinn state status
+odinn backup
+```
+
+Updates verify checksums and release identity before switching versions.
+Rollback refuses an application that cannot read current state. Uninstall
+preserves state unless `--remove-state` is explicitly confirmed. See the
+[user guide](docs/user-guide.md#updates-backups-restore-and-uninstall).
+
 The console normally opens at
 [http://127.0.0.1:18790/](http://127.0.0.1:18790/). That address points to your
 own computer, not a public website.
@@ -172,8 +186,8 @@ approvals, allowing private-network access, or installing third-party code.
 
 ## Honest limits
 
-- The current 0.x releases are pre-v1. Keep backups and review important
-  output until the v1 migration and lifecycle guarantees ship.
+- The current 0.x releases are pre-v1. The lifecycle safeguards are available,
+  but the stable compatibility promise begins with `v1.0.0`.
 - It is not a safety-critical system and should not make medical, legal,
   financial, or other high-stakes decisions for you.
 - Its worker processes help contain crashes; they are not a security sandbox

@@ -116,6 +116,20 @@ recoverable. `odinn state migrate --dry-run` reports the versions, steps,
 planned backup location, rollback compatibility, and blockers without writing
 state.
 
+The v1 backup manifest records its format version and kind, creation time,
+source application version and commit, every store schema, whether sensitive
+state was included, explicit exclusions, and a path, size, and SHA-256 digest
+for every payload file. v1.x may add optional fields, but restore continues to
+validate all required fields and rejects unknown future schemas.
+
+The stable lifecycle commands are `odinn update check`, `odinn update`,
+`odinn rollback`, `odinn backup`, `odinn restore`, `odinn uninstall`,
+`odinn state status`, and `odinn state migrate --dry-run`. Their documented
+safety properties—verified release identity, rollback compatibility checks,
+backup-before-replace, state preservation by default, and explicit destructive
+confirmation—are part of the v1 contract. Version-directory names, pointer
+files, recovery directory names, and staging filenames remain internal.
+
 ### Gateway routes
 
 Documented loopback gateway routes, request meanings, authentication boundary,

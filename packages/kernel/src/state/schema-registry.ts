@@ -2,6 +2,8 @@ import { AUDIT_SCHEMA_VERSION } from "@odinn/protocol";
 import { STORE_SCHEMA_VERSION } from "@odinn/store-file";
 import { SQLITE_SCHEMA_VERSION } from "@odinn/store-sqlite";
 
+export const STATE_SCHEMA_MINIMUM_APPLICATION_VERSION = "0.4.0";
+
 export const STATE_SCHEMA_TARGETS = Object.freeze({
   config: 1,
   records: STORE_SCHEMA_VERSION,

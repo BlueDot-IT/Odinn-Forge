@@ -25,6 +25,13 @@ being published.
 Run these commands from a clean, committed checkout:
 
 ```bash
+pnpm test:migrations
+pnpm test:update
+pnpm test:rollback
+pnpm test:backup
+pnpm test:restore
+pnpm test:uninstall
+pnpm test:compiled-release
 pnpm release:package
 pnpm release:soak
 pnpm release:checksums

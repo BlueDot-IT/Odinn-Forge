@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +28,24 @@ test("native installer upgrades by atomic pointer and rolls back to the previous
   assert.equal(rolledBack.current, first.current);
   assert.equal(rolledBack.previous, upgraded.current);
   assert.equal(rolledBack.currentVersion, "0.1.0");
+});
+
+test("native installer refuses a shared launcher directory", async () => {
+  const prefix = await mkdtemp(join(tmpdir(), "odinn-unsafe-install-"));
+  await mkdir(join(prefix, "bin"));
+  await writeFile(join(prefix, "bin", "unrelated-tool"), "keep\n");
+  const result = spawnSync(process.execPath, [
+    join(root, "scripts", "install.ts"),
+    "install",
+    "--source",
+    root,
+    "--prefix",
+    prefix,
+    "--skip-deps"
+  ], { cwd: root, encoding: "utf8" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /unrelated launcher entry/u);
+  assert.equal(await readFile(join(prefix, "bin", "unrelated-tool"), "utf8"), "keep\n");
 });
 
 function run(args: any) {
