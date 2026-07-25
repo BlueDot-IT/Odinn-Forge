@@ -1,20 +1,21 @@
 # Contributing to Odinn Forge
 
-Odinn Forge is preparing for v1. Changes should preserve cross-platform
-behavior, explicit security boundaries, durable state transitions, and a small
-understandable core.
+Odinn Forge v1 is stable for the local, single-user workflow defined in the
+compatibility policy. Changes should preserve cross-platform behavior, explicit
+security boundaries, durable state transitions, and a small understandable
+core.
 
-## v1 feature freeze
+## v1 maintenance boundary
 
-Until `v1.0.0` ships, accepted work is limited to bug and security fixes,
-production packaging, upgrades and migrations, lifecycle commands,
-compatibility fixes, documentation corrections, behavior-preserving
-refactoring, and provider maintenance required for existing supported paths.
+For v1.x, prioritize bug and security fixes, production packaging, upgrades and
+migrations, lifecycle commands, compatibility fixes, documentation
+corrections, behavior-preserving refactoring, and provider maintenance required
+for existing supported paths.
 
 Do not add major features, experimental runtime systems, broad remote-hosting
 expansion, channel integrations, marketplaces, unrelated provider expansion,
 large UI redesigns, or architectural rewrites. Track those requests for
-post-v1 work instead.
+later release work instead.
 
 ## Development setup
 
