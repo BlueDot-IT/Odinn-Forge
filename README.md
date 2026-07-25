@@ -1,54 +1,123 @@
 # Ódinn Forge
 
-![Ódinn Forge — local-first agent runtime](docs/odinn-header.png)
+![Ódinn Forge — your AI assistant, on your computer](docs/odinn-header.png)
 
-[![CI](https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml)
-[![Security](https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml)
-[![Package Integrity](https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml)
-[![Workflow Lint](https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml)
+> **Your AI assistant, on your computer, under your control.**
 
-> A local-first personal AI agent runtime with durable memory, model freedom, real-world tools, and security controls that make dangerous choices explicit.
+Ódinn Forge is an AI assistant that runs on a computer you control. It can
+remember useful context, research the web, use approved tools, and help you
+carry work across multiple conversations.
 
-Ódinn Forge is a cross-platform agent runtime for people who want an assistant that can do more than generate text without turning the machine into an unattended blast radius. It provides the kernel, policy layer, model/provider adapters, browser and web capabilities, sessions, audit trails, and a chat-first local console in one small Node.js workspace.
+It is built for people who want more than a chatbot, but do not want an AI
+quietly clicking buttons, changing accounts, or hiding what it did.
 
-The project is a clean-room implementation. It does not copy OpenClaw, Hermes, OpenViking, or any other agent framework. It takes architectural inspiration from the problems those projects solve and implements Ódinn Forge's own contracts, storage, and security model.
+**Ódinn Forge is currently beta software.** It works on Linux, macOS, and
+Windows, but installation still requires Node.js and a few terminal commands.
 
-## What it does
+## What can I use it for?
 
-Ódinn Forge is a local-first personal AI agent runtime for people who want an
-assistant that can use tools, remember context, and work across real tasks
-without making dangerous choices invisible.
+### Everyday work
 
-It combines model and provider adapters, durable memory, sessions and goals,
-web and browser tools, an audited execution kernel, a local chat console, and a
-CLI in one cross-platform Node.js workspace.
+- Research a topic and turn the results into a useful summary.
+- Keep separate conversations, saved details, and goals for different projects.
+- Remember preferences and project context you choose to save.
+- Draft plans, documents, checklists, and communications.
+- Use the web without mixing its browser activity into your personal browser
+  profile.
+- Review a clear history of tool use and important decisions.
 
-Highlights:
+### Small business owners and independent professionals
 
-- Chat with models through API keys, OAuth, imported OAuth sessions, local
-  servers, or CLI adapters.
-- Keep durable user and project context across sessions.
-- Search the public web and use an isolated browser profile.
-- Require approval before browser actions that can change external state.
-- Inspect sessions, memory, runs, goals, improvements, providers, and audit
-  events.
-- Run deterministic tools and bounded model/tool loops through one audited
-  kernel path.
+- Research competitors, suppliers, products, or market changes.
+- Keep client and internal projects separated inside one workspace.
+- Preserve useful business context between work sessions.
+- Schedule repeatable tool-based tasks.
+- Choose the AI service that fits your budget and privacy needs.
+- Keep an activity trail so you can see what ran, when it ran, and whether it
+  succeeded.
 
-The default gateway is single-user and loopback-only. Remote hosting is an
-opt-in TLS mode with separate application state per user; it is not a hostile
-user operating-system sandbox.
+Ódinn is not a finished industry-specific business suite. It is a general
+assistant you can connect to the models and tools that make sense for your
+work.
 
-See the [surface matrix](docs/surface-matrix.md) for capability boundaries and
-[release validation](docs/release-validation.md) for artifact checks.
+## Why use Ódinn instead of a regular chatbot?
 
-- Forked workers are crash containment, not a security sandbox.
-- Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
-- External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
+### Your work stays organized
+
+Ódinn groups conversations, goals, memories, and activity by project. You can
+return later without rebuilding all the context from scratch.
+
+### You choose the AI
+
+Use OpenAI / ChatGPT, another supported cloud provider, or a local model through
+Ollama and other OpenAI-compatible servers. You are not locked into one model
+company.
+
+### Important actions are visible
+
+Reading a public webpage is different from clicking **Buy**, sending a form, or
+changing an account. Ódinn treats those actions differently and asks for
+approval before browser actions that can change something outside your
+computer.
+
+### Memory is inspectable
+
+Ódinn can suggest useful details to remember, but you decide what to keep. You
+can review, edit, scope, or forget saved memories instead of trusting a hidden
+profile you cannot inspect.
+
+### There is a record of what happened
+
+Tool runs, approvals, and important system events are recorded locally. This
+makes it easier to understand failures, review past work, and verify that the
+assistant followed the expected path.
 
 ## Quick start
 
-Requirements: Node.js 24+ and Corepack.
+### What you need
+
+- Linux, macOS, or Windows
+- [Node.js 24 or newer](https://nodejs.org/)
+- Corepack, which is included with Node.js 24
+- An account with a supported AI provider, or a local AI model through Ollama
+
+### Install a release
+
+Download the latest package from
+[GitHub Releases](https://github.com/jason-allen-oneal/Odinn/releases), then
+follow the platform instructions in the [user guide](docs/user-guide.md).
+
+After installation, run:
+
+```bash
+odinn onboard
+```
+
+Setup will help you:
+
+1. Choose an AI provider and model.
+2. Sign in or connect a local model.
+3. Review what the assistant is allowed to do.
+4. Test a real AI response before saving the setup.
+5. Open the local console in your browser.
+
+To open Ódinn again later:
+
+```bash
+odinn start
+```
+
+The console normally opens at
+[http://127.0.0.1:18790/](http://127.0.0.1:18790/). That address points to your
+own computer, not a public website.
+
+Already use OpenClaw or Hermes? Setup can detect compatible installations and
+offer to copy supported sign-in details or state. It does not change the
+original installation.
+
+### Run from source
+
+If you are a developer or want to try the current repository checkout:
 
 ```bash
 corepack enable
@@ -57,252 +126,135 @@ pnpm check
 pnpm odinn onboard
 ```
 
-Open [http://127.0.0.1:18790/](http://127.0.0.1:18790/).
+See [Getting started](docs/getting-started.md) for local-model setup, scripted
+installation, headless systems, and troubleshooting.
 
-After installing a release, the normal path is shorter:
+## Privacy in plain language
 
-```bash
-odinn onboard
-```
+Ódinn has no built-in product telemetry. Its settings, memories, conversations,
+browser profile, and activity records stay in its local state folder by
+default.
 
-Onboarding offers Quick, Guided, Blank Slate, and detected OpenClaw/Hermes import paths. Existing installs get separate Open, Repair, Change AI, Review capabilities, Advanced, and confirmed reset actions. Changes are staged, backed up, and verified with a real model response before they are committed; custom capability policies remain untouched unless explicitly changed. Use `odinn start --no-open` on headless machines. See [Getting started](docs/getting-started.md) for scripted provider, local-model, and troubleshooting examples.
+Local-first does **not** mean nothing ever leaves your computer:
 
-Verify the configured account and model through the same runtime path used by chat:
+- If you use a cloud AI provider, that provider receives the prompts and
+  context needed to answer you.
+- If Ódinn visits a website, that website receives normal web traffic.
+- If you enable third-party extensions or tools, they may have their own data
+  practices.
+- A local model can keep AI requests on your machine, but web activity still
+  reaches the websites you ask Ódinn to visit.
 
-```bash
-pnpm odinn onboard --verify --non-interactive
-```
+Choose providers and tools that are appropriate for the information you handle.
+Do not give any AI system secrets or sensitive client data unless you understand
+where that data will go.
 
-For a deterministic smoke test:
+## Safety and control
 
-```bash
-pnpm odinn run --tool text.echo --input-json '{"text":"ODINN_OK"}'
-pnpm odinn plan --file examples/local-smoke.plan.json
-pnpm odinn runs
-pnpm odinn audit
-```
+Ódinn is designed to make consequential choices explicit:
 
-The packaged integration check goes beyond the local echo smoke: CI launches the gateway as a child process, configures a local OpenAI-compatible provider endpoint, sends a model request through the gateway, and verifies the assistant response was written to the run record. See the [runtime ledger](docs/runtime-ledger.md) for implementation details and known limits.
+- It uses a separate browser profile instead of silently taking cookies from
+  your everyday browser.
+- Browser clicks, typing, and keypresses require approval by default.
+- New agent, skill, and extension packages start disabled.
+- Setup changes are reviewed, tested, and backed up before replacing a working
+  configuration.
+- Built-in automatic improvements are limited to reversible reliability
+  settings. They cannot rewrite the application, disable safeguards, change
+  credentials, or grant themselves new permissions.
 
-### Phase 0 runtime ledger
+You can weaken some of these controls, but Ódinn makes that an explicit choice.
+Read [SECURITY.md](SECURITY.md) before enabling remote access, relaxing
+approvals, allowing private-network access, or installing third-party code.
 
-Every CLI and gateway tool boundary can now write a durable SQLite run ledger with ordered steps, redacted content-addressed artifacts, conservative tool-safety metadata, experimental feature flags, and a SHA-256 event chain. Inspect a run without reading raw JSONL:
+## Honest limits
 
-```bash
-pnpm --silent odinn run show <run-id> --state .odinn
-pnpm --silent odinn run events <run-id> --state .odinn
-pnpm --silent odinn run verify <run-id> --state .odinn
-```
+- Ódinn is beta software. Keep backups and review important output.
+- It is not a safety-critical system and should not make medical, legal,
+  financial, or other high-stakes decisions for you.
+- Its worker processes help contain crashes; they are not a security sandbox
+  for hostile code.
+- It cannot guarantee that an action on an outside website can be undone.
+- AI responses can be wrong, and cloud services can be unavailable, rate
+  limited, or changed by their providers.
+- The normal local console is for one person on one computer. Do not expose it
+  directly to the public internet.
+- Multi-user hosting is available for experienced operators, but people who do
+  not trust one another should use separate operating-system accounts,
+  containers, or machines.
 
-This is the shared foundation for the experimental Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual slices. They are disabled by default and must be enabled individually. The consolidated CLI home shows every gate, its safe inspection paths, and the real commands behind it:
+The [surface matrix](docs/surface-matrix.md) separates tested behavior,
+experimental features, provider-dependent behavior, and unsupported uses.
 
-```bash
-pnpm odinn experimental status
-pnpm odinn experimental help proof
-pnpm odinn experimental enable proof --confirm-impact
-```
+## Advanced features
 
-The existing `config experimental` and feature-specific commands remain available for scripts. The local console also provides an **Experimental Lab** for live gate status, recent runtime-ledger records, and operator-invoked actions against the same authenticated APIs; it never enables a feature silently. Read the feature notes under [docs/features](docs/features/) before enabling them. See [the event-ledger architecture note](docs/architecture/event-ledger.md).
+Ódinn includes optional labs for people who want deeper control and
+inspection. These features are disabled until you turn them on individually.
 
-### Experimental runtime slices
+- **Proof** checks whether a run met specific acceptance rules.
+- **Sentinel** checks commands, file locations, and approval requirements
+  before an operation.
+- **Capability Tokens** give one narrowly defined permission to one run.
+- **Rewind** saves selected local files and previews a restore before applying
+  it.
+- **Capsules** export a redacted, verifiable bundle of a run.
+- **Counterfactual** compares work in separate copies of a workspace.
+- **Darwin** compares models using recorded reliability, speed, cost, policy,
+  and verification results.
 
-- **Proof** runs shell-free command and file acceptance assertions, stores bounded evidence, and is the only path that can mark a run verified.
-- **Sentinel** evaluates deterministic command, filesystem-root, and approval invariants before an operation.
-- **Capability Tokens** bind short-lived, one-use authority to a run, step, tool, and resource constraint.
-- **Rewind** snapshots selected local files and defaults to a dry-run restore preview.
-- **Capsules** export redacted ZIP-compatible run bundles with checksum verification and safe extraction.
-- **Counterfactual** creates separate filesystem copies of candidate workspaces and compares their durable run records; these copies are not OS sandboxes, and candidate execution and selection remain operator-driven.
-- **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
-- **Automatic improvements** watches for repeated audited failures, uses the configured model for a plain-language assessment, and automatically applies only reversible, allowlisted reliability tuning. It does not rewrite code, change safeguards, install skills, or invent its own actions.
+These tools improve visibility and recovery for local work. They do not make
+outside actions perfectly reversible, and copied workspaces are not security
+sandboxes.
 
-These are local slices, not a claim that arbitrary remote effects can be
-reversed or perfectly replayed. Browser sessions and external mutations are
-supported only through the documented approval, recovery, and egress
-boundaries. Counterfactual execution is explicit and operator-driven. Forked
-workers are crash containment, not a security sandbox. External effects and
-nondeterministic provider behavior are outside full replay/rollback guarantees.
-See the [surface matrix](docs/surface-matrix.md) before enabling an
-experimental feature.
+Use the **Experimental Lab** in the console or read the notes under
+[docs/features](docs/features/) before enabling a lab.
 
-The authenticated gateway exposes the same experimental surfaces through `/runtime/runs`, `/proof`, `/policy/evaluate`, `/capabilities/*`, `/checkpoints`, `/rewind/*`, `/capsules/*`, `/counterfactual/*`, and `/routing/*`. Each surface remains disabled until its matching experimental flag is enabled in `.odinn/config.json`.
-
-## Model providers
-
-The normal provider path is intentionally short:
-
-```bash
-pnpm odinn onboard
-```
-
-Choose OpenAI / ChatGPT in the guided setup to sign in through the browser. API-key setup remains available for scripted and advanced installs:
-
-```bash
-export OPENAI_API_KEY="..."
-pnpm odinn onboard --provider openai --auth api-key
-```
-
-Local models work without a cloud account:
-
-```bash
-pnpm odinn onboard --provider ollama --model <installed-model>
-```
-
-Ódinn Forge does not assume a particular local model. Pass the model name already served by your Ollama instance.
-
-Ódinn Forge also includes URL-free presets for OpenRouter, Groq, Together, Mistral, DeepSeek, xAI, Moonshot, Fireworks, Cerebras, Cohere, DeepInfra, NVIDIA, Z.ai, Qianfan, Volcengine, Xiaomi, Hugging Face, Venice, Chutes, LiteLLM, vLLM, SGLang, LM Studio, GitHub Copilot, xAI device OAuth, and Antigravity.
-
-Inspect the catalog with:
+## Useful commands
 
 ```bash
-pnpm odinn config provider catalog
+odinn status          # Check the current setup
+odinn onboard         # Set up, repair, or change the AI connection
+odinn start           # Open the local console
+odinn sessions        # List saved conversations
+odinn runs            # Show recent tool runs
+odinn audit verify    # Check the local activity record
+odinn doctor          # Create a safe diagnostic summary
 ```
 
-Reuse an existing OpenClaw OAuth session without signing in again:
+## Documentation
 
-```bash
-pnpm odinn auth import openclaw --state .odinn
-```
+- [User guide](docs/user-guide.md) — installation, privacy, and bug reports
+- [Getting started](docs/getting-started.md) — setup and troubleshooting
+- [Operator console](docs/operator-console.md) — projects, tasks, memory, and
+  scheduled jobs
+- [Security guide](SECURITY.md) — safe operation and vulnerability reporting
+- [Capability boundaries](docs/surface-matrix.md) — what is tested,
+  experimental, provider-dependent, or unsupported
 
-Framework state and skills can be imported into an isolated state directory:
+## For developers and contributors
 
-```bash
-pnpm odinn import openclaw --state .odinn
-pnpm odinn import hermes --state .odinn
-```
+Ódinn Forge is an original, clean-room implementation. It does not copy
+OpenClaw, Hermes, OpenViking, or another agent framework.
 
-Secrets stay outside `config.json`. OAuth tokens live in `.odinn/oauth/` with restrictive permissions.
+[![CI](https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml)
+[![Security](https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml)
+[![Package Integrity](https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml)
+[![Workflow Lint](https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml)
 
-Gateway API clients bootstrap a per-state bearer token by requesting `/` once, which sets an `HttpOnly` same-site cookie. Browser clients use that cookie automatically; scripts should send `Authorization: Bearer <token>` or the bootstrap cookie. The token is stored in `.odinn/gateway.token` with mode `0600`. Mutating requests also require a valid same-origin request.
-
-## Memory
-
-Ódinn Forge's memory is an original local context system built around an append-only journal and explicit provenance. It is not a proprietary database clone and does not depend on a closed memory service.
-
-The current memory spine provides:
-
-- durable typed records for preferences, people, projects, decisions, procedures, artifacts, corrections, and system facts;
-- ranked lexical recall with subject, tag, confidence, and recency signals;
-- hierarchical namespaces such as `user/preferences`, `project/decisions`, and `sessions/<id>`;
-- three context tiers: L0 summaries, L1 durable facts, and L2 supporting evidence;
-- automatic recall injected into bounded agent turns as clearly marked context;
-- automatic extraction of strong user statements such as “remember that…”, “I prefer…”, and “we decided…”;
-- session compaction into durable L0 summaries once conversations become long;
-- namespace browsing and record inspection through the gateway, GUI, and CLI;
-- duplicate suppression, corrections/supersession, and expiry enforcement;
-- explicit `memory.recall`, `memory.remember`, `memory.search`, `memory.correct`, and `memory.curate` tools;
-- session provenance linking learned facts back to the originating turn.
-
-Manual memory commands remain available:
-
-```bash
-pnpm odinn memory remember \
-  --kind preference \
-  --subject cli \
-  --text "Prefer exact runnable commands with concise context." \
-  --tags commands,ux
-
-pnpm odinn memory search --query "runnable commands"
-pnpm odinn memory recall --query "how should CLI output behave?"
-pnpm odinn memory browse --namespace user
-pnpm odinn memory open --id <memory-id>
-pnpm odinn memory compact --session <session-id>
-pnpm odinn memory curate
-```
-
-The memory layer is deliberately transparent: inspect the journal, inspect the recall result, correct bad records, and audit the agent path. Embedding-backed retrieval and a pluggable vector index are planned extensions, not hidden magic pretending to exist today.
-
-## Web, browser, and real-world actions
-
-Public web access is available through `web.search` and `web.fetch`.
-
-Private-account access uses Ódinn Forge's isolated persistent browser profile. The user logs in manually; Ódinn Forge does not silently extract cookies from another browser. Browser reads are available to the agent, while clicks, typing, and keypresses require approval by default.
-
-Security controls are configurable:
-
-```bash
-pnpm odinn config security show
-pnpm odinn config security set --surface web --allowed-domains docs.example.com
-pnpm odinn config security set --surface browser --require-approval false --confirm-impact
-```
-
-The last command weakens the default posture. That is intentional: the user owns the dangerous decision, and the configuration makes the decision visible.
-
-State lifecycle commands are explicit and recoverable:
-
-```bash
-pnpm odinn state backup --output /secure/path/odinn-backup
-pnpm odinn state restore --input /secure/path/odinn-backup --confirm
-```
-
-Extension manifests are inert until reviewed and enabled with explicit grants:
-
-```bash
-pnpm odinn extension install --manifest ./extension.json
-pnpm odinn extension enable --id example-tool --grant web.read --trust
-pnpm odinn extension run --id example-tool --capability web.read --input-json '{"query":"hello"}'
-pnpm odinn extension disable --id example-tool
-pnpm odinn extension rollback --id example-tool
-```
-
-Executable extensions use one of two explicit adapters. `container` is the default for third-party code and requires a SHA-256 digest over the complete immutable bundle; it runs read-only with no network, dropped capabilities, no-new-privileges, a PID limit, CPU/memory limits, and a bounded temporary filesystem. `unconfined-process` remains available only for fully trusted local code with a verified entrypoint digest and an explicit unsafe-sandbox acknowledgement. Both adapters receive bounded I/O and cross the audited Sentinel/capability boundary. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use JSON-RPC `tools/call` over JSONL.
-
-Use `--allow-unsafe-sandbox` only when enabling a manifest that explicitly selects `unconfined-process`. The flag is not required for the default container adapter.
-
-The local console includes Projects, scoped Sessions and Goals, automatic Memory with a user-curated suggestion inbox, Activity with overview and searchable history tabs, Cron Jobs, paginated and manageable Tasks, an Agent SDK package registry, a managed Skills SDK, and seven dedicated Labs pages under a collapsible navigation group. Agent and skill packages install disabled; registration or discovery does not execute or activate them. See [Operator console](docs/operator-console.md) for the API, persistence, and security boundaries behind those views.
-
-## Architecture
+The repository is a Node.js workspace:
 
 ```text
-chat / CLI / plans
-          │
-          ▼
-  audited gateway or CLI
-          │
-          ▼
- policy-gated kernel ─── model/provider adapters
-          │              ├─ API key
-          │              ├─ OAuth / device OAuth
-          │              ├─ local OpenAI-compatible servers
-          │              └─ CLI adapters
-  ├── web and isolated browser tools
-  ├── durable projects, scoped sessions, goals, improvements
-  ├── original memory journal and ranked recall
-          ├── SQLite run ledger, artifacts, snapshots, and verification evidence
-          ├── Proof, Sentinel, capabilities, rewind, capsules, branches, and routing
-          └── append-only audit events
+apps/cli/              command-line interface and setup
+apps/gateway/          local service and browser-based console
+packages/kernel/       AI providers, memory, sessions, and tool execution
+packages/policy/       permissions and safety rules
+packages/protocol/     shared request and activity formats
+packages/store-file/   local append-only storage
+packages/store-sqlite/ durable run and artifact storage
+tests/                 unit, integration, CLI, and platform coverage
 ```
 
-Repository layout:
-
-```text
-apps/cli/              user-facing CLI and TUI
-apps/gateway/          local HTTP gateway and web console
-packages/kernel/       policy-gated execution, providers, memory, sessions
-packages/policy/       capability and security policy evaluation
-packages/protocol/     shared request and audit contracts
-packages/store-file/   append-only local stores
-tests/                 kernel, gateway, CLI, integration, and platform coverage
-```
-
-## Local state
-
-By default, runtime state lives under `.odinn/`:
-
-- `config.json` — provider and policy metadata;
-- `records.jsonl` — memory, project, session, goal, and improvement records;
-- `audit.jsonl` — policy decisions and execution events;
-- `db/odinn.sqlite` and `artifacts/` — the durable run ledger and content-addressed evidence;
-- `jobs/`, `approvals.json`, and browser recovery records — restart-safe execution state;
-- `cron-jobs.json` and `agents.json` — scheduled jobs and Agent SDK package state;
-- `skills/registry.json` and `skills/packages/` — managed Skill SDK state and immutable package versions;
-- `gateway.token` and audit signing keys — owner-only local control-plane secrets;
-- `oauth/` — refreshable OAuth tokens;
-- `browser-profile/` — the isolated Chromium profile;
-- `imports/` and `skills/imported/` — reviewed framework imports.
-
-This list identifies the main stores rather than every internal migration or recovery file. Never put API keys, bearer tokens, or private account exports into plans, commits, or audit payloads.
-
-## Development
+Common development commands:
 
 ```bash
 pnpm install
@@ -311,50 +263,11 @@ pnpm test
 pnpm build
 ```
 
-Ódinn Forge targets Node.js 24 and supports Linux, macOS, and Windows paths
-through the platform layer.
-
-Release-package validation extracts both source archives, installs with the frozen lockfile, completes onboarding in a fresh state directory, and executes a real CLI tool from the extracted tree. Run it locally with:
-
-```bash
-pnpm release:package
-pnpm release:soak
-pnpm release:checksums
-node scripts/release/verify.ts
-pnpm release:install-smoke
-pnpm storage:drill
-```
-
-Run this sequence from a clean, committed candidate: the packager archives
-`HEAD`, not uncommitted working-tree changes. Run the soak before checksums so
-`soak-report.json` is included in the final checksum set; if any release
-artifact changes afterward, regenerate the checksums and rerun verification.
-
-## Security
-
-Read [SECURITY.md](SECURITY.md) before enabling remote access, autonomous improvement, disabling approvals, allowing private networks, or installing imported skills. Never bind the single-user gateway publicly. Remote deployments must use the separate multi-user host with TLS and explicit user provisioning.
-
-Versioned install and rollback:
-
-```bash
-./scripts/install.sh --prefix "$HOME/.local/share/odinn"
-node scripts/install.ts upgrade --source . --prefix "$HOME/.local/share/odinn"
-node scripts/install.ts rollback --prefix "$HOME/.local/share/odinn"
-```
-
-Opt-in multi-user host:
-
-```bash
-ODINN_HOST_STATE=/srv/odinn ODINN_USER_PASSWORD='use-a-password-manager' \
-  node apps/gateway/src/host.ts user-add --id alice --workspace /srv/workspaces/alice
-
-ODINN_CONFIRM_IMPACT=true ODINN_HOST=0.0.0.0 ODINN_PORT=443 ODINN_HOST_STATE=/srv/odinn \
-ODINN_PUBLIC_ORIGIN=https://odinn.example.com \
-ODINN_TLS_CERT=/etc/letsencrypt/live/odinn.example.com/fullchain.pem \
-ODINN_TLS_KEY=/etc/letsencrypt/live/odinn.example.com/privkey.pem \
-  pnpm host:start
-```
+Detailed architecture, release validation, storage formats, remote hosting, API
+routes, and extension contracts live under [docs/](docs/). Keeping those
+details there lets this README explain the product before exposing the
+machinery underneath it.
 
 ## License
 
-MIT
+[MIT](LICENSE)
