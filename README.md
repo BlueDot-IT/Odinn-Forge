@@ -11,8 +11,10 @@ carry work across multiple conversations.
 It is built for people who want more than a chatbot, but do not want an AI
 quietly clicking buttons, changing accounts, or hiding what it did.
 
-**Ódinn Forge is currently beta software.** It works on Linux, macOS, and
-Windows, but installation still requires Node.js and a few terminal commands.
+**The current 0.x line is pre-v1.** The
+[v1 compatibility contract](docs/v1-compatibility.md) is frozen around the
+local single-user workflow. Packaging, migration, and lifecycle work must be
+completed before that promise becomes effective with `v1.0.0`.
 
 ## What can I use it for?
 
@@ -169,7 +171,8 @@ approvals, allowing private-network access, or installing third-party code.
 
 ## Honest limits
 
-- Ódinn is beta software. Keep backups and review important output.
+- The current 0.x releases are pre-v1. Keep backups and review important
+  output until the v1 migration and lifecycle guarantees ship.
 - It is not a safety-critical system and should not make medical, legal,
   financial, or other high-stakes decisions for you.
 - Its worker processes help contain crashes; they are not a security sandbox
@@ -183,8 +186,10 @@ approvals, allowing private-network access, or installing third-party code.
   not trust one another should use separate operating-system accounts,
   containers, or machines.
 
-The [surface matrix](docs/surface-matrix.md) separates tested behavior,
-experimental features, provider-dependent behavior, and unsupported uses.
+The [surface matrix](docs/surface-matrix.md) distinguishes stable v1
+interfaces, internal implementation details, experimental interfaces,
+provider-dependent behavior, platform-dependent behavior, and unsupported
+behavior.
 
 ## Advanced features
 
@@ -223,6 +228,8 @@ odinn doctor          # Create a safe diagnostic summary
 
 ## Documentation
 
+- [v1 compatibility policy](docs/v1-compatibility.md) — the stable product
+  promise and its boundaries
 - [User guide](docs/user-guide.md) — installation, privacy, and bug reports
 - [Getting started](docs/getting-started.md) — setup and troubleshooting
 - [Operator console](docs/operator-console.md) — projects, tasks, memory, and

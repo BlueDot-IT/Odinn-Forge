@@ -1,0 +1,193 @@
+# Odinn Forge v1 compatibility policy
+
+This document defines the compatibility promise for Odinn Forge v1. It is the
+authoritative source for deciding whether a surface is stable, experimental,
+provider-dependent, platform-dependent, internal, or unsupported.
+
+The policy becomes effective with `v1.0.0`. During the pre-v1 release cycle it
+defines the frozen target; it does not claim that unfinished v1 packaging,
+migration, or lifecycle work is already complete.
+
+## Boundary terms
+
+- **Stable v1 interface** — documented behavior that v1.x releases preserve.
+  Additive changes are allowed. Removal or incompatible semantic change
+  requires deprecation or a new major version, except when a security fix must
+  fail closed.
+- **Internal implementation detail** — file layout, module boundaries, private
+  package APIs, storage filenames, HTML structure, and other internals that may
+  change without a compatibility promise.
+- **Experimental interface** — an opt-in surface that may change or be removed
+  in a minor release. Experimental state is not promised a stable migration
+  path unless a release says otherwise.
+- **Provider-dependent behavior** — behavior controlled in part by an external
+  model provider, account, model, quota, endpoint, or network service.
+- **Platform-dependent behavior** — behavior controlled in part by the host
+  operating system, browser engine, filesystem, process model, or installed
+  local software.
+- **Unsupported behavior** — behavior outside the product contract. Do not
+  depend on it for production use.
+
+## Stable v1 interfaces
+
+The stable local, single-user product includes:
+
+- CLI startup and documented core commands
+- Local onboarding
+- Configuration loading and validation
+- The loopback gateway and documented gateway routes
+- The local web console
+- Projects
+- Sessions and messages
+- Goals
+- Memory
+- Tasks, jobs, and cron jobs
+- Provider inference through documented adapter contracts
+- Audited tool execution
+- Public web reads
+- Isolated browser operation
+- Approval before browser mutations
+- Restart recovery and uncertain-outcome recovery
+- Diagnostics
+- Installation, update, rollback, backup, restore, and uninstall
+- Persistent-state inspection and migration
+- Audit verification
+
+The [surface matrix](surface-matrix.md) maps individual product areas to these
+terms. Passing tests or having an implementation does not by itself make an
+undocumented interface stable.
+
+## Compatibility expectations
+
+### CLI commands and exit codes
+
+Documented core command names, option meanings, and automation-relevant exit
+behavior are stable. Exit code `0` means success; failures return a nonzero
+code. New commands and optional flags may be added in v1.x.
+
+Human-readable wording, spacing, color, and ordering may change. Scripts must
+use documented machine-readable output where available rather than parse prose.
+Removing a documented command, changing an option incompatibly, or turning a
+successful operation into a different semantic operation requires deprecation
+or a new major version.
+
+### Configuration fields
+
+Documented configuration fields, their types, and their security meaning are
+stable. v1.x may add optional fields and stricter validation for invalid or
+unsafe values. Security-sensitive defaults will not be silently weakened.
+Compatible unknown fields are preserved where doing so is safe.
+
+Undocumented fields, derived values, comments, ordering, and the internal file
+layout are implementation details.
+
+### Persistent state schemas
+
+Every stable persistent store has an explicit schema owner and version.
+Supported older schemas migrate through a validated, testable migration path
+after planning and backup. Unknown newer schemas fail closed before mutation.
+An older application must refuse state it cannot read instead of rewriting it.
+
+The logical records and documented backup manifest are stable. Physical
+filenames, JSON formatting, indexes, and module-level storage APIs are internal
+unless this policy or the backup documentation says otherwise.
+
+### Gateway routes
+
+Documented loopback gateway routes, request meanings, authentication boundary,
+and stable response fields are v1 interfaces. New optional fields or routes may
+be added. Undocumented routes, HTML structure, CSS selectors, JavaScript
+bundles, and internal service calls are implementation details.
+
+Browser-cookie mutations continue to require the documented same-origin
+boundary. Authentication, approval, network, and recovery requirements are
+part of the route contract, not optional implementation details.
+
+### Audit event formats
+
+The documented audit event schema, event meaning, integrity verification, and
+correlation identifiers are stable. v1.x may add optional event types or
+fields. Existing required fields will not be silently repurposed.
+
+The physical journal encoding, file segmentation, key storage layout, and
+internal TypeScript types are implementation details. A migration that must
+re-establish integrity records a deliberate migration event.
+
+### Provider adapter contracts
+
+The normalized request, response, error-redaction, retry, usage, and diagnostic
+contracts for first-class providers and the generic OpenAI-compatible adapter
+are stable. Provider presets and support tiers live outside the kernel entry
+module.
+
+Live model availability, pricing, quotas, rate limits, service behavior, OAuth
+availability, and provider-specific output remain provider-dependent. Local
+model installation, CLI adapters, and host acceleration may also be
+platform-dependent.
+
+### Extension manifests and packages
+
+Extension manifests, Skill SDK packages, Agent SDK packages, third-party
+packages, and MCP packages are experimental interfaces for v1. Registration or
+discovery does not grant trust or execute code. Validation, integrity review,
+explicit enablement, capability grants, and policy enforcement still fail
+closed.
+
+All repository packages and application packages currently marked `private`
+are internal implementation details. They are not stable public SDKs merely
+because source code or TypeScript exports are visible.
+
+### Experimental features
+
+Proof, Sentinel, Rewind, Capsules, Darwin, Capability Tokens,
+Counterfactual, Agent SDK packages, Skill SDK packages, third-party
+extensions, MCP packages, multi-user hosting, and unconfined process execution
+are experimental interfaces. They may ship with v1 but remain outside normal
+v1 compatibility and migration guarantees. They are not promoted to stable by
+this release effort.
+
+## Provider- and platform-dependent behavior
+
+The compatibility promise covers Odinn's local validation, policy, redaction,
+recovery, and normalized adapter behavior. It cannot guarantee that an external
+provider, website, login flow, browser engine, or local model server remains
+available or behaves identically.
+
+Linux, macOS, and Windows remain supported CI platforms. A platform-specific
+capability may depend on the operating system and installed software without
+changing the cross-platform CLI and state contracts.
+
+## Unsupported behavior
+
+The following are explicitly unsupported:
+
+- Using forked workers as hostile-code security sandboxes
+- Exposing the single-user loopback gateway directly to a network
+- Treating multi-user hosting as hostile-user operating-system isolation
+- Guaranteed replay or rollback of external effects or nondeterministic
+  provider behavior
+- Bypassing approval, policy, audit, update verification, or state compatibility
+  checks
+- Relying on undocumented private packages, routes, files, or console DOM
+- Assuming imported or generated code is trusted because it was discovered or
+  registered
+
+## Versioning and deprecation
+
+v1.x releases preserve stable v1 interfaces while allowing additive behavior,
+bug fixes, security fixes, provider maintenance, and internal refactoring.
+Breaking a stable interface normally requires a new major version. When an
+active security issue requires an incompatible restriction, Odinn may fail
+closed in a minor or patch release and will document the exception.
+
+Experimental interfaces may change without a major version. Provider- and
+platform-dependent changes are documented when known but are not fully under
+Odinn's control.
+
+## Three hard limits
+
+- Forked workers are crash containment, not a security sandbox.
+- Remote hosting is application-level tenant isolation, not hostile-user OS
+  isolation.
+- External effects and nondeterministic provider behavior are outside full
+  replay and rollback guarantees.

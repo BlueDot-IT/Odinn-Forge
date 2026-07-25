@@ -1,29 +1,30 @@
 # Surface matrix
 
-This is the operator-facing classification for Ódinn Forge surfaces. The
-classification labels are normative and are reused by the [README](../README.md),
-[user guide](user-guide.md), [runtime ledger](runtime-ledger.md), and [operator
-console guide](operator-console.md).
+This matrix applies the terms from the authoritative
+[v1 compatibility policy](v1-compatibility.md). During the pre-v1 release cycle
+it describes the frozen target, not evidence that unfinished v1 work is already
+complete.
 
-| Surface | Classification | Operator claim and boundary |
+| Surface | Classification | Boundary |
 | --- | --- | --- |
-| Local onboarding, CLI, loopback gateway, and local console | **verified local behavior** | The normal single-operator workflow is supported on an owner-controlled machine with the gateway bound to loopback. |
-| Durable jobs, run ledger, audit chain, approval journal, browser-recovery journal, and local state repair | **verified local behavior** | Restart recovery, audit verification, and bounded local restore paths are implemented. An unknown unsafe outcome remains `needs-review`; it is not silently replayed. |
-| Deterministic local tools, policy checks, capability boundaries, and owner-controlled workspace operations | **verified local behavior** | These paths are audited and bounded when used through the documented CLI or gateway execution boundary. |
-| Forked gateway workers | **verified local behavior** | Forked workers are crash containment, not a security sandbox. They retain the parent OS identity, environment, filesystem, and network authority. |
-| Release archives, checksums, package smoke, and versioned installer rollback | **verified local behavior** | The packaged artifact and installer pointers have local verification and rollback paths; operators must verify the exact release evidence. |
-| Provider transport adapters, retry/backoff handling, OAuth refresh paths, usage normalization, and local protocol-provider smoke | **verified local behavior** | The local adapter contracts and protocol smoke are covered. A passing local protocol provider does not prove a live provider account or service. |
-| Live provider accounts, model availability, quotas, rate limits, OAuth/device flows, local model servers, and CLI adapters | **provider- or platform-dependent** | Behavior depends on the provider service, account, credentials, installed model/server, adapter, operating system, and network. |
-| Public web reads, fetch egress, isolated browser profiles, browser engines, and approval prompts | **provider- or platform-dependent** | Availability, rendering, login state, network behavior, and site responses depend on external services and the host platform. |
-| Approved browser mutations and other external side effects | **provider- or platform-dependent** | Approval and recovery journals provide operator control and recovery blocking, but the external outcome may be delayed, partial, or unknown. |
-| Opt-in TLS multi-user remote hosting | **provider- or platform-dependent** | Remote hosting is application-level tenant isolation, not hostile-user OS isolation. Each tenant has separate application state, but the host still needs OS, container, or machine isolation for mutually hostile users. |
-| Proof, Sentinel, Capability Tokens, Rewind, Capsules, Counterfactuals, and Darwin | **experimental and disabled by default** | These seven local vertical slices require explicit per-feature enablement and remain bounded as documented. |
-| Automatic improvements | **enabled by default and bounded** | Uses the configured model for assessment and applies only reversible, allowlisted reliability tuning. |
-| Audited extension and MCP execution adapters and their policy/capability boundary | **verified local behavior** | Enabled adapters cross the shared audited execution boundary. Container execution has the documented restrictions; direct extension execution is rejected. |
-| Third-party extension/MCP packages, Agent SDK packages, and Skill SDK packages | **experimental and disabled by default** | Installation, registration, or discovery does not grant trust or execute code. Enablement requires explicit review, integrity, grants, and the documented policy boundary. |
-| Experimental replay, rewind, capsule, and counterfactual actions in disposable or copied local workspaces | **experimental and disabled by default** | These paths can preserve and compare bounded local records, but they do not extend guarantees to arbitrary remote effects. |
-| Full replay or rollback of external effects, remote browser/provider mutations, or nondeterministic provider behavior | **explicitly unsupported** | External effects and nondeterministic provider behavior are outside full replay/rollback guarantees. |
-| Hostile-code containment by forked workers or hostile-user OS isolation through remote hosting | **explicitly unsupported** | Use separate operating-system users, containers, or machines when the code or users are mutually hostile. |
+| CLI startup and documented core commands | **Stable v1 interface** | Command names, option meanings, and automation-relevant success or failure behavior follow the compatibility policy. Human-readable wording may evolve. |
+| Local onboarding and configuration loading or validation | **Stable v1 interface** | Documented configuration fields and security meanings remain compatible. File formatting and derived values are internal. |
+| Loopback gateway and documented local console behavior | **Stable v1 interface** | Documented routes, authentication, origin checks, and user workflows are stable. HTML structure, CSS, and undocumented routes are internal implementation details. |
+| Projects, sessions, messages, goals, and memory | **Stable v1 interface** | Documented records and user workflows receive compatible schema migrations. Physical store layout is internal. |
+| Tasks, durable jobs, cron jobs, approvals, restart recovery, and uncertain-outcome recovery | **Stable v1 interface** | Safe work recovers after restart. Unknown external outcomes remain blocked for review rather than being silently replayed. |
+| Audited tool execution, diagnostics, and audit verification | **Stable v1 interface** | Documented event meaning, integrity verification, redaction, and correlation behavior are stable. Journal encoding is internal. |
+| Public web reads, isolated browser operation, and browser mutation approval | **Stable v1 interface** | Network policy, private-network blocking, redirect validation, separate browser data, approval, and recovery boundaries remain enforced. Site availability is provider-dependent behavior; rendering can be platform-dependent behavior. |
+| Installation, update, rollback, backup, restore, uninstall, and state migration | **Stable v1 interface** | Built releases verify identity, preserve recoverable state, and reject incompatible application or state combinations. Version-directory and pointer layout is internal. |
+| First-class provider adapters and custom OpenAI-compatible endpoints | **Stable v1 interface** | Configuration, normalized inference, response parsing, redaction, retry, model selection, diagnostics, and onboarding contracts are stable. |
+| Live provider services, accounts, models, quotas, prices, rate limits, and OAuth flows | **Provider-dependent behavior** | External services can change independently. A local protocol test does not prove a live service or account. |
+| Browser engines, local model servers, local CLI adapters, filesystem semantics, and host process behavior | **Platform-dependent behavior** | Availability and exact behavior depend on the operating system and installed software. |
+| Kernel module layout, private package exports, storage filenames, console DOM, CSS, and undocumented routes | **Internal implementation detail** | These may change during compatible refactoring. Repository packages marked `private` are not public SDKs. |
+| Proof, Sentinel, Rewind, Capsules, Darwin, Capability Tokens, and Counterfactual | **Experimental interface** | These surfaces remain outside normal v1 compatibility and migration guarantees. They are not promoted during the v1 release effort. |
+| Agent SDK packages, Skill SDK packages, third-party extensions, and MCP packages | **Experimental interface** | Discovery and registration do not execute code or grant trust. Review, integrity checks, explicit enablement, grants, and policy remain required. |
+| Multi-user hosting and unconfined process execution | **Experimental interface** | These require explicit operator choices and remain outside the stable local single-user promise. |
+| Full replay or rollback of external effects or nondeterministic provider behavior | **Unsupported behavior** | External outcomes can be delayed, partial, repeated, or unknowable. |
+| Hostile-code containment by forked workers or hostile-user OS isolation through remote hosting | **Unsupported behavior** | Use separate operating-system users, containers, or machines for mutually hostile code or users. |
+| Bypassing approval, policy, audit, verified updates, or state compatibility checks | **Unsupported behavior** | Safety and compatibility checks are part of the supported contract. |
 
 ## Three hard limits
 
@@ -31,6 +32,6 @@ console guide](operator-console.md).
 - Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
 - External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
-When a surface is not clearly covered by the matrix, treat it as
-**explicitly unsupported** until the release evidence and operator
-documentation say otherwise.
+When a surface is not covered by the compatibility policy or this matrix, treat
+it as **Unsupported behavior** until the documentation explicitly says
+otherwise.

@@ -25,12 +25,15 @@ inspect what happened, and roll back without guessing.
 
 ### 1. Surface and safety claims
 
-Create one operator-facing matrix that classifies every surface as:
+Use the [v1 compatibility policy](v1-compatibility.md) and one operator-facing
+matrix that classify every surface as:
 
-- verified local behavior;
-- experimental and disabled by default;
-- provider- or platform-dependent;
-- explicitly unsupported.
+- Stable v1 interface;
+- Internal implementation detail;
+- Experimental interface;
+- Provider-dependent behavior;
+- Platform-dependent behavior;
+- Unsupported behavior.
 
 Use the same terminology in `README.md`, `docs/user-guide.md`,
 `docs/runtime-ledger.md`, CLI help, and the console. Keep the following claims

@@ -307,7 +307,7 @@ Common commands:
 Help:
   odinn help --all                  Show every advanced command
 
-Safety: experimental features are disabled by default. See docs/surface-matrix.md for capability boundaries.`);
+Support: the local single-user workflow is the stable v1 target. Experimental features remain outside the compatibility promise. See docs/v1-compatibility.md.`);
 }
 
 function usage() {
@@ -424,7 +424,7 @@ Built-in tools:
   improve.list
   improve.decide
 
-Safety: experimental features are disabled by default. See docs/surface-matrix.md for capability boundaries.`);
+Support: the local single-user workflow is the stable v1 target. Experimental features remain outside the compatibility promise. See docs/v1-compatibility.md.`);
 }
 
 function option(args: any, name: any, fallback: any = undefined) {

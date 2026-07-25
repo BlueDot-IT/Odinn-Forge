@@ -32,6 +32,12 @@ communicate the revised timeline before disclosure.
 
 Ódinn Forge has explicit capability boundaries, append-only audit events, restart-safe approval and browser-recovery claims, forked crash-containment workers, isolated browser profiles, durable stores, and a loopback-only default control plane. The task workers retain the parent operating-system identity, filesystem, environment, and network authority; they are not a security sandbox. Remote hosting is a separate opt-in service that requires TLS and gives every provisioned user an independent gateway and state/workspace boundary.
 
+The [v1 compatibility policy](docs/v1-compatibility.md) is authoritative for
+stable, internal, experimental, provider-dependent, platform-dependent, and
+unsupported behavior. The stable v1 security boundary covers the documented
+local single-user workflow. Experimental packages, unconfined execution, and
+multi-user hosting remain outside that normal compatibility promise.
+
 Before the 1.0 release:
 
 - Do not expose the Gateway directly to the public internet.

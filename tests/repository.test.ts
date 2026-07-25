@@ -63,6 +63,7 @@ test("user documentation and reporting surfaces ship in the release tree", async
   for (const path of [
     "docs/user-guide.md",
     "docs/release-validation.md",
+    "docs/v1-compatibility.md",
     "docs/surface-matrix.md",
     ".github/ISSUE_TEMPLATE/bug-report.yml",
     ".github/ISSUE_TEMPLATE/feature-request.yml",
@@ -79,11 +80,24 @@ test("user documentation and reporting surfaces ship in the release tree", async
   assert.match(releaseValidation, /archive checksums,[\s\S]*SBOM,[\s\S]*provenance/u);
   const matrix = await read("docs/surface-matrix.md");
   for (const label of [
-    "verified local behavior",
-    "experimental and disabled by default",
-    "provider- or platform-dependent",
-    "explicitly unsupported"
+    "Stable v1 interface",
+    "Internal implementation detail",
+    "Experimental interface",
+    "Provider-dependent behavior",
+    "Platform-dependent behavior",
+    "Unsupported behavior"
   ]) assert.match(matrix, new RegExp(label, "i"));
+  const compatibility = await read("docs/v1-compatibility.md");
+  for (const subject of [
+    "CLI commands and exit codes",
+    "Configuration fields",
+    "Persistent state schemas",
+    "Gateway routes",
+    "Audit event formats",
+    "Provider adapter contracts",
+    "Extension manifests and packages",
+    "Experimental features"
+  ]) assert.match(compatibility, new RegExp(subject, "i"));
   assert.match(matrix, /forked workers are crash containment, not a security sandbox/i);
   assert.match(matrix, /remote hosting is application-level tenant isolation, not hostile-user OS isolation/i);
   assert.match(matrix, /external effects and nondeterministic provider behavior are outside full replay\/rollback guarantees/i);

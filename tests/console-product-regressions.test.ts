@@ -78,6 +78,8 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     assert.doesNotMatch(navigation, /data-view="(?:skill-workshop|workshop)"|>\s*Skill Workshop\s*</i);
     assert.match(navigation, /data-view="agents"[^>]*data-title="Agent SDK"/);
     assert.match(navigation, /data-view="skills"[^>]*data-title="Skills SDK"/);
+    assert.match(navigation, /Agent SDK · Experimental/);
+    assert.match(navigation, /Skills SDK · Experimental/);
     assert.match(navigation, /data-view="projects"[^>]*data-title="Projects"/);
     assert.match(navigation, /data-view="config"[^>]*data-title="Configuration"/);
 
@@ -97,6 +99,7 @@ test("console presents the human-first product surfaces and dedicated Labs pages
 
     const skills = section(html, /<section id="view-skills"[^>]*>/, /<\/section>/);
     assert.match(skills, /<h1>Skills SDK<\/h1>/);
+    assert.match(skills, /Experimental package/);
     assert.match(skills, /Build, review, and manage reusable instructions/);
     assert.match(skills, /Create (?:a )?skill/i);
     assertIds(skills, ["new-skill", "skill-status-filter", "skill-enable", "skill-disable", "skill-verify", "skill-quarantine"]);
@@ -194,6 +197,7 @@ test("console presents the human-first product surfaces and dedicated Labs pages
 
     const agents = section(html, /<section id="view-agents"[^>]*>/, /<\/section>/);
     assert.match(agents, /<h1>Agent SDK<\/h1>/);
+    assert.match(agents, /Experimental package/);
     assert.match(agents, /<label class="switch-label"><input type="checkbox" id="agent-advanced-toggle"> Developer setup<\/label>/);
     assertIds(agents, ["manifest-fields", "agent-manifest", "agent-manifest-error"]);
     assert.doesNotMatch(agents, /Register Agent SDK manifest|Package ID|Network allowlist/);
