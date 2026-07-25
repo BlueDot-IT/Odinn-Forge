@@ -2,9 +2,15 @@ name: Odinn Maintainer
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited, labeled, unlabeled]
   issues:
-    types: [opened, edited, reopened]
+    types: [opened, edited, reopened, labeled, unlabeled]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited]
   workflow_dispatch:
     inputs:
       kind:
@@ -18,31 +24,68 @@ on:
         required: true
         type: number
 
-permissions:
-  contents: read
-  checks: write
-  issues: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: odinn-maintainer-${{ github.event.pull_request.number || github.event.issue.number || inputs.number || github.run_id }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  review:
-    name: Review PR or issue
+  plan:
+    name: Plan review and guarded action
+    if: github.actor != 'github-actions[bot]' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+      issues: read
+      pull-requests: read
     steps:
-      # Keep the event workflow in Odinn, but execute the reviewed logic from
-      # the separately owned maintainer repository at an immutable commit.
       - id: maintainer
-        uses: jason-allen-oneal/odinn-maintainer/.github/actions/review@e2b81cb3731dcb557badc46e9d969d56b7fb5209 # v0.3.0
+        uses: jason-allen-oneal/odinn-maintainer/.github/actions/plan@9c2bd3e60eff731f1d0ece991a6b282aed8d7d28 # v0.4.0
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-read-token: ${{ github.token }}
           oauth-json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
           model: ${{ vars.ODINN_MAINTAINER_MODEL || 'gpt-5.5' }}
           number: ${{ inputs.number }}
           oauth-client-id: ${{ vars.ODINN_OPENAI_OAUTH_CLIENT_ID || 'app_EMoamEEZ73f0CkXaXp7hrann' }}
-          originator: ${{ vars.ODINN_OPENAI_ORIGINATOR || 'openclaw' }}
-          client-version: ${{ vars.ODINN_OPENAI_CLIENT_VERSION || '2026.6.11' }}
+          originator: ${{ vars.ODINN_OPENAI_ORIGINATOR || 'odinn-maintainer' }}
+          client-version: ${{ vars.ODINN_OPENAI_CLIENT_VERSION || '4.0.0' }}
+          allow-automation: ${{ vars.ODINN_MAINTAINER_AUTOMATION_ENABLED || 'false' }}
+          allow-repair: ${{ vars.ODINN_MAINTAINER_ALLOW_REPAIR || 'false' }}
+      - name: Upload bounded plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: odinn-maintainer-plan-${{ github.run_id }}
+          path: ${{ steps.maintainer.outputs.plan-path }}
+          if-no-files-found: error
+          retention-days: 1
+
+  apply:
+    name: Apply guarded action
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+      checks: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Download bounded plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: odinn-maintainer-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/odinn-maintainer-plan
+      - id: maintainer
+        uses: jason-allen-oneal/odinn-maintainer/.github/actions/apply@9c2bd3e60eff731f1d0ece991a6b282aed8d7d28 # v0.4.0
+        with:
+          github-token: ${{ github.token }}
+          plan-path: ${{ runner.temp }}/odinn-maintainer-plan/plan.json
+          allow-automation: ${{ vars.ODINN_MAINTAINER_AUTOMATION_ENABLED || 'false' }}
+          allow-labels: ${{ vars.ODINN_MAINTAINER_ALLOW_LABELS || 'false' }}
+          allow-close: ${{ vars.ODINN_MAINTAINER_ALLOW_CLOSE || 'false' }}
+          allow-merge: ${{ vars.ODINN_MAINTAINER_ALLOW_MERGE || 'false' }}
+          allow-repair: ${{ vars.ODINN_MAINTAINER_ALLOW_REPAIR || 'false' }}
