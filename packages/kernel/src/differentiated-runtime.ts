@@ -6,6 +6,8 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { createRunLedger, redact } from "./run-ledger.ts";
 import { ProofVerifier } from "./proof.ts";
 
+declare const __ODINN_COMPILED__: boolean | undefined;
+
 type AnyRecord = Record<string, any>;
 type FeatureFlags = Record<string, boolean>;
 const failureMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -42,7 +44,8 @@ function odinnVersion() {
   const configured = process.env.ODINN_VERSION?.trim();
   if (configured) return configured;
   try {
-    const manifest = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8"));
+    const compiled = typeof __ODINN_COMPILED__ !== "undefined";
+    const manifest = JSON.parse(readFileSync(new URL(compiled ? "../../package.json" : "../../../package.json", import.meta.url), "utf8"));
     if (typeof manifest.version === "string" && manifest.version.trim()) return manifest.version.trim();
   } catch {}
   return "unknown";

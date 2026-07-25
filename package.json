@@ -18,7 +18,9 @@
     "test": "node --test --test-concurrency=1 --test-reporter=spec tests/*.test.ts",
     "test:platform": "node --test --test-reporter=spec tests/platform.test.ts",
     "test:integration": "node --test --test-reporter=spec tests/integration.test.ts",
+    "test:compiled-release": "pnpm build && pnpm release:package && pnpm release:checksums && node scripts/release/verify.ts && node --test --test-reporter=spec tests/v1/compiled-release.test.ts",
     "build": "node scripts/ci/run.ts build",
+    "build:production": "node scripts/build-production.ts",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm smoke:onboarding && pnpm build",
     "odinn": "node ./apps/cli/src/cli.ts",
     "onboard": "pnpm --filter @odinn/cli start -- onboard",
@@ -39,6 +41,7 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/node": "24.10.1",
+    "esbuild": "0.28.1",
     "eslint": "10.7.0",
     "fast-check": "4.9.0",
     "typescript": "5.9.3",

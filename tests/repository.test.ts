@@ -107,6 +107,25 @@ test("release packaging removes stale assets before creating a version", async (
   const packaging = await read("scripts/release/package.ts");
   assert.match(packaging, /rm\(output, \{ recursive: true, force: true \}\)/);
   assert.ok(packaging.indexOf("rm(output") < packaging.indexOf("mkdir(output"));
+  assert.doesNotMatch(packaging, /git archive/);
+  assert.match(packaging, /distribution: "compiled"/);
+  assert.match(packaging, /for \(const directory of \["cli", "gateway", "workers", "install"\]/);
+  assert.match(packaging, /join\(packageRoot, "node_modules", "playwright-core"\)/);
+
+  const build = await read("scripts/build-production.ts");
+  for (const entrypoint of [
+    "apps/cli/src/cli.ts",
+    "apps/gateway/src/server.ts",
+    "packages/kernel/src/task-worker.ts",
+    "packages/kernel/src/browser-worker.ts"
+  ]) assert.match(build, new RegExp(entrypoint.replaceAll("/", "\\/")));
+  assert.match(build, /sourcemap: "external"/);
+
+  const installSmoke = await read("scripts/release/install-smoke.ts");
+  assert.doesNotMatch(installSmoke, /pnpm|corepack|apps\/cli\/src\/cli\.ts/);
+  assert.match(installSmoke, /odinn-gateway/);
+  assert.match(installSmoke, /"--version"/);
+  assert.match(installSmoke, /\/diagnostics/);
 });
 
 test("third-party workflow actions are pinned to immutable commit SHAs", async () => {

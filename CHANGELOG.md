@@ -6,6 +6,21 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## Unreleased
 
+### Added
+
+* build ZIP and tar.gz releases from compiled JavaScript with source maps and
+  the pruned `playwright-core` runtime dependency
+* add a compiled-release verification command that checks archive equivalence,
+  production SBOM coverage, release identity, launchers, clean installation,
+  gateway diagnostics, and persisted-state reopen
+
+### Changed
+
+* remove pnpm, Corepack, workspace installation, and TypeScript execution from
+  the normal release installation path
+* run the existing restart, recovery, audit, upgrade, and rollback soak against
+  the assembled production archive
+
 ## [0.4.0](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0-beta.3...v0.4.0) (2026-07-25)
 
 ### Added

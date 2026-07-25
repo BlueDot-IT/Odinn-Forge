@@ -12,6 +12,8 @@ const required = [
   "SECURITY.md",
   "docs/user-guide.md",
   "docs/surface-matrix.md",
+  "docs/v1-compatibility.md",
+  "scripts/build-production.ts",
   "pnpm-lock.yaml",
   ".github/ISSUE_TEMPLATE/bug-report.yml",
   ".github/workflows/ci.yml",

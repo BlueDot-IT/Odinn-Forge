@@ -33,11 +33,17 @@ It includes:
 
 ### Nightly
 
-Runs the complete repository check, integration test, protocol smoke, performance threshold, dependency audit, and source packaging every day. Nightly artifacts are retained for seven days.
+Runs the complete repository check, integration test, protocol smoke,
+performance threshold, dependency audit, and compiled production packaging
+every day. Nightly artifacts are retained for seven days.
 
 ### Package Integrity
 
-Runs on every pull request and push to `main`. Linux, macOS, and Windows each build the source archives, verify checksums and archive contents, install from the frozen lockfile, complete onboarding, and execute the packaged CLI smoke.
+Runs on every pull request and push to `main`. Linux, macOS, and Windows each
+build the compiled production archives, verify checksums and archive contents,
+install without a workspace dependency install, complete onboarding, execute a
+packaged CLI tool, start the gateway, verify diagnostics, stop cleanly, and
+reopen state.
 
 ### Workflow and pull-request policy
 
@@ -63,11 +69,17 @@ existing tag for recovery, but cannot release an untagged branch. The workflow:
 1. Checks out the exact tag.
 2. Verifies that the tag matches `package.json`.
 3. Runs all quality, integration, inference protocol, benchmark, and dependency-audit gates.
-4. Produces ZIP and tar.gz source archives from the tagged Git tree.
-5. Generates an SPDX JSON SBOM.
-6. Generates SHA-256 checksums.
-7. Creates GitHub build provenance attestations.
-8. Publishes assets to the GitHub release through the protected `release` environment.
+4. Compiles the CLI, gateway, workers, installer, and runtime packages to
+   JavaScript with source maps.
+5. Assembles equivalent ZIP and tar.gz production archives with runtime
+   dependencies only.
+6. Runs the packaged restart/recovery soak against the compiled archive.
+7. Generates production-package SPDX JSON SBOMs.
+8. Generates SHA-256 checksums and verifies archive identity and contents.
+9. Runs clean install smoke against the exact archives.
+10. Creates GitHub build provenance attestations.
+11. Publishes the verified assets to the GitHub release through the protected
+    `release` environment.
 
 The workflow cannot publish from an untagged branch or a tag that disagrees with the package version.
 

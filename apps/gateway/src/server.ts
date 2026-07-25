@@ -8,9 +8,12 @@ import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDif
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
+declare const __ODINN_COMPILED__: boolean | undefined;
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
-const PUBLIC_DIR = fileURLToPath(new URL("../public/", import.meta.url));
-const PACKAGE_FILE = fileURLToPath(new URL("../../../package.json", import.meta.url));
+const compiledRuntime = typeof __ODINN_COMPILED__ !== "undefined";
+const PUBLIC_DIR = fileURLToPath(new URL(compiledRuntime ? "./public/" : "../public/", import.meta.url));
+const PACKAGE_FILE = fileURLToPath(new URL(compiledRuntime ? "../../package.json" : "../../../package.json", import.meta.url));
+const INSTALL_METADATA_FILE = fileURLToPath(new URL(compiledRuntime ? "../../install-metadata.json" : "../../../install-metadata.json", import.meta.url));
 
 async function productVersion() {
   try {
@@ -1763,10 +1766,10 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
   try { ownerOnly = ((await statPath(state)).mode & 0o077) === 0; } catch {}
   const normalized = normalizeModelConfig(config);
   let version = "unknown";
-  try { version = JSON.parse(await readFile(new URL("../../../package.json", import.meta.url), "utf8")).version ?? version; } catch {}
+  try { version = JSON.parse(await readFile(PACKAGE_FILE, "utf8")).version ?? version; } catch {}
   let commit = process.env.ODINN_COMMIT ?? "";
   if (!commit) {
-    try { commit = JSON.parse(await readFile(new URL("../../../install-metadata.json", import.meta.url), "utf8")).commit ?? ""; } catch {}
+    try { commit = JSON.parse(await readFile(INSTALL_METADATA_FILE, "utf8")).commit ?? ""; } catch {}
   }
   return {
     ok: audit.valid,

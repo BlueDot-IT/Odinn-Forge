@@ -13,7 +13,11 @@ import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
 import { decideGatewayAction, openBrowser, probeGateway } from "./onboarding/runtime.ts";
 import { ACCESS_PROFILES, accessProfileLabel, applyAccessProfile, capabilityDelta, identifyAccessProfile } from "./onboarding/state.ts";
 
+declare const __ODINN_COMPILED__: boolean | undefined;
 const rawArgs = process.argv.slice(2);
+const compiledRuntime = typeof __ODINN_COMPILED__ !== "undefined";
+const PACKAGE_FILE = new URL(compiledRuntime ? "../../package.json" : "../../../package.json", import.meta.url);
+const INSTALL_METADATA_FILE = new URL(compiledRuntime ? "../../install-metadata.json" : "../../../install-metadata.json", import.meta.url);
 const configBaselines = new WeakMap<object, string | null>();
 if (rawArgs[0] === "--") rawArgs.shift();
 const [command, ...args] = rawArgs;
@@ -177,6 +181,10 @@ function requireImpactConfirmation(args: any[], kind: keyof typeof DANGEROUS_IMP
 
 async function main() {
   switch (command) {
+    case "--version":
+    case "-V":
+      console.log(JSON.parse(readFileSync(PACKAGE_FILE, "utf8")).version ?? "unknown");
+      break;
     case "init":
       await init(args);
       break;
@@ -1186,10 +1194,10 @@ async function doctor(args: any) {
   let ownerOnly = false;
   try { ownerOnly = ((await statPath(state)).mode & 0o077) === 0; } catch {}
   let version = "unknown";
-  try { version = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")).version ?? version; } catch {}
+  try { version = JSON.parse(readFileSync(PACKAGE_FILE, "utf8")).version ?? version; } catch {}
   let commit = process.env.ODINN_COMMIT ?? "";
   if (!commit) {
-    try { commit = JSON.parse(await readFile(new URL("../../../install-metadata.json", import.meta.url), "utf8")).commit ?? ""; } catch {}
+    try { commit = JSON.parse(await readFile(INSTALL_METADATA_FILE, "utf8")).commit ?? ""; } catch {}
   }
   return {
     ok: audit.valid,

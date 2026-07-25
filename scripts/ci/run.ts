@@ -147,6 +147,14 @@ async function typecheck() {
 
 async function build() {
   if (await workspacePackageCount()) await runWorkspaceScript("build");
+  const production = spawnSync(process.execPath, ["scripts/build-production.ts"], {
+    cwd: root,
+    encoding: "utf8",
+    env: boundedEnvironment()
+  });
+  if (production.stdout) process.stdout.write(production.stdout);
+  if (production.stderr) process.stderr.write(production.stderr);
+  if (production.status !== 0) process.exit(production.status ?? 1);
   const result = spawnSync("git", ["ls-files", "-z"], { cwd: root, encoding: "buffer" });
   if (result.status !== 0) throw new Error("git ls-files failed");
   const files = result.stdout.toString("utf8").split("\0").filter(Boolean).sort();
