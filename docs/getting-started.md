@@ -2,11 +2,12 @@
 
 Ódinn Forge needs Node.js 24 or newer. The downloaded release already contains
 the built application and runtime dependencies, so normal installation does
-not need pnpm, Corepack, or a source checkout. Install the release for your
-platform. Start the guided onboarding with:
+not need pnpm, Corepack, or a source checkout.
 
 For release downloads, checksum verification, privacy expectations, and
 diagnostics, start with the [user guide](user-guide.md).
+
+After installing the release for your platform, start guided setup with:
 
 ```bash
 odinn onboard

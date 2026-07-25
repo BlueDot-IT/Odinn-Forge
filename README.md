@@ -8,14 +8,14 @@
 remember useful context, research the web, use approved tools, and help you
 carry work across multiple conversations.
 
-It is built for people who want more than a chatbot, but do not want an AI
-quietly clicking buttons, changing accounts, or hiding what it did.
+It is built for everyday users, business owners, and independent professionals
+who want more than a chatbot—but do not want an AI quietly clicking buttons,
+changing accounts, or hiding what it did.
 
-**The current 0.x line is pre-v1.** The
-[v1 compatibility contract](docs/v1-compatibility.md) is frozen around the
-local single-user workflow. Compiled packaging, state migration, and lifecycle
-commands are implemented and being release-verified before that promise
-becomes effective with `v1.0.0`.
+Odinn Forge v1 supports the local, single-user workflow described in the
+[v1 compatibility policy](docs/v1-compatibility.md). Optional Labs,
+third-party packages, and remote multi-user hosting have separate support
+boundaries.
 
 ## What can I use it for?
 
@@ -52,15 +52,13 @@ return later without rebuilding all the context from scratch.
 
 ### You choose the AI
 
-Use OpenAI / ChatGPT, another supported cloud provider, or a local model through
-Ollama and other OpenAI-compatible servers. You are not locked into one model
-company.
+Use OpenAI / ChatGPT, OpenRouter, a local model through Ollama, or another
+compatible AI service. You are not locked into one model company.
 
-Odinn labels each connection honestly: OpenAI, OpenRouter, and Ollama receive
-first-class v1 coverage; compatibility presets share a maintained connection
-layer without a live-service guarantee; specialized provider paths can remain
-experimental; and your own endpoint is shown as custom compatibility mode.
-See [AI provider support](docs/provider-support.md).
+OpenAI, OpenRouter, and Ollama are tested as primary connections. Other listed
+services may depend on shared compatibility support or on features controlled
+by that provider. See [AI provider support](docs/provider-support.md) for the
+plain-language labels shown during setup.
 
 ### Important actions are visible
 
@@ -125,9 +123,10 @@ odinn state status
 odinn backup
 ```
 
-Updates verify checksums and release identity before switching versions.
-Rollback refuses an application that cannot read current state. Uninstall
-preserves state unless `--remove-state` is explicitly confirmed. See the
+Odinn checks an update before installing it, keeps the previous application
+available when possible, and will not roll back if doing so could damage newer
+saved data. Uninstall keeps your saved state unless you explicitly ask to
+remove it. See the
 [user guide](docs/user-guide.md#updates-backups-restore-and-uninstall).
 
 The console normally opens at
@@ -192,8 +191,6 @@ approvals, allowing private-network access, or installing third-party code.
 
 ## Honest limits
 
-- The current 0.x releases are pre-v1. The lifecycle safeguards are available,
-  but the stable compatibility promise begins with `v1.0.0`.
 - It is not a safety-critical system and should not make medical, legal,
   financial, or other high-stakes decisions for you.
 - Its worker processes help contain crashes; they are not a security sandbox
