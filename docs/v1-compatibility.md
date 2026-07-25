@@ -92,6 +92,30 @@ The logical records and documented backup manifest are stable. Physical
 filenames, JSON formatting, indexes, and module-level storage APIs are internal
 unless this policy or the backup documentation says otherwise.
 
+The canonical per-store registry is
+`packages/kernel/src/state/schema-registry.ts`. The v1 owners are:
+
+| Logical state | Schema owner | v1 support |
+| --- | --- | --- |
+| Configuration | Kernel configuration boundary | Stable |
+| Records, sessions, projects, goals, and memory | File store plus the matching kernel module | Stable |
+| Jobs | File store and job supervisor | Stable |
+| Audit events and verification keyring | Protocol and file store | Stable |
+| Approvals | Kernel approval boundary | Stable |
+| Browser recovery and durable tab handles | Kernel browser boundary | Stable |
+| Cron definitions | Gateway cron boundary | Stable |
+| Runtime database | SQLite store | Stable |
+| Extension, Skill SDK, and Agent SDK registries | Their owning package boundary | Experimental |
+| Per-store compatibility metadata | Kernel state boundary | Internal |
+
+Before a supported migration changes state, Odinn inspects every store, proves
+that a complete migration path exists, creates a protected backup, transforms
+and verifies a staging tree, and then switches the state directory. An
+interprocess lock and an external in-progress marker make an interrupted switch
+recoverable. `odinn state migrate --dry-run` reports the versions, steps,
+planned backup location, rollback compatibility, and blockers without writing
+state.
+
 ### Gateway routes
 
 Documented loopback gateway routes, request meanings, authentication boundary,

@@ -25,6 +25,10 @@ export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, 
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
 export { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
 export { withStateMutationLock } from "./state-mutation.ts";
+export { STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions } from "./state/schema-registry.ts";
+export type { StateSchemaOwner, StateSchemaVersions, StateSupport, StateSurface } from "./state/schema-registry.ts";
+export { applyStateMigrations, ensureStateCompatibility, inspectStateSchemas, planStateMigration, recoverInterruptedStateMigration } from "./state/migration-manager.ts";
+export type { PlannedMigrationStep, StateCompatibilityOptions, StateInspection, StateMigrationPlan, StateMigrationReport, StateSurfaceStatus } from "./state/migration-manager.ts";
 
 export const PROVIDER_PRESETS = {
   openai: {

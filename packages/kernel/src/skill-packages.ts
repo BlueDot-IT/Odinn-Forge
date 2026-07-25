@@ -190,7 +190,9 @@ export class SkillPackageStore {
   private async read(): Promise<RegistryState> {
     try {
       const value = JSON.parse(await readFile(this.registryPath, "utf8"));
-      return value?.schemaVersion === 1 && Array.isArray(value.packages) ? value : { schemaVersion: 1, packages: [] };
+      if (value?.schemaVersion !== 1) throw new Error(`unsupported skill registry schema: ${String(value?.schemaVersion)}`);
+      if (!Array.isArray(value.packages)) throw new Error("skill registry packages must be an array");
+      return value;
     } catch (error: any) {
       if (error?.code === "ENOENT") return { schemaVersion: 1, packages: [] };
       throw error;

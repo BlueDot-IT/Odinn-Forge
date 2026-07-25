@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 
 export const SQLITE_SCHEMA_VERSION = 3;
+export type SqliteStoreOptions = { targetVersion?: number };
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
 type FeatureFlags = Record<string, boolean>;
@@ -295,19 +296,36 @@ export class SqliteStore {
   readonly path: string;
   readonly db: DatabaseSync;
 
-  constructor(path: string) {
+  constructor(path: string, { targetVersion = SQLITE_SCHEMA_VERSION }: SqliteStoreOptions = {}) {
     if (!path) throw new Error("SqliteStore requires a path");
+    if (!Number.isInteger(targetVersion) || targetVersion < 0 || targetVersion > SQLITE_SCHEMA_VERSION) {
+      throw new Error(`unsupported SQLite migration target: ${String(targetVersion)}`);
+    }
     this.path = resolve(path);
+    const existingVersion = inspectExistingSqliteSchema(this.path);
+    if (existingVersion > SQLITE_SCHEMA_VERSION) {
+      throw new Error(`SQLite state schema ${existingVersion} is newer than this Odinn version supports (${SQLITE_SCHEMA_VERSION})`);
+    }
+    if (existingVersion > targetVersion) {
+      throw new Error(`invalid SQLite migration target ${targetVersion} from schema ${existingVersion}`);
+    }
     mkdirSync(dirname(this.path), { recursive: true });
     this.db = new DatabaseSync(this.path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
-    this.migrate();
+    this.migrate(targetVersion);
   }
 
-  migrate() {
+  migrate(targetVersion = SQLITE_SCHEMA_VERSION) {
     const current = (this.db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get() as SqlRow).version;
-    for (let version = Number(current) + 1; version <= MIGRATIONS.length; version += 1) {
+    if (!Number.isInteger(current) || Number(current) < 0) throw new Error(`invalid SQLite schema version: ${String(current)}`);
+    if (Number(current) > SQLITE_SCHEMA_VERSION) {
+      throw new Error(`SQLite state schema ${String(current)} is newer than this Odinn version supports (${SQLITE_SCHEMA_VERSION})`);
+    }
+    if (!Number.isInteger(targetVersion) || targetVersion < Number(current) || targetVersion > SQLITE_SCHEMA_VERSION) {
+      throw new Error(`invalid SQLite migration target ${String(targetVersion)} from schema ${String(current)}`);
+    }
+    for (let version = Number(current) + 1; version <= targetVersion; version += 1) {
       this.db.exec("BEGIN IMMEDIATE");
       try {
         this.db.exec(MIGRATIONS[version - 1]!);
@@ -334,6 +352,22 @@ export class SqliteStore {
 
   close() {
     this.db.close();
+  }
+}
+
+export function inspectExistingSqliteSchema(path: string): number {
+  const resolved = resolve(path);
+  if (!existsSync(resolved)) return 0;
+  const database = new DatabaseSync(resolved, { readOnly: true });
+  try {
+    const table = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'").get();
+    if (!table) return 0;
+    const row = database.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get() as SqlRow;
+    const version = Number(row.version);
+    if (!Number.isInteger(version) || version < 0) throw new Error(`invalid SQLite schema version: ${String(row.version)}`);
+    return version;
+  } finally {
+    database.close();
   }
 }
 

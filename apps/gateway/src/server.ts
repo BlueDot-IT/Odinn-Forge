@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
@@ -21,6 +21,16 @@ async function productVersion() {
     return String(pkg.version || "development");
   } catch {
     return String(process.env.ODINN_VERSION || "development");
+  }
+}
+
+async function productCommit() {
+  try {
+    const metadata = JSON.parse(await readFile(INSTALL_METADATA_FILE, "utf8"));
+    return String(metadata.commit || process.env.ODINN_COMMIT || "unknown");
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+    return String(process.env.ODINN_COMMIT || "unknown");
   }
 }
 
@@ -503,6 +513,7 @@ export async function createGatewayServer({
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
   const version = await productVersion();
+  await ensureStateCompatibility(state, { applicationVersion: version, applicationCommit: await productCommit() });
   await ensureSecureStateDirectory(state);
   const config = await readConfig(state, { hosted });
   const featureFlags = normalizeExperimentalFlags(config.experimental);

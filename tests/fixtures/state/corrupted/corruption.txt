@@ -1,0 +1,1 @@
+config.json is deliberately created with truncated JSON by the migration test.

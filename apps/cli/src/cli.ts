@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
-import { closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
 import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
@@ -180,6 +180,11 @@ function requireImpactConfirmation(args: any[], kind: keyof typeof DANGEROUS_IMP
 }
 
 async function main() {
+  if (requiresStateCompatibilityCheck(command, args)) {
+    const identity = applicationIdentity();
+    const report = await ensureStateCompatibility(stateDir(args), identity);
+    if (report) console.error(`Odinn migrated persistent state safely. Backup: ${report.backupLocation}`);
+  }
   switch (command) {
     case "--version":
     case "-V":
@@ -318,6 +323,26 @@ Help:
 Support: the local single-user workflow is the stable v1 target. Experimental features remain outside the compatibility promise. See docs/v1-compatibility.md.`);
 }
 
+function requiresStateCompatibilityCheck(currentCommand: string | undefined, currentArgs: string[]): boolean {
+  if (!currentCommand || ["--version", "-V", "help", "--help", "-h"].includes(currentCommand)) return false;
+  if (currentCommand === "config" && currentArgs[0] === "provider" && currentArgs[1] === "catalog") return false;
+  return !(currentCommand === "state" && ["migrate", "restore", "import"].includes(currentArgs[0]));
+}
+
+function applicationIdentity() {
+  const packageMetadata = JSON.parse(readFileSync(PACKAGE_FILE, "utf8"));
+  let installMetadata: Record<string, unknown> = {};
+  try {
+    installMetadata = JSON.parse(readFileSync(INSTALL_METADATA_FILE, "utf8"));
+  } catch (error: unknown) {
+    if (!(typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  return {
+    applicationVersion: String(packageMetadata.version || "development"),
+    applicationCommit: String(installMetadata.commit || process.env.ODINN_COMMIT || "unknown")
+  };
+}
+
 function usage() {
   console.log(`Usage:
   odinn start [--state .odinn] [--port 18790] [--no-open]
@@ -341,6 +366,7 @@ function usage() {
   odinn import openclaw|hermes [--source <path>] [--auth-only|--skills-only] [--dry-run] [--state .odinn]
   odinn state backup --output <directory> [--state .odinn]
   odinn state restore --input <directory> --confirm [--state .odinn]
+  odinn state migrate --dry-run [--state .odinn]
   odinn extension install --manifest <manifest.json> [--state .odinn]
   odinn extension list [--state .odinn]
   odinn extension enable --id <id> --grant <capability[,capability]> [--trust] [--allow-unsafe-sandbox] [--confirm-impact] [--state .odinn]
@@ -2571,6 +2597,11 @@ async function extensionCommand(args: any) {
 async function stateCommand(args: any) {
   const [subcommand, ...rest] = args;
   const state = stateDir(rest);
+  if (subcommand === "migrate") {
+    if (!hasFlag(rest, "--dry-run")) throw new Error("state migrate currently requires --dry-run; normal startup applies supported migrations after creating a backup");
+    await printJson(await planStateMigration(state, applicationIdentity()));
+    return;
+  }
   if (subcommand === "backup" || subcommand === "export") {
     const output = option(rest, "--output");
     if (!output) throw new Error("state backup requires --output <directory>");
@@ -2613,7 +2644,7 @@ async function stateCommand(args: any) {
     await printJson({ ok: true, operation: "restore", source, destination: state, preRestoreBackup: currentBackup });
     return;
   }
-  throw new Error("state requires subcommand: backup or restore");
+  throw new Error("state requires subcommand: backup, restore, or migrate --dry-run");
 }
 
 async function validateStateBackupTree(root: string, { requireManifest }: { requireManifest: boolean }) {
