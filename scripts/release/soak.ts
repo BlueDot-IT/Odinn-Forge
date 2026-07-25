@@ -13,6 +13,8 @@ const manifest = JSON.parse(await readFile(join(releaseDir, "release-manifest.js
 const archive = join(releaseDir, `odinn-v${pkg.version}.tar.gz`);
 const startedAt = Date.now();
 const steps: any[] = [];
+const soakReleaseA = { commit: "a".repeat(40), artifactSha256: "a".repeat(64) };
+const soakReleaseB = { commit: "b".repeat(40), artifactSha256: "b".repeat(64) };
 
 async function run(command: string, args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
   return await new Promise<string>((resolveRun, rejectRun) => {
@@ -254,9 +256,9 @@ try {
   await record("audit-integrity-and-persisted-output", async () => { const verification = JSON.parse(await run(process.execPath, [cliEntry, "audit", "verify", "--state", state], workspace, { INIT_CWD: workspace })); if (!verification.valid) throw new Error("audit verification failed"); await run(process.execPath, [cliEntry, "run", "show", rewindRun.id, "--state", state], workspace, { INIT_CWD: workspace }); return { auditVerification: true }; });
 
   await record("installer-upgrade-rollback", async () => {
-    await run(process.execPath, [installerEntry, "install", "--source", packageRoot, "--prefix", installPrefix, "--version", pkg.version, "--commit", "soak-release-a", "--artifact-sha256", "soak-a"], workspace);
+    await run(process.execPath, [installerEntry, "install", "--source", packageRoot, "--prefix", installPrefix, "--version", pkg.version, "--commit", soakReleaseA.commit, "--artifact-sha256", soakReleaseA.artifactSha256], workspace);
     const first = JSON.parse(await run(process.execPath, [installerEntry, "status", "--prefix", installPrefix], workspace));
-    await run(process.execPath, [installerEntry, "upgrade", "--source", packageRoot, "--prefix", installPrefix, "--version", `${pkg.version}-soak-b`, "--commit", "soak-release-b", "--artifact-sha256", "soak-b"], workspace);
+    await run(process.execPath, [installerEntry, "upgrade", "--source", packageRoot, "--prefix", installPrefix, "--version", `${pkg.version}-soak-b`, "--commit", soakReleaseB.commit, "--artifact-sha256", soakReleaseB.artifactSha256], workspace);
     const upgraded = JSON.parse(await run(process.execPath, [installerEntry, "status", "--prefix", installPrefix], workspace));
     if (upgraded.previous !== first.current) throw new Error("installer did not preserve the previous release pointer");
     await run(process.execPath, [installerEntry, "rollback", "--prefix", installPrefix], workspace);
