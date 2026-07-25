@@ -43,7 +43,7 @@ jobs:
       pull-requests: read
     steps:
       - id: maintainer
-        uses: jason-allen-oneal/odinn-maintainer/.github/actions/plan@57a9ab387ba7aba3ebedba50cd6e1abf488a3dda # v0.4.1
+        uses: jason-allen-oneal/odinn-maintainer/.github/actions/plan@cc058d9a9b504ca81b2c77a16d6f80219dc4c4c0 # v0.4.2
         with:
           github-read-token: ${{ github.token }}
           oauth-json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
@@ -51,7 +51,7 @@ jobs:
           number: ${{ inputs.number }}
           oauth-client-id: ${{ vars.ODINN_OPENAI_OAUTH_CLIENT_ID || 'app_EMoamEEZ73f0CkXaXp7hrann' }}
           originator: ${{ vars.ODINN_OPENAI_ORIGINATOR || 'odinn-maintainer' }}
-          client-version: ${{ vars.ODINN_OPENAI_CLIENT_VERSION || '4.0.1' }}
+          client-version: ${{ vars.ODINN_OPENAI_CLIENT_VERSION || '4.0.2' }}
           allow-automation: ${{ vars.ODINN_MAINTAINER_AUTOMATION_ENABLED || 'false' }}
           allow-repair: ${{ vars.ODINN_MAINTAINER_ALLOW_REPAIR || 'false' }}
       - name: Upload bounded plan
@@ -80,7 +80,7 @@ jobs:
           name: odinn-maintainer-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/odinn-maintainer-plan
       - id: maintainer
-        uses: jason-allen-oneal/odinn-maintainer/.github/actions/apply@57a9ab387ba7aba3ebedba50cd6e1abf488a3dda # v0.4.1
+        uses: jason-allen-oneal/odinn-maintainer/.github/actions/apply@cc058d9a9b504ca81b2c77a16d6f80219dc4c4c0 # v0.4.2
         with:
           github-token: ${{ github.token }}
           plan-path: ${{ runner.temp }}/odinn-maintainer-plan/plan.json
