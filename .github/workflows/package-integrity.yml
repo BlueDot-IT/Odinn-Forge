@@ -40,6 +40,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm release:preflight
+      - run: pnpm build
       - run: pnpm release:package
       - run: pnpm release:checksums
       - run: node scripts/release/verify.ts

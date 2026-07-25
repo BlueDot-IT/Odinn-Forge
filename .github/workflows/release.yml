@@ -74,9 +74,9 @@ jobs:
       - run: pnpm release:soak
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          path: .
+          path: dist/package-stage
           format: spdx-json
-          output-file: dist/release/odinn.spdx.json
+          output-file: dist/release/odinn-anchore.spdx.json
       - run: pnpm release:checksums
       - run: node scripts/release/verify.ts
       - run: pnpm release:install-smoke

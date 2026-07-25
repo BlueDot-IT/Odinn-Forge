@@ -37,9 +37,10 @@ It is not the default path. Do not expose the single-user gateway to a network.
 ## Install a verified release
 
 Download the current release from the repository's Releases page. Release
-assets include ZIP and tar.gz source archives, `SHA256SUMS.txt`, an SPDX SBOM,
-and a release manifest. GitHub also exposes build-provenance attestations for
-the workflow-built assets.
+assets include ZIP and tar.gz production archives, `SHA256SUMS.txt`, production
+SBOMs, and a release manifest. The archives contain compiled JavaScript and
+runtime dependencies; they do not require pnpm or a source checkout. GitHub
+also exposes build-provenance attestations for the workflow-built assets.
 
 ### Linux and macOS
 
@@ -52,8 +53,7 @@ curl -fLO "https://github.com/jason-allen-oneal/Odinn/releases/download/$tag/SHA
 grep "  odinn-$tag.tar.gz$" SHA256SUMS.txt | sha256sum -c -
 tar -xzf "odinn-$tag.tar.gz"
 cd "odinn-$tag"
-corepack enable
-./scripts/install.sh --prefix "$HOME/.local/share/odinn"
+./install/install.sh --prefix "$HOME/.local/share/odinn"
 export PATH="$HOME/.local/share/odinn/bin:$PATH"
 odinn onboard
 ```
@@ -83,19 +83,15 @@ $Actual = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($Actual -ne $Expected) { throw "checksum mismatch for $Archive" }
 Expand-Archive $Archive -DestinationPath . -Force
 Set-Location "odinn-$Tag"
-corepack enable
-./scripts/install.ps1 -Prefix "$HOME/.local/share/odinn"
+./install/install.ps1 -Prefix "$HOME/.local/share/odinn"
 $env:Path = "$HOME/.local/share/odinn/bin;$env:Path"
 odinn.cmd onboard
 odinn.cmd start
 ```
 
-The installer keeps immutable version directories and a previous-version pointer. Inspect or roll back with:
-
-```bash
-node scripts/install.ts status --prefix "$HOME/.local/share/odinn"
-node scripts/install.ts rollback --prefix "$HOME/.local/share/odinn"
-```
+The installer keeps immutable version directories and a previous-version
+pointer. The v1 lifecycle commands will expose update and compatibility-aware
+rollback without requiring internal scripts.
 
 ## Privacy and external services
 

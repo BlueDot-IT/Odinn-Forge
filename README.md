@@ -80,7 +80,6 @@ assistant followed the expected path.
 
 - Linux, macOS, or Windows
 - [Node.js 24 or newer](https://nodejs.org/)
-- Corepack, which is included with Node.js 24
 - An account with a supported AI provider, or a local AI model through Ollama
 
 ### Install a release
@@ -88,6 +87,8 @@ assistant followed the expected path.
 Download the latest package from
 [GitHub Releases](https://github.com/jason-allen-oneal/Odinn/releases), then
 follow the platform instructions in the [user guide](docs/user-guide.md).
+Release packages contain the built application and its runtime dependencies;
+normal installation does not require pnpm or a source checkout.
 
 After installation, run:
 

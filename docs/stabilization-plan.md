@@ -87,7 +87,7 @@ from package installation or discovery.
 
 Keep mutable runtime state outside the source checkout in documented examples
 and release workflows. The default state path must remain owner-only and must
-not be included in source archives or diagnostics.
+not be included in production archives or diagnostics.
 
 Verify that these are never bundled or uploaded:
 
@@ -101,11 +101,13 @@ Verify that these are never bundled or uploaded:
 ### 5. Release and rollback hygiene
 
 Treat every release as an immutable artifact identified by its exact commit,
-version, archive checksum, lockfile state, and Node/pnpm toolchain.
+version, compiled-runtime digest, archive checksum, source lockfile state, and
+build toolchain. pnpm remains a build tool, not an installed runtime
+requirement.
 
 The release proof must include:
 
-- source archive contents;
+- production archive contents;
 - ZIP and tarball checksums;
 - SBOM and provenance output;
 - installed version path;

@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { resolve, sep } from "node:path";
 import type { JsonObject } from "@odinn/protocol";
 
+declare const __ODINN_COMPILED__: boolean | undefined;
+
 export interface JobRecord {
   id: string;
   status: string;
@@ -200,8 +202,14 @@ function isWorkerResponse(message: unknown): message is WorkerResponse {
 export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): TaskExecutor {
   const { stateDir, workspaceRoot, config, policy } = options;
   const authoritativeRoot = resolve(workspaceRoot ?? process.cwd());
-  const workerPath = fileURLToPath(new URL("./task-worker.ts", import.meta.url));
-  const browserWorkerPath = fileURLToPath(new URL("./browser-worker.ts", import.meta.url));
+  const workerPath = fileURLToPath(new URL(
+    typeof __ODINN_COMPILED__ !== "undefined" ? "../workers/task-worker.js" : "./task-worker.ts",
+    import.meta.url
+  ));
+  const browserWorkerPath = fileURLToPath(new URL(
+    typeof __ODINN_COMPILED__ !== "undefined" ? "../workers/browser-worker.js" : "./browser-worker.ts",
+    import.meta.url
+  ));
   const browserExecutor = createPersistentWorkerExecutor({ workerPath: browserWorkerPath, stateDir, workspaceRoot: authoritativeRoot, config, policy });
   const children = new Set<ChildProcess>();
   const execute = ((payload: WorkerPayload, { signal }: ExecutorOptions = {}) => {

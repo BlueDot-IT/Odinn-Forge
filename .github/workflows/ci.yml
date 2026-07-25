@@ -116,6 +116,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm release:preflight
+      - run: pnpm build
       - run: pnpm release:package
       - run: pnpm release:checksums
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

@@ -30,7 +30,10 @@ The three hard limits are:
 - [x] Store schema versions, atomic job writes, explicit corruption recovery, owner-only state permissions, atomic replacement restore with symlink/hardlink/special-file rejection, and persisted task output for replay.
 - [x] Audit-journal key rotation and cross-process append serialization. Signed journal records retain retired verification keys; `odinn audit rotate-key` rotates the active key and `odinn audit verify` validates the single signed chain. Legacy unsigned records are reported and can be rejected without silently rewriting history.
 - [x] Packaged gateway/provider smoke, onboarding smoke, checksums, SBOM/provenance workflow hooks, and cross-platform package tests.
-- [x] Versioned POSIX/PowerShell installers with atomic current/previous pointers and tested application rollback, alongside source archive extraction, frozen dependency installation, onboarding, and CLI release smoke.
+- [x] Compiled production archives with versioned POSIX/PowerShell installers,
+  atomic current/previous pointers, tested application rollback, bundled runtime
+  dependencies, onboarding, gateway diagnostics, and CLI release smoke without
+  a workspace dependency installation.
 - [x] Structured audit events, run timelines, persisted output, replay endpoint, provider failure tests, and failure categorization for task lifecycle.
 
 ## Experimental runtime slices
@@ -58,10 +61,21 @@ The self-improvement loop runs automatically by default. It applies only allowli
 
 ## Required release proof
 
-The CI integration test launches `apps/gateway/src/server.ts`, configures an OpenAI-compatible provider endpoint, calls the gateway, and verifies the response is present in the persisted run record. It exercises the packaged gateway/provider path with a local protocol provider; it does not call a cloud provider or pretend a direct fixture request is production-model validation.
+The normal CI integration test launches the source gateway, configures an
+OpenAI-compatible provider endpoint, calls the gateway, and verifies the
+response is present in the persisted run record. The separate production
+package smoke exercises the compiled gateway/provider path. Neither calls a
+cloud provider or pretends a local protocol fixture is production-model
+validation.
 
 The cross-platform CI matrix runs the CLI onboarding smoke on Linux, macOS, and Windows. The smoke uses a fresh state directory and completes without credentials; provider-specific auth remains an explicit onboarding path.
 
-Package integrity CI extracts both source archives, installs dependencies with the locked toolchain, completes onboarding in a clean state directory, and runs a real CLI tool through the extracted tree. Native installer integration tests separately prove immutable version installation, atomic current/previous pointer changes, and application rollback.
+Package integrity CI builds and extracts both production archives without
+running pnpm in the extracted tree. It installs the compiled application,
+checks its version, completes onboarding, runs a real CLI tool, starts the
+gateway, verifies diagnostics, stops it cleanly, and reopens persisted state.
+Native installer integration tests separately prove immutable version
+installation, atomic current/previous pointer changes, and application
+rollback.
 
 The single-user gateway remains loopback-only. Remote operation must use the TLS-only multi-user host. Extension manifests remain untrusted until explicitly enabled and grant-scoped.
