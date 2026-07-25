@@ -27,8 +27,8 @@ async function delay(ms: number): Promise<void> {
   await new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-async function startGateway(command: string, cwd: string, state: string) {
-  const child = spawn(command, [], {
+async function startGateway(command: string, args: string[], cwd: string, state: string) {
+  const child = spawn(command, args, {
     cwd,
     env: {
       ...process.env,
@@ -118,7 +118,13 @@ for (const extension of ["zip", "tar.gz"]) {
     }
 
     const cli = join(prefix, "bin", process.platform === "win32" ? "odinn.cmd" : "odinn");
-    const gatewayCommand = join(prefix, "bin", process.platform === "win32" ? "odinn-gateway.cmd" : "odinn-gateway");
+    let gatewayCommand = join(prefix, "bin", "odinn-gateway");
+    let gatewayArgs: string[] = [];
+    if (process.platform === "win32") {
+      const installState = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
+      gatewayCommand = process.execPath;
+      gatewayArgs = [join(prefix, "versions", installState.current, "dist", "gateway", "server.js")];
+    }
     const version = run(cli, ["--version"], workspace).trim();
     if (version !== pkg.version) throw new Error(`installed ${basename(archive)} reported version ${version}`);
 
@@ -138,7 +144,7 @@ for (const extension of ["zip", "tar.gz"]) {
       throw new Error(`installed ${basename(archive)} did not execute the compiled CLI smoke`);
     }
 
-    const gateway = await startGateway(gatewayCommand, workspace, state);
+    const gateway = await startGateway(gatewayCommand, gatewayArgs, workspace, state);
     try {
       const diagnostics = await fetch(`${gateway.base}/diagnostics`, {
         headers: { cookie: gateway.cookie }
@@ -159,7 +165,7 @@ for (const extension of ["zip", "tar.gz"]) {
       throw new Error(`installed ${basename(archive)} could not reopen persisted state`);
     }
   } finally {
-    await rm(destination, { recursive: true, force: true });
+    await rm(destination, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 
