@@ -7,7 +7,7 @@ import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, r
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -966,7 +966,11 @@ async function guidedAdvancedProviderSetup(prompts: any, state: any, args: any) 
   const provider = await prompts.select({
     message: "Choose another AI provider",
     options: [
-      ...catalog.map((entry: any) => ({ value: entry, label: friendlyProviderName(entry.name), hint: entry.auth })),
+      ...catalog.map((entry: any) => ({
+        value: entry,
+        label: entry.displayName,
+        hint: `${providerTierLabel(entry.supportTier)} · ${entry.auth}${entry.genericCompatibilityMode ? " · shared compatibility mode" : ""}`
+      })),
       { value: null, label: "Back" }
     ],
     defaultValue: null
@@ -1285,13 +1289,20 @@ async function doctor(args: any) {
     version,
     commit: commit || "unknown",
     platform: { os: process.platform, arch: process.arch, node: process.version },
-    providerMode: await Promise.all(Object.entries(normalizedModels.providers ?? {}).map(async ([name, provider]: any) => ({
-      name,
-      type: provider.type ?? "openai-compatible",
-      authMode: provider.auth?.mode ?? "api-key",
-      configured: provider.auth?.mode === "oauth" ? await oauthTokenExists(provider, state) : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv]),
-      models: provider.models ?? []
-    }))),
+    providerMode: await Promise.all(Object.entries(normalizedModels.providers ?? {}).map(async ([name, provider]: any) => {
+      const support = providerSupport(name);
+      return {
+        name,
+        displayName: support.displayName,
+        supportTier: support.supportTier,
+        locallyTested: support.locallyTested,
+        genericCompatibilityMode: support.genericCompatibilityMode,
+        type: provider.type ?? "openai-compatible",
+        authMode: provider.auth?.mode ?? "api-key",
+        configured: provider.auth?.mode === "oauth" ? await oauthTokenExists(provider, state) : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv]),
+        models: provider.models ?? []
+      };
+    })),
     experimental: normalizeExperimentalFlags(config.experimental),
     audit: { valid: audit.valid, events: audit.events, unsigned: audit.unsigned, failureCount: audit.failures.length },
     approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
@@ -1643,7 +1654,7 @@ async function configCommand(args: any) {
       await printJson({ ok: true, removed: provider });
       return;
     }
-    throw new Error("config provider requires add, list, or remove");
+    throw new Error("config provider requires add, list, catalog, or remove");
   }
   if (subcommand === "default") {
     const model = rest[0];
@@ -2062,19 +2073,27 @@ async function addProvider(state: any, args: any, name: any, existingConfig: any
 }
 
 async function summarizeProviders(config: any, state: any) {
-  return Promise.all(Object.entries(config.providers ?? {}).map(async ([name, provider]: any) => ({
-    name,
-    type: provider.type ?? "openai-compatible",
-    baseUrl: provider.baseUrl,
-    authMode: provider.auth?.mode ?? "api-key",
-    apiKeyEnv: provider.apiKeyEnv ?? "",
-    models: provider.models ?? [],
-    configured: ["oauth", "device"].includes(provider.auth?.mode)
-      ? await oauthTokenExists(provider, state)
-      : provider.auth?.mode === "cli"
-        ? commandAvailable(process.env[provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"] || "agy")
-      : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv])
-  })));
+  return Promise.all(Object.entries(config.providers ?? {}).map(async ([name, provider]: any) => {
+    const support = providerSupport(name);
+    return {
+      name,
+      displayName: support.displayName,
+      supportTier: support.supportTier,
+      locallyTested: support.locallyTested,
+      genericCompatibilityMode: support.genericCompatibilityMode,
+      modelAvailability: support.modelAvailability,
+      type: provider.type ?? "openai-compatible",
+      baseUrl: provider.baseUrl,
+      authMode: provider.auth?.mode ?? "api-key",
+      apiKeyEnv: provider.apiKeyEnv ?? "",
+      models: provider.models ?? [],
+      configured: ["oauth", "device"].includes(provider.auth?.mode)
+        ? await oauthTokenExists(provider, state)
+        : provider.auth?.mode === "cli"
+          ? commandAvailable(process.env[provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"] || "agy")
+          : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv])
+    };
+  }));
 }
 
 async function oauthTokenExists(provider: any, state: any) {
@@ -3132,10 +3151,15 @@ function renderSetupComplete(current: any) {
 }
 
 function friendlyProviderName(name: any) {
-  if (name === "openai") return "OpenAI / ChatGPT";
-  if (name === "ollama") return "Ollama (local)";
   if (!name) return "Not connected";
-  return String(name).split(/[-_]/u).map((part) => part ? `${part[0].toUpperCase()}${part.slice(1)}` : part).join(" ");
+  return providerSupport(String(name)).displayName;
+}
+
+function providerTierLabel(tier: any) {
+  if (tier === "first-class") return "First-class support";
+  if (tier === "compatible") return "Compatibility preset";
+  if (tier === "experimental") return "Experimental";
+  return "Custom compatibility mode";
 }
 
 function friendlyModelName(model: any) {
@@ -3152,7 +3176,7 @@ function friendlyAccessName(policyOrCapabilities: any = []) {
 
 function renderOnboardingDetails({ state, workspaceRoot, configPath, tools, allowedCapabilities, providers, defaultModel, runs }: any) {
   const providerLines = providers.length
-    ? providers.map((provider: any) => `  - ${provider.name} [${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? " [credential missing]" : ""}`)
+    ? providers.map((provider: any) => `  - ${provider.displayName ?? friendlyProviderName(provider.name)} [${providerTierLabel(provider.supportTier)}; ${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? " [credential missing]" : ""}`)
     : ["  - none"];
   return [
     "Technical details",

@@ -56,6 +56,12 @@ Use OpenAI / ChatGPT, another supported cloud provider, or a local model through
 Ollama and other OpenAI-compatible servers. You are not locked into one model
 company.
 
+Odinn labels each connection honestly: OpenAI, OpenRouter, and Ollama receive
+first-class v1 coverage; compatibility presets share a maintained connection
+layer without a live-service guarantee; specialized provider paths can remain
+experimental; and your own endpoint is shown as custom compatibility mode.
+See [AI provider support](docs/provider-support.md).
+
 ### Important actions are visible
 
 Reading a public webpage is different from clicking **Buy**, sending a form, or

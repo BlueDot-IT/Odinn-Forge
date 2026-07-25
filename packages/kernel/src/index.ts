@@ -31,309 +31,8 @@ export { applyStateMigrations, ensureStateCompatibility, inspectStateSchemas, pl
 export type { PlannedMigrationStep, StateCompatibilityOptions, StateInspection, StateMigrationPlan, StateMigrationReport, StateSurfaceStatus } from "./state/migration-manager.ts";
 export { createStateBackup, inspectStateBackup, restoreStateBackup, stateLifecycleStatus } from "./state/backup-manager.ts";
 export type { BackupApplicationIdentity, CreateStateBackupOptions, InspectedStateBackup, RestoreStateBackupOptions, RestoreStateBackupReport, StateBackupFile, StateBackupManifest } from "./state/backup-manager.ts";
-
-export const PROVIDER_PRESETS = {
-  openai: {
-    defaultAuth: "oauth",
-    type: "openai-compatible",
-    baseUrl: "https://api.openai.com/v1",
-    apiKeyEnv: "OPENAI_API_KEY",
-    models: ["gpt-4.1-mini"],
-    oauth: {
-      baseUrl: "https://chatgpt.com/backend-api/codex",
-      models: ["gpt-5.5", "gpt-5.4-mini"],
-      transport: "openai-chatgpt-responses",
-      auth: {
-        mode: "oauth",
-        authorizationUrl: "https://auth.openai.com/oauth/authorize",
-        tokenUrl: "https://auth.openai.com/oauth/token",
-        clientId: "app_EMoamEEZ73f0CkXaXp7hrann",
-        scopes: ["openid", "profile", "email", "offline_access"],
-        redirectUri: "http://localhost:1455/auth/callback",
-        authorizationParams: {
-          id_token_add_organizations: "true",
-          codex_cli_simplified_flow: "true",
-          originator: "odinn"
-        }
-      }
-    }
-  },
-  openrouter: {
-    defaultAuth: "oauth",
-    type: "openai-compatible",
-    baseUrl: "https://openrouter.ai/api/v1",
-    apiKeyEnv: "OPENROUTER_API_KEY",
-    models: ["openrouter/auto"],
-    oauth: {
-      flow: "openrouter-pkce"
-    }
-  },
-  groq: {
-    type: "openai-compatible",
-    baseUrl: "https://api.groq.com/openai/v1",
-    apiKeyEnv: "GROQ_API_KEY",
-    models: ["llama-3.3-70b-versatile"]
-  },
-  together: {
-    type: "openai-compatible",
-    baseUrl: "https://api.together.xyz/v1",
-    apiKeyEnv: "TOGETHER_API_KEY",
-    models: ["meta-llama/Llama-3.3-70B-Instruct-Turbo"]
-  },
-  mistral: {
-    type: "openai-compatible",
-    baseUrl: "https://api.mistral.ai/v1",
-    apiKeyEnv: "MISTRAL_API_KEY",
-    models: ["mistral-large-latest"]
-  },
-  deepseek: {
-    type: "openai-compatible",
-    baseUrl: "https://api.deepseek.com",
-    apiKeyEnv: "DEEPSEEK_API_KEY",
-    models: ["deepseek-v4-flash"]
-  },
-  xai: {
-    type: "openai-compatible",
-    baseUrl: "https://api.x.ai/v1",
-    apiKeyEnv: "XAI_API_KEY",
-    models: ["grok-4.3"]
-  },
-  moonshot: {
-    type: "openai-compatible",
-    baseUrl: "https://api.moonshot.ai/v1",
-    apiKeyEnv: "MOONSHOT_API_KEY",
-    models: ["kimi-k2.6"]
-  },
-  "moonshot-cn": {
-    type: "openai-compatible",
-    baseUrl: "https://api.moonshot.cn/v1",
-    apiKeyEnv: "MOONSHOT_API_KEY",
-    models: ["kimi-k2.6"]
-  },
-  fireworks: {
-    type: "openai-compatible",
-    baseUrl: "https://api.fireworks.ai/inference/v1",
-    apiKeyEnv: "FIREWORKS_API_KEY",
-    models: ["accounts/fireworks/routers/kimi-k2p5-turbo"]
-  },
-  cerebras: {
-    type: "openai-compatible",
-    baseUrl: "https://api.cerebras.ai/v1",
-    apiKeyEnv: "CEREBRAS_API_KEY",
-    models: ["zai-glm-4.7"]
-  },
-  cohere: {
-    type: "openai-compatible",
-    baseUrl: "https://api.cohere.ai/compatibility/v1",
-    apiKeyEnv: "COHERE_API_KEY",
-    models: ["command-a-03-2025"]
-  },
-  deepinfra: {
-    type: "openai-compatible",
-    baseUrl: "https://api.deepinfra.com/v1/openai",
-    apiKeyEnv: "DEEPINFRA_API_KEY",
-    models: ["deepseek-ai/DeepSeek-V4-Flash"]
-  },
-  nvidia: {
-    type: "openai-compatible",
-    baseUrl: "https://integrate.api.nvidia.com/v1",
-    apiKeyEnv: "NVIDIA_API_KEY",
-    models: ["meta/llama-3.3-70b-instruct"]
-  },
-  zai: {
-    type: "openai-compatible",
-    baseUrl: "https://api.z.ai/api/paas/v4",
-    apiKeyEnv: "ZAI_API_KEY",
-    models: ["glm-5.1"]
-  },
-  "zai-cn": {
-    type: "openai-compatible",
-    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
-    apiKeyEnv: "ZAI_API_KEY",
-    models: ["glm-5.1"]
-  },
-  "zai-coding": {
-    type: "openai-compatible",
-    baseUrl: "https://api.z.ai/api/coding/paas/v4",
-    apiKeyEnv: "ZAI_API_KEY",
-    models: ["glm-5.2"]
-  },
-  "zai-coding-cn": {
-    type: "openai-compatible",
-    baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
-    apiKeyEnv: "ZAI_API_KEY",
-    models: ["glm-5.2"]
-  },
-  qianfan: {
-    type: "openai-compatible",
-    baseUrl: "https://qianfan.baidubce.com/v2",
-    apiKeyEnv: "QIANFAN_API_KEY",
-    models: ["deepseek-v3.2"]
-  },
-  volcengine: {
-    type: "openai-compatible",
-    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
-    apiKeyEnv: "VOLCANO_ENGINE_API_KEY",
-    models: ["doubao-seed-1-8-251228"]
-  },
-  "volcengine-plan": {
-    type: "openai-compatible",
-    baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3",
-    apiKeyEnv: "VOLCANO_ENGINE_API_KEY",
-    models: ["ark-code-latest"]
-  },
-  xiaomi: {
-    type: "openai-compatible",
-    baseUrl: "https://api.xiaomimimo.com/v1",
-    apiKeyEnv: "XIAOMI_API_KEY",
-    models: ["mimo-v2-flash"]
-  },
-  huggingface: {
-    type: "openai-compatible",
-    baseUrl: "https://router.huggingface.co/v1",
-    apiKeyEnv: "HF_TOKEN",
-    models: ["deepseek-ai/DeepSeek-R1"]
-  },
-  venice: {
-    type: "openai-compatible",
-    baseUrl: "https://api.venice.ai/api/v1",
-    apiKeyEnv: "VENICE_API_KEY",
-    models: ["kimi-k2-5"]
-  },
-  arcee: {
-    type: "openai-compatible",
-    baseUrl: "https://api.arcee.ai/api/v1",
-    apiKeyEnv: "ARCEEAI_API_KEY",
-    models: ["trinity-large-thinking"]
-  },
-  chutes: {
-    defaultAuth: "oauth",
-    type: "openai-compatible",
-    baseUrl: "https://llm.chutes.ai/v1",
-    apiKeyEnv: "CHUTES_API_KEY",
-    models: ["zai-org/GLM-4.7-TEE"],
-    oauth: {
-      flow: "chutes-pkce",
-      auth: {
-        authorizationUrl: "https://api.chutes.ai/idp/authorize",
-        tokenUrl: "https://api.chutes.ai/idp/token",
-        clientIdEnv: "CHUTES_CLIENT_ID",
-        clientSecretEnv: "CHUTES_CLIENT_SECRET",
-        scopes: ["openid", "profile", "chutes:invoke"],
-        redirectUri: "http://127.0.0.1:1456/oauth-callback"
-      }
-    }
-  },
-  featherless: {
-    type: "openai-compatible",
-    baseUrl: "https://api.featherless.ai/v1",
-    apiKeyEnv: "FEATHERLESS_API_KEY",
-    models: ["Qwen/Qwen3-32B"]
-  },
-  gmi: {
-    type: "openai-compatible",
-    baseUrl: "https://api.gmi-serving.com/v1",
-    apiKeyEnv: "GMI_API_KEY",
-    models: ["google/gemini-3.1-flash-lite"]
-  },
-  kilocode: {
-    type: "openai-compatible",
-    baseUrl: "https://api.kilo.ai/api/gateway",
-    apiKeyEnv: "KILOCODE_API_KEY",
-    models: ["kilo/auto"]
-  },
-  longcat: {
-    type: "openai-compatible",
-    baseUrl: "https://api.longcat.chat/openai",
-    apiKeyEnv: "LONGCAT_API_KEY",
-    models: ["LongCat-2.0"]
-  },
-  novita: {
-    type: "openai-compatible",
-    baseUrl: "https://api.novita.ai/openai/v1",
-    apiKeyEnv: "NOVITA_API_KEY",
-    models: ["deepseek/deepseek-v3-0324"]
-  },
-  litellm: {
-    type: "openai-compatible",
-    baseUrl: "http://127.0.0.1:4000/v1",
-    apiKeyEnv: "LITELLM_API_KEY",
-    models: ["claude-opus-4-6"]
-  },
-  vllm: {
-    type: "openai-compatible",
-    baseUrl: "http://127.0.0.1:8000/v1",
-    apiKeyEnv: "VLLM_API_KEY",
-    models: ["local-model"]
-  },
-  sglang: {
-    type: "openai-compatible",
-    baseUrl: "http://127.0.0.1:30000/v1",
-    apiKeyEnv: "SGLANG_API_KEY",
-    models: ["Qwen/Qwen3-8B"]
-  },
-  "github-copilot": {
-    type: "openai-compatible",
-    baseUrl: "https://api.individual.githubcopilot.com",
-    apiKeyEnv: "",
-    models: ["gpt-5.5"],
-    defaultAuth: "device",
-    auth: {
-      mode: "device",
-      flow: "github-copilot-device"
-    }
-  },
-  "xai-oauth": {
-    type: "openai-compatible",
-    baseUrl: "https://api.x.ai/v1",
-    apiKeyEnv: "",
-    models: ["grok-4.3"],
-    defaultAuth: "device",
-    auth: {
-      mode: "device",
-      flow: "xai-device",
-      clientId: "b1a00492-073a-47ea-816f-4c329264a828"
-    }
-  },
-  antigravity: {
-    type: "cli",
-    baseUrl: "",
-    apiKeyEnv: "",
-    models: ["gemini-3-flash", "gemini-3-pro-high"],
-    defaultAuth: "cli",
-    transport: "cli-antigravity",
-    auth: {
-      mode: "cli",
-      flow: "antigravity-cli",
-      commandEnv: "ODINN_ANTIGRAVITY_CLI"
-    }
-  },
-  "google-antigravity": {
-    type: "cli",
-    baseUrl: "",
-    apiKeyEnv: "",
-    models: ["gemini-3-flash", "gemini-3-pro-high"],
-    defaultAuth: "cli",
-    transport: "cli-antigravity",
-    auth: {
-      mode: "cli",
-      flow: "antigravity-cli",
-      commandEnv: "ODINN_ANTIGRAVITY_CLI"
-    }
-  },
-  ollama: {
-    type: "openai-compatible",
-    baseUrl: "http://127.0.0.1:11434/v1",
-    apiKeyEnv: "",
-    models: []
-  },
-  lmstudio: {
-    type: "openai-compatible",
-    baseUrl: "http://127.0.0.1:1234/v1",
-    apiKeyEnv: "",
-    models: []
-  }
-};
+export { CUSTOM_PROVIDER_SUPPORT, listProviderPresets, providerSupport, PROVIDER_PRESETS, PROVIDER_REGISTRY } from "./providers/registry.ts";
+export type { ProviderAuthMode, ProviderAuthorization, ProviderAuthVariant, ProviderDefinition, ProviderPresetInput, ProviderSupportDescriptor, ProviderSupportTier, ProviderTransport } from "./providers/types.ts";
 
 export function normalizeModelConfig(config: any = {}) {
   const providers: AnyRecord = {};
@@ -604,23 +303,6 @@ export function listConfiguredModels(config: any = {}) {
       transport: value.transport ?? "openai-chat-completions"
     }))
   );
-}
-
-export function listProviderPresets() {
-  return Object.entries(PROVIDER_PRESETS).map(([name, preset]: any) => ({
-    name,
-    auth: preset.defaultAuth === "oauth"
-      ? "oauth or api-key"
-      : preset.defaultAuth === "device"
-        ? "device oauth"
-        : preset.defaultAuth === "cli"
-          ? "cli oauth"
-          : "api-key",
-    baseUrl: preset.baseUrl ?? preset.oauth?.baseUrl ?? "",
-    apiKeyEnv: preset.apiKeyEnv ?? "",
-    models: preset.models ?? [],
-    transport: preset.transport ?? "openai-chat-completions"
-  }));
 }
 
 export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll }: any = {}) {
@@ -2146,7 +1828,7 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
       await waitForRetry(response, attempt, controller.signal);
     }
     if (!response) throw new Error("model provider returned no response");
-    if (!response.ok) throw new Error(`model provider returned ${response.status}: ${modelErrorMessage(payload)}`);
+    if (!response.ok) throw new Error(`model provider returned ${response.status}: ${modelErrorMessage(payload, [accessToken])}`);
     const content = isResponsesTransport ? responseText(payload) : payload?.choices?.[0]?.message?.content;
     const toolCalls = extractToolCalls(payload, isResponsesTransport, tools);
     if ((!content || !content.trim()) && !toolCalls.length) {
@@ -2446,8 +2128,15 @@ async function* boundedResponseLines(response: any, maxBytes = MAX_MODEL_RESPONS
   if (buffer) yield buffer.replace(/\r$/u, "");
 }
 
-function modelErrorMessage(payload: any) {
-  return modelString(payload?.error?.message, modelString(payload?.error, "request failed"));
+function modelErrorMessage(payload: any, secretValues: unknown[] = []) {
+  let message = modelString(payload?.error?.message, modelString(payload?.error, "request failed"));
+  for (const secret of secretValues) {
+    if (typeof secret === "string" && secret.length >= 4) message = message.replaceAll(secret, "[redacted]");
+  }
+  message = message
+    .replace(/\bBearer\s+\S+/giu, "Bearer [redacted]")
+    .replace(/\b(api[_ -]?key|access[_ -]?token|refresh[_ -]?token|authorization|password|secret)\s*[:=]\s*[^\s,;]+/giu, "$1=[redacted]");
+  return message.slice(0, 1_000);
 }
 
 function parseModelRef(value: any) {

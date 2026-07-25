@@ -64,6 +64,7 @@ test("user documentation and reporting surfaces ship in the release tree", async
     "docs/user-guide.md",
     "docs/release-validation.md",
     "docs/v1-compatibility.md",
+    "docs/provider-support.md",
     "docs/surface-matrix.md",
     ".github/ISSUE_TEMPLATE/bug-report.yml",
     ".github/ISSUE_TEMPLATE/feature-request.yml",

@@ -95,6 +95,7 @@ for (const path of [
   "SECURITY.md",
   "docs/getting-started.md",
   "docs/operator-console.md",
+  "docs/provider-support.md",
   "docs/surface-matrix.md",
   "docs/user-guide.md",
   "docs/v1-compatibility.md"
