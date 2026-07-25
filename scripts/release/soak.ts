@@ -148,7 +148,7 @@ async function record(name: string, operation: () => Promise<any> | any, summari
   }
 }
 
-const temp = await mkdtemp(join(tmpdir(), "odinn-beta3-soak-"));
+const temp = await mkdtemp(join(tmpdir(), "odinn-release-soak-"));
 const workspace = join(temp, "workspace");
 const state = join(temp, "state");
 const installPrefix = join(temp, "installed");

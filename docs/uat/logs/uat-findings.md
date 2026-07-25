@@ -1,6 +1,6 @@
-# Beta 4 UAT findings proof log
+# UAT findings proof log
 
-Branch: `fix/beta4-uat-findings`
+Branch: `fix/uat-findings`
 
 Date: 2026-07-21
 
@@ -88,4 +88,4 @@ separate private-network guard; no global SSRF bypass was enabled.
 - Multi-day daily-use behavior.
 
 The complete artifact-level Linux and macOS acceptance record is in
-`docs/uat/v0.4.0-beta.1.md`.
+`docs/uat/v0.4.0-uat.md`.

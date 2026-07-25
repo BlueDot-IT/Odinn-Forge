@@ -2,7 +2,8 @@
 
 ## Supported versions
 
-Until Odinn Forge reaches a stable 1.0 release, security fixes are applied only to the latest commit on `main` and the newest published prerelease.
+Until Odinn Forge reaches a 1.0 release, security fixes are applied only to the
+latest commit on `main` and the newest published release.
 
 ## Reporting a vulnerability
 
@@ -29,9 +30,9 @@ communicate the revised timeline before disclosure.
 
 ## Security boundaries
 
-Ódinn Forge's beta has explicit capability boundaries, append-only audit events, restart-safe approval and browser-recovery claims, forked crash-containment workers, isolated browser profiles, durable stores, and a loopback-only default control plane. The task workers retain the parent operating-system identity, filesystem, environment, and network authority; they are not a security sandbox. Remote hosting is a separate opt-in service that requires TLS and gives every provisioned user an independent gateway and state/workspace boundary.
+Ódinn Forge has explicit capability boundaries, append-only audit events, restart-safe approval and browser-recovery claims, forked crash-containment workers, isolated browser profiles, durable stores, and a loopback-only default control plane. The task workers retain the parent operating-system identity, filesystem, environment, and network authority; they are not a security sandbox. Remote hosting is a separate opt-in service that requires TLS and gives every provisioned user an independent gateway and state/workspace boundary.
 
-Before the first stable release:
+Before the 1.0 release:
 
 - Do not expose the Gateway directly to the public internet.
 - Do not run unreviewed tools, skills, MCP servers, or channel adapters. Installed extensions are disabled and untrusted by default. Container extensions require a verified whole-bundle digest and explicit grants; unconfined process execution additionally requires explicit trust and unsafe-mode acknowledgement.
@@ -53,7 +54,7 @@ pnpm odinn config security set --surface browser --require-approval false
 
 Private-network access can expose local services and metadata endpoints. Disabling browser approval allows the model to drive external accounts without a human checkpoint. Those settings are operator decisions, not safe defaults.
 
-The web tools follow redirects through the same URL policy and enforce blocked/allowed domains at each hop. `web.fetch` resolves DNS, rejects private/link-local/metadata ranges, and pins the validated address into the request so validation and connection do not use separate DNS answers. Browser navigation and post-action snapshots are checked against the same network and domain rules. Workspace reads resolve real paths and reject escaping symlinks. The beta does not expose file upload or download tools.
+The web tools follow redirects through the same URL policy and enforce blocked/allowed domains at each hop. `web.fetch` resolves DNS, rejects private/link-local/metadata ranges, and pins the validated address into the request so validation and connection do not use separate DNS answers. Browser navigation and post-action snapshots are checked against the same network and domain rules. Workspace reads resolve real paths and reject escaping symlinks. Ódinn does not expose file upload or download tools.
 
 ### Experimental runtime controls
 
@@ -77,7 +78,7 @@ Proof is evidence-based: model text cannot set `verified`. Sentinel decisions ar
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
 - The single-user gateway remains loopback-only. Remote deployment uses `host.ts`; non-loopback startup fails without a certificate, key, and exact public origin. Passwords are scrypt-derived, sessions are signed, cookies are HttpOnly/SameSite=Strict/Secure under TLS, and tenants never share state roots or gateway bearer tokens.
 
-### Known beta gaps
+### Known gaps
 
 Browser mutations are journaled before execution; an interrupted or failed mutation blocks further actions until the operator inspects and resolves the uncertain outcome. Native installs use immutable version directories and an atomic current/previous pointer. Full capsule replay requires a disposable workspace, complete non-redacted inputs, an audited executor, and explicit approval for network, credential, or external-state effects. Arbitrary remote services remain nondeterministic and an approved replay is not a guarantee that a remote mutation is reversible. The multi-user host provides application-level tenant isolation, not hostile-code containment between Unix users; use OS/container isolation for mutually untrusted tenants.
 

@@ -3515,17 +3515,6 @@ function renderConsoleHtml(version = "development") {
       background: linear-gradient(135deg, rgba(101, 87, 34, .18), rgba(17, 22, 30, .92));
     }
     .experimental-warning p { margin: 5px 0 0; color: var(--muted); line-height: 1.5; }
-    .beta-boundary { display: grid; gap: 12px; border-color: #3b4b5f; background: linear-gradient(145deg, rgba(34, 48, 64, .7), rgba(17, 22, 30, .96)); }
-    .beta-boundary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .beta-boundary-card { display: grid; gap: 7px; min-height: 132px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: rgba(12, 15, 20, .48); }
-    .beta-boundary-card strong { color: var(--text); font-size: 12px; line-height: 1.3; }
-    .beta-boundary-card p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
-    .beta-boundary-card.verified { border-color: #245849; }
-    .beta-boundary-card.experimental { border-color: #655722; }
-    .beta-boundary-card.dependent { border-color: #456071; }
-    .beta-boundary-card.unsupported { border-color: #703141; }
-    .beta-boundary-limits { margin: 0; padding: 10px 12px 10px 28px; border-top: 1px solid var(--line-soft); color: #c8d2df; font-size: 12px; line-height: 1.5; }
-    .beta-boundary-limits li + li { margin-top: 4px; }
     .experimental-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
@@ -3622,7 +3611,6 @@ function renderConsoleHtml(version = "development") {
     @media (max-width: 900px) {
       .usage-grid, .agent-layout, .project-layout, .memory-management-layout, .workshop-grid, .experimental-workbench, .experimental-page-layout, .feature-hero { grid-template-columns: 1fr; }
       .feature-steps { grid-template-columns: 1fr; }
-      .beta-boundary-grid { grid-template-columns: 1fr 1fr; }
       .session-filters { grid-template-columns: 1fr; }
       .filter-grid { grid-template-columns: 1fr 1fr; }
       .summary-bar { align-items: flex-start; flex-direction: column; gap: 10px; }
@@ -3632,7 +3620,6 @@ function renderConsoleHtml(version = "development") {
       .memory-status-summary span:first-child { padding-left: 0; border-left: 0; }
     }
     @media (max-width: 600px) {
-      .beta-boundary-grid, .filter-grid { grid-template-columns: 1fr; }
       .memory-status-bar { align-items: start; }
       .memory-status-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px; }
       .memory-status-summary span { padding: 0; border: 0; white-space: normal; }
@@ -5138,7 +5125,7 @@ function renderConsoleHtml(version = "development") {
       $("chat-status").textContent = "Thinking";
       const sessionId = await ensureChat();
       const currentTitle = $("chat-title").textContent.trim();
-      if (!state.messages.length && ["Gateway beta chat", "Beta chat", "New chat"].includes(currentTitle)) {
+      if (!state.messages.length && ["Gateway chat", "Chat", "New chat"].includes(currentTitle)) {
         const title = suggestedChatTitle(content);
         if (title) {
           await api("/sessions/" + encodeURIComponent(sessionId), {
@@ -6138,7 +6125,7 @@ function renderConsoleHtml(version = "development") {
       const seenGenericTitles = new Set();
       for (const session of chatSessions) {
         const title = String(session.title || "").trim();
-        const generic = /^(gateway beta chat|beta chat|new chat)$/i.test(title);
+      const generic = /^(gateway chat|chat|new chat)$/i.test(title);
         if (generic && seenGenericTitles.has(title.toLowerCase()) && session.id !== state.activeChatId) continue;
         if (generic) seenGenericTitles.add(title.toLowerCase());
         recent.push(session);

@@ -13,8 +13,8 @@ test("bulk advisory inventory collects unique transitive package versions", () =
 test("bulk advisory evaluation enforces the requested severity threshold", () => {
   const payload = {
     alpha: [{ id: 1, title: "moderate issue", severity: "moderate" }],
-    beta: [{ id: 2, title: "critical issue", severity: "critical" }]
+    gamma: [{ id: 2, title: "critical issue", severity: "critical" }]
   };
-  assert.deepEqual(matchingAdvisories(payload, "high").map((item) => item.package), ["beta"]);
+  assert.deepEqual(matchingAdvisories(payload, "high").map((item) => item.package), ["gamma"]);
   assert.throws(() => matchingAdvisories({ alpha: [{ severity: "mystery" }] }, "high"), /unknown severity/);
 });

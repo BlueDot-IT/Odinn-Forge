@@ -59,26 +59,25 @@ test("dispatched release pull requests receive dependency and title checks", asy
   assert.match(title, /github\.event\.pull_request\.title \|\| inputs\.pr_title/);
 });
 
-test("public beta support and reporting surfaces ship in the release tree", async () => {
+test("user documentation and reporting surfaces ship in the release tree", async () => {
   for (const path of [
-    "docs/public-beta.md",
-    "docs/BETA-4-STABLE-EXIT.md",
-    "docs/BETA-3-SURFACE-MATRIX.md",
+    "docs/user-guide.md",
+    "docs/release-validation.md",
+    "docs/surface-matrix.md",
     ".github/ISSUE_TEMPLATE/bug-report.yml",
     ".github/ISSUE_TEMPLATE/feature-request.yml",
     ".github/ISSUE_TEMPLATE/config.yml"
   ]) {
     assert.ok((await read(path)).trim().length > 0, `${path} must not be empty`);
   }
-  const betaGuide = await read("docs/public-beta.md");
-  assert.doesNotMatch(betaGuide, /v\d+\.\d+\.\d+-beta\.\d+/);
-  assert.match(betaGuide, /registration and discovery do not execute or activate/u);
-  assert.doesNotMatch(betaGuide, /attachments sent to their configured API/u);
-  const stableExit = await read("docs/BETA-4-STABLE-EXIT.md");
-  assert.match(stableExit, /No unresolved production CodeQL alerts/u);
-  assert.match(stableExit, /Linux[\s\S]*macOS[\s\S]*Windows/u);
-  assert.match(stableExit, /one cloud OAuth path, one API-key path, and one local Ollama path/u);
-  const matrix = await read("docs/BETA-3-SURFACE-MATRIX.md");
+  const userGuide = await read("docs/user-guide.md");
+  assert.doesNotMatch(userGuide, /v\d+\.\d+\.\d+-beta\.\d+/);
+  assert.match(userGuide, /registration and discovery do not execute or activate/u);
+  assert.doesNotMatch(userGuide, /attachments sent to their configured API/u);
+  const releaseValidation = await read("docs/release-validation.md");
+  assert.match(releaseValidation, /clean Linux, macOS, and Windows environment/u);
+  assert.match(releaseValidation, /archive checksums,[\s\S]*SBOM,[\s\S]*provenance/u);
+  const matrix = await read("docs/surface-matrix.md");
   for (const label of [
     "verified local behavior",
     "experimental and disabled by default",

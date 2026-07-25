@@ -13,53 +13,34 @@
 
 The project is a clean-room implementation. It does not copy OpenClaw, Hermes, OpenViking, or any other agent framework. It takes architectural inspiration from the problems those projects solve and implements Ódinn Forge's own contracts, storage, and security model.
 
-## Beta status
+## What it does
 
-Ódinn Forge is a prerelease beta. The core local workflows and release
-automation have substantial verification, but the external evidence required
-for `v0.4.0` stable is not complete.
+Ódinn Forge is a local-first personal AI agent runtime for people who want an
+assistant that can use tools, remember context, and work across real tasks
+without making dangerous choices invisible.
 
-Public beta participants should begin with the [public beta guide](docs/public-beta.md). It defines the supported local-first scope, verified release installation, privacy boundary, diagnostics, and bug-reporting path.
+It combines model and provider adapters, durable memory, sessions and goals,
+web and browser tools, an audited execution kernel, a local chat console, and a
+CLI in one cross-platform Node.js workspace.
 
-### Verified beta behavior
+Highlights:
 
-- chat with configured models through API keys, OAuth, imported OAuth sessions, local servers, or CLI adapters;
-- recall durable user and project context across sessions;
-- search the public web and fetch pages;
-- operate an isolated browser profile for accounts you sign into manually;
-- ask for approval before browser actions that can change external state;
-- inspect sessions, memory, runs, goals, improvements, providers, and audit events;
-- run deterministic tools and bounded model/tool loops through one audited kernel path.
+- Chat with models through API keys, OAuth, imported OAuth sessions, local
+  servers, or CLI adapters.
+- Keep durable user and project context across sessions.
+- Search the public web and use an isolated browser profile.
+- Require approval before browser actions that can change external state.
+- Inspect sessions, memory, runs, goals, improvements, providers, and audit
+  events.
+- Run deterministic tools and bounded model/tool loops through one audited
+  kernel path.
 
-These behaviors have local regression coverage, and the release pipeline builds
-and exercises clean source archives on Linux, macOS, and Windows. The
-[artifact-level Beta 4 UAT record](docs/uat/v0.4.0-beta.1.md) additionally
-records clean Linux/macOS installation, local Ollama use, restart/recovery, and
-installer rollback evidence. Automated cross-platform and synthetic-provider
-checks do not substitute for the external stable-release evidence below.
+The default gateway is single-user and loopback-only. Remote hosting is an
+opt-in TLS mode with separate application state per user; it is not a hostile
+user operating-system sandbox.
 
-The default gateway remains single-user and loopback-only. An opt-in multi-user host is available for remote deployments; it terminates TLS and routes each authenticated user into an independent loopback gateway, state root, workspace, audit ledger, OAuth store, and browser profile. Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
-
-The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval and browser-recovery journals, provider retries and usage normalization, universally audited process/MCP extension execution, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, versioned native installers with pointer rollback, signed audit-key rotation, bounded counterfactual execution, approved full capsule replay in disposable workspaces, autonomous rollback-safe reliability tuning, and opt-in remote hosting with application-level tenant isolation. See the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md) and [P0 beta ledger](docs/P0-BETA-GATES.md) for the boundaries and release evidence.
-
-### External evidence still required for stable
-
-`v0.4.0` stable remains blocked on three tracked validation campaigns:
-
-- [Windows artifact validation](https://github.com/jason-allen-oneal/Odinn/issues/49) covering installation, onboarding, restart/recovery, and rollback on a real Windows host;
-- [three-user, multi-day validation](https://github.com/jason-allen-oneal/Odinn/issues/51) covering Projects, Sessions, Goals, Memory, and audited tool execution;
-- [final security review and go/no-go](https://github.com/jason-allen-oneal/Odinn/issues/52) covering exact-candidate security evidence, the P0/P1 audit, and the maintainer release decision.
-
-Published `v0.4.0-beta.3` validation completed the
-[cloud OAuth and API-key provider gate](https://github.com/jason-allen-oneal/Odinn/issues/50#issuecomment-5054659155)
-with clean installation, restart persistence, and secret-leak evidence.
-
-The [Beta 4 stable-exit plan](docs/BETA-4-STABLE-EXIT.md) is the authoritative
-ledger. No unchecked external gate should be inferred from a green synthetic
-check, and new runtime subsystems remain deferred until the stable gates are
-satisfied.
-
-For the authoritative surface classifications, see the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md). Its labels are **verified local behavior**, **experimental and disabled by default**, **provider- or platform-dependent**, and **explicitly unsupported**. The three hard limits are:
+See the [surface matrix](docs/surface-matrix.md) for capability boundaries and
+[release validation](docs/release-validation.md) for artifact checks.
 
 - Forked workers are crash containment, not a security sandbox.
 - Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
@@ -101,7 +82,7 @@ pnpm odinn runs
 pnpm odinn audit
 ```
 
-The packaged integration check goes beyond the local echo smoke: CI launches the gateway as a child process, configures a local OpenAI-compatible provider endpoint, sends a model request through the gateway, and verifies the assistant response was written to the run record. See [the P0 beta ledger](docs/P0-BETA-GATES.md) for the current implementation evidence and known limits.
+The packaged integration check goes beyond the local echo smoke: CI launches the gateway as a child process, configures a local OpenAI-compatible provider endpoint, sends a model request through the gateway, and verifies the assistant response was written to the run record. See the [runtime ledger](docs/runtime-ledger.md) for implementation details and known limits.
 
 ### Phase 0 runtime ledger
 
@@ -134,7 +115,14 @@ The existing `config experimental` and feature-specific commands remain availabl
 - **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
 - **Automatic improvements** watches for repeated audited failures, uses the configured model for a plain-language assessment, and automatically applies only reversible, allowlisted reliability tuning. It does not rewrite code, change safeguards, install skills, or invent its own actions.
 
-These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions and external mutations are supported only through the documented approval, recovery, and egress boundaries. Counterfactual execution is explicit and operator-driven. Forked workers are crash containment, not a security sandbox. Remote hosting is application-level tenant isolation, not hostile-user OS isolation. External effects and nondeterministic provider behavior are outside full replay/rollback guarantees. See the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md) before enabling an experimental feature.
+These are local slices, not a claim that arbitrary remote effects can be
+reversed or perfectly replayed. Browser sessions and external mutations are
+supported only through the documented approval, recovery, and egress
+boundaries. Counterfactual execution is explicit and operator-driven. Forked
+workers are crash containment, not a security sandbox. External effects and
+nondeterministic provider behavior are outside full replay/rollback guarantees.
+See the [surface matrix](docs/surface-matrix.md) before enabling an
+experimental feature.
 
 The authenticated gateway exposes the same experimental surfaces through `/runtime/runs`, `/proof`, `/policy/evaluate`, `/capabilities/*`, `/checkpoints`, `/rewind/*`, `/capsules/*`, `/counterfactual/*`, and `/routing/*`. Each surface remains disabled until its matching experimental flag is enabled in `.odinn/config.json`.
 
@@ -323,7 +311,8 @@ pnpm test
 pnpm build
 ```
 
-The beta currently targets Node.js 24 and supports Linux, macOS, and Windows paths through the platform layer.
+Ódinn Forge targets Node.js 24 and supports Linux, macOS, and Windows paths
+through the platform layer.
 
 Release-package validation extracts both source archives, installs with the frozen lockfile, completes onboarding in a fresh state directory, and executes a real CLI tool from the extracted tree. Run it locally with:
 

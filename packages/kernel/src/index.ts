@@ -999,7 +999,7 @@ async function searchWeb(input: any = {}) {
   const limit = Math.min(normalizeLimit(input.limit, 5), 10);
   const endpoint = process.env.ODINN_SEARCH_ENDPOINT || "https://html.duckduckgo.com/html/";
   const response = await fetch(`${endpoint}?q=${encodeURIComponent(query)}`, {
-    headers: { "user-agent": "Odinn-Forge/0.1 beta web-search" },
+      headers: { "user-agent": "Odinn-Forge/0.1 web-search" },
     signal: AbortSignal.timeout(WEB_TIMEOUT_MS)
   });
   if (!response.ok) throw new Error(`web search returned ${response.status}`);
@@ -1090,7 +1090,7 @@ async function requestValidatedUrl(value: any, security: any = {}, resolveNetwor
       else resolveResponse(value);
     };
     const request = transport(parsed, {
-      headers: { "user-agent": "Odinn-Forge/0.1 beta web-fetch" },
+      headers: { "user-agent": "Odinn-Forge/0.1 web-fetch" },
       lookup: pinnedAddressLookup(address)
     }, (response: any) => {
       const chunks: Buffer[] = [];
