@@ -18,6 +18,7 @@
     "test": "node --test --test-concurrency=1 --test-reporter=spec tests/*.test.ts",
     "test:platform": "node --test --test-reporter=spec tests/platform.test.ts",
     "test:integration": "node --test --test-reporter=spec tests/integration.test.ts",
+    "test:migrations": "node --test --test-reporter=spec tests/state-migrations.test.ts",
     "test:compiled-release": "pnpm build && pnpm release:package && pnpm release:checksums && node scripts/release/verify.ts && node --test --test-reporter=spec tests/v1/compiled-release.test.ts",
     "build": "node scripts/ci/run.ts build",
     "build:production": "node scripts/build-production.ts",
