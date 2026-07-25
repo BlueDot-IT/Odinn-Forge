@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible Odinn Forge public-beta defect.
+description: Report a reproducible Odinn Forge defect.
 title: "bug: "
 labels:
   - bug
@@ -22,7 +22,7 @@ body:
     attributes:
       label: Odinn Forge version
       description: Run `odinn doctor` or provide the release tag.
-      placeholder: v0.2.1-beta.0
+      placeholder: v0.4.0
     validations:
       required: true
   - type: input

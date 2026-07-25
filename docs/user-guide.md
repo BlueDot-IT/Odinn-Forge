@@ -5,10 +5,11 @@ guide covers the supported local workflow, installation, privacy boundary,
 diagnostics, and bug reporting. Do not use it as a safety-critical service or
 as a hostile-code sandbox.
 
-Use the [surface matrix](surface-matrix.md) as the operator-facing source for
-the four classifications: **verified local behavior**, **experimental and
-disabled by default**, **provider- or platform-dependent**, and **explicitly
-unsupported**.
+The [v1 compatibility policy](v1-compatibility.md) is the authoritative
+contract. The [surface matrix](surface-matrix.md) applies its six terms:
+**Stable v1 interface**, **Internal implementation detail**,
+**Experimental interface**, **Provider-dependent behavior**,
+**Platform-dependent behavior**, and **Unsupported behavior**.
 
 The three hard limits are:
 
@@ -17,6 +18,10 @@ The three hard limits are:
 - External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
 ## Supported boundary
+
+The current 0.x release line is pre-v1. This section describes the frozen v1
+target; release evidence determines which unfinished packaging, migration, and
+lifecycle work is available before `v1.0.0`.
 
 - Linux, macOS, or Windows with Node.js 24 or newer and Corepack.
 - One local operator using the loopback gateway at `127.0.0.1`.

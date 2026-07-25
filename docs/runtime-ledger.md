@@ -3,9 +3,11 @@
 This is the implementation ledger for Ódinn Forge. A checked item has code
 and regression coverage. The default remains local and single-user; remote
 multi-user operation is an explicit TLS-only host mode. Use the [surface
-matrix](surface-matrix.md) for the authoritative operator classifications:
-**verified local behavior**, **experimental and disabled by default**,
-**provider- or platform-dependent**, and **explicitly unsupported**.
+matrix](surface-matrix.md) and [v1 compatibility
+policy](v1-compatibility.md) for the authoritative classifications:
+**Stable v1 interface**, **Internal implementation detail**,
+**Experimental interface**, **Provider-dependent behavior**,
+**Platform-dependent behavior**, and **Unsupported behavior**.
 
 The three hard limits are:
 

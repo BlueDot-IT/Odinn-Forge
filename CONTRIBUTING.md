@@ -1,6 +1,20 @@
 # Contributing to Odinn Forge
 
-Odinn Forge is early-stage infrastructure. Changes should preserve cross-platform behavior, explicit security boundaries, durable state transitions, and a small understandable core.
+Odinn Forge is preparing for v1. Changes should preserve cross-platform
+behavior, explicit security boundaries, durable state transitions, and a small
+understandable core.
+
+## v1 feature freeze
+
+Until `v1.0.0` ships, accepted work is limited to bug and security fixes,
+production packaging, upgrades and migrations, lifecycle commands,
+compatibility fixes, documentation corrections, behavior-preserving
+refactoring, and provider maintenance required for existing supported paths.
+
+Do not add major features, experimental runtime systems, broad remote-hosting
+expansion, channel integrations, marketplaces, unrelated provider expansion,
+large UI redesigns, or architectural rewrites. Track those requests for
+post-v1 work instead.
 
 ## Development setup
 
@@ -34,7 +48,16 @@ fix(store): recover expired queue leases
 ci(release): attest packaged artifacts
 ```
 
-A pull request should explain the behavior being changed, security implications, cross-platform impact, and the exact verification performed.
+A pull request must use the repository template and explain the problem,
+implementation, compatibility impact, persistent-state or migration impact,
+security impact, exact validation, and rollback path. Each pull request must
+address one coherent area.
+
+Do not mix feature work with migration work or broad refactoring with lifecycle
+behavior changes. A pull request that affects a stable interface or persistent
+state must say so explicitly. Persistent-state changes also require the
+previous and new schemas, migration path, backup and failure behavior, rollback
+compatibility, and fixture coverage.
 
 ## Required local checks
 

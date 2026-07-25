@@ -24,8 +24,8 @@ test("CLI advanced help exposes documented safety controls", () => {
     "--constraints <json>",
     "--show-token",
     "improve rollback --improvement <id>",
-    "Safety: experimental features are disabled by default",
-    "docs/surface-matrix.md"
+    "Support: the local single-user workflow is the stable v1 target",
+    "docs/v1-compatibility.md"
   ]) {
     assert.match(help.stdout, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
