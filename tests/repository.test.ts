@@ -59,6 +59,31 @@ test("dispatched release pull requests receive dependency and title checks", asy
   assert.match(title, /github\.event\.pull_request\.title \|\| inputs\.pr_title/);
 });
 
+test("security coverage completes before Scorecard evaluates it", async () => {
+  const security = await read(".github/workflows/security.yml");
+  assert.match(
+    security,
+    /^  group: security-\$\{\{ github\.workflow \}\}-\$\{\{ github\.event_name == 'pull_request' && github\.ref \|\| github\.run_id \}\}$/m,
+  );
+  assert.match(
+    security,
+    /^  cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}$/m,
+  );
+  const scorecardStart = security.indexOf("\n  scorecard:\n");
+  assert.notEqual(scorecardStart, -1, "security workflow must define the Scorecard job");
+  const scorecardHeader = "  scorecard:\n";
+  const scorecardTail = security.slice(scorecardStart + 1);
+  const nextJobOffset = scorecardTail.slice(scorecardHeader.length).search(/^  [A-Za-z0-9_-]+:\n/m);
+  const scorecard = nextJobOffset === -1
+    ? scorecardTail
+    : scorecardTail.slice(0, scorecardHeader.length + nextJobOffset);
+  assert.match(scorecard, /^    needs: codeql$/m);
+  assert.match(
+    scorecard,
+    /^    if: \$\{\{ !cancelled\(\) && github\.event_name != 'pull_request' && \(github\.event_name != 'workflow_dispatch' \|\| github\.ref_name == github\.event\.repository\.default_branch\) \}\}$/m,
+  );
+});
+
 test("user documentation and reporting surfaces ship in the release tree", async () => {
   for (const path of [
     "docs/user-guide.md",
