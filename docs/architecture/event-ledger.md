@@ -1,8 +1,8 @@
 # Ódinn Forge runtime event ledger
 
-The event ledger is the durable runtime spine used by core advanced Proof,
-Rewind, Sentinel, and Darwin services and the optional Capsule, Capability,
-and Counterfactual plugin modules. Each remote-host tenant receives an
+The event ledger is the durable runtime spine used by core advanced Runemark,
+Norn Restore, Gatewatch, and Raven Route services and the optional Saga
+Archive, Rune Key, and Worldtree Paths plugin modules. Each remote-host tenant receives an
 independent state root and ledger.
 
 ## Storage
@@ -36,7 +36,7 @@ The ledger is an integrity journal, not a blockchain. It does not provide remote
 
 Built-in descriptors currently classify reads, local record writes,
 model/provider calls, and browser mutations. This is the shared interception
-boundary for always-available Sentinel enforcement and Capability enforcement
+boundary for always-available Gatewatch enforcement and Rune Key enforcement
 when its plugin is enabled. Extension and MCP adapters must enter through this
 boundary; direct extension execution is rejected.
 
@@ -54,14 +54,23 @@ every run:
 ```
 
 They are disabled by default and are not silently inferred from model output
-or tool metadata. Proof, Rewind, Sentinel, and Darwin are core services and
+or tool metadata. Runemark, Norn Restore, Gatewatch, and Raven Route are core services and
 therefore have no enable flags.
 
 ## Current limitations
 
-The ledger now backs Proof, Rewind, Sentinel, Capability, Capsule, Darwin, and Counterfactual slices. It does not make remote side effects reversible, make model output deterministic, or provide tamper resistance against an attacker who controls a tenant's state directory. Counterfactual plans execute bounded tasks in isolated candidate roots and selection supports dry-run or explicit apply. Full capsule replay executes only in a disposable workspace through an audited executor; external effects require explicit approval and redacted inputs cannot be replayed.
+The ledger now backs Runemark, Norn Restore, Gatewatch, Rune Key, Saga Archive,
+Raven Route, and Worldtree Paths. Their existing technical identifiers remain
+in events, routes, configuration, and SDK exports for compatibility. The
+ledger does not make remote side effects reversible, make model output
+deterministic, or provide tamper resistance against an attacker who controls a
+tenant's state directory. Worldtree Paths plans execute bounded tasks in
+isolated candidate roots and selection supports dry-run or explicit apply.
+Full Saga Archive replay executes only in a disposable workspace through an
+audited executor; external effects require explicit approval and redacted
+inputs cannot be replayed.
 
-Darwin adds `model-routing-decision`, `model-observation`, and
+Raven Route adds `model-routing-decision`, `model-observation`, and
 `model-observation-verification` events so a run can be followed from model
-selection through measured outcome and Proof disposition. Candidate events
+selection through measured outcome and Runemark disposition. Candidate events
 contain scores and identifiers, not prompts or credentials.

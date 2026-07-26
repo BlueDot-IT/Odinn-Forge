@@ -1,6 +1,12 @@
-# Odinn Forge Capability Tokens
+# Rune Key — Scoped temporary access
 
-Capability Tokens is an optional runtime plugin module. Tokens bind one short-lived operation to a run, step, tool, resource constraints, and a use count. The signing key is local-only with restrictive permissions. Raw credentials are never placed in token claims, ledger payloads, or normal CLI output.
+Rune Key is Ódinn Forge's optional scoped-access plugin module. The existing
+`capability` CLI command, `experimental.capabilities` configuration key,
+gateway routes, and SDK names remain compatibility identifiers. Each key binds
+one short-lived operation to a run, step, tool, resource constraints, and a use
+count. The signing key is local-only with restrictive permissions. Raw
+credentials are never placed in token claims, ledger payloads, or normal CLI
+output.
 
 ```bash
 odinn config experimental enable capabilities --confirm-impact
@@ -14,4 +20,4 @@ The broker validates signature, expiration, run/tool binding, resource constrain
 Enabling this optional plugin module changes direct CLI execution immediately:
 ordinary tool runs require a matching scoped token after capability enforcement is
 active. Issue the token first, or disable the feature before returning to normal
-manual runs. Counterfactual read-only execution issues its own one-use token.
+manual runs. Worldtree Paths read-only execution issues its own one-use key.

@@ -38,12 +38,13 @@ The stable command groups are:
 | Runs and audit | `odinn run ...`, `odinn runs`, `odinn show`, `odinn audit`, `odinn audit verify` | JSON task results, run events, redacted history, or integrity-verification results |
 | Plans | `odinn plan` | The JSON execution result for the submitted task plan |
 
-Commands under `odinn experimental` control optional plugin modules. Proof,
-Sentinel, Rewind, and Darwin are always-available core advanced commands.
-Neither core placement nor appearance in CLI help promotes an advanced
-surface to a stable public SDK. Consult the [surface matrix](surface-matrix.md)
-before automating these services, plugin modules, extensions, Agent SDK, or
-Skill SDK surfaces.
+Commands under `odinn experimental` control optional plugin modules. Runemark,
+Gatewatch, Norn Restore, and Raven Route are always-available core advanced
+services. Their existing `proof`, `policy`, `checkpoint`/`rewind`, and
+`routing` commands remain the compatibility interface. Neither core placement
+nor appearance in CLI help promotes an advanced surface to a stable public
+SDK. Consult the [surface matrix](surface-matrix.md) before automating these
+services, plugin modules, extensions, Agent SDK, or Skill SDK surfaces.
 
 ## Loopback gateway
 

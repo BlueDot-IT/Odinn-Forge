@@ -20,7 +20,7 @@ The three hard limits are:
 - [x] Durable queued jobs with persisted state, cancellation, timeouts, restart recovery, content-bound idempotent submission, and graceful supervisor shutdown. Retries require an explicit safe/idempotent tool descriptor; interrupted unsafe work stops in `needs-review` instead of replaying an unknown external outcome.
 - [x] Forked crash-containment workers for every gateway-submitted task. These workers retain the parent OS identity, environment, filesystem, and network authority and are not described as a security sandbox; the local CLI remains an explicitly local operator path.
 - [x] Extension manifests with type, version, digest, provenance, sandbox declaration, capability grants, enable/disable, and rollback. Installed extensions remain disabled and untrusted by default.
-- [x] Extension/MCP execution adapters. Container extensions require a whole-bundle digest and execute with read-only mounts, no network, dropped capabilities, no-new-privileges, CPU/memory/PID/tmpfs limits, and bounded output. Trusted `unconfined-process` extensions still require an entrypoint digest and explicit unsafe acknowledgement. Both cross the audited Sentinel/capability boundary. MCP manifests use an explicit JSON-RPC `tools/call` JSONL adapter.
+- [x] Extension/MCP execution adapters. Container extensions require a whole-bundle digest and execute with read-only mounts, no network, dropped capabilities, no-new-privileges, CPU/memory/PID/tmpfs limits, and bounded output. Trusted `unconfined-process` extensions still require an entrypoint digest and explicit unsafe acknowledgement. Both cross the audited Gatewatch/Rune Key boundary. MCP manifests use an explicit JSON-RPC `tools/call` JSONL adapter.
 - [x] Provider retries for transient failures, rate-limit backoff, generic chat SSE normalization, OAuth refresh path, and provider transport tests.
 - [x] Provider catalog conformance contract across every preset, generic chat/Responses/SSE/tool-call fixtures, retry behavior, and canonical token accounting. Live provider-account and provider-specific service behavior remains an external release test, not a fake local green check.
 - [x] Loopback-only gateway default, strict localhost/127.0.0.1/[::1] Host validation, per-state bearer token, browser bootstrap cookie, exact scheme/host/port checks for cookie-authenticated mutations, missing-Origin rejection for cookie mutations, request limits, content-bound idempotency keys, graceful shutdown, and reconnectable audit SSE.
@@ -40,16 +40,16 @@ The three hard limits are:
 
 The core advanced services are available without feature flags:
 
-- [x] One gateway Proof verification path with strict schema validation, exact operator-controlled command allowlists, minimal command environments, process-tree termination, file assertions, evidence artifacts, persisted assertion results, and verified/failed run transitions. Legacy arbitrary-command assertions are rejected.
-- [x] Sentinel policy validation and pre-operation invariant decisions for denied commands, allowed roots, and approval-required tools.
-- [x] Rewind snapshots with content-addressed file artifacts, dry-run previews, symlink rejection, bounded capture, exact selected-root restoration, and an automatic pre-restore recovery snapshot.
-- [x] Darwin observations, automatic configured-model routing, Proof promotion, transparent routing scores, uncertainty penalties, and human-readable selection reasons.
+- [x] One gateway Runemark verification path with strict schema validation, exact operator-controlled command allowlists, minimal command environments, process-tree termination, file assertions, evidence artifacts, persisted assertion results, and verified/failed run transitions. Legacy arbitrary-command assertions are rejected.
+- [x] Gatewatch policy validation and pre-operation invariant decisions for denied commands, allowed roots, and approval-required tools.
+- [x] Norn Restore snapshots with content-addressed file artifacts, dry-run previews, symlink rejection, bounded capture, exact selected-root restoration, and an automatic pre-restore recovery snapshot.
+- [x] Raven Route observations, automatic configured-model routing, Runemark promotion, transparent routing scores, uncertainty penalties, and human-readable selection reasons.
 
 The optional runtime plugin modules remain disabled by default:
 
 - [x] Capability tokens with local signing keys, expiry, run/step/tool binding, resource constraints, revocation, and one-use enforcement.
-- [x] Capsules with redaction, ZIP path validation, checksums, verification-only contract metadata, tool-mocked durable boundary replay, tamper detection, and full replay through the audited executor in disposable workspaces. External effects require explicit approval and redacted inputs remain fail-closed.
-- [x] Counterfactual workspace copies with independent runs, bounded task execution through the audited tool boundary, optional shared Proof runs, candidate comparison, and dry-run/apply branch selection with source backup. Irreversible external actions remain approval-gated and full remote rollback is not claimed.
+- [x] Saga Archive bundles with redaction, ZIP path validation, checksums, verification-only contract metadata, tool-mocked durable boundary replay, tamper detection, and full replay through the audited executor in disposable workspaces. External effects require explicit approval and redacted inputs remain fail-closed.
+- [x] Worldtree Paths workspace copies with independent runs, bounded task execution through the audited tool boundary, optional shared Runemark checks, candidate comparison, and dry-run/apply branch selection with source backup. Irreversible external actions remain approval-gated and full remote rollback is not claimed.
 
 The private kernel plugin boundary exposes a descriptor, configuration key,
 enabled state, and service factory for each of those three modules. It is an
@@ -66,7 +66,7 @@ not hostile-user OS isolation. External effects and nondeterministic provider
 behavior are outside full replay/rollback guarantees. See the [surface
 matrix](surface-matrix.md) for the complete surface classification.
 
-The self-improvement loop runs automatically by default. It applies only allowlisted reliability tuning, captures a rollback snapshot, and cannot widen permissions, disable safeguards, change credentials, install extensions, or weaken Sentinel.
+The self-improvement loop runs automatically by default. It applies only allowlisted reliability tuning, captures a rollback snapshot, and cannot widen permissions, disable safeguards, change credentials, install extensions, or weaken Gatewatch.
 
 ## Required release proof
 

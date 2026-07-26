@@ -1,9 +1,10 @@
-# Odinn Forge Sentinel
+# Gatewatch — Policy safety
 
-Sentinel is a core advanced policy service available without a feature flag.
-It evaluates deterministic invariants before an operation. It is code, not a
-model opinion. A blocked decision is persisted in `policy_evaluations` and the
-hash-chained ledger.
+Gatewatch is Ódinn Forge's core advanced policy-safety service, available
+without a feature flag. The existing `policy` CLI command and `Sentinel` SDK
+name remain compatibility identifiers. Gatewatch evaluates deterministic
+invariants before an operation. It is code, not a model opinion. A blocked
+decision is persisted in `policy_evaluations` and the hash-chained ledger.
 
 The initial policy schema accepts JSON or simple YAML-shaped documents:
 

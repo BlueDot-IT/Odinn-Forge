@@ -1,6 +1,7 @@
 # Task Contract Reference
 
-The strict Proof API currently uses:
+The strict Runemark verification API currently uses the compatibility
+identifier `proof`:
 
 ```json
 {

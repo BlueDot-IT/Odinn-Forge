@@ -222,20 +222,25 @@ behavior.
 
 Ódinn includes core advanced services for deeper control and inspection:
 
-- **Proof** checks whether a run met specific acceptance rules.
-- **Sentinel** checks commands, file locations, and approval requirements
+- **Runemark — run verification** checks whether a run met specific acceptance
+  rules.
+- **Gatewatch — policy safety** checks commands, file locations, and approval requirements
   before an operation.
-- **Rewind** saves selected local files and previews a restore before applying
-  it.
-- **Darwin** routes configured models using recorded reliability, speed, cost,
-  policy, rollback, and verification results.
+- **Norn Restore — restore points** saves selected local files and previews a
+  restore before applying it.
+- **Raven Route — model routing** chooses among configured models using
+  recorded reliability, speed, cost, policy, rollback, and verification
+  results.
 
 Three additional features are optional plugin modules and remain disabled
 until enabled individually:
 
-- **Capability Tokens** give one narrowly defined permission to one run.
-- **Capsules** export a redacted, verifiable bundle of a run.
-- **Counterfactual** compares work in separate copies of a workspace.
+- **Rune Key — scoped temporary access** gives one narrowly defined permission
+  to one run.
+- **Saga Archive — portable run bundles** exports a redacted, verifiable copy
+  of a run.
+- **Worldtree Paths — scenario comparison** compares work in separate copies
+  of a workspace.
 
 These tools improve visibility and recovery for local work. They do not make
 outside actions perfectly reversible, and copied workspaces are not security
@@ -243,7 +248,9 @@ sandboxes.
 
 Use **Advanced** in the console or read the notes under
 [docs/features](docs/features/). Core placement does not make an advanced API
-a stable public SDK; the compatibility policy remains authoritative.
+a stable public SDK; the compatibility policy remains authoritative. Existing
+CLI commands, configuration keys, routes, event names, and SDK exports retain
+their original technical identifiers for compatibility.
 
 ## Useful commands
 

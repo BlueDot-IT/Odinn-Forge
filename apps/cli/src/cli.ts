@@ -7,7 +7,7 @@ import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, r
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -27,7 +27,7 @@ const [command, ...args] = rawArgs;
 const EXPERIMENTAL_HOME = [
   {
     id: "capabilities",
-    label: "Capability Tokens",
+    label: `${ADVANCED_FEATURE_BRANDS.capabilities.name} — ${ADVANCED_FEATURE_BRANDS.capabilities.descriptor}`,
     configKey: "experimental.capabilities",
     description: "Issue, consume, inspect, and revoke short-lived tokens scoped to one run and tool.",
     safeActions: [
@@ -41,7 +41,7 @@ const EXPERIMENTAL_HOME = [
   },
   {
     id: "capsules",
-    label: "Capsules",
+    label: `${ADVANCED_FEATURE_BRANDS.capsules.name} — ${ADVANCED_FEATURE_BRANDS.capsules.descriptor}`,
     configKey: "experimental.capsules",
     description: "Export, verify, inspect, and deliberately replay redacted content-addressed run archives.",
     safeActions: [
@@ -55,7 +55,7 @@ const EXPERIMENTAL_HOME = [
   },
   {
     id: "counterfactual",
-    label: "Counterfactuals",
+    label: `${ADVANCED_FEATURE_BRANDS.counterfactual.name} — ${ADVANCED_FEATURE_BRANDS.counterfactual.descriptor}`,
     configKey: "experimental.counterfactual",
     description: "Create isolated candidate workspaces, compare their evidence, and preview selection before applying it.",
     safeActions: [
@@ -110,7 +110,7 @@ const DANGEROUS_IMPACT_SUMMARIES = Object.freeze({
   "autonomous-self-improvement": {
     title: "Autonomous self-improvement impact summary",
     authority: "Allows the bounded self-improvement controller to apply allowlisted runtime tuning without a separate approval for every proposal.",
-    approvals: "The allowlist, Sentinel, capability policy, credentials, extensions, and approval policy remain protected; this is not arbitrary code or policy mutation.",
+    approvals: "The allowlist, Gatewatch policy, capability policy, credentials, extensions, and approval policy remain protected; this is not arbitrary code or policy mutation.",
     rollback: "Each applied change must have a captured configuration snapshot and can be reverted through the improvement rollback path.",
     audit: "Proposals, decisions, snapshots, applications, failures, and rollbacks are recorded in the configured Odinn audit journal and improvement store."
   },
@@ -123,7 +123,7 @@ const DANGEROUS_IMPACT_SUMMARIES = Object.freeze({
   },
   "experimental-replay": {
     title: "Experimental replay and restore impact summary",
-    authority: "Enables local Proof, Rewind, Capsules, or Counterfactual operations that read, copy, verify, restore, or replay bounded local run data.",
+    authority: "Enables local Runemark, Norn Restore, Saga Archive, or Worldtree Paths operations that read, copy, verify, restore, or replay bounded local run data.",
     approvals: "Feature flags remain individually persisted and disabled by default. Full capsule replay and destructive restores retain their own explicit checks and approval gates.",
     rollback: "Disable the feature or restore the local workspace from a verified snapshot. Remote effects and nondeterministic provider behavior are outside deterministic rollback guarantees.",
     audit: "Run-ledger events, evidence, snapshots, and replay decisions are stored in the configured Odinn state directory and audit journal."
@@ -1402,7 +1402,7 @@ Status:
   odinn experimental status ${entry.id} [--state .odinn]`);
     return;
   }
-  console.log(`Ódinn plugin modules and experimental systems
+  console.log(`Ódinn branded plugin modules and experimental systems
 
 The three optional runtime plugin flags are off by default. Automatic improvement runs by default
 and remains limited to reversible, allowlisted reliability adjustments.
@@ -1417,6 +1417,7 @@ Commands:
 Systems:
 ${EXPERIMENTAL_HOME.map((entry) => `  ${entry.id.padEnd(17)} ${entry.label}`).join("\n")}
 
+Brand names are user-facing. Existing command names and configuration keys remain compatible.
 Use \`odinn experimental help <feature>\` for the real runtime actions behind a system.`);
 }
 
