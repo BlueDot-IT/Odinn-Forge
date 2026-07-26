@@ -5,17 +5,29 @@ compatibility policy. Changes should preserve cross-platform behavior, explicit
 security boundaries, durable state transitions, and a small understandable
 core.
 
-## v1 maintenance boundary
+## Feature development
 
-For v1.x, prioritize bug and security fixes, production packaging, upgrades and
-migrations, lifecycle commands, compatibility fixes, documentation
-corrections, behavior-preserving refactoring, and provider maintenance required
-for existing supported paths.
+Odinn v1 is stable, not feature-frozen. New capabilities—including channel
+adapters, providers, plugins, remote workflows, and interface improvements—are
+welcome when they are coherent, supportable, and meet the same security and
+compatibility standards as the existing product. Evaluate proposals on their
+implementation and operational risk rather than rejecting entire feature
+categories.
 
-Do not add major features, experimental runtime systems, broad remote-hosting
-expansion, channel integrations, marketplaces, unrelated provider expansion,
-large UI redesigns, or architectural rewrites. Track those requests for
-later release work instead.
+Substantial features must:
+
+- preserve stable interfaces or document a deliberate, versioned transition;
+- define permissions, secrets, network access, audit evidence, failure
+  behavior, and other affected trust boundaries;
+- keep optional integrations modular, explicitly configured, and safe by
+  default;
+- include migrations and rollback behavior for persistent-state changes;
+- include focused automated coverage and operator-facing documentation; and
+- avoid coupling the feature to unrelated architectural rewrites.
+
+Experimental work may enter through an explicit advanced or plugin boundary
+while its interface is still evolving. It must remain opt-in, clearly labeled,
+and subject to the normal review and security requirements.
 
 ## Development setup
 

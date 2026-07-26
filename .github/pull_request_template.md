@@ -1,6 +1,6 @@
 ## Problem
 
-Describe the specific problem and why it belongs in the current release scope.
+Describe the specific problem and why it belongs in Odinn.
 
 ## Implementation
 
