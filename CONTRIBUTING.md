@@ -60,6 +60,12 @@ state must say so explicitly. Persistent-state changes also require the
 previous and new schemas, migration path, backup and failure behavior, rollback
 compatibility, and fixture coverage.
 
+Changes that add or alter production behavior must add or update automated
+tests that exercise the changed behavior. Bug fixes should include a regression
+test when practical. Documentation-only and non-behavioral metadata changes do
+not require new tests. If automated coverage is not practical, explain why in
+the pull request and provide exact manual validation.
+
 ## Required local checks
 
 ```bash
