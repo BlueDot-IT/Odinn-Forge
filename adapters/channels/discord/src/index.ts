@@ -93,6 +93,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       let sequence: number | null = null;
       let heartbeat: NodeJS.Timeout | undefined;
       let settled = false;
+      const beat = () => socket.send(JSON.stringify({ op: 1, d: sequence }));
       const finish = (error?: unknown) => {
         if (settled) return;
         settled = true;
@@ -107,7 +108,6 @@ export class DiscordChannelAdapter implements ChannelAdapter {
           if (payload.op === 10) {
             const interval = Number(payload.d?.heartbeat_interval);
             if (!Number.isFinite(interval) || interval < 1_000) throw new Error("Discord Gateway returned an invalid heartbeat interval");
-            const beat = () => socket.send(JSON.stringify({ op: 1, d: sequence }));
             heartbeat = setInterval(beat, interval);
             socket.send(JSON.stringify({
               op: 2,
@@ -117,6 +117,10 @@ export class DiscordChannelAdapter implements ChannelAdapter {
                 properties: { os: process.platform, browser: "odinn", device: "odinn" }
               }
             }));
+            return;
+          }
+          if (payload.op === 1) {
+            beat();
             return;
           }
           if (payload.op === 7 || payload.op === 9) {

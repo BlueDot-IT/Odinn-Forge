@@ -175,6 +175,7 @@ test("Discord Gateway identifies and delivers normalized message events", async 
   await new Promise((resolveWait) => setImmediate(resolveWait));
   socket.emit("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }) });
   socket.emit("message", { data: JSON.stringify({ op: 0, t: "READY", s: 1, d: { user: { id: "600" } } }) });
+  socket.emit("message", { data: JSON.stringify({ op: 1, d: null }) });
   socket.emit("message", { data: JSON.stringify({
     op: 0,
     t: "MESSAGE_CREATE",
@@ -192,6 +193,7 @@ test("Discord Gateway identifies and delivers normalized message events", async 
   await new Promise((resolveWait) => setImmediate(resolveWait));
   assert.equal(socket.sent[0].op, 2);
   assert.equal(socket.sent[0].d.intents, 37_377);
+  assert.deepEqual(socket.sent[1], { op: 1, d: 1 });
   assert.equal(delivered[0].text, "hello");
   await adapter.stop();
 });
