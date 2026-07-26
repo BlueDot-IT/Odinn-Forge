@@ -1,6 +1,9 @@
 # Odinn Forge Sentinel
 
-Sentinel evaluates deterministic invariants before an operation. It is code, not a model opinion. A blocked decision is persisted in `policy_evaluations` and the hash-chained ledger.
+Sentinel is a core advanced policy service available without a feature flag.
+It evaluates deterministic invariants before an operation. It is code, not a
+model opinion. A blocked decision is persisted in `policy_evaluations` and the
+hash-chained ledger.
 
 The initial policy schema accepts JSON or simple YAML-shaped documents:
 

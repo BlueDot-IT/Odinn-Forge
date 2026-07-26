@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { closeBrowserManagers, createAuditStore, createBuiltInRegistry, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.ts";
+import { closeBrowserManagers, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
 process.env.ODINN_BROWSER_HEADLESS = "1";
@@ -137,6 +137,79 @@ test("kernel routes model.chat through an OpenAI-compatible provider", async () 
     assert.equal(result.output.provider, "test");
     assert.equal((await auditStore.readRun("run_model")).status, "completed");
   } finally {
+    if (previousKey === undefined) delete process.env.ODINN_TEST_API_KEY;
+    else process.env.ODINN_TEST_API_KEY = previousKey;
+    await new Promise((resolve: any, reject: any) => provider.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("Darwin routes unpinned model.chat calls among configured models and records provisional evidence", async () => {
+  let requestedModel = "";
+  const provider = createHttpServer(async (request: any, response: any) => {
+    let raw = "";
+    for await (const chunk of request) raw += chunk;
+    requestedModel = JSON.parse(raw).model;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "chat_darwin",
+      choices: [{ message: { role: "assistant", content: "ROUTED" } }],
+      usage: { total_tokens: 3 }
+    }));
+  });
+  await new Promise((resolve: any) => provider.listen(0, "127.0.0.1", resolve));
+  const { port } = provider.address();
+  const { root, auditStore } = await fixture();
+  const stateDir = join(root, ".odinn");
+  const config = {
+    defaultModel: "test:slow",
+    providers: {
+      test: {
+        type: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        apiKeyEnv: "ODINN_TEST_API_KEY",
+        models: ["slow", "best"]
+      }
+    }
+  };
+  const runtime = createDifferentiatedRuntime({ stateDir, workspaceRoot: root });
+  const previousKey = process.env.ODINN_TEST_API_KEY;
+  process.env.ODINN_TEST_API_KEY = "test-key";
+  try {
+    runtime.ledger.ensureRun({ runId: "darwin_seed_best", objective: "routing evidence" });
+    runtime.ledger.ensureRun({ runId: "darwin_seed_slow", objective: "routing evidence" });
+    runtime.darwin.observe({ runId: "darwin_seed_best", providerId: "test", modelId: "best", taskClass: "analysis", verified: true, durationMs: 10 });
+    runtime.darwin.observe({ runId: "darwin_seed_slow", providerId: "test", modelId: "slow", taskClass: "analysis", toolErrors: 1, durationMs: 100 });
+    const result = await runTask({
+      task: { id: "darwin_routed", tool: "model.chat", input: { taskClass: "analysis", messages: [{ role: "user", content: "route me" }] } },
+      auditStore,
+      registry: createBuiltInRegistry({ workspaceRoot: root, stateDir, config }),
+      runLedger: runtime.ledger
+    });
+    assert.equal(result.output.model, "best");
+    assert.equal(requestedModel, "best");
+    assert.deepEqual(
+      { ...runtime.ledger.database.db.prepare("SELECT provider_id, model_id, verified, partially_verified FROM model_observations WHERE run_id = ?").get("darwin_routed") },
+      { provider_id: "test", model_id: "best", verified: 0, partially_verified: 1 }
+    );
+    const routedEvents = runtime.ledger.getRun("darwin_routed").events.filter((event: any) => event.type.startsWith("model-"));
+    assert.deepEqual(routedEvents.map((event: any) => event.type), ["model-routing-decision", "model-observation"]);
+    assert.equal(routedEvents[0].payload.source, "darwin");
+    assert.equal(routedEvents[0].payload.model, "test:best");
+    assert.equal(routedEvents[0].payload.candidates[0].modelId, "best");
+    assert.doesNotMatch(JSON.stringify(routedEvents), /route me/);
+
+    const fallback = await runTask({
+      task: { id: "darwin_fallback", tool: "model.chat", input: { taskClass: "unseen", messages: [{ role: "user", content: "use the default" }] } },
+      auditStore,
+      registry: createBuiltInRegistry({ workspaceRoot: root, stateDir, config }),
+      runLedger: runtime.ledger
+    });
+    assert.equal(fallback.output.model, "slow");
+    const fallbackDecision = runtime.ledger.getRun("darwin_fallback").events.find((event: any) => event.type === "model-routing-decision" && event.payload.source === "configured-default");
+    assert.equal(fallbackDecision.payload.source, "configured-default");
+    assert.equal(fallbackDecision.payload.model, "test:slow");
+  } finally {
+    runtime.ledger.close();
     if (previousKey === undefined) delete process.env.ODINN_TEST_API_KEY;
     else process.env.ODINN_TEST_API_KEY = previousKey;
     await new Promise((resolve: any, reject: any) => provider.close((error: any) => error ? reject(error) : resolve()));

@@ -5,6 +5,9 @@ import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:f
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createRunLedger, redact } from "./run-ledger.ts";
 import { ProofVerifier } from "./proof.ts";
+import { evaluatePolicyInvariants, normalizePolicyInvariants } from "@odinn/policy";
+import { ODINN_ERROR_CODES, OdinnRuntimeError } from "./runtime-errors.ts";
+import { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 
@@ -12,23 +15,7 @@ type AnyRecord = Record<string, any>;
 type FeatureFlags = Record<string, boolean>;
 const failureMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
-export const ODINN_ERROR_CODES = Object.freeze([
-  "POLICY_VIOLATION", "CAPABILITY_DENIED", "CAPABILITY_EXPIRED", "CAPABILITY_SCOPE_MISMATCH",
-  "VERIFICATION_FAILED", "SNAPSHOT_FAILED", "ROLLBACK_CONFLICT", "COMPENSATION_FAILED",
-  "CAPSULE_INVALID", "CAPSULE_TAMPERED", "REPLAY_UNSUPPORTED", "BUDGET_EXCEEDED",
-  "WORKSPACE_CONFLICT", "MODEL_ROUTING_UNAVAILABLE"
-]);
-
-export class OdinnRuntimeError extends Error {
-  readonly code: string;
-  readonly details: AnyRecord;
-  constructor(code: string, message: string, details: AnyRecord = {}) {
-    super(message);
-    this.name = "OdinnRuntimeError";
-    this.code = code;
-    this.details = details;
-  }
-}
+export { ODINN_ERROR_CODES, OdinnRuntimeError };
 
 function now() { return new Date().toISOString(); }
 function json(value: unknown) { return JSON.stringify(value); }
@@ -159,16 +146,11 @@ export function validatePolicy(policy: unknown): AnyRecord {
   if (!policy || typeof policy !== "object" || Array.isArray(policy)) throw new OdinnRuntimeError("POLICY_VIOLATION", "policy must be an object");
   const value = policy as AnyRecord;
   if (value.version !== 1) throw new OdinnRuntimeError("POLICY_VIOLATION", "policy version must be 1");
-  if (!Array.isArray(value.invariants)) throw new OdinnRuntimeError("POLICY_VIOLATION", "policy invariants must be an array");
-  const ids = new Set<string>();
-  for (const item of value.invariants) {
-    if (!isPlainRecord(item) || typeof item.id !== "string" || !item.id.trim() || ids.has(item.id)) throw new OdinnRuntimeError("POLICY_VIOLATION", "policy invariant ids must be unique non-empty strings");
-    ids.add(item.id);
-    if (!["command.deny-pattern", "tool.requires-approval", "filesystem.allowed-roots"].includes(item.type)) throw new OdinnRuntimeError("POLICY_VIOLATION", `unsupported policy invariant type: ${String(item.type ?? "missing")}`);
-    if (!Array.isArray(item.values) || item.values.length === 0 || item.values.some((entry: unknown) => typeof entry !== "string" || !entry.trim())) throw new OdinnRuntimeError("POLICY_VIOLATION", `policy invariant ${item.id} requires non-empty string values`);
-    if (!["log", "warn", "pause", "block", "rollback", "terminate"].includes(item.enforcement ?? "block")) throw new OdinnRuntimeError("POLICY_VIOLATION", `invalid enforcement for policy invariant ${item.id}`);
+  try {
+    return { ...value, invariants: normalizePolicyInvariants(value.invariants ?? []) };
+  } catch (error) {
+    throw new OdinnRuntimeError("POLICY_VIOLATION", failureMessage(error));
   }
-  return value;
 }
 
 interface ProcessResult { code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean }
@@ -193,7 +175,6 @@ export class ProofEngine {
     this.verifierOptions = { allowedCommands, maxOutputBytes, maxFileBytes, commandEnvironment };
   }
   async run(runId: string, contract: AnyRecord, { workspaceRoot = process.cwd() }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "proof", this.ledger);
     if (contract?.schemaVersion === 1) {
       const verifierOptions = Object.fromEntries(Object.entries(this.verifierOptions).filter(([, value]) => value !== undefined));
       return new ProofVerifier({
@@ -224,8 +205,14 @@ export class ProofEngine {
     const failed = required.some((item) => ["failed", "error"].includes(item.status));
     const passed = required.length > 0 && required.every((item) => item.status === "passed");
     const status = failed ? "failed" : passed ? "verified" : "partially-verified";
-    this.ledger.database.db.prepare("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?").run(status, now(), runId);
+    const modelObservationIds = (this.ledger.database.db.prepare("SELECT id FROM model_observations WHERE run_id = ? ORDER BY created_at").all(runId) as AnyRecord[]).map((row: AnyRecord) => row.id);
+    this.ledger.database.transaction((db: any) => {
+      db.prepare("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?").run(status, now(), runId);
+      db.prepare("UPDATE model_observations SET verified = ?, partially_verified = ? WHERE run_id = ?")
+        .run(status === "verified" ? 1 : 0, status === "partially-verified" ? 1 : 0, runId);
+    });
     this.ledger.appendEvent({ runId, type: "verification-completed", payload: { contractId: id, status, results: results.map(({ assertionId, status: resultStatus }) => ({ assertionId, status: resultStatus })) } });
+    if (modelObservationIds.length) this.ledger.appendEvent({ runId, type: "model-observation-verification", payload: { contractId: id, status, verified: status === "verified", observationIds: modelObservationIds } });
     return { runId, contractId: id, status, results };
   }
   async evaluate(assertion: AnyRecord, workspaceRoot: string): Promise<AnyRecord> {
@@ -255,33 +242,23 @@ export class ProofEngine {
   show(runId: string) { return this.ledger.database.db.prepare("SELECT * FROM assertion_results WHERE run_id = ? ORDER BY completed_at").all(runId).map((row: AnyRecord) => ({ ...row, evidenceArtifactIds: parse(row.evidence_artifact_ids_json, []), result: parse(row.result_json) })); }
 }
 
-function policyMatch(invariant: AnyRecord, toolName: string, input: AnyRecord, workspaceRoot = process.cwd()) {
-  const value = JSON.stringify(input ?? {});
-  if (invariant.type === "tool.requires-approval") return (invariant.values ?? []).includes(toolName);
-  if (invariant.type === "command.deny-pattern") return (invariant.values ?? []).some((pattern: string) => value.includes(pattern));
-  if (invariant.type === "filesystem.allowed-roots") {
-    if (!toolName.includes("write") || typeof input?.path !== "string") return false;
-    const target = safePath(workspaceRoot, input.path);
-    return !(invariant.values ?? []).some((root: string) => isWithin(safePath(workspaceRoot, root), target));
-  }
-  return false;
-}
-
 export class Sentinel {
   [key: string]: any;
   constructor({ ledger, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
   evaluate({ runId, stepId, toolName, input, policy, workspaceRoot = process.cwd() }: AnyRecord) {
-    requireExperimental(this.featureFlags, "sentinel", this.ledger); validatePolicy(policy);
+    const normalizedPolicy = validatePolicy(policy);
     const policyId = policy.id ?? `policy_${runId}_${hash(json(redact(policy))).slice(0, 16)}`;
     this.ledger.database.db.prepare("INSERT OR IGNORE INTO policies(id, run_id, policy_json, created_at) VALUES (?, ?, ?, ?)").run(policyId, runId, json(redact(policy)), now());
-    const evaluations = [];
-    for (const invariant of policy.invariants) {
-      const violated = policyMatch(invariant, toolName, input, workspaceRoot);
-      const decision = violated ? (invariant.enforcement ?? "block") : "allow";
-      const evaluation = { id: randomUUID(), runId, stepId, policyId, invariantId: invariant.id, decision, enforcement: invariant.enforcement ?? "block", reason: violated ? `invariant violated: ${invariant.id}` : "invariant satisfied", input: redact({ toolName, input }), createdAt: now() };
-      this.ledger.database.db.prepare("INSERT INTO policy_evaluations(id, run_id, step_id, policy_id, invariant_id, decision, enforcement, reason, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(evaluation.id, runId, stepId ?? null, evaluation.policyId, evaluation.invariantId, decision, evaluation.enforcement, evaluation.reason, json(evaluation.input), evaluation.createdAt);
-      this.ledger.appendEvent({ runId, type: "policy-check", payload: evaluation }); evaluations.push(evaluation);
-    }
+    const evaluations = evaluatePolicyInvariants({
+      policy: normalizedPolicy as any,
+      request: { tool: toolName, input },
+      workspaceRoot
+    }).map((result) => {
+      const evaluation = { id: randomUUID(), runId, stepId, policyId, ...result, input: redact({ toolName, input }), createdAt: now() };
+      this.ledger.database.db.prepare("INSERT INTO policy_evaluations(id, run_id, step_id, policy_id, invariant_id, decision, enforcement, reason, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(evaluation.id, runId, stepId ?? null, evaluation.policyId, evaluation.invariantId, evaluation.decision, evaluation.enforcement, evaluation.reason, json(evaluation.input), evaluation.createdAt);
+      this.ledger.appendEvent({ runId, type: "policy-check", payload: evaluation });
+      return evaluation;
+    });
     const blocked = evaluations.find((item) => ["block", "terminate", "rollback", "pause"].includes(item.decision));
     if (blocked) throw new OdinnRuntimeError("POLICY_VIOLATION", blocked.reason, { evaluation: blocked });
     return { allowed: true, evaluations };
@@ -339,35 +316,53 @@ function rejectSymbolicPath(root: string, target: string) {
 
 export class SnapshotManager {
   [key: string]: any;
-  constructor({ ledger, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
+  constructor({ ledger, featureFlags = {}, maxFiles = 10_000, maxBytes = 256 * 1024 * 1024 }: AnyRecord = {}) {
+    this.ledger = ledger;
+    this.featureFlags = featureFlags;
+    this.maxFiles = maxFiles;
+    this.maxBytes = maxBytes;
+  }
   create({ runId, stepId, paths = [], label, workspaceRoot = process.cwd() }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "rewind", this.ledger);
     if (!this.ledger.getRun(runId)) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot run not found", { runId });
     if (!Array.isArray(paths) || paths.length === 0 || paths.some((path) => typeof path !== "string" || !path.trim())) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths must contain at least one non-empty path");
     const requestedPaths = [...new Set(paths)];
     if (requestedPaths.length !== paths.length) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths must be unique");
     const root = resolve(workspaceRoot);
+    const normalizedPaths = requestedPaths.map((path) => relative(root, safePath(root, path)));
+    if (normalizedPaths.some((path, index) => normalizedPaths.some((other, otherIndex) => index !== otherIndex && isWithin(resolve(root, other), resolve(root, path))))) {
+      throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths must not overlap");
+    }
     const snapshotId = `snap_${randomUUID()}`;
     const entriesByPath = new Map<string, AnyRecord>();
+    const roots: AnyRecord[] = [];
+    let totalBytes = 0;
     for (const relativePath of requestedPaths) {
       const target = safeExistingPath(root, relativePath);
       if (isWithin(target, this.ledger.stateDir) || isWithin(this.ledger.stateDir, target)) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths cannot include the Odinn state directory", { path: relativePath });
       rejectSymbolicPath(root, target);
+      roots.push({
+        path: relative(root, target),
+        existed: existsSync(target),
+        type: existsSync(target) && lstatSync(target).isDirectory() ? "directory" : existsSync(target) ? "file" : "missing",
+        mode: existsSync(target) ? lstatSync(target).mode : null
+      });
       for (const path of walkFiles(root, target)) {
         const rel = relative(root, path);
         if (entriesByPath.has(rel)) continue;
         const bytes = readFileSync(path);
+        totalBytes += bytes.byteLength;
+        if (entriesByPath.size + 1 > this.maxFiles) throw new OdinnRuntimeError("BUDGET_EXCEEDED", "snapshot exceeds the file limit", { maxFiles: this.maxFiles });
+        if (totalBytes > this.maxBytes) throw new OdinnRuntimeError("BUDGET_EXCEEDED", "snapshot exceeds the byte limit", { maxBytes: this.maxBytes });
         const artifact = this.ledger.artifacts.put(bytes);
         entriesByPath.set(rel, { path: rel, existed: true, mode: lstatSync(path).mode, digest: hash(bytes), artifactDigest: artifact.digest });
       }
       if (!existsSync(target)) entriesByPath.set(relativePath, { path: relativePath, existed: false });
     }
     const entries = [...entriesByPath.values()];
-    const createdAt = now(); this.ledger.database.transaction((db: any) => { db.prepare("INSERT INTO snapshots(id, run_id, step_id, label, workspace_root, manifest_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(snapshotId, runId, stepId ?? null, label ?? null, resolve(workspaceRoot), json({ entries: entries.map((entry) => ({ path: entry.path, existed: entry.existed, digest: entry.digest, artifactDigest: entry.artifactDigest })) }), createdAt); for (const entry of entries) db.prepare("INSERT INTO snapshot_entries(id, snapshot_id, path, existed, mode, digest, artifact_digest) VALUES (?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), snapshotId, entry.path, entry.existed ? 1 : 0, entry.mode ?? null, entry.digest ?? null, entry.artifactDigest ?? null); }); this.ledger.appendEvent({ runId, type: "snapshot", payload: { snapshotId, label, entries: entries.length } }); return { snapshotId, entries };
+    const createdAt = now(); this.ledger.database.transaction((db: any) => { db.prepare("INSERT INTO snapshots(id, run_id, step_id, label, workspace_root, manifest_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(snapshotId, runId, stepId ?? null, label ?? null, resolve(workspaceRoot), json({ roots, totalBytes, entries: entries.map((entry) => ({ path: entry.path, existed: entry.existed, digest: entry.digest, artifactDigest: entry.artifactDigest })) }), createdAt); for (const entry of entries) db.prepare("INSERT INTO snapshot_entries(id, snapshot_id, path, existed, mode, digest, artifact_digest) VALUES (?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), snapshotId, entry.path, entry.existed ? 1 : 0, entry.mode ?? null, entry.digest ?? null, entry.artifactDigest ?? null); }); this.ledger.appendEvent({ runId, type: "snapshot", payload: { snapshotId, label, entries: entries.length, totalBytes } }); return { snapshotId, entries, roots, totalBytes };
   }
-  plan(snapshotId: string): AnyRecord { const snapshot = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord | undefined; if (!snapshot) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot not found"); return { snapshotId, workspaceRoot: snapshot.workspace_root, entries: this.ledger.database.db.prepare("SELECT * FROM snapshot_entries WHERE snapshot_id = ? ORDER BY path").all(snapshotId) }; }
+  plan(snapshotId: string): AnyRecord { const snapshot = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord | undefined; if (!snapshot) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot not found"); const manifest = parse(snapshot.manifest_json, {}); return { snapshotId, workspaceRoot: snapshot.workspace_root, roots: Array.isArray(manifest.roots) ? manifest.roots : [], entries: this.ledger.database.db.prepare("SELECT * FROM snapshot_entries WHERE snapshot_id = ? ORDER BY path").all(snapshotId) }; }
   restore(snapshotId: string, { apply = false }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "rewind", this.ledger);
     const plan = this.plan(snapshotId);
     const prepared = plan.entries.map((entry: AnyRecord) => {
       const target = safeExistingPath(plan.workspaceRoot, entry.path);
@@ -382,6 +377,25 @@ export class SnapshotManager {
       return { entry, target, bytes };
     });
     const actions: AnyRecord[] = [];
+    const snapshotRow = this.ledger.database.db.prepare("SELECT run_id FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord;
+    let recoverySnapshotId;
+    if (apply) {
+      const recoveryPaths = plan.roots.length ? plan.roots.map((root: AnyRecord) => root.path) : plan.entries.map((entry: AnyRecord) => entry.path);
+      const recovery = this.create({
+        runId: snapshotRow.run_id,
+        stepId: `recovery:${snapshotId}`,
+        paths: recoveryPaths,
+        label: `Automatic recovery point before restoring ${snapshotId}`,
+        workspaceRoot: plan.workspaceRoot
+      });
+      recoverySnapshotId = recovery.snapshotId;
+      for (const root of plan.roots) {
+        const target = safeExistingPath(plan.workspaceRoot, root.path);
+        rejectSymbolicPath(plan.workspaceRoot, target);
+        if (existsSync(target)) rmSync(target, { recursive: true, force: true });
+        if (root.existed && root.type === "directory") mkdirSync(target, { recursive: true, mode: root.mode ?? 0o700 });
+      }
+    }
     for (const item of prepared) {
       const { entry, target, bytes } = item;
       if (!apply) { actions.push({ path: entry.path, action: entry.existed ? "restore" : "remove" }); continue; }
@@ -394,18 +408,152 @@ export class SnapshotManager {
         actions.push({ path: entry.path, action: "removed" });
       }
     }
-    const snapshotRow = this.ledger.database.db.prepare("SELECT run_id FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord;
-    this.ledger.appendEvent({ runId: snapshotRow.run_id, type: "rollback", payload: { snapshotId, applied: apply, actions } });
-    return { snapshotId, applied: apply, actions };
+    this.ledger.appendEvent({ runId: snapshotRow.run_id, type: "rollback", payload: { snapshotId, applied: apply, recoverySnapshotId, actions } });
+    return { snapshotId, applied: apply, recoverySnapshotId, actions };
   }
 }
 
 export class DarwinRouter {
   [key: string]: any;
-  constructor({ ledger, featureFlags = {}, weights = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; this.weights = { verified: 0.45, reliability: 0.15, speed: 0.1, cost: 0.15, compliance: 0.15, ...weights }; }
-  observe(observation: AnyRecord) { requireExperimental(this.featureFlags, "darwin", this.ledger); const item = { id: observation.id ?? randomUUID(), runId: observation.runId, providerId: observation.providerId, modelId: observation.modelId, taskClass: observation.taskClass ?? "general", verified: Boolean(observation.verified), partiallyVerified: Boolean(observation.partiallyVerified), costUsd: observation.costUsd ?? null, durationMs: Number(observation.durationMs ?? 0), toolCalls: Number(observation.toolCalls ?? 0), toolErrors: Number(observation.toolErrors ?? 0), retries: Number(observation.retries ?? 0), policyViolations: Number(observation.policyViolations ?? 0), rolledBack: Boolean(observation.rolledBack), createdAt: now() }; this.ledger.database.db.prepare("INSERT INTO model_observations(id, run_id, provider_id, model_id, task_class, verified, partially_verified, cost_usd, duration_ms, tool_calls, tool_errors, retries, policy_violations, rolled_back, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(item.id, item.runId, item.providerId, item.modelId, item.taskClass, item.verified ? 1 : 0, item.partiallyVerified ? 1 : 0, item.costUsd, item.durationMs, item.toolCalls, item.toolErrors, item.retries, item.policyViolations, item.rolledBack ? 1 : 0, item.createdAt); return item; }
-  stats(taskClass = "general") { requireExperimental(this.featureFlags, "darwin", this.ledger); const rows = this.ledger.database.db.prepare("SELECT provider_id, model_id, AVG(verified) verified, AVG(tool_errors = 0) reliability, AVG(duration_ms) duration, AVG(COALESCE(cost_usd, 0)) cost, AVG(policy_violations = 0) compliance, COUNT(*) observations FROM model_observations WHERE task_class = ? GROUP BY provider_id, model_id").all(taskClass) as AnyRecord[]; const maxDuration = Math.max(...rows.map((row: AnyRecord) => Number(row.duration)), 1); const maxCost = Math.max(...rows.map((row: AnyRecord) => Number(row.cost)), 0.000001); return rows.map((row: AnyRecord) => ({ ...row, score: Number(row.verified) * this.weights.verified + Number(row.reliability) * this.weights.reliability + (1 - Number(row.duration) / maxDuration) * this.weights.speed + (1 - Number(row.cost) / maxCost) * this.weights.cost + Number(row.compliance) * this.weights.compliance, uncertaintyPenalty: 1 / Math.max(Number(row.observations), 1) })); }
-  choose(taskClass = "general", { pinnedModel }: AnyRecord = {}) { requireExperimental(this.featureFlags, "darwin", this.ledger); if (pinnedModel) return { model: pinnedModel, reason: "user-pinned model" }; const stats: AnyRecord[] = this.stats(taskClass).map((row: AnyRecord) => ({ ...row, adjustedScore: row.score - row.uncertaintyPenalty })); stats.sort((a: AnyRecord, b: AnyRecord) => b.adjustedScore - a.adjustedScore); if (!stats[0]) throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "no observations for task class", { taskClass }); return { model: `${stats[0].provider_id}:${stats[0].model_id}`, taskClass, score: stats[0].adjustedScore, explanation: `selected from ${stats[0].observations} observed runs; verified=${Number(stats[0].verified).toFixed(2)}, reliability=${Number(stats[0].reliability).toFixed(2)}`, candidates: stats };
+  constructor({ ledger, featureFlags = {}, weights = {} }: AnyRecord = {}) {
+    this.ledger = ledger;
+    this.featureFlags = featureFlags;
+    this.weights = {
+      verified: 0.35,
+      partiallyVerified: 0.1,
+      reliability: 0.15,
+      speed: 0.1,
+      cost: 0.1,
+      compliance: 0.1,
+      rollbackFree: 0.1,
+      ...weights
+    };
+  }
+  observe(observation: AnyRecord) {
+    for (const field of ["runId", "providerId", "modelId"]) {
+      if (typeof observation?.[field] !== "string" || !observation[field].trim()) {
+        throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", `${field} is required for a model observation`);
+      }
+    }
+    if (!this.ledger.getRun(observation.runId)) {
+      throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "observation run not found", { runId: observation.runId });
+    }
+    const metric = (name: string, fallback = 0) => {
+      const value = Number(observation[name] ?? fallback);
+      if (!Number.isFinite(value) || value < 0) throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", `${name} must be a non-negative number`);
+      return value;
+    };
+    const item = {
+      id: observation.id ?? randomUUID(),
+      runId: observation.runId,
+      providerId: observation.providerId,
+      modelId: observation.modelId,
+      taskClass: observation.taskClass ?? "general",
+      verified: Boolean(observation.verified),
+      partiallyVerified: Boolean(observation.partiallyVerified),
+      costUsd: observation.costUsd === undefined || observation.costUsd === null ? null : metric("costUsd"),
+      durationMs: metric("durationMs"),
+      toolCalls: metric("toolCalls"),
+      toolErrors: metric("toolErrors"),
+      retries: metric("retries"),
+      policyViolations: metric("policyViolations"),
+      rolledBack: Boolean(observation.rolledBack),
+      createdAt: now()
+    };
+    this.ledger.database.db.prepare("INSERT INTO model_observations(id, run_id, provider_id, model_id, task_class, verified, partially_verified, cost_usd, duration_ms, tool_calls, tool_errors, retries, policy_violations, rolled_back, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(item.id, item.runId, item.providerId, item.modelId, item.taskClass, item.verified ? 1 : 0, item.partiallyVerified ? 1 : 0, item.costUsd, item.durationMs, item.toolCalls, item.toolErrors, item.retries, item.policyViolations, item.rolledBack ? 1 : 0, item.createdAt);
+    try {
+      this.ledger.appendEvent({
+        runId: item.runId,
+        type: "model-observation",
+        payload: {
+          observationId: item.id,
+          providerId: item.providerId,
+          modelId: item.modelId,
+          taskClass: item.taskClass,
+          verified: item.verified,
+          partiallyVerified: item.partiallyVerified,
+          costUsd: item.costUsd,
+          durationMs: item.durationMs,
+          toolCalls: item.toolCalls,
+          toolErrors: item.toolErrors,
+          retries: item.retries,
+          policyViolations: item.policyViolations,
+          rolledBack: item.rolledBack
+        }
+      });
+    } catch (error) {
+      this.ledger.database.db.prepare("DELETE FROM model_observations WHERE id = ?").run(item.id);
+      throw error;
+    }
+    return item;
+  }
+  stats(taskClass = "general") {
+    const rows = this.ledger.database.db.prepare("SELECT provider_id, model_id, AVG(verified) verified, AVG(partially_verified) partially_verified, AVG(tool_errors = 0) reliability, AVG(duration_ms) duration, AVG(cost_usd) cost, AVG(policy_violations = 0) compliance, AVG(rolled_back = 0) rollback_free, COUNT(*) observations FROM model_observations WHERE task_class = ? GROUP BY provider_id, model_id").all(taskClass) as AnyRecord[];
+    const maxDuration = Math.max(...rows.map((row: AnyRecord) => Number(row.duration)), 1);
+    const knownCosts = rows.map((row: AnyRecord) => row.cost).filter((value) => value !== null).map(Number);
+    const maxCost = Math.max(...knownCosts, 0.000001);
+    return rows.map((row: AnyRecord) => ({
+      ...row,
+      score: Number(row.verified) * this.weights.verified
+        + Number(row.partially_verified) * this.weights.partiallyVerified
+        + Number(row.reliability) * this.weights.reliability
+        + (1 - Number(row.duration) / maxDuration) * this.weights.speed
+        + (row.cost === null ? 0 : 1 - Number(row.cost) / maxCost) * this.weights.cost
+        + Number(row.compliance) * this.weights.compliance
+        + Number(row.rollback_free) * this.weights.rollbackFree,
+      uncertaintyPenalty: 1 / Math.sqrt(Math.max(Number(row.observations), 1))
+    }));
+  }
+  recordDecision({ runId, taskClass = "general", model, source, reason, candidates = [] }: AnyRecord) {
+    if (!runId) return;
+    if (!this.ledger.getRun(runId)) throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "routing decision run not found", { runId });
+    this.ledger.appendEvent({
+      runId,
+      type: "model-routing-decision",
+      payload: {
+        taskClass,
+        model,
+        source,
+        reason,
+        candidates: candidates.map((candidate: AnyRecord) => ({
+          providerId: candidate.provider_id,
+          modelId: candidate.model_id,
+          observations: Number(candidate.observations),
+          score: Number(candidate.score),
+          uncertaintyPenalty: Number(candidate.uncertaintyPenalty),
+          adjustedScore: Number(candidate.adjustedScore)
+        }))
+      }
+    });
+  }
+  choose(taskClass = "general", { pinnedModel, availableModels = [], runId }: AnyRecord = {}) {
+    const decisionRunId = runId ?? `routing-${randomUUID()}`;
+    if (!this.ledger.getRun(decisionRunId)) this.ledger.ensureRun({ runId: decisionRunId, objective: `choose a model for ${taskClass}` });
+    if (pinnedModel) {
+      const result = { model: pinnedModel, reason: "user-pinned model", source: "pinned", taskClass, runId: decisionRunId };
+      this.recordDecision({ runId: decisionRunId, taskClass, model: result.model, source: result.source, reason: result.reason });
+      return result;
+    }
+    const available = new Set(Array.isArray(availableModels) ? availableModels : []);
+    const stats: AnyRecord[] = this.stats(taskClass)
+      .filter((row: AnyRecord) => !available.size || available.has(`${row.provider_id}:${row.model_id}`))
+      .map((row: AnyRecord) => ({ ...row, adjustedScore: row.score - row.uncertaintyPenalty }));
+    stats.sort((a: AnyRecord, b: AnyRecord) => b.adjustedScore - a.adjustedScore);
+    if (!stats[0]) {
+      this.recordDecision({ runId: decisionRunId, taskClass, model: null, source: "unavailable", reason: "no applicable observations for task class" });
+      throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "no observations for task class", { taskClass, runId: decisionRunId });
+    }
+    const result = {
+      model: `${stats[0].provider_id}:${stats[0].model_id}`,
+      taskClass,
+      runId: decisionRunId,
+      score: stats[0].adjustedScore,
+      source: "darwin",
+      explanation: `selected from ${stats[0].observations} observed runs; verified=${Number(stats[0].verified).toFixed(2)}, reliability=${Number(stats[0].reliability).toFixed(2)}`,
+      candidates: stats
+    };
+    this.recordDecision({ runId: decisionRunId, taskClass, model: result.model, source: result.source, reason: result.explanation, candidates: stats });
+    return result;
   }
 }
 
@@ -737,5 +885,21 @@ async function syncWorkspace(source: string, destination: string) {
 export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {}, proofOptions = {} }: AnyRecord = {}) {
   const ledger = createRunLedger({ stateDir, workspaceRoot, featureFlags });
   const runtimeFlags = { ...featureFlags, __ledger: ledger };
-  return { ledger, proof: new ProofEngine({ ledger, featureFlags: runtimeFlags, ...proofOptions }), sentinel: new Sentinel({ ledger, featureFlags: runtimeFlags }), capabilities: new CapabilityBroker({ ledger, stateDir, featureFlags: runtimeFlags }), snapshots: new SnapshotManager({ ledger, featureFlags: runtimeFlags }), capsules: new CapsuleManager({ ledger, stateDir, featureFlags: runtimeFlags }), counterfactual: new CounterfactualManager({ ledger, stateDir, featureFlags: runtimeFlags }), darwin: new DarwinRouter({ ledger, featureFlags: runtimeFlags }) };
+  const plugins = loadRuntimePlugins({
+    ledger,
+    stateDir: resolve(stateDir),
+    workspaceRoot: resolve(workspaceRoot),
+    featureFlags: runtimeFlags
+  }, [capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin]);
+  return {
+    ledger,
+    proof: new ProofEngine({ ledger, ...proofOptions }),
+    sentinel: new Sentinel({ ledger }),
+    snapshots: new SnapshotManager({ ledger }),
+    darwin: new DarwinRouter({ ledger }),
+    plugins,
+    capabilities: plugins.get("capabilities")!.service as CapabilityBroker,
+    capsules: plugins.get("capsules")!.service as CapsuleManager,
+    counterfactual: plugins.get("counterfactual")!.service as CounterfactualManager
+  };
 }

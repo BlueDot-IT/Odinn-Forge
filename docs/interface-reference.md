@@ -38,10 +38,12 @@ The stable command groups are:
 | Runs and audit | `odinn run ...`, `odinn runs`, `odinn show`, `odinn audit`, `odinn audit verify` | JSON task results, run events, redacted history, or integrity-verification results |
 | Plans | `odinn plan` | The JSON execution result for the submitted task plan |
 
-Commands under `odinn experimental`, and the Proof, Sentinel, Rewind, Capsules,
-Darwin, Capability Tokens, Counterfactual, extension, Agent SDK, and Skill SDK
-surfaces are not promoted to stable by appearing in CLI help. Consult the
-[surface matrix](surface-matrix.md) before automating them.
+Commands under `odinn experimental` control optional plugin modules. Proof,
+Sentinel, Rewind, and Darwin are always-available core advanced commands.
+Neither core placement nor appearance in CLI help promotes an advanced
+surface to a stable public SDK. Consult the [surface matrix](surface-matrix.md)
+before automating these services, plugin modules, extensions, Agent SDK, or
+Skill SDK surfaces.
 
 ## Loopback gateway
 
@@ -86,7 +88,7 @@ formal JSON Schema definitions.
 | --- | --- | --- |
 | `GET /config` | No body | `{ ok, config, restartRequired, ... }` with editable configuration and metadata |
 | `PUT /config` | `{ config, fingerprint }`, using the current 64-character fingerprint from `GET /config` | `{ ok, config, fingerprint, restartRequired }`; stale fingerprints return `409` without overwriting newer configuration |
-| `GET /status` | No body | Version, absolute state/workspace paths, configured models/providers, tools, capabilities, security policy, experimental flags, and pending approvals |
+| `GET /status` | No body | Version, absolute state/workspace paths, configured models/providers, tools, capabilities, security policy, core advanced services, optional plugin flags, and pending approvals |
 | `GET /diagnostics` | No body | A credential-redacted health and configuration report |
 
 ### Project, session, and goal routes
@@ -145,7 +147,7 @@ formal JSON Schema definitions.
 | `GET /audit/query` | Optional `q`, `type`, `tool`, `actor`, `outcome`, `from`, `to`, `page`, and `pageSize` | Filtered audit events and pagination metadata |
 | `GET /audit/verify` | No body | Audit-chain integrity verification |
 
-Experimental feature routes documented in the
-[operator console guide](operator-console.md) remain experimental. Other
-implemented routes are internal unless this reference or another v1 document
-explicitly defines them.
+Advanced-service and optional-plugin routes documented in the
+[operator console guide](operator-console.md) retain the classifications in
+the surface matrix. Other implemented routes are internal unless this
+reference or another v1 document explicitly defines them.

@@ -36,17 +36,26 @@ The three hard limits are:
   a workspace dependency installation.
 - [x] Structured audit events, run timelines, persisted output, replay endpoint, provider failure tests, and failure categorization for task lifecycle.
 
-## Experimental runtime slices
+## Core advanced services and optional plugin modules
 
-These are implemented as local vertical slices and remain disabled by default:
+The core advanced services are available without feature flags:
 
 - [x] One gateway Proof verification path with strict schema validation, exact operator-controlled command allowlists, minimal command environments, process-tree termination, file assertions, evidence artifacts, persisted assertion results, and verified/failed run transitions. Legacy arbitrary-command assertions are rejected.
 - [x] Sentinel policy validation and pre-operation invariant decisions for denied commands, allowed roots, and approval-required tools.
+- [x] Rewind snapshots with content-addressed file artifacts, dry-run previews, symlink rejection, bounded capture, exact selected-root restoration, and an automatic pre-restore recovery snapshot.
+- [x] Darwin observations, automatic configured-model routing, Proof promotion, transparent routing scores, uncertainty penalties, and human-readable selection reasons.
+
+The optional runtime plugin modules remain disabled by default:
+
 - [x] Capability tokens with local signing keys, expiry, run/step/tool binding, resource constraints, revocation, and one-use enforcement.
-- [x] Rewind snapshots with content-addressed file artifacts, dry-run previews, symlink rejection, and actual local restoration.
 - [x] Capsules with redaction, ZIP path validation, checksums, verification-only contract metadata, tool-mocked durable boundary replay, tamper detection, and full replay through the audited executor in disposable workspaces. External effects require explicit approval and redacted inputs remain fail-closed.
 - [x] Counterfactual workspace copies with independent runs, bounded task execution through the audited tool boundary, optional shared Proof runs, candidate comparison, and dry-run/apply branch selection with source backup. Irreversible external actions remain approval-gated and full remote rollback is not claimed.
-- [x] Darwin observations and transparent routing scores with uncertainty penalties and human-readable selection reasons.
+
+The private kernel plugin boundary exposes a descriptor, configuration key,
+enabled state, and service factory for each of those three modules. It is an
+internal composition boundary, not a stable third-party plugin SDK. Existing
+runtime service properties remain as compatibility aliases to the loaded
+module services.
 
 These slices do not claim to reverse arbitrary remote mutations or make
 nondeterministic model and remote-service results deterministic. Built-in tools

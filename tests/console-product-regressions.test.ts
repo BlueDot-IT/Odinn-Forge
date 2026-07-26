@@ -51,7 +51,7 @@ function cssBlocks(source: string, header: RegExp) {
   return blocks;
 }
 
-test("console presents the human-first product surfaces and dedicated Labs pages", async () => {
+test("console presents the human-first product surfaces and dedicated Advanced pages", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-console-product-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -87,7 +87,7 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     const navigationMatches = [...navigation.matchAll(/\bdata-view=["']([^"']+)["']/giu)].map((match) => match[1]);
     const views = [...new Set(viewMatches)];
     const navigationTargets = [...new Set(navigationMatches)];
-    assert.equal(views.length, 20, "the console must expose the product surface plus seven dedicated Labs pages");
+    assert.equal(views.length, 20, "the console must expose the product surface plus seven dedicated Advanced pages");
     assert.equal(viewMatches.length, views.length, "console view ids must be unique");
     assert.equal(navigationMatches.length, navigationTargets.length, "console navigation targets must be unique");
     assert.deepEqual(
@@ -149,6 +149,9 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     assert.match(config, /Everything Ódinn can configure/);
     assert.match(config, /Model providers/);
     assert.match(config, /Sentinel invariants/);
+    assert.match(config, /Optional plugin modules/);
+    for (const plugin of ["capabilities", "capsules", "counterfactual"]) assert.match(config, new RegExp(`data-config-experimental="${plugin}"`));
+    for (const core of ["proof", "sentinel", "rewind", "darwin"]) assert.doesNotMatch(config, new RegExp(`data-config-experimental="${core}"`));
     assert.match(config, /Proof command allowlist/);
     assert.match(config, /data-config-security="web\.requireApproval"/u);
     assert.match(config, /data-config-security="web\.allowDownloads"/u);
@@ -222,7 +225,8 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     ]);
     assert.equal(experiments.match(/data-experimental-page=/g)?.length ?? 0, 7);
     assert.match(experiments, /Runs quietly in the background/);
-    assert.match(experiments, /Experimental feature/);
+    assert.match(experiments, /Core capability/);
+    assert.match(experiments, /Optional plugin module/);
     assert.doesNotMatch(experiments, /release blocker|release-blocker|review queue|content-addressed artifact store/i);
     assert.doesNotMatch(html, /id="view-experiments"/);
 

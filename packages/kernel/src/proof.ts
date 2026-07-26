@@ -373,7 +373,6 @@ export class ProofVerifier {
 
   async verify(input: unknown) {
     const contract = validateVerificationContract(input);
-    if (this.runLedger.featureFlags?.proof !== true) throw new Error("experimental proof feature is disabled");
     const root = await realpath(this.allowedRoot);
     if (!this.runLedger.getRun(contract.runId)) throw new Error(`run not found for verification contract: ${contract.runId}`);
     const existing = this.runLedger.database.db.prepare("SELECT id FROM verification_contracts WHERE id = ?").get(contract.id);
@@ -426,15 +425,25 @@ export class ProofVerifier {
     const passed = results.every((result) => result.passed);
     const status = passed ? "passed" : "failed";
     const completedAt = new Date().toISOString();
+    const modelObservationIds = (this.runLedger.database.db.prepare("SELECT id FROM model_observations WHERE run_id = ? ORDER BY created_at").all(contract.runId) as Array<{ id: string }>).map((row) => row.id);
     this.runLedger.database.transaction((db) => {
       db.prepare("UPDATE runs SET status = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?")
         .run(passed ? "verified" : "failed", completedAt, contract.runId);
+      db.prepare("UPDATE model_observations SET verified = ?, partially_verified = 0 WHERE run_id = ?")
+        .run(passed ? 1 : 0, contract.runId);
     });
     this.runLedger.appendEvent({
       runId: contract.runId,
       type: "verification-completed",
       payload: { contractId: contract.id, status, passed: results.filter((result) => result.passed).length, failed: results.filter((result) => !result.passed).length }
     });
+    if (modelObservationIds.length) {
+      this.runLedger.appendEvent({
+        runId: contract.runId,
+        type: "model-observation-verification",
+        payload: { contractId: contract.id, status, verified: passed, observationIds: modelObservationIds }
+      });
+    }
     return { contractId: contract.id, runId: contract.runId, status, passed, startedAt, completedAt, assertions: results };
   }
 

@@ -28,17 +28,21 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.ok(status.tools.includes("web.search"));
     assert.ok(status.tools.includes("browser.open"));
     assert.ok(status.tools.includes("agent.run"));
+    assert.deepEqual(status.coreAdvanced, ["proof", "sentinel", "rewind", "darwin"]);
+    assert.deepEqual(status.pluginModules.map((plugin: any) => plugin.id), ["capabilities", "capsules", "counterfactual"]);
+    assert.ok(status.pluginModules.every((plugin: any) => plugin.enabled === false));
     assert.equal(status.security.web.allowPrivateNetwork, false);
     assert.equal(status.security.browser.requireApproval, true);
     assert.ok(status.toolDetails.some((tool: any) => tool.name === "text.echo" && tool.capability === "text.echo"));
 
-    const disabledProof = await fetch(`${base}/proof`, {
+    await postJson(`${base}/run`, { id: "core-proof-run", tool: "text.echo", input: { text: "proof source" } });
+    const coreProof = await fetch(`${base}/proof`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ schemaVersion: 1, id: "disabled-proof", runId: "disabled-proof-run", assertions: [{ id: "fixture", type: "file", path: "README.md", expect: { exists: true } }] })
+      body: JSON.stringify({ schemaVersion: 1, id: "core-proof", runId: "core-proof-run", assertions: [{ id: "fixture", type: "file", path: "README.md", expect: { exists: true } }] })
     });
-    assert.equal(disabledProof.status, 409);
-    assert.match((await disabledProof.json()).error, /experimental\.proof is disabled/);
+    assert.equal(coreProof.status, 200);
+    assert.equal((await coreProof.json()).status, "passed");
 
     const run = await postJson(`${base}/run`, { tool: "text.echo", input: { text: "ODINN_GATEWAY_OK" } });
     assert.equal(run.ok, true);
@@ -103,7 +107,7 @@ test("gateway permits capability inspection and revocation after the feature is 
   const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-workspace-"));
   const enabledConfig = {
     version: 1,
-    experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: true, counterfactual: false }
+    experimental: { capsules: false, capabilities: true, counterfactual: false }
   };
   await writeFile(join(stateDir, "config.json"), JSON.stringify(enabledConfig));
   let server = await createGatewayServer({ stateDir, workspaceRoot });
@@ -535,14 +539,14 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
   await writeFile(join(workspaceRoot, "fixture.txt"), "before\n");
   await writeFile(join(stateDir, "config.json"), JSON.stringify({
     version: 1,
-    experimental: { proof: true, rewind: true, sentinel: true, capsules: true, darwin: true, capabilities: true, counterfactual: true }
+    experimental: { capsules: true, capabilities: true, counterfactual: true }
   }));
   const server = await createGatewayServer({ stateDir, workspaceRoot });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const status = await getJson(`${base}/status`);
-    assert.equal(status.experimental.proof, true);
+    assert.deepEqual(status.coreAdvanced, ["proof", "sentinel", "rewind", "darwin"]);
     assert.equal(status.experimental.capabilities, true);
 
     const issued = await postJson(`${base}/capabilities/issue`, {
@@ -617,6 +621,9 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
     assert.equal(observed.modelId, "verified");
     const choice = await postJson(`${base}/routing/choose`, { taskClass: "general" });
     assert.equal(choice.model, "test:verified");
+    assert.match(choice.runId, /^routing-/);
+    const routingTimeline = await getJson(`${base}/runtime/runs/${choice.runId}`);
+    assert.ok(routingTimeline.events.some((event: any) => event.type === "model-routing-decision" && event.payload.model === "test:verified"));
 
     await writeFile(join(workspaceRoot, "branch-evidence.txt"), "candidate-only evidence\n");
     const branch = await postJson(`${base}/counterfactual`, {
