@@ -137,7 +137,9 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
 
   constructor(options: GatewayChannelHandlerOptions) {
     if (!options.token.trim()) throw new Error("channel gateway handler requires a gateway token");
-    this.#baseUrl = (options.baseUrl ?? "http://127.0.0.1:18790").replace(/\/+$/u, "");
+    let baseUrl = options.baseUrl ?? "http://127.0.0.1:18790";
+    while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
+    this.#baseUrl = baseUrl;
     this.#token = options.token;
     this.#bindings = options.bindings;
     this.#defaultModel = options.defaultModel;
