@@ -2,6 +2,13 @@
 
 ![Ódinn Forge — your AI assistant, on your computer](docs/odinn-header.png)
 
+<p align="center">
+  <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml"><img alt="Security" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml"><img alt="Package Integrity" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml"><img alt="Workflow Lint" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml/badge.svg?branch=main"></a>
+</p>
+
 > **Your AI assistant, on your computer, under your control.**
 
 Ódinn Forge is an AI assistant that runs on a computer you control. It can
@@ -257,14 +264,6 @@ odinn doctor          # Create a safe diagnostic summary
   experimental, provider-dependent, or unsupported
 
 ## For developers and contributors
-
-Ódinn Forge is an original, clean-room implementation. It does not copy
-OpenClaw, Hermes, OpenViking, or another agent framework.
-
-[![CI](https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml)
-[![Security](https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml)
-[![Package Integrity](https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml)
-[![Workflow Lint](https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml)
 
 The repository is a Node.js workspace:
 
