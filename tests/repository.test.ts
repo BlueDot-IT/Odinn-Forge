@@ -86,6 +86,10 @@ test("security coverage completes before Scorecard evaluates it", async () => {
 
 test("security scanning is license-independent and optional maintenance is explicitly enabled", async () => {
   const security = await read(".github/workflows/security.yml");
+  assert.match(
+    security,
+    /codeql:[\s\S]*?permissions:\s*\n\s+actions: read\s*\n\s+contents: read/u,
+  );
   assert.doesNotMatch(security, /gitleaks\/gitleaks-action/u);
   assert.match(
     security,
