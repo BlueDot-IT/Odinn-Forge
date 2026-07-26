@@ -388,6 +388,9 @@ function usage() {
   odinn extension run --id <id> --input-json <json> [--capability <capability>] [--capability-token <token>] [--state .odinn]
   odinn config model default <provider:model> [--state .odinn]
   odinn config model list [--state .odinn]
+  odinn config channel add telegram <name> --token-env <ENV_NAME> --allowlist <telegram:user-or-chat-id,...> [--model <provider:model>] [--state .odinn]
+  odinn config channel list [--state .odinn]
+  odinn config channel enable|disable|remove <name> [--state .odinn]
   odinn status [--state .odinn]
   odinn audit [--state .odinn]
   odinn audit verify [--allow-unsigned] [--state .odinn]
@@ -1196,8 +1199,22 @@ async function status(args: any) {
     },
     defaultModel: normalizeModelConfig(config).defaultModel,
     models,
-    providers: await summarizeProviders(config, state)
+    providers: await summarizeProviders(config, state),
+    channels: summarizeChannelConfig(config)
   };
+}
+
+function summarizeChannelConfig(config: any) {
+  return Object.entries(config.channels ?? {}).map(([name, value]: any) => ({
+    name,
+    type: value.type ?? "telegram",
+    enabled: value.enabled === true,
+    credentialConfigured: Boolean(value.tokenEnv),
+    credentialPresent: Boolean(value.tokenEnv && process.env[value.tokenEnv]),
+    tokenEnv: value.tokenEnv ?? "",
+    allowlistEntries: Array.isArray(value.allowlist) ? value.allowlist.length : 0,
+    defaultModel: value.defaultModel ?? ""
+  }));
 }
 
 async function readJsonIfPresent(path: string, fallback: any) {
@@ -1264,6 +1281,7 @@ async function doctor(args: any) {
     })),
     coreAdvanced: CORE_ADVANCED_FEATURES,
     experimental: normalizeExperimentalFlags(config.experimental),
+    channels: summarizeChannelConfig(config),
     audit: { valid: audit.valid, events: audit.events, unsigned: audit.unsigned, failureCount: audit.failures.length },
     approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
     browserRecovery: { status: recovery.status ?? "clear", pending: ["executing", "unknown"].includes(recovery.status), id: recovery.id ?? undefined },
@@ -1533,11 +1551,54 @@ function providerVerificationTimeoutMs(requested = "") {
 
 async function configCommand(args: any) {
   const [section, subcommand, ...rest] = args;
-  if (!["provider", "model", "security", "experimental", "self-improvement"].includes(section)) {
-    throw new Error("config requires provider, model, security, experimental, or self-improvement");
+  if (!["provider", "model", "channel", "security", "experimental", "self-improvement"].includes(section)) {
+    throw new Error("config requires provider, model, channel, security, experimental, or self-improvement");
   }
   const state = stateDir(rest);
   const config = await readConfig(state);
+  if (section === "channel") {
+    config.channels ??= {};
+    if (subcommand === "list" || !subcommand) {
+      await printJson(summarizeChannelConfig(config));
+      return;
+    }
+    if (subcommand === "add") {
+      const type = rest[0];
+      const name = rest[1];
+      if (type !== "telegram" || !name) throw new Error("config channel add requires telegram <name>");
+      if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name)) throw new Error("channel name contains unsupported characters");
+      const tokenEnv = option(rest, "--token-env", "");
+      if (!/^[A-Z_][A-Z0-9_]{1,127}$/u.test(tokenEnv)) throw new Error("config channel add requires --token-env <UPPERCASE_ENV_NAME>");
+      config.channels[name] = {
+        type,
+        enabled: false,
+        tokenEnv,
+        allowlist: splitCsv(option(rest, "--allowlist", "")),
+        ...(option(rest, "--model", "") ? { defaultModel: option(rest, "--model") } : {})
+      };
+      await saveConfig(state, config);
+      await printJson({ ok: true, channel: summarizeChannelConfig(config).find((entry: any) => entry.name === name) });
+      return;
+    }
+    if (["enable", "disable", "remove"].includes(subcommand)) {
+      const name = rest[0];
+      if (!name || !config.channels[name]) throw new Error(`channel not found: ${name || "(missing)"}`);
+      if (subcommand === "enable") {
+        if (!config.channels[name].allowlist?.length) throw new Error("channel enable requires at least one allowlist entry");
+        config.channels[name].enabled = true;
+      } else if (subcommand === "disable") {
+        config.channels[name].enabled = false;
+      } else {
+        delete config.channels[name];
+      }
+      await saveConfig(state, config);
+      await printJson(subcommand === "remove"
+        ? { ok: true, removed: name }
+        : { ok: true, channel: summarizeChannelConfig(config).find((entry: any) => entry.name === name) });
+      return;
+    }
+    throw new Error("config channel requires add, list, enable, disable, or remove");
+  }
   if (section === "self-improvement") {
     if (subcommand === "show" || !subcommand) { await printJson(normalizeSelfImprovementConfig(config.selfImprovement)); return; }
     if (subcommand !== "set") throw new Error("config self-improvement requires show or set");
@@ -2984,7 +3045,7 @@ async function readConfig(state: any) {
     return config;
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
-    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
+    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
     configBaselines.set(config, null);
     return config;
   }
@@ -3000,6 +3061,7 @@ async function ensureConfig(state: any) {
       policy: createDefaultPolicy(),
       auditLog: "audit.jsonl",
       providers: {},
+      channels: {},
       defaultModel: "",
       experimental: normalizeExperimentalFlags(),
       selfImprovement: normalizeSelfImprovementConfig()
@@ -3017,6 +3079,7 @@ async function saveConfig(state: any, config: any) {
     policy: config.policy ?? createDefaultPolicy(),
     auditLog: config.auditLog ?? "audit.jsonl",
     providers: config.providers ?? {},
+    channels: config.channels ?? {},
     experimental: normalizeExperimentalFlags(config.experimental),
     selfImprovement: normalizeSelfImprovementConfig(config.selfImprovement),
     runtime: config.runtime ?? {},

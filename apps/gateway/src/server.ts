@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
+import { ChannelRouter, FileSessionBindingStore, GatewayChannelHandler, createAllowlistPolicy } from "@odinn/channels";
+import { TelegramChannelAdapter } from "@odinn/channel-telegram";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
@@ -535,6 +537,7 @@ export async function createGatewayServer({
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
   const skillStore = new SkillPackageStore(state);
   const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
+  const channelSupervisor = createChannelSupervisor({ config, state, gatewayToken });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry });
   await supervisor.start();
   const cronTimer = setInterval(() => runDueCronJobs(cronStore, isolatedTaskExecutor).catch(() => undefined), 30_000);
@@ -628,7 +631,10 @@ export async function createGatewayServer({
         });
       }
       if (request.method === "GET" && url.pathname === "/diagnostics") {
-        return json(response, 200, await diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor }));
+        return json(response, 200, await diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor }));
+      }
+      if (request.method === "GET" && url.pathname === "/channels") {
+        return json(response, 200, { ok: true, channels: channelSupervisor.status() });
       }
       if (request.method === "GET" && url.pathname === "/agents") {
         return json(response, 200, { agents: await agentStore.list(), sdkVersion: "0.3" });
@@ -1275,13 +1281,18 @@ export async function createGatewayServer({
     if (improvementStartupTimer) clearTimeout(improvementStartupTimer);
     if (improvementTimer) clearInterval(improvementTimer);
     clearInterval(cronTimer);
-    Promise.allSettled([supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
+    Promise.allSettled([channelSupervisor.stop(), supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
       .then(() => close(callback))
       .catch((error: any) => callback?.(error));
     return server;
   };
   server.on("close", () => supervisor.shutdown().catch(() => undefined));
   server.on("close", () => runtime.ledger.close());
+  server.on("listening", () => {
+    const address = server.address();
+    if (!address || typeof address === "string") return;
+    channelSupervisor.start(`http://127.0.0.1:${address.port}`).catch(() => undefined);
+  });
   server.odinnAuthToken = gatewayToken;
   return server;
 }
@@ -1432,6 +1443,9 @@ function isPrivateHostedProviderUrl(value: string) {
 }
 
 function validateHostedProviderConfig(config: any) {
+  if (Object.values(config?.channels ?? {}).some((channel: any) => channel?.enabled === true)) {
+    throw new GatewayError(400, "multi-user host does not allow messaging channels");
+  }
   for (const [name, provider] of Object.entries(config?.providers ?? {}) as Array<[string, any]>) {
     const auth = provider?.auth && typeof provider.auth === "object" && !Array.isArray(provider.auth) ? provider.auth : {};
     if (provider?.type === "cli" || String(provider?.transport ?? "").startsWith("cli-") || auth.mode === "cli") {
@@ -1477,7 +1491,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
         if (readError?.code !== "ENOENT") throw readError;
       }
       await mkdir(state, { recursive: true });
-      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await chmod(path, 0o600);
       return config;
@@ -1519,6 +1533,23 @@ function validateGatewayConfig(config: any) {
   }
   if (config.defaultModel !== undefined && typeof config.defaultModel !== "string") {
     throw new GatewayError(400, "config.defaultModel must be a string");
+  }
+  if (config.channels !== undefined) {
+    assertConfigRecord(config.channels, "config.channels");
+    for (const [name, channel] of Object.entries(config.channels) as Array<[string, any]>) {
+      if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name)) throw new GatewayError(400, `config.channels contains an invalid channel name: ${name}`);
+      assertConfigRecord(channel, `config.channels.${name}`);
+      assertOptionalConfigBoolean(channel, "enabled", `config.channels.${name}`);
+      for (const key of ["type", "tokenEnv", "defaultModel"]) {
+        if (channel[key] !== undefined && typeof channel[key] !== "string") throw new GatewayError(400, `config.channels.${name}.${key} must be a string`);
+      }
+      if (channel.type !== undefined && channel.type !== "telegram") throw new GatewayError(400, `config.channels.${name}.type must be telegram`);
+      if (channel.token !== undefined || channel.botToken !== undefined) throw new GatewayError(400, `config.channels.${name} must reference a tokenEnv instead of storing a bot token`);
+      if (channel.tokenEnv !== undefined && !/^[A-Z_][A-Z0-9_]{1,127}$/u.test(channel.tokenEnv)) {
+        throw new GatewayError(400, `config.channels.${name}.tokenEnv must be an uppercase environment variable name`);
+      }
+      if (channel.allowlist !== undefined) assertConfigStringArray(channel.allowlist, `config.channels.${name}.allowlist`);
+    }
   }
 
   if (config.providers !== undefined) {
@@ -1770,7 +1801,76 @@ async function summarizeProviders(config: any, state: any) {
   }));
 }
 
-async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor }: any) {
+function createChannelSupervisor({ config, state, gatewayToken }: any) {
+  const configured = Object.entries(config.channels ?? {}).map(([name, value]: any) => ({
+    name,
+    type: value.type ?? "telegram",
+    enabled: value.enabled === true,
+    tokenEnv: String(value.tokenEnv ?? ""),
+    allowlist: Array.isArray(value.allowlist) ? value.allowlist : [],
+    defaultModel: typeof value.defaultModel === "string" ? value.defaultModel : "",
+    running: false,
+    error: ""
+  }));
+  const adapters: any[] = [];
+  let started = false;
+  return {
+    status() {
+      return configured.map((channel) => ({
+        name: channel.name,
+        type: channel.type,
+        enabled: channel.enabled,
+        running: channel.running,
+        credentialConfigured: Boolean(channel.tokenEnv),
+        credentialPresent: Boolean(channel.tokenEnv && process.env[channel.tokenEnv]),
+        allowlistEntries: channel.allowlist.length,
+        error: channel.error
+      }));
+    },
+    async start(baseUrl: string) {
+      if (started) return;
+      started = true;
+      for (const channel of configured) {
+        if (!channel.enabled) continue;
+        try {
+          const token = channel.tokenEnv ? process.env[channel.tokenEnv] : "";
+          if (!token) throw new Error(`channel credential is unavailable in ${channel.tokenEnv || "an environment variable"}`);
+          const adapter = new TelegramChannelAdapter({
+            token,
+            accountId: channel.name,
+            onError(error) { channel.error = error instanceof Error ? error.message : String(error); }
+          });
+          const handler = new GatewayChannelHandler({
+            baseUrl,
+            token: gatewayToken,
+            bindings: new FileSessionBindingStore(join(state, "channel-bindings.json")),
+            ...(channel.defaultModel ? { defaultModel: channel.defaultModel } : {})
+          });
+          const router = new ChannelRouter(handler, {
+            access: createAllowlistPolicy(channel.allowlist),
+            onError(error) {
+              channel.error = error instanceof Error ? error.message : String(error);
+            }
+          });
+          await router.attach(adapter);
+          adapters.push(adapter);
+          channel.running = true;
+          channel.error = "";
+        } catch (error) {
+          channel.running = false;
+          channel.error = error instanceof Error ? error.message : String(error);
+        }
+      }
+    },
+    async stop() {
+      started = false;
+      await Promise.allSettled(adapters.splice(0).map((adapter) => adapter.stop()));
+      for (const channel of configured) channel.running = false;
+    }
+  };
+}
+
+async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor }: any) {
   let audit = { valid: true, events: 0, unsigned: 0, failureCount: 0 };
   try {
     const auditPath = join(state, config.auditLog ?? "audit.jsonl");
@@ -1814,6 +1914,7 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
     })),
     coreAdvanced: CORE_ADVANCED_FEATURES,
     experimental: featureFlags,
+    channels: channelSupervisor.status(),
     audit,
     approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
     browserRecovery: { status: recovery.status ?? "clear", pending: ["executing", "unknown"].includes(recovery.status), id: recovery.id ?? undefined },
@@ -4009,6 +4110,11 @@ function renderConsoleHtml(version = "development") {
             </div>
 
             <div class="panel config-section">
+              <div class="panel-head"><div><h2>Messaging channels</h2><p class="config-help">Connect Ódinn to approved chat accounts. Bot tokens stay in environment variables and changes require a restart.</p></div><button class="secondary" id="config-add-channel" type="button">Add Telegram</button></div>
+              <div id="config-channels" class="config-list"></div>
+            </div>
+
+            <div class="panel config-section">
               <div class="panel-head"><div><h2>Policy and safety</h2><p class="config-help">Choose which capabilities are available and how web and browser access behave.</p></div></div>
               <div class="grid-2">
                 <div class="field"><label for="config-policy-max-input">Maximum input bytes</label><input id="config-policy-max-input" data-config-policy="maxInputBytes" type="number" min="1" step="1"><span class="config-help">Requests above this size are rejected.</span></div>
@@ -5393,6 +5499,21 @@ function renderConsoleHtml(version = "development") {
         </article>\`;
     }
 
+    function renderChannelForm(name, channel = {}) {
+      return \`
+        <article class="config-card" data-channel-card data-original-name="\${escapeHtml(name)}">
+          <div class="config-card-head"><div><h3>Telegram channel</h3><p>Only allowlisted Telegram user or chat identifiers can reach this bot.</p></div><button class="danger-button" data-remove-channel type="button">Remove channel</button></div>
+          <div class="grid-2">
+            <div class="field"><label>Channel name</label><input data-channel-field="name" value="\${escapeHtml(name)}" placeholder="personal" autocomplete="off"></div>
+            <div class="field"><label>Type</label><input value="telegram" disabled><input data-channel-field="type" value="telegram" type="hidden"></div>
+            <div class="field"><label>Bot token environment variable</label><input data-channel-field="tokenEnv" value="\${escapeHtml(channel.tokenEnv || "")}" placeholder="ODINN_TELEGRAM_BOT_TOKEN" autocomplete="off"></div>
+            <div class="field"><label>Default model override</label><input data-channel-field="defaultModel" value="\${escapeHtml(channel.defaultModel || "")}" placeholder="provider:model" autocomplete="off"></div>
+          </div>
+          <div class="field"><label>Allowlist</label><textarea data-channel-field="allowlist" rows="4" placeholder="telegram:123456789&#10;telegram:-1001234567890">\${escapeHtml(Array.isArray(channel.allowlist) ? channel.allowlist.join("\\n") : "")}</textarea><span class="config-help">One Telegram user or chat entry per line. Empty means nobody is allowed.</span></div>
+          <label class="switch-label"><input data-channel-field="enabled" type="checkbox"\${channel.enabled === true ? " checked" : ""}> Enable after gateway restart</label>
+        </article>\`;
+    }
+
     function renderInvariantForm(invariant = {}) {
       return \`<div class="config-card" data-invariant-row><div class="config-list-row"><div class="grid-2"><div class="field"><label>Invariant ID</label><input data-invariant-field="id" value="\${escapeHtml(invariant.id || "")}" placeholder="deny-shell" autocomplete="off"></div><div class="field"><label>Type</label><select data-invariant-field="type">\${renderOptions(["command.deny-pattern", "tool.requires-approval", "filesystem.allowed-roots"], invariant.type || "command.deny-pattern")}</select></div><div class="field"><label>Values</label><textarea data-invariant-field="values" rows="3" placeholder="One value per line">\${escapeHtml(Array.isArray(invariant.values) ? invariant.values.join("\\n") : "")}</textarea></div><div class="field"><label>Enforcement</label><select data-invariant-field="enforcement">\${renderOptions(["log", "warn", "pause", "block", "rollback", "terminate"], invariant.enforcement || "block")}</select></div></div><button class="danger-button" data-remove-invariant type="button">Remove</button></div></div>\`;
     }
@@ -5445,6 +5566,7 @@ function renderConsoleHtml(version = "development") {
         if (input) input.checked = memory[key] !== false;
       }
       $("config-providers").innerHTML = Object.entries(value.providers || {}).map(([name, provider]) => renderProviderForm(name, provider)).join("") || '<div class="empty-state"><strong>No providers configured</strong><span>Add a provider to make model conversations available.</span></div>';
+      $("config-channels").innerHTML = Object.entries(value.channels || {}).map(([name, channel]) => renderChannelForm(name, channel)).join("") || '<div class="empty-state"><strong>No messaging channels configured</strong><span>Add Telegram when you want to talk to Ódinn outside this console.</span></div>';
       $("config-invariants").innerHTML = (Array.isArray(policy.invariants) ? policy.invariants : []).map(renderInvariantForm).join("") || '<div class="empty-state"><strong>No Gatewatch rules</strong><span>Add a rule only when you need a policy check beyond the default capability controls.</span></div>';
       $("config-proof-commands").innerHTML = (Array.isArray(value.proof?.allowedCommands) ? value.proof.allowedCommands : []).map(renderProofCommand).join("") || '<div class="empty-state"><strong>No Runemark commands allowed</strong><span>Runemark command checks remain unavailable until you add an exact executable argument vector.</span></div>';
       $("config-field-count").textContent = "All supported fields shown; unknown settings are preserved.";
@@ -5521,6 +5643,20 @@ function renderConsoleHtml(version = "development") {
         providers[name] = provider;
       }
       config.providers = providers;
+      const channels = {};
+      for (const card of document.querySelectorAll("[data-channel-card]")) {
+        const name = card.querySelector('[data-channel-field="name"]').value.trim();
+        if (!name) throw new Error("Every messaging channel needs a name.");
+        if (channels[name]) throw new Error("Messaging channel names must be unique: " + name);
+        channels[name] = {
+          type: "telegram",
+          enabled: card.querySelector('[data-channel-field="enabled"]').checked,
+          tokenEnv: card.querySelector('[data-channel-field="tokenEnv"]').value.trim(),
+          allowlist: configLines(card.querySelector('[data-channel-field="allowlist"]').value),
+          ...(card.querySelector('[data-channel-field="defaultModel"]').value.trim() ? { defaultModel: card.querySelector('[data-channel-field="defaultModel"]').value.trim() } : {})
+        };
+      }
+      config.channels = channels;
       const commands = Array.from(document.querySelectorAll("[data-proof-command]")).map((row) => configLines(row.querySelector("[data-command-args]").value)).filter((command) => command.length);
       config.proof = { ...(config.proof || {}), allowedCommands: commands };
       return config;
@@ -6418,6 +6554,23 @@ function renderConsoleHtml(version = "development") {
         state.config = draft;
         renderConfigForm(draft);
       } catch (error) { $("config-error").textContent = error.message; }
+    });
+    $("config-add-channel").addEventListener("click", () => {
+      try {
+        const draft = readStructuredConfig();
+        const channels = draft.channels || {};
+        let name = "telegram";
+        let index = 2;
+        while (channels[name]) name = "telegram-" + index++;
+        channels[name] = { type: "telegram", enabled: false, tokenEnv: "ODINN_TELEGRAM_BOT_TOKEN", allowlist: [] };
+        draft.channels = channels;
+        state.config = draft;
+        renderConfigForm(draft);
+      } catch (error) { $("config-error").textContent = error.message; }
+    });
+    $("config-channels").addEventListener("click", (event) => {
+      const removeChannel = event.target.closest("[data-remove-channel]");
+      if (removeChannel) removeChannel.closest("[data-channel-card]").remove();
     });
     $("config-providers").addEventListener("click", (event) => {
       const removeProvider = event.target.closest("[data-remove-provider]");
