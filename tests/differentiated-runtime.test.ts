@@ -3,10 +3,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, OdinnRuntimeError, ProofVerifier, runTask } from "../packages/kernel/src/index.ts";
+import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, OdinnRuntimeError, ProofVerifier, SnapshotManager, runTask } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
-const flags = { proof: true, rewind: true, sentinel: true, capsules: true, darwin: true, capabilities: true, counterfactual: true };
+const flags = { capsules: true, capabilities: true, counterfactual: true };
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "odinn-diff-"));
@@ -22,6 +22,21 @@ test("Sentinel blocks a denied command before execution and records the decision
     runtime.ledger.ensureRun({ runId: "run-sentinel", objective: "policy test" });
     assert.throws(() => runtime.sentinel.evaluate({ runId: "run-sentinel", toolName: "process.exec", input: { command: "terraform apply" }, policy: { version: 1, invariants: [{ id: "deny", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] } }), (error: any) => error instanceof OdinnRuntimeError && error.code === "POLICY_VIOLATION");
     assert.equal(runtime.ledger.database.db.prepare("SELECT COUNT(*) count FROM policy_evaluations WHERE run_id = ?").get("run-sentinel").count, 1);
+  } finally { runtime.ledger.close(); }
+});
+
+test("Sentinel applies typed invariants without matching command text in unrelated tool input", async () => {
+  const { root, runtime } = await fixture();
+  try {
+    for (const runId of ["sentinel-text", "sentinel-root"]) runtime.ledger.ensureRun({ runId, objective: "typed policy test" });
+    const commandPolicy = { version: 1, invariants: [{ id: "deny-command", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] };
+    assert.equal(runtime.sentinel.evaluate({ runId: "sentinel-text", toolName: "text.echo", input: { text: "terraform apply" }, policy: commandPolicy }).allowed, true);
+    const rootPolicy = { version: 1, invariants: [{ id: "workspace-only", type: "filesystem.allowed-roots", values: ["safe"], enforcement: "block" }] };
+    assert.equal(runtime.sentinel.evaluate({ runId: "sentinel-root", toolName: "workspace.readText", input: { path: "safe/file.txt" }, policy: rootPolicy, workspaceRoot: root }).allowed, true);
+    assert.throws(
+      () => runtime.sentinel.evaluate({ runId: "sentinel-root", toolName: "workspace.readText", input: { path: "outside.txt" }, policy: rootPolicy, workspaceRoot: root }),
+      (error: any) => error.code === "POLICY_VIOLATION"
+    );
   } finally { runtime.ledger.close(); }
 });
 
@@ -46,9 +61,38 @@ test("snapshots restore a modified file and remove an agent-created file", async
     await writeFile(join(root, "seed.txt"), "after\n"); await writeFile(join(root, "created.txt"), "new\n");
     const preview = runtime.snapshots.restore(snapshot.snapshotId);
     assert.equal(preview.applied, false); assert.equal(preview.actions.length, 2);
-    runtime.snapshots.restore(snapshot.snapshotId, { apply: true });
+    const restored = runtime.snapshots.restore(snapshot.snapshotId, { apply: true });
+    assert.match(restored.recoverySnapshotId, /^snap_/);
     assert.equal(await readFile(join(root, "seed.txt"), "utf8"), "before\n");
     await assert.rejects(readFile(join(root, "created.txt"), "utf8"), { code: "ENOENT" });
+    runtime.snapshots.restore(restored.recoverySnapshotId, { apply: true });
+    assert.equal(await readFile(join(root, "seed.txt"), "utf8"), "after\n");
+    assert.equal(await readFile(join(root, "created.txt"), "utf8"), "new\n");
+  } finally { runtime.ledger.close(); }
+});
+
+test("Rewind restores selected directory roots exactly and enforces capture bounds", async () => {
+  const { root, runtime } = await fixture();
+  try {
+    runtime.ledger.ensureRun({ runId: "run-rewind-tree", objective: "rewind tree test" });
+    await mkdir(join(root, "tree"));
+    await writeFile(join(root, "tree", "kept.txt"), "before\n");
+    const snapshot = runtime.snapshots.create({ runId: "run-rewind-tree", paths: ["tree"], workspaceRoot: root });
+    await writeFile(join(root, "tree", "kept.txt"), "after\n");
+    await writeFile(join(root, "tree", "extra.txt"), "extra\n");
+    runtime.snapshots.restore(snapshot.snapshotId, { apply: true });
+    assert.equal(await readFile(join(root, "tree", "kept.txt"), "utf8"), "before\n");
+    await assert.rejects(readFile(join(root, "tree", "extra.txt"), "utf8"), { code: "ENOENT" });
+    assert.throws(
+      () => runtime.snapshots.create({ runId: "run-rewind-tree", paths: ["tree", "tree/kept.txt"], workspaceRoot: root }),
+      /must not overlap/
+    );
+    await writeFile(join(root, "tree", "second.txt"), "second\n");
+    const bounded = new SnapshotManager({ ledger: runtime.ledger, maxFiles: 1 });
+    assert.throws(
+      () => bounded.create({ runId: "run-rewind-tree", paths: ["tree"], workspaceRoot: root }),
+      /file limit/
+    );
   } finally { runtime.ledger.close(); }
 });
 
@@ -56,10 +100,13 @@ test("Proof persists evidence and refuses model claims without passing assertion
   const { root, runtime } = await fixture();
   try {
     runtime.ledger.ensureRun({ runId: "run-proof", objective: "proof test" });
+    runtime.darwin.observe({ runId: "run-proof", providerId: "p", modelId: "m", taskClass: "proof-test", partiallyVerified: true, durationMs: 10 });
     const proof = await new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root }).verify({ schemaVersion: 1, id: "contract-proof", runId: "run-proof", assertions: [{ id: "file", type: "file", path: "seed.txt", expect: { exists: true, content: { contains: "before" } } }] });
     assert.equal(proof.status, "passed");
     assert.equal(runtime.ledger.getRun("run-proof").status, "verified");
     assert.equal(runtime.ledger.database.db.prepare("SELECT COUNT(*) count FROM assertion_results WHERE run_id = ?").get("run-proof").count, 1);
+    assert.deepEqual({ ...runtime.ledger.database.db.prepare("SELECT verified, partially_verified FROM model_observations WHERE run_id = ?").get("run-proof") }, { verified: 1, partially_verified: 0 });
+    assert.ok(runtime.ledger.getRun("run-proof").events.some((event: any) => event.type === "model-observation-verification" && event.payload.observationIds.length === 1));
   } finally { runtime.ledger.close(); }
 });
 
@@ -95,6 +142,7 @@ test("Darwin chooses a model using observed verification outcomes", async () => 
     runtime.darwin.observe({ runId: "run-darwin-a", providerId: "p", modelId: "good", taskClass: "bug-fix", verified: true, durationMs: 10, toolCalls: 1 });
     runtime.darwin.observe({ runId: "run-darwin-b", providerId: "p", modelId: "bad", taskClass: "bug-fix", verified: false, durationMs: 1, toolCalls: 1, toolErrors: 1 });
     assert.equal(runtime.darwin.choose("bug-fix").model, "p:good");
+    assert.ok(runtime.ledger.getRun("run-darwin-a").events.some((event: any) => event.type === "model-observation" && event.payload.modelId === "good"));
   } finally { runtime.ledger.close(); }
 });
 
@@ -148,8 +196,11 @@ test("kernel execution enforces Sentinel and capability tokens at the real tool 
   const auditStore = createAuditStore(join(state, "audit.jsonl"));
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state });
   try {
-    const policy = createDefaultPolicy({ invariants: [{ id: "deny-prod", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] });
-    await assert.rejects(runTask({ task: { id: "run-kernel-block", tool: "text.echo", input: { text: "terraform apply" }, actor: "test" }, auditStore, policy, registry, runLedger: runtime.ledger }), (error: any) => error.code === "POLICY_VIOLATION");
+    let executed = false;
+    registry.set("process.exec", { capability: "process.exec", execute: async () => { executed = true; return { ok: true }; } });
+    const policy = createDefaultPolicy({ allowedCapabilities: ["process.exec"], invariants: [{ id: "deny-prod", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] });
+    await assert.rejects(runTask({ task: { id: "run-kernel-block", tool: "process.exec", input: { command: "terraform apply" }, actor: "test" }, auditStore, policy, registry, runLedger: runtime.ledger }), (error: any) => error.code === "POLICY_VIOLATION");
+    assert.equal(executed, false);
     assert.equal(runtime.ledger.getRun("run-kernel-block").status, "blocked");
 
     runtime.ledger.ensureRun({ runId: "run-kernel-cap", objective: "capability execution" });
@@ -160,19 +211,22 @@ test("kernel execution enforces Sentinel and capability tokens at the real tool 
   } finally { runtime.ledger.close(); }
 });
 
-test("every experimental runtime gate rejects disabled features and records a durable rejection", async () => {
+test("core advanced services remain available while disabled plugin modules reject active operations", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-diff-disabled-"));
   const state = join(root, ".odinn");
-  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false } });
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: { capsules: false, capabilities: false, counterfactual: false } });
   try {
-    await assert.rejects(runtime.proof.run("disabled-proof", { version: 1, goal: "blocked", acceptance: [{ id: "a", type: "file", path: "missing", expect: { exists: false } }] }), /experimental\.proof is disabled/);
-    assert.throws(() => runtime.sentinel.evaluate({ runId: "disabled-sentinel", toolName: "text.echo", input: {}, policy: { version: 1, invariants: [] } }), /experimental\.sentinel is disabled/);
+    for (const runId of ["core-proof", "core-sentinel", "core-rewind"]) runtime.ledger.ensureRun({ runId, objective: "core service test" });
+    assert.equal((await runtime.proof.run("core-proof", { version: 1, goal: "available", acceptance: [{ id: "a", type: "file", path: "missing", expect: { exists: false } }] })).status, "verified");
+    assert.equal(runtime.sentinel.evaluate({ runId: "core-sentinel", toolName: "text.echo", input: {}, policy: { version: 1, invariants: [] } }).allowed, true);
+    assert.match(runtime.snapshots.create({ runId: "core-rewind", stepId: "step", paths: ["missing"], workspaceRoot: root }).snapshotId, /^snap_/);
+    assert.equal(runtime.darwin.choose("general", { pinnedModel: "pinned:model" }).model, "pinned:model");
     assert.throws(() => runtime.capabilities.issue({ runId: "disabled-cap", stepId: "step", toolName: "text.echo" }), /experimental\.capabilities is disabled/);
-    assert.throws(() => runtime.snapshots.create({ runId: "disabled-rewind", stepId: "step", paths: ["README.md"], workspaceRoot: root }), /experimental\.rewind is disabled/);
     await assert.rejects(runtime.capsules.verify(join(root, "missing.odinn")), /experimental\.capsules is disabled/);
     await assert.rejects(runtime.counterfactual.create({ sourceRunId: "disabled-counterfactual", sourceStepId: "step", workspaceRoot: root, plans: [] }), /experimental\.counterfactual is disabled/);
-    assert.throws(() => runtime.darwin.choose("general", { pinnedModel: "pinned:model" }), /experimental\.darwin is disabled/);
-    for (const feature of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin"]) {
+    assert.deepEqual([...runtime.plugins.keys()], ["capabilities", "capsules", "counterfactual"]);
+    assert.ok([...runtime.plugins.values()].every((plugin: any) => plugin.enabled === false));
+    for (const feature of ["capabilities", "capsules", "counterfactual"]) {
       const run = runtime.ledger.getRun(`system:experimental:${feature}`);
       assert.ok(run?.events.some((event: any) => event.type === "experimental-feature-rejected" && event.payload.feature === feature));
     }

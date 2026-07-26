@@ -181,14 +181,24 @@ All repository packages and application packages currently marked `private`
 are internal implementation details. They are not stable public SDKs merely
 because source code or TypeScript exports are visible.
 
-### Experimental features
+### Advanced services and experimental modules
 
-Proof, Sentinel, Rewind, Capsules, Darwin, Capability Tokens,
-Counterfactual, Agent SDK packages, Skill SDK packages, third-party
-extensions, MCP packages, multi-user hosting, and unconfined process execution
-are experimental interfaces. They may ship with v1 but remain outside normal
-v1 compatibility and migration guarantees. They are not promoted to stable by
-this release effort.
+Proof, Sentinel, Rewind, and Darwin are core advanced runtime services and do
+not require feature flags. Their documented CLI and gateway surfaces remain
+experimental interfaces unless another row in this policy explicitly marks
+them stable; core placement is an implementation and availability decision,
+not a public-SDK compatibility promise.
+
+Capsules, Capability Tokens, Counterfactual, Agent SDK packages, Skill SDK
+packages, third-party extensions, MCP packages, multi-user hosting, and
+unconfined process execution are optional experimental interfaces. They remain
+outside normal v1 compatibility and migration guarantees.
+
+For configuration compatibility, old `experimental.proof`,
+`experimental.sentinel`, `experimental.rewind`, and `experimental.darwin`
+fields may still be read from existing files, but they no longer control
+runtime availability. Only `capabilities`, `capsules`, and `counterfactual`
+are normalized as optional runtime-plugin flags.
 
 ## Provider- and platform-dependent behavior
 

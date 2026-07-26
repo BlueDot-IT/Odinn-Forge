@@ -122,7 +122,7 @@ test("user documentation and reporting surfaces ship in the release tree", async
     "Audit event formats",
     "Provider adapter contracts",
     "Extension manifests and packages",
-    "Experimental features"
+    "Advanced services and experimental modules"
   ]) assert.match(compatibility, new RegExp(subject, "i"));
   assert.match(matrix, /forked workers are crash containment, not a security sandbox/i);
   assert.match(matrix, /remote hosting is application-level tenant isolation, not hostile-user OS isolation/i);

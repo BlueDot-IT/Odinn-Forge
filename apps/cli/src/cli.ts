@@ -7,7 +7,7 @@ import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, r
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -26,25 +26,6 @@ const [command, ...args] = rawArgs;
 
 const EXPERIMENTAL_HOME = [
   {
-    id: "proof",
-    label: "Proof",
-    configKey: "experimental.proof",
-    description: "Verify a recorded run against operator-controlled file, HTTP, Git, or allowlisted command assertions.",
-    safeActions: [
-      "odinn experimental proof contract validate <contract.json|yml>",
-      "odinn experimental proof show <run-id> [--state .odinn]"
-    ],
-    activeActions: ["odinn experimental proof run <run-id> --contract <contract.json|yml> [--state .odinn]"]
-  },
-  {
-    id: "sentinel",
-    label: "Sentinel",
-    configKey: "experimental.sentinel",
-    description: "Evaluate tool input against explicit runtime invariants before execution.",
-    safeActions: ["odinn experimental sentinel validate <policy.json|yml>"],
-    activeActions: ["odinn experimental sentinel test <policy.json|yml> --tool <tool> --input-json <json> [--state .odinn]"]
-  },
-  {
     id: "capabilities",
     label: "Capability Tokens",
     configKey: "experimental.capabilities",
@@ -56,17 +37,6 @@ const EXPERIMENTAL_HOME = [
     activeActions: [
       "odinn experimental capabilities issue --run <run-id> --step <step-id> --tool <tool> [--show-token] [--state .odinn]",
       "odinn experimental capabilities use --token <token> --run <run-id> --tool <tool> [--state .odinn]"
-    ]
-  },
-  {
-    id: "rewind",
-    label: "Rewind",
-    configKey: "experimental.rewind",
-    description: "Capture workspace checkpoints and preview or explicitly apply a restore plan.",
-    safeActions: ["odinn experimental rewind restore <snapshot-id> [--state .odinn]"],
-    activeActions: [
-      "odinn experimental rewind checkpoint create <run-id> --path <path[,path]> [--state .odinn]",
-      "odinn experimental rewind restore <snapshot-id> --apply [--state .odinn]"
     ]
   },
   {
@@ -95,17 +65,6 @@ const EXPERIMENTAL_HOME = [
     activeActions: [
       "odinn experimental counterfactual run --source-run <run-id> --from <step-id> --plan-file <plan.json> [--execute] [--state .odinn]",
       "odinn experimental counterfactual select <group-id> --run <run-id> --apply [--state .odinn]"
-    ]
-  },
-  {
-    id: "darwin",
-    label: "Darwin Routing",
-    configKey: "experimental.darwin",
-    description: "Record verified model outcomes and choose a route from measured reliability, speed, cost, and compliance.",
-    safeActions: ["odinn experimental darwin stats [--task-class <class>] [--state .odinn]"],
-    activeActions: [
-      "odinn experimental darwin observe --run <run-id> --provider <id> --model <id> --verified true|false [--state .odinn]",
-      "odinn experimental darwin choose --task-class <class> [--state .odinn]"
     ]
   },
   {
@@ -345,7 +304,7 @@ Common commands:
 Help:
   odinn help --all                  Show every advanced command
 
-Support: the local single-user workflow is the stable v1 target. Experimental features remain outside the compatibility promise. See docs/v1-compatibility.md.`);
+Support: the local single-user workflow is the stable v1 target. Advanced services and optional plugin modules have separate compatibility boundaries. See docs/v1-compatibility.md.`);
 }
 
 function requiresStateCompatibilityCheck(currentCommand: string | undefined, currentArgs: string[]): boolean {
@@ -512,7 +471,7 @@ Built-in tools:
   improve.list
   improve.decide
 
-Support: the local single-user workflow is the stable v1 target. Experimental features remain outside the compatibility promise. See docs/v1-compatibility.md.`);
+Support: the local single-user workflow is the stable v1 target. Advanced services and optional plugin modules have separate compatibility boundaries. See docs/v1-compatibility.md.`);
 }
 
 function option(args: any, name: any, fallback: any = undefined) {
@@ -1303,6 +1262,7 @@ async function doctor(args: any) {
         models: provider.models ?? []
       };
     })),
+    coreAdvanced: CORE_ADVANCED_FEATURES,
     experimental: normalizeExperimentalFlags(config.experimental),
     audit: { valid: audit.valid, events: audit.events, unsigned: audit.unsigned, failureCount: audit.failures.length },
     approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
@@ -1357,21 +1317,14 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
 
 function normalizeExperimentalHomeFeature(value: any) {
   const aliases: Record<string, string> = {
-    proof: "proof",
-    sentinel: "sentinel",
-    policy: "sentinel",
     capability: "capabilities",
     capabilities: "capabilities",
     "capability-token": "capabilities",
     "capability-tokens": "capabilities",
-    rewind: "rewind",
-    checkpoint: "rewind",
     capsule: "capsules",
     capsules: "capsules",
     counterfactual: "counterfactual",
     counterfactuals: "counterfactual",
-    darwin: "darwin",
-    routing: "darwin",
     improve: "self-improvement",
     improvement: "self-improvement",
     "self-improvement": "self-improvement"
@@ -1421,7 +1374,9 @@ async function experimentalStatus(args: any, requestedFeature: any = undefined, 
     configPath: join(state, "config.json"),
     configured: existsSync(join(state, "config.json")),
     warning: experimentalFeatureWarning(config.experimental),
+    coreAdvanced: CORE_ADVANCED_FEATURES,
     disabledByDefault: false,
+    pluginModulesDisabledByDefault: true,
     experimentalFeaturesDisabledByDefault: true,
     automaticSelfImprovementDefault: true,
     features: visible
@@ -1447,9 +1402,9 @@ Status:
   odinn experimental status ${entry.id} [--state .odinn]`);
     return;
   }
-  console.log(`Ódinn experimental systems
+  console.log(`Ódinn plugin modules and experimental systems
 
-The seven Labs feature flags are off by default. Automatic improvement runs by default
+The three optional runtime plugin flags are off by default. Automatic improvement runs by default
 and remains limited to reversible, allowlisted reliability adjustments.
 
 Commands:
@@ -1498,30 +1453,14 @@ async function toggleExperimentalFeature(requestedFeature: any, enabled: boolean
 
 async function dispatchExperimentalFeature(feature: any, args: any) {
   switch (feature) {
-    case "proof": {
-      await proof(args);
-      return;
-    }
-    case "sentinel":
-      await policyCommand(args[0] === "policy" ? args.slice(1) : args);
-      return;
     case "capabilities":
       await capabilityCommand(args);
       return;
-    case "rewind": {
-      const [action, ...rest] = args;
-      if (action === "checkpoint") { await rewindCommand("checkpoint", rest); return; }
-      if (action === "restore" || action === "preview") { await rewindCommand("rewind", rest); return; }
-      throw new Error("experimental rewind requires checkpoint create or restore");
-    }
     case "capsules":
       await capsuleCommand(args);
       return;
     case "counterfactual":
       await counterfactualCommand(args);
-      return;
-    case "darwin":
-      await routingCommand(args);
       return;
     case "self-improvement":
       if (args[0] === "set") { await configCommand(["self-improvement", "set", ...args.slice(1)]); return; }
@@ -2864,7 +2803,6 @@ async function proof(args: any) {
   const { runtime, config } = runtimeFor(rest);
   try {
     if (subcommand === "run") {
-      if (!normalizeExperimentalFlags(config.experimental).proof) throw new Error("experimental.proof is disabled; enable it before running verification");
       const runId = rest.find((value: any) => !value.startsWith("--")); const path = option(rest, "--contract"); if (!runId || !path) throw new Error("proof run requires <run-id> and --contract");
       const contract = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path);
       if (contract.schemaVersion === 1) {
@@ -2969,7 +2907,6 @@ async function counterfactualCommand(args: any) {
         proof: {
           run: async (runId: any, contract: any, { workspaceRoot = invocationRoot() }: any = {}) => {
             if (contract?.schemaVersion === 1) {
-              if (!normalizeExperimentalFlags(config.experimental).proof) throw new Error("experimental.proof is disabled; counterfactual verification cannot run");
               return new ProofVerifier({
                 runLedger: runtime.ledger,
                 allowedRoot: workspaceRoot,
@@ -2995,9 +2932,9 @@ async function counterfactualCommand(args: any) {
 
 async function routingCommand(args: any) {
   const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
-    if (subcommand === "observe") { await printJson(runtime.darwin.observe({ runId: option(rest, "--run"), providerId: option(rest, "--provider"), modelId: option(rest, "--model"), taskClass: option(rest, "--task-class", "general"), verified: option(rest, "--verified") === "true", partiallyVerified: option(rest, "--partial") === "true", durationMs: Number(option(rest, "--duration-ms", "0")), costUsd: Number(option(rest, "--cost-usd", "0")), toolCalls: Number(option(rest, "--tool-calls", "0")), toolErrors: Number(option(rest, "--tool-errors", "0")), retries: Number(option(rest, "--retries", "0")), policyViolations: Number(option(rest, "--policy-violations", "0")), rolledBack: hasFlag(rest, "--rolled-back") })); return; }
+    if (subcommand === "observe") { await printJson(runtime.darwin.observe({ runId: option(rest, "--run"), providerId: option(rest, "--provider"), modelId: option(rest, "--model"), taskClass: option(rest, "--task-class", "general"), verified: option(rest, "--verified") === "true", partiallyVerified: option(rest, "--partial") === "true", durationMs: Number(option(rest, "--duration-ms", "0")), costUsd: rest.includes("--cost-usd") ? Number(option(rest, "--cost-usd")) : null, toolCalls: Number(option(rest, "--tool-calls", "0")), toolErrors: Number(option(rest, "--tool-errors", "0")), retries: Number(option(rest, "--retries", "0")), policyViolations: Number(option(rest, "--policy-violations", "0")), rolledBack: hasFlag(rest, "--rolled-back") })); return; }
     if (subcommand === "stats") { await printJson(runtime.darwin.stats(option(rest, "--task-class", "general"))); return; }
-    if (subcommand === "choose") { await printJson(runtime.darwin.choose(option(rest, "--task-class", "general"), { pinnedModel: option(rest, "--model", "") })); return; }
+    if (subcommand === "choose") { const runId = option(rest, "--run", `routing-${randomUUID()}`); runtime.ledger.ensureRun({ runId, objective: `choose a model for ${option(rest, "--task-class", "general")}` }); await printJson({ ...runtime.darwin.choose(option(rest, "--task-class", "general"), { pinnedModel: option(rest, "--model", ""), runId }), runId }); return; }
     throw new Error("routing requires observe, stats, or choose");
   } finally { runtime.ledger.close(); }
 }

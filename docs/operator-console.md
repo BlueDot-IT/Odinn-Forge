@@ -24,7 +24,7 @@ Cron expressions contain five fields. Each job has an explicit IANA timezone, to
 
 Tasks is the operator view over meaningful user, agent, and automation runs. Routine console reads are hidden unless **System activity** is enabled. Server-side search, filtering, and pagination keep the list bounded. Operators can select tasks, stop active supervised jobs, and run tasks again only when recorded input is declared retry-safe. The replay endpoint enforces the same classification server-side; external effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
-The History tab in Activity provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Proof remains disabled by default and command assertions require exact operator-owned argument-vector allowlisting. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
+The History tab in Activity provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Proof is a core advanced service; command assertions still require exact operator-owned argument-vector allowlisting. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
 
 Runtime errors return a stable request correlation ID in the `x-odinn-request-id`
 header and JSON body. Audit entries retain run, task/step, provider-attempt,
@@ -32,11 +32,19 @@ approval, and browser-recovery identifiers where applicable. Use `odinn doctor`
 or `GET /diagnostics` for a redacted health snapshot rather than collecting the
 raw state directory.
 
-## Labs
+## Advanced
 
-Labs is a collapsible navigation group, not a landing page. Run Checks, Safety Preview, Temporary Access, Restore Points, Portable Runs, Compare Approaches, and Smart Routing each have a dedicated page with a guided workflow. Developer input and raw endpoint details stay collapsed under Advanced options.
+Advanced is a collapsible navigation group, not a landing page. Run Checks,
+Safety Preview, Restore Points, and Smart Routing are core capabilities.
+Temporary Access, Portable Runs, and Compare Approaches are optional plugin
+modules. Each has a dedicated guided workflow, while developer input and raw
+endpoint details stay collapsed under Advanced options.
 
-The seven Labs feature flags remain off by default. A disabled feature stays locked, destructive operations remain explicit, and restore or comparison selection defaults to a preview. Configuration changes require an intentional edit or `odinn experimental enable <feature> --confirm-impact` followed by a gateway restart.
+The three plugin-module flags remain off by default. A disabled plugin stays
+locked. Destructive operations remain explicit, and restore or comparison
+selection defaults to a preview. Plugin configuration changes require an
+intentional edit or `odinn experimental enable <feature> --confirm-impact`
+followed by a gateway restart.
 
 Automatic improvements has its own page and runs by default. It uses the configured model for plain-language assessment and applies only reversible, allowlisted reliability adjustments.
 

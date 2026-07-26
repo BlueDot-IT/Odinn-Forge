@@ -1,6 +1,6 @@
 # Odinn Forge Capability Tokens
 
-Capability tokens bind one short-lived operation to a run, step, tool, resource constraints, and a use count. The signing key is local-only with restrictive permissions. Raw credentials are never placed in token claims, ledger payloads, or normal CLI output.
+Capability Tokens is an optional runtime plugin module. Tokens bind one short-lived operation to a run, step, tool, resource constraints, and a use count. The signing key is local-only with restrictive permissions. Raw credentials are never placed in token claims, ledger payloads, or normal CLI output.
 
 ```bash
 odinn config experimental enable capabilities --confirm-impact
@@ -11,7 +11,7 @@ odinn capability revoke <capability-id>
 
 The broker validates signature, expiration, run/tool binding, resource constraints, revocation, and replay count before recording a use.
 
-Enabling this experimental feature changes direct CLI execution immediately:
+Enabling this optional plugin module changes direct CLI execution immediately:
 ordinary tool runs require a matching scoped token after capability enforcement is
 active. Issue the token first, or disable the feature before returning to normal
 manual runs. Counterfactual read-only execution issues its own one-use token.

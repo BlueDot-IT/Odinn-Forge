@@ -16,7 +16,7 @@ import {
 
 async function fixture(runId: any = "run_proof_test") {
   const root = await mkdtemp(join(tmpdir(), "odinn-proof-"));
-  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root, featureFlags: { proof: true } });
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
   ledger.ensureRun({ runId, objective: "verify the proof contract" });
   return { root, ledger, runId };
 }
@@ -249,16 +249,14 @@ test("Proof rejects unknown runs and immutable contract id reuse", async () => {
   }
 });
 
-test("Proof remains disabled unless the run ledger enables the experimental feature", async () => {
-  const root = await mkdtemp(join(tmpdir(), "odinn-proof-disabled-"));
+test("Proof is available as a core service without an experimental feature flag", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-proof-core-"));
   const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
-  ledger.ensureRun({ runId: "run_proof_disabled", objective: "remain disabled" });
+  ledger.ensureRun({ runId: "run_proof_core", objective: "core verification" });
   try {
-    await assert.rejects(
-      verifyContract(contract("run_proof_disabled", [{ id: "absent", type: "file", path: "none", expect: { exists: false } }], "proof_disabled"), { runLedger: ledger }),
-      /experimental proof feature is disabled/
-    );
-    assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM verification_contracts").get().count, 0);
+    const result = await verifyContract(contract("run_proof_core", [{ id: "absent", type: "file", path: "none", expect: { exists: false } }], "proof_core"), { runLedger: ledger });
+    assert.equal(result.passed, true);
+    assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM verification_contracts").get().count, 1);
   } finally {
     ledger.close();
   }

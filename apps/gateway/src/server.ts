@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
@@ -613,6 +613,8 @@ export async function createGatewayServer({
           defaultModel: normalizeModelConfig(config).defaultModel,
           models: listConfiguredModels(normalizeModelConfig(config)),
           providers: await summarizeProviders(config, state),
+          coreAdvanced: CORE_ADVANCED_FEATURES,
+          pluginModules: [...runtime.plugins.values()].map(({ id, displayName, configKey, enabled }: any) => ({ id, displayName, configKey, enabled })),
           experimental: featureFlags,
           security: policy.security,
           selfImprovement: {
@@ -695,7 +697,6 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/proof") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        if (featureFlags.proof !== true) throw new GatewayError(409, "experimental.proof is disabled; enable it in config and restart the gateway");
         return json(response, 200, await proofVerifier.verify(body));
       }
       if (request.method === "GET" && url.pathname.startsWith("/proof/")) {
@@ -764,7 +765,6 @@ export async function createGatewayServer({
           capabilities: runtime.capabilities,
           proof: {
             run: async (runId: string, contract: any, { workspaceRoot = root }: any = {}) => {
-              if (featureFlags.proof !== true) throw new GatewayError(409, "experimental.proof is disabled; counterfactual verification cannot run");
               return new ProofVerifier({
                 runLedger: runtime.ledger,
                 allowedRoot: workspaceRoot,
@@ -789,7 +789,9 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/routing/choose") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, runtime.darwin.choose(body.taskClass ?? "general", { pinnedModel: body.pinnedModel }));
+        const runId = body.runId ?? `routing-${randomBytes(12).toString("hex")}`;
+        runtime.ledger.ensureRun({ runId, objective: `choose a model for ${body.taskClass ?? "general"}` });
+        return json(response, 200, { ...runtime.darwin.choose(body.taskClass ?? "general", { pinnedModel: body.pinnedModel, runId }), runId });
       }
       if (request.method === "GET" && url.pathname === "/runs") {
         return json(response, 200, await auditStore.readRuns());
@@ -1475,7 +1477,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
         if (readError?.code !== "ENOENT") throw readError;
       }
       await mkdir(state, { recursive: true });
-      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await chmod(path, 0o600);
       return config;
@@ -1810,6 +1812,7 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
         models: provider.models ?? []
       };
     })),
+    coreAdvanced: CORE_ADVANCED_FEATURES,
     experimental: featureFlags,
     audit,
     approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
@@ -1860,9 +1863,10 @@ async function oauthTokenExists(provider: any, state: any) {
   }
 }
 
-const EXPERIMENTAL_CONSOLE_PAGES = [
+const ADVANCED_CONSOLE_PAGES = [
   {
     key: "proof",
+    core: true,
     view: "lab-run-checks",
     title: "Run Checks",
     technicalName: "Proof",
@@ -1872,6 +1876,7 @@ const EXPERIMENTAL_CONSOLE_PAGES = [
   },
   {
     key: "sentinel",
+    core: true,
     view: "lab-safety-preview",
     title: "Safety Preview",
     technicalName: "Sentinel",
@@ -1890,6 +1895,7 @@ const EXPERIMENTAL_CONSOLE_PAGES = [
   },
   {
     key: "rewind",
+    core: true,
     view: "lab-restore-points",
     title: "Restore Points",
     technicalName: "Rewind",
@@ -1917,6 +1923,7 @@ const EXPERIMENTAL_CONSOLE_PAGES = [
   },
   {
     key: "darwin",
+    core: true,
     view: "lab-model-routing",
     title: "Smart Routing",
     technicalName: "Darwin Router",
@@ -1927,16 +1934,16 @@ const EXPERIMENTAL_CONSOLE_PAGES = [
 ];
 
 function experimentalConsoleNavigation() {
-  return EXPERIMENTAL_CONSOLE_PAGES.map((feature) => `
+  return ADVANCED_CONSOLE_PAGES.map((feature) => `
             <button data-view="${feature.view}" data-title="${feature.title}" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">${feature.title}</span></button>`).join("");
 }
 
 function experimentalConsolePages() {
-  return EXPERIMENTAL_CONSOLE_PAGES.map((feature) => `
+  return ADVANCED_CONSOLE_PAGES.map((feature) => `
       <section id="view-${feature.view}" class="view" data-experimental-page="${feature.key}">
         <div class="page oc-page">
           <div class="page-head">
-            <div><div class="section-kicker">Experimental feature</div><h1>${feature.title}</h1><p>${feature.summary}</p></div>
+            <div><div class="section-kicker">${feature.core ? "Core capability" : "Optional plugin module"}</div><h1>${feature.title}</h1><p>${feature.summary}</p></div>
             <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
           </div>
           <div class="feature-hero panel">
@@ -3788,7 +3795,7 @@ function renderConsoleHtml(version = "development") {
           <button data-view="skills" data-title="Skills SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skills SDK · Experimental</span></button>
           <button data-view="automatic-improvements" data-title="Automatic improvements" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></span><span class="nav-label">Automatic improvements</span></button>
           <details class="nav-labs">
-            <summary><span class="nav-group-label"><svg class="icon-svg"><use href="#icon-spark"></use></svg> Labs</span><span class="badge warn" id="nav-experimental-count">0/7</span><span class="nav-chevron">⌄</span></summary>
+            <summary><span class="nav-group-label"><svg class="icon-svg"><use href="#icon-spark"></use></svg> Advanced</span><span class="badge warn" id="nav-experimental-count">0/3 plugins</span><span class="nav-chevron">⌄</span></summary>
             <div class="labs-nav">
             ${experimentalConsoleNavigation()}
             </div>
@@ -3977,7 +3984,7 @@ function renderConsoleHtml(version = "development") {
             <div>
               <div class="section-kicker">Everything Ódinn can configure</div>
               <h1>Configuration</h1>
-              <p>Set up providers, safety rules, experimental features, memory, and runtime behavior without editing JSON by hand.</p>
+              <p>Set up providers, safety rules, optional plugin modules, memory, and runtime behavior without editing JSON by hand.</p>
             </div>
             <span class="chip" id="config-state">Not loaded</span>
           </div>
@@ -4022,7 +4029,7 @@ function renderConsoleHtml(version = "development") {
                 <div class="grid-2"><div class="field"><label for="config-browser-allowed">Allowed domains</label><textarea id="config-browser-allowed" data-config-security-list="browser.allowedDomains" rows="4" placeholder="example.com"></textarea></div><div class="field"><label for="config-browser-blocked">Blocked domains</label><textarea id="config-browser-blocked" data-config-security-list="browser.blockedDomains" rows="4" placeholder="example.net"></textarea></div></div>
               </div>
               <div class="config-subsection">
-                <div><h3>Sentinel invariants</h3><p class="config-help">Optional rules used by the safety preview when Sentinel is enabled.</p></div>
+                <div><h3>Sentinel invariants</h3><p class="config-help">Optional rules enforced by the core runtime and shown by the safety preview.</p></div>
                 <div class="grid-2"><div class="field"><label for="config-policy-version">Policy version</label><input id="config-policy-version" data-config-policy="version" type="number" min="1" step="1"></div><div class="field"><label for="config-policy-invariants-help">Invariant format</label><input id="config-policy-invariants-help" value="id · type · values · enforcement" readonly></div></div>
                 <div id="config-invariants" class="config-list"></div>
                 <button class="secondary" id="config-add-invariant" type="button">Add invariant</button>
@@ -4030,9 +4037,9 @@ function renderConsoleHtml(version = "development") {
             </div>
 
             <div class="panel config-section">
-              <div class="panel-head"><div><h2>Experimental features</h2><p class="config-help">These controls expose the Labs capabilities. Leave them off until you understand the behavior.</p></div></div>
+              <div class="panel-head"><div><h2>Optional plugin modules</h2><p class="config-help">Enable only the additional modules you want this runtime to load.</p></div></div>
               <div class="config-check-grid">
-                <label class="switch-label"><input type="checkbox" data-config-experimental="proof"> Proof checks</label><label class="switch-label"><input type="checkbox" data-config-experimental="sentinel"> Sentinel safety preview</label><label class="switch-label"><input type="checkbox" data-config-experimental="capabilities"> Capability tokens</label><label class="switch-label"><input type="checkbox" data-config-experimental="rewind"> Restore points</label><label class="switch-label"><input type="checkbox" data-config-experimental="capsules"> Portable runs</label><label class="switch-label"><input type="checkbox" data-config-experimental="counterfactual"> Compare approaches</label><label class="switch-label"><input type="checkbox" data-config-experimental="darwin"> Smart routing</label>
+                <label class="switch-label"><input type="checkbox" data-config-experimental="capabilities"> Capability tokens</label><label class="switch-label"><input type="checkbox" data-config-experimental="capsules"> Portable runs</label><label class="switch-label"><input type="checkbox" data-config-experimental="counterfactual"> Compare approaches</label>
               </div>
             </div>
 
@@ -4189,6 +4196,7 @@ function renderConsoleHtml(version = "development") {
     };
     const experimentalFeatures = {
       proof: {
+        core: true,
         title: "Run Checks",
         technicalName: "Proof",
         view: "lab-run-checks",
@@ -4200,6 +4208,7 @@ function renderConsoleHtml(version = "development") {
         ]
       },
       sentinel: {
+        core: true,
         title: "Safety Preview",
         technicalName: "Sentinel",
         view: "lab-safety-preview",
@@ -4223,6 +4232,7 @@ function renderConsoleHtml(version = "development") {
         ]
       },
       rewind: {
+        core: true,
         title: "Restore Points",
         technicalName: "Rewind",
         view: "lab-restore-points",
@@ -4261,6 +4271,7 @@ function renderConsoleHtml(version = "development") {
         ]
       },
       darwin: {
+        core: true,
         title: "Smart Routing",
         technicalName: "Darwin Router",
         view: "lab-model-routing",
@@ -4639,10 +4650,10 @@ function renderConsoleHtml(version = "development") {
       state.experimentalActions ||= {};
       if (!state.experimentalActions[featureKey]) state.experimentalActions[featureKey] = feature.actions[0]?.id;
       const action = selectedExperimentalAction(featureKey);
-      const enabled = state.status?.experimental?.[featureKey] === true;
+      const enabled = feature.core === true || state.status?.experimental?.[featureKey] === true;
       const available = enabled || action.availableWhenDisabled === true;
       const status = page.querySelector('[data-role="feature-status"]');
-      status.textContent = enabled ? "Available" : "Currently off";
+      status.textContent = feature.core ? "Core" : enabled ? "Available" : "Currently off";
       status.className = "chip " + (enabled ? "ok" : "warn");
       const list = page.querySelector('[data-role="action-list"]');
       list.innerHTML = feature.actions.map((item) =>
@@ -4671,14 +4682,15 @@ function renderConsoleHtml(version = "development") {
       const run = page.querySelector('[data-role="run"]');
       run.disabled = !available;
       run.className = action.dangerous ? "danger" : "";
-      run.textContent = available ? action.label : "Turn on this Lab to continue";
+      run.textContent = available ? action.label : "Enable this plugin to continue";
     }
 
     function renderExperimentalHome(status) {
       const entries = Object.entries(experimentalFeatures);
+      const plugins = entries.filter(([, feature]) => feature.core !== true);
       const flags = status?.experimental || {};
-      const enabledCount = entries.filter(([key]) => flags[key] === true).length;
-      $("nav-experimental-count").textContent = enabledCount + "/" + entries.length;
+      const enabledCount = plugins.filter(([key]) => flags[key] === true).length;
+      $("nav-experimental-count").textContent = enabledCount + "/" + plugins.length + " plugins";
       $("nav-experimental-count").className = "badge " + (enabledCount ? "ok" : "warn");
       renderSelfImprovementStatus(status);
       entries.forEach(([key]) => renderExperimentalFeaturePage(key));
@@ -4694,7 +4706,8 @@ function renderConsoleHtml(version = "development") {
       const page = experimentalPage(featureKey);
       const action = selectedExperimentalAction(featureKey);
       if (!page || !action) return;
-      if (state.status?.experimental?.[featureKey] !== true && action.availableWhenDisabled !== true) throw new Error("This Lab is currently off. Turn it on in Odinn settings and restart before using this action.");
+      const feature = experimentalFeatures[featureKey];
+      if (feature?.core !== true && state.status?.experimental?.[featureKey] !== true && action.availableWhenDisabled !== true) throw new Error("This plugin is currently off. Enable it in Odinn settings and restart before using this action.");
       const target = page.querySelector('[data-role="target"]').value.trim();
       const path = experimentalPath(action, target, true);
       if (action.dangerous && !window.confirm('Continue with “' + action.label + '”? ' + action.description + " A preview is recommended whenever one is available.")) return;
@@ -5414,7 +5427,7 @@ function renderConsoleHtml(version = "development") {
           if (input) input.value = Array.isArray(source[key]) ? source[key].join("\\n") : "";
         }
       }
-      for (const key of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin"]) {
+      for (const key of ["capabilities", "capsules", "counterfactual"]) {
         const input = document.querySelector('[data-config-experimental="' + key + '"]');
         if (input) input.checked = experimental[key] === true;
       }
@@ -5470,7 +5483,7 @@ function renderConsoleHtml(version = "development") {
       }));
       config.policy = policy;
       config.experimental = { ...(config.experimental || {}) };
-      for (const key of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin"]) config.experimental[key] = document.querySelector('[data-config-experimental="' + key + '"]').checked;
+      for (const key of ["capabilities", "capsules", "counterfactual"]) config.experimental[key] = document.querySelector('[data-config-experimental="' + key + '"]').checked;
       config.selfImprovement = { ...(config.selfImprovement || {}) };
       for (const key of ["enabled", "rollbackOnFailure"]) config.selfImprovement[key] = document.querySelector('[data-config-self="' + key + '"]').checked;
       config.selfImprovement.mode = $("config-self-mode").value;

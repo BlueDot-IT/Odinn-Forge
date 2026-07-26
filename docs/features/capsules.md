@@ -1,6 +1,6 @@
 # Odinn Forge Capsule
 
-Capsules are ZIP-compatible, redacted run bundles containing the manifest, run record, events, environment metadata, verification results, snapshot index, referenced content-addressed artifacts, optional contract/policy, and checksums. Secrets are represented only as redaction categories; credentials are not exported.
+Capsules is an optional runtime plugin module. Capsules are ZIP-compatible, redacted run bundles containing the manifest, run record, events, environment metadata, verification results, snapshot index, referenced content-addressed artifacts, optional contract/policy, and checksums. Secrets are represented only as redaction categories; credentials are not exported.
 
 ```bash
 odinn config experimental enable capsules --confirm-impact

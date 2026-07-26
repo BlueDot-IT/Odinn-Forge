@@ -30,14 +30,15 @@ function expectOk(result: ReturnType<typeof invoke>) {
   return result.stdout.trim() ? JSON.parse(result.stdout) : undefined;
 }
 
-test("experimental CLI keeps seven Labs off while automatic improvement starts on", async () => {
+test("experimental CLI exposes three optional plugin modules while automatic improvement starts on", async () => {
   const { workspace, state } = await fixture();
   const help = invoke(workspace, ["experimental", "help"]);
   assert.equal(help.status, 0, help.stderr || help.stdout);
-  for (const feature of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin", "self-improvement"]) {
+  for (const feature of ["capabilities", "capsules", "counterfactual", "self-improvement"]) {
     assert.match(help.stdout, new RegExp(feature));
   }
-  assert.match(help.stdout, /seven Labs feature flags are off by default/);
+  for (const coreFeature of ["proof", "sentinel", "rewind", "darwin"]) assert.doesNotMatch(help.stdout, new RegExp(`^\\s+${coreFeature}\\s`, "m"));
+  assert.match(help.stdout, /three optional runtime plugin flags are off by default/);
   assert.match(help.stdout, /Automatic improvement runs by default/);
 
   const initial = expectOk(invoke(workspace, ["experimental", "status", "--state", state]));
@@ -45,28 +46,28 @@ test("experimental CLI keeps seven Labs off while automatic improvement starts o
   assert.equal(initial.disabledByDefault, false);
   assert.equal(initial.experimentalFeaturesDisabledByDefault, true);
   assert.equal(initial.automaticSelfImprovementDefault, true);
-  assert.equal(initial.features.length, 8);
+  assert.equal(initial.features.length, 4);
   assert.ok(initial.features.filter((feature: any) => feature.id !== "self-improvement").every((feature: any) => feature.enabled === false));
   assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").enabled, true);
   assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").mode, "auto");
 
-  const missingConfirmation = invoke(workspace, ["experimental", "enable", "proof", "--state", state]);
+  const missingConfirmation = invoke(workspace, ["experimental", "enable", "capabilities", "--state", state]);
   assert.equal(missingConfirmation.status, 1);
   assert.match(missingConfirmation.stderr, /Explicit confirmation required/);
-  const enabled = expectOk(invoke(workspace, ["experimental", "enable", "proof", "--confirm-impact", "--state", state]));
-  assert.equal(enabled.feature, "proof");
+  const enabled = expectOk(invoke(workspace, ["experimental", "enable", "capabilities", "--confirm-impact", "--state", state]));
+  assert.equal(enabled.feature, "capabilities");
   assert.equal(enabled.enabled, true);
-  const proofStatus = expectOk(invoke(workspace, ["experimental", "proof", "status", "--state", state]));
-  assert.equal(proofStatus.features[0].enabled, true);
-  assert.equal(proofStatus.features[0].configKey, "experimental.proof");
+  const capabilityStatus = expectOk(invoke(workspace, ["experimental", "status", "capabilities", "--state", state]));
+  assert.equal(capabilityStatus.features[0].enabled, true);
+  assert.equal(capabilityStatus.features[0].configKey, "experimental.capabilities");
 
   const improvement = expectOk(invoke(workspace, ["experimental", "enable", "self-improvement", "--state", state]));
   assert.equal(improvement.selfImprovement.enabled, true);
   assert.equal(improvement.selfImprovement.mode, "auto");
 
-  expectOk(invoke(workspace, ["experimental", "disable", "proof", "--state", state]));
+  expectOk(invoke(workspace, ["experimental", "disable", "capabilities", "--state", state]));
   const persisted = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
-  assert.equal(persisted.experimental.proof, false);
+  assert.equal(persisted.experimental.capabilities, false);
   assert.equal(persisted.selfImprovement.enabled, true);
 });
 
@@ -99,24 +100,18 @@ test("experimental CLI routes every system to its real runtime implementation", 
     invariants: [{ id: "deny-deploy", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }]
   })}\n`);
 
-  assert.equal(expectOk(invoke(workspace, ["experimental", "proof", "contract", "validate", contractPath])).valid, true);
-  assert.equal(expectOk(invoke(workspace, ["experimental", "sentinel", "validate", policyPath])).valid, true);
-  const disabledProof = invoke(workspace, ["experimental", "proof", "run", run.id, "--contract", contractPath, "--state", state]);
-  assert.equal(disabledProof.status, 1);
-  assert.match(disabledProof.stderr, /experimental\.proof is disabled/);
-  const directDisabledProof = invoke(workspace, ["proof", "run", run.id, "--contract", contractPath, "--state", state]);
-  assert.equal(directDisabledProof.status, 1);
-  assert.match(directDisabledProof.stderr, /experimental\.proof is disabled/);
+  assert.equal(expectOk(invoke(workspace, ["proof", "contract", "validate", contractPath])).valid, true);
+  assert.equal(expectOk(invoke(workspace, ["policy", "validate", policyPath])).valid, true);
+  const directProof = expectOk(invoke(workspace, ["proof", "run", run.id, "--contract", contractPath, "--state", state]));
+  assert.equal(directProof.status, "passed");
 
-  for (const feature of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin"]) {
+  for (const feature of ["capabilities", "capsules", "counterfactual"]) {
     const toggled = expectOk(invoke(workspace, ["experimental", "enable", feature, "--confirm-impact", "--state", state]));
     assert.equal(toggled.enabled, true);
   }
 
-  const proof = expectOk(invoke(workspace, ["experimental", "proof", "run", run.id, "--contract", contractPath, "--state", state]));
-  assert.equal(proof.status, "passed");
   const sentinel = expectOk(invoke(workspace, [
-    "experimental", "sentinel", "test", policyPath,
+    "policy", "test", policyPath,
     "--tool", "text.echo", "--input-json", "{\"text\":\"safe\"}", "--state", state
   ]));
   assert.equal(sentinel.allowed, true);
@@ -131,9 +126,9 @@ test("experimental CLI routes every system to its real runtime implementation", 
   assert.ok(capabilities.some((capability: any) => capability.id === issued.claims.id));
 
   const checkpoint = expectOk(invoke(workspace, [
-    "experimental", "rewind", "checkpoint", "create", run.id, "--path", "seed.txt", "--state", state
+    "checkpoint", "create", run.id, "--path", "seed.txt", "--state", state
   ]));
-  const preview = expectOk(invoke(workspace, ["experimental", "rewind", "restore", checkpoint.snapshotId, "--state", state]));
+  const preview = expectOk(invoke(workspace, ["rewind", checkpoint.snapshotId, "--state", state]));
   assert.equal(preview.applied, false);
   assert.equal(preview.actions[0].action, "restore");
 
@@ -164,10 +159,10 @@ test("experimental CLI routes every system to its real runtime implementation", 
   assert.equal(counterfactual.execution.results[0].proof.status, "passed");
 
   const observed = expectOk(invoke(workspace, [
-    "experimental", "darwin", "observe", "--run", run.id,
+    "routing", "observe", "--run", run.id,
     "--provider", "fixture", "--model", "verified", "--task-class", "cli-test", "--verified", "true", "--duration-ms", "10", "--state", state
   ]));
   assert.equal(observed.modelId, "verified");
-  const stats = expectOk(invoke(workspace, ["experimental", "darwin", "stats", "--task-class", "cli-test", "--state", state]));
+  const stats = expectOk(invoke(workspace, ["routing", "stats", "--task-class", "cli-test", "--state", state]));
   assert.equal(stats[0].model_id, "verified");
 });

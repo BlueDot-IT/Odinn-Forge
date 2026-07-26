@@ -122,7 +122,7 @@ test("extension execution crosses the audited Sentinel and capability boundary",
   await registry.install({ id: "guarded-tool", version: "1.0.0", type: "tool", entrypoint: "tool.ts", capabilities: ["text.echo"], sandbox: "unconfined-process", contentDigest: digest(extensionSource) });
   await registry.enable("guarded-tool", { grants: ["text.echo"], trust: true, allowUnsafeSandbox: true });
   const stateDir = join(root, ".odinn");
-  const runtime = createDifferentiatedRuntime({ stateDir, workspaceRoot: root, featureFlags: { sentinel: true, capabilities: true } });
+  const runtime = createDifferentiatedRuntime({ stateDir, workspaceRoot: root, featureFlags: { capabilities: true } });
   const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
   const executor = new ExtensionExecutor(registry, { workspaceRoot: root, defaultTimeoutMs: 2_000 });
   const runId = "extension-guarded-run";

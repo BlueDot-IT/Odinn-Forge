@@ -25,7 +25,9 @@ Odinn Forge v1 supports this local, single-user workflow:
 - One local operator using the loopback gateway at `127.0.0.1`.
 - Public web reading, an isolated browser profile, scoped durable memory, audited tools, projects, sessions, goals, and cron jobs. The console can register and inspect declarative Agent SDK packages and build integrity-checked Skill SDK packages; both install disabled, and registration and discovery do not execute or activate them.
 - Explicit approval for browser mutations and other external side effects.
-- Experimental Proof, Rewind, Sentinel, Capsules, Darwin, Capability, and Counterfactual features remain disabled until individually enabled.
+- Core advanced Proof, Rewind, Sentinel, and Darwin services are available by
+  default. Capsules, Capability Tokens, and Counterfactual remain optional
+  plugin modules until individually enabled.
 - Automatic improvements runs by default and is limited to reversible, allowlisted reliability tuning.
 
 The TLS multi-user host is available to experienced operators, but remote

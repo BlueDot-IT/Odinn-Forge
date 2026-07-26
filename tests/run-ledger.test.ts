@@ -9,7 +9,7 @@ import { createAuditStore, createBuiltInRegistry, createRunLedger, normalizeExpe
 test("Phase 0 records a real tool call as a durable redacted hash chain", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-phase0-ledger-"));
   const stateDir = join(root, ".odinn");
-  const ledger = createRunLedger({ stateDir, workspaceRoot: root, featureFlags: { proof: true } });
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root, featureFlags: normalizeExperimentalFlags({ capsules: true }) });
   try {
     const result = await runTask({
       task: { id: "run_phase0_echo", tool: "text.echo", input: { text: "ODINN_PHASE0_OK", apiKey: "sk-do-not-persist-this" }, actor: "test" },
@@ -21,7 +21,8 @@ test("Phase 0 records a real tool call as a durable redacted hash chain", async 
     assert.equal(result.output.text, "ODINN_PHASE0_OK");
     const run = ledger.getRun("run_phase0_echo");
     assert.equal(run.status, "completed-unverified");
-    assert.equal(run.featureFlags.proof, true);
+    assert.equal(run.featureFlags.capsules, true);
+    assert.equal(run.featureFlags.proof, undefined);
     assert.equal(run.steps.length, 1);
     assert.equal(run.steps[0].type, "tool-request");
     assert.equal(run.steps[0].status, "succeeded");

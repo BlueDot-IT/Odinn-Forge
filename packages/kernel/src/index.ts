@@ -6,9 +6,11 @@ import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/p
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 export { SkillPackageStore, validateSkillPackage } from "./skill-packages.ts";
-import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
+export { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
+export type { LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
+import { CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
-import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
+import { CapabilityBroker, DarwinRouter, OdinnRuntimeError, Sentinel } from "./differentiated-runtime.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
 import { appendSessionMessage, assignSessionProject, createGoal, createProject, createSession, DEFAULT_PROJECT_ID, deleteSession, listGoals, listProjects, listSessions, readSession, reduceProjects, reduceSessions, renameSession, updateGoal, updateProject, updateSession } from "./workspace-records.ts";
 import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, formatMemoryContext, learnFromConversation, listMemoryCandidates, normalizeMemoryOptions, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
@@ -23,7 +25,7 @@ export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
 export { ExtensionRegistry, ExtensionExecutor } from "./extensions.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
-export { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
+export { CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
 export { withStateMutationLock } from "./state-mutation.ts";
 export { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions } from "./state/schema-registry.ts";
 export type { StateSchemaOwner, StateSchemaVersions, StateSupport, StateSurface } from "./state/schema-registry.ts";
@@ -155,12 +157,82 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["model.chat", {
       capability: "model.chat",
       description: "Send a chat completion through a configured OpenAI-compatible provider.",
-      execute: async (input: any, context: any) => chatWithModel(modelConfig, {
-        ...(input.retries === undefined && input.maxRetries === undefined && config.runtime?.modelRetries !== undefined
-          ? { retries: config.runtime.modelRetries }
-          : {}),
-        ...input
-      }, { stateDir, signal: context.signal, onDelta: context.onModelDelta, onProviderAttempt: context.onProviderAttempt })
+      execute: async (input: any, context: any) => {
+        const startedAt = Date.now();
+        const taskClass = typeof input.taskClass === "string" && input.taskClass.trim() ? input.taskClass.trim() : "general";
+        const router = context.runLedger ? new DarwinRouter({ ledger: context.runLedger }) : undefined;
+        const availableModels = listConfiguredModels(modelConfig).map((model: any) => model.id);
+        let selectedModel = typeof input.model === "string" && input.model.trim() ? input.model.trim() : "";
+        let routingDecisionRecorded = false;
+        if (selectedModel && router) {
+          router.choose(taskClass, { pinnedModel: selectedModel, availableModels, runId: context.request.id });
+          routingDecisionRecorded = true;
+        } else if (router && availableModels.length) {
+          try {
+            selectedModel = router.choose(taskClass, { availableModels, runId: context.request.id }).model;
+            routingDecisionRecorded = true;
+          } catch (error) {
+            if (!(error instanceof OdinnRuntimeError) || error.code !== "MODEL_ROUTING_UNAVAILABLE") throw error;
+          }
+        }
+        selectedModel ||= modelConfig.defaultModel ?? "";
+        if (router && selectedModel && !routingDecisionRecorded) {
+          router.recordDecision({
+            runId: context.request.id,
+            taskClass,
+            model: selectedModel,
+            source: "configured-default",
+            reason: "no applicable Darwin observations; used the configured default"
+          });
+        }
+        const modelInput = {
+          ...(input.retries === undefined && input.maxRetries === undefined && config.runtime?.modelRetries !== undefined
+            ? { retries: config.runtime.modelRetries }
+            : {}),
+          ...input,
+          ...(selectedModel ? { model: selectedModel } : {})
+        };
+        let output;
+        try {
+          output = await chatWithModel(modelConfig, modelInput, {
+            stateDir,
+            signal: context.signal,
+            onDelta: context.onModelDelta,
+            onProviderAttempt: context.onProviderAttempt
+          });
+        } catch (error) {
+          const separator = selectedModel.indexOf(":");
+          if (router && separator > 0) {
+            try {
+              router.observe({
+                runId: context.request.id,
+                providerId: selectedModel.slice(0, separator),
+                modelId: selectedModel.slice(separator + 1),
+                taskClass,
+                durationMs: Date.now() - startedAt,
+                toolErrors: 1
+              });
+            } catch {
+              // Routing telemetry must never replace the provider failure.
+            }
+          }
+          throw error;
+        }
+        context.runLedger?.database.db.prepare("UPDATE runs SET provider_id = ?, model_id = ? WHERE id = ?")
+          .run(output.provider, output.model, context.request.id);
+        if (router) {
+          router.observe({
+            runId: context.request.id,
+            providerId: output.provider,
+            modelId: output.model,
+            taskClass,
+            partiallyVerified: true,
+            durationMs: Date.now() - startedAt,
+            toolCalls: "toolCalls" in output && Array.isArray(output.toolCalls) ? output.toolCalls.length : 0
+          });
+        }
+        return output;
+      }
     }],
     ["memory.remember", {
       capability: "memory.write",
@@ -503,19 +575,15 @@ export async function runTask({
 
   let capabilityClaims;
   try {
-    if (runLedger?.featureFlags?.sentinel === true) {
-      if (Array.isArray(policy?.invariants)) {
-        new Sentinel({ ledger: runLedger, featureFlags: runLedger.featureFlags }).evaluate({
-          runId: request.id,
-          stepId: ledgerStep?.stepId,
-          toolName: request.tool,
-          input: request.input,
-          policy: { id: policy.id, version: 1, invariants: policy.invariants },
-          workspaceRoot: runLedger.workspaceRoot
-        });
-      } else {
-        runLedger.appendEvent({ runId: request.id, type: "policy-check", payload: { stepId: ledgerStep?.stepId, decision: "allow", reason: "sentinel enabled with no configured invariants" } });
-      }
+    if (runLedger && Array.isArray(policy?.invariants) && policy.invariants.length) {
+      new Sentinel({ ledger: runLedger }).evaluate({
+        runId: request.id,
+        stepId: ledgerStep?.stepId,
+        toolName: request.tool,
+        input: request.input,
+        policy: { id: policy.id, version: 1, invariants: policy.invariants },
+        workspaceRoot: runLedger.workspaceRoot
+      });
     }
     if (runLedger?.featureFlags?.capabilities === true && safety.requiresCapability) {
       const token = request.input?.capabilityToken;

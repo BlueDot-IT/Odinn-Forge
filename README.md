@@ -22,9 +22,9 @@ who want more than a chatbot—but do not want an AI quietly clicking buttons,
 changing accounts, or hiding what it did.
 
 Odinn Forge v1 supports the local, single-user workflow described in the
-[v1 compatibility policy](docs/v1-compatibility.md). Optional Labs,
-third-party packages, and remote multi-user hosting have separate support
-boundaries.
+[v1 compatibility policy](docs/v1-compatibility.md). Core advanced services,
+optional plugin modules, third-party packages, and remote multi-user hosting
+have separate support boundaries.
 
 ## What can I use it for?
 
@@ -220,26 +220,30 @@ behavior.
 
 ## Advanced features
 
-Ódinn includes optional labs for people who want deeper control and
-inspection. These features are disabled until you turn them on individually.
+Ódinn includes core advanced services for deeper control and inspection:
 
 - **Proof** checks whether a run met specific acceptance rules.
 - **Sentinel** checks commands, file locations, and approval requirements
   before an operation.
-- **Capability Tokens** give one narrowly defined permission to one run.
 - **Rewind** saves selected local files and previews a restore before applying
   it.
+- **Darwin** routes configured models using recorded reliability, speed, cost,
+  policy, rollback, and verification results.
+
+Three additional features are optional plugin modules and remain disabled
+until enabled individually:
+
+- **Capability Tokens** give one narrowly defined permission to one run.
 - **Capsules** export a redacted, verifiable bundle of a run.
 - **Counterfactual** compares work in separate copies of a workspace.
-- **Darwin** compares models using recorded reliability, speed, cost, policy,
-  and verification results.
 
 These tools improve visibility and recovery for local work. They do not make
 outside actions perfectly reversible, and copied workspaces are not security
 sandboxes.
 
-Use the **Experimental Lab** in the console or read the notes under
-[docs/features](docs/features/) before enabling a lab.
+Use **Advanced** in the console or read the notes under
+[docs/features](docs/features/). Core placement does not make an advanced API
+a stable public SDK; the compatibility policy remains authoritative.
 
 ## Useful commands
 

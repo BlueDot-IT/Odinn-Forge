@@ -195,13 +195,8 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
   const safeInput = redact({ extensionId: id, input, capability: requested });
   const append = (event: JsonObject) => auditStore.append({ at: new Date().toISOString(), runId, actor: runtime.actor ?? "extension", tool: "extension.invoke", capability: extension.capabilities[0], ...event });
   try {
-    if (featureFlags.sentinel === true) {
-      if (runtime.policy?.version === 1 && Array.isArray(runtime.policy.invariants)) {
-        const sentinelOptions = { ledger, featureFlags };
-        new Sentinel(sentinelOptions).evaluate({ runId, stepId: ledgerStep.stepId, toolName: "extension.invoke", input: safeInput, policy: runtime.policy, workspaceRoot: runtime.workspaceRoot ?? ledger.workspaceRoot });
-      } else {
-        ledger.appendEvent({ runId, type: "policy-check", payload: { stepId: ledgerStep.stepId, decision: "allow", reason: "sentinel enabled with no configured invariants" } });
-      }
+    if (runtime.policy?.version === 1 && Array.isArray(runtime.policy.invariants) && runtime.policy.invariants.length) {
+      new Sentinel({ ledger }).evaluate({ runId, stepId: ledgerStep.stepId, toolName: "extension.invoke", input: safeInput, policy: runtime.policy, workspaceRoot: runtime.workspaceRoot ?? ledger.workspaceRoot });
     }
     let claims;
     if (featureFlags.capabilities === true) {
