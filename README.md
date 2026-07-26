@@ -254,6 +254,8 @@ odinn doctor          # Create a safe diagnostic summary
 
 ## Documentation
 
+- [Latest release](https://github.com/jason-allen-oneal/Odinn/releases/latest) —
+  download the current supported release
 - [v1 compatibility policy](docs/v1-compatibility.md) — the stable product
   promise and its boundaries
 - [User guide](docs/user-guide.md) — installation, privacy, and bug reports
@@ -263,6 +265,18 @@ odinn doctor          # Create a safe diagnostic summary
 - [Security guide](SECURITY.md) — safe operation and vulnerability reporting
 - [Capability boundaries](docs/surface-matrix.md) — what is tested,
   experimental, provider-dependent, or unsupported
+- [Interface reference](docs/interface-reference.md) — CLI and authenticated
+  loopback gateway inputs and outputs
+- [Report a bug or request a feature](https://github.com/jason-allen-oneal/Odinn/issues/new/choose)
+- [Contributing guide](CONTRIBUTING.md) — development setup, pull requests,
+  validation, and releases
+
+The primary user-facing external interfaces are the documented CLI and
+authenticated loopback gateway. The
+[interface reference](docs/interface-reference.md) describes their inputs and
+outputs. The [surface matrix](docs/surface-matrix.md) identifies stable,
+experimental, provider-dependent, platform-dependent, internal, and unsupported
+surfaces.
 
 ## For developers and contributors
 
