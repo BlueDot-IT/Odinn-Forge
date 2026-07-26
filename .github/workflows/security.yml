@@ -32,7 +32,6 @@ jobs:
     permissions:
       actions: read
       contents: read
-      security-events: write
       packages: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -43,6 +42,15 @@ jobs:
       - uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4
         with:
           category: /language:javascript-typescript
+          output: ${{ runner.temp }}/codeql-results
+          upload: false
+      - name: Retain CodeQL results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: codeql-results-${{ github.sha }}
+          path: ${{ runner.temp }}/codeql-results
+          if-no-files-found: error
+          retention-days: 14
 
   dependency-review:
     name: Dependency review
@@ -158,8 +166,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      security-events: write
-      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -169,7 +175,11 @@ jobs:
         with:
           results_file: results.sarif
           results_format: sarif
-          publish_results: true
-      - uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4
+          publish_results: false
+      - name: Retain Scorecard results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          sarif_file: results.sarif
+          name: scorecard-results-${{ github.sha }}
+          path: results.sarif
+          if-no-files-found: error
+          retention-days: 14

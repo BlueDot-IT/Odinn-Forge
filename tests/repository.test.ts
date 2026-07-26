@@ -90,6 +90,11 @@ test("security scanning is license-independent and optional maintenance is expli
     security,
     /codeql:[\s\S]*?permissions:\s*\n\s+actions: read\s*\n\s+contents: read/u,
   );
+  assert.match(security, /output: \$\{\{ runner\.temp \}\}\/codeql-results/u);
+  assert.match(security, /upload: false/u);
+  assert.match(security, /name: codeql-results-\$\{\{ github\.sha \}\}/u);
+  assert.doesNotMatch(security, /security-events: write/u);
+  assert.doesNotMatch(security, /github\/codeql-action\/upload-sarif/u);
   assert.doesNotMatch(security, /gitleaks\/gitleaks-action/u);
   assert.match(
     security,
