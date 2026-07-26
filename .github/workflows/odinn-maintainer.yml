@@ -57,7 +57,7 @@ jobs:
   plan:
     name: "Plan ${{ matrix.target.kind }} #${{ matrix.target.number }}"
     needs: discover
-    if: needs.discover.outputs.count != '0'
+    if: needs.discover.outputs.count != '0' && vars.ODINN_MAINTAINER_ENABLED == 'true'
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -96,7 +96,7 @@ jobs:
   apply:
     name: "Apply ${{ matrix.target.kind }} #${{ matrix.target.number }}"
     needs: [discover, plan]
-    if: always() && needs.discover.outputs.count != '0' && needs.plan.result == 'success'
+    if: always() && needs.discover.outputs.count != '0' && vars.ODINN_MAINTAINER_ENABLED == 'true' && needs.plan.result == 'success'
     strategy:
       fail-fast: false
       max-parallel: 5
