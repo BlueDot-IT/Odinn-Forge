@@ -3,10 +3,11 @@
 ![Ódinn Forge — your AI assistant, on your computer](docs/odinn-header.png)
 
 <p align="center">
+  <a href="https://github.com/jason-allen-oneal/Odinn/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jason-allen-oneal/Odinn"></a>
   <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml"><img alt="Security" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml"><img alt="Package Integrity" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml"><img alt="Workflow Lint" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml/badge.svg?branch=main"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/jason-allen-oneal/Odinn"></a>
 </p>
 
 > **Your AI assistant, on your computer, under your control.**
