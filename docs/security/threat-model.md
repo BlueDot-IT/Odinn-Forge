@@ -10,11 +10,11 @@
 
 - The default gateway is loopback-only. Cookie-authenticated mutations require an exact scheme/host/port Origin and reject missing Origin; bearer clients are authenticated separately. Remote deployments use a separate TLS-only host with exact-origin enforcement, throttled authentication, signed revocable sessions, and per-tenant gateway/state/workspace/browser boundaries.
 - Unknown tools default to irreversible, approval-required safety descriptors.
-- Paths are canonicalized and symlink escapes are rejected for Proof and snapshots.
-- Proof commands are denied by default and require an exact operator-owned argument-vector allowlist; approved commands use no shell, a minimal environment, bounded output, and process-tree termination.
+- Paths are canonicalized and symlink escapes are rejected for Runemark verification and snapshots.
+- Runemark commands are denied by default and require an exact operator-owned argument-vector allowlist; approved commands use no shell, a minimal environment, bounded output, and process-tree termination.
 - HTTP request bodies cannot replace the gateway's authoritative workspace. Internal alternate roots must be validated descendants of the assigned workspace.
 - Ledger payloads and artifact evidence are redacted and bounded.
-- Sentinel decisions are deterministic and persisted before execution.
+- Gatewatch decisions are deterministic and persisted before execution.
 - Capability tokens are signed, short-lived, run/step/tool bound, scoped, revocable, and replay-limited.
 - Capsule extraction rejects traversal and absolute paths.
 - The gateway rejects hostile `Host` headers before issuing its bootstrap cookie.
@@ -25,7 +25,7 @@
 - State directories and records are repaired to owner-only permissions; restores reject symlinks, hardlinks, and special files before copying; run IDs and job idempotency keys are bound to canonical request digests.
 - Signed audit appends use an interprocess lock so forked workers cannot create sibling successors from one previous signature.
 - Browser mutations are journaled before execution. Unknown outcomes block further mutation until explicitly resolved.
-- Extensions and MCP adapters execute through the audited Sentinel/capability boundary; direct extension execution is rejected. Third-party extensions use the container adapter with a whole-bundle digest, read-only mount, no network, dropped capabilities, no-new-privileges, and CPU/memory/PID/filesystem limits. Explicit `unconfined-process` extensions remain trusted-code-only.
+- Extensions and MCP adapters execute through the audited Gatewatch/Rune Key boundary; direct extension execution is rejected. Third-party extensions use the container adapter with a whole-bundle digest, read-only mount, no network, dropped capabilities, no-new-privileges, and CPU/memory/PID/filesystem limits. Explicit `unconfined-process` extensions remain trusted-code-only.
 - Full capsule replay requires a disposable workspace, complete non-redacted inputs, an audited executor, and explicit approval for external effects.
 
 ## Residual risk

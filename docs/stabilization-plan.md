@@ -60,7 +60,7 @@ Required sequence:
 6. Queue work, stop the process, restart it, and verify recovery state.
 7. Interrupt a browser mutation and verify recovery blocking.
 8. Verify the audit chain and inspect persisted run output.
-9. Restore a modified workspace through Rewind in dry-run mode.
+9. Restore a modified workspace through Norn Restore (`odinn rewind`) in dry-run mode.
 10. Roll back the installed version and repeat the smoke path.
 
 The soak must record duration, restart count, recovered jobs, unresolved

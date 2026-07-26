@@ -1,6 +1,15 @@
-# Odinn Forge Counterfactual
+# Worldtree Paths — Scenario comparison
 
-Counterfactual is an optional runtime plugin module. It recursively copies a workspace into separate candidate directories under `.odinn-worktrees/<group>/<plan>` and creates independent run records, ledger relationships, and candidate plans. They are filesystem copies, not Git worktrees or operating-system sandboxes. Generated and cache-heavy roots (`.git`, `node_modules`, `dist`, `build`, `coverage`, `.next`, `.cache`, `.turbo`, and `.pnpm-store`) are excluded. The source workspace is not modified by branch creation.
+Worldtree Paths is Ódinn Forge's optional scenario-comparison plugin module.
+The existing `counterfactual` CLI command, configuration key, gateway routes,
+and SDK names remain compatibility identifiers. It recursively copies a
+workspace into separate candidate directories under
+`.odinn-worktrees/<group>/<plan>` and creates independent run records, ledger
+relationships, and candidate plans. They are filesystem copies, not Git
+worktrees or operating-system sandboxes. Generated and cache-heavy roots
+(`.git`, `node_modules`, `dist`, `build`, `coverage`, `.next`, `.cache`,
+`.turbo`, and `.pnpm-store`) are excluded. The source workspace is not modified
+by branch creation.
 
 ```bash
 odinn config experimental enable counterfactual --confirm-impact
@@ -9,4 +18,14 @@ odinn counterfactual compare <group-id>
 odinn counterfactual select <group-id> --run <candidate-run-id> --apply
 ```
 
-An executable plan contains a bounded `tasks` array of ordinary Odinn Forge task objects and may include a Proof contract. Read-only tasks may set `readOnly: true`; Ódinn Forge then issues a one-use, candidate-bound read capability. Mutating tasks must carry an explicitly approved capability token. `--execute` runs each candidate independently through the normal audited tool boundary, then runs the candidate contract when present. Plans without `--execute` remain dry-run branch creation only. Selection is also a dry-run unless `--apply` is supplied; applying replaces only files outside `.git`, `.odinn`, and `.odinn-worktrees`, with a temporary source backup for recovery. Irreversible external actions remain approval-gated and are not silently made safe by branching.
+An executable plan contains a bounded `tasks` array of ordinary Odinn Forge
+task objects and may include a Runemark contract. Read-only tasks may set
+`readOnly: true`; Ódinn Forge then issues a one-use, candidate-bound Rune Key.
+Mutating tasks must carry an explicitly approved key. `--execute` runs each
+candidate independently through the normal audited tool boundary, then runs
+the candidate contract when present. Plans without `--execute` remain dry-run
+branch creation only. Selection is also a dry-run unless `--apply` is supplied;
+applying replaces only files outside `.git`, `.odinn`, and
+`.odinn-worktrees`, with a temporary source backup for recovery. Irreversible
+external actions remain approval-gated and are not silently made safe by
+branching.

@@ -20,11 +20,11 @@ Cron Jobs are stored in `.odinn/cron-jobs.json` and evaluated by the running gat
 
 Cron expressions contain five fields. Each job has an explicit IANA timezone, tool, and JSON input. Treat creation or editing as a privileged control-plane mutation.
 
-## Tasks, Proof, and activity history
+## Tasks, Runemark verification, and activity history
 
 Tasks is the operator view over meaningful user, agent, and automation runs. Routine console reads are hidden unless **System activity** is enabled. Server-side search, filtering, and pagination keep the list bounded. Operators can select tasks, stop active supervised jobs, and run tasks again only when recorded input is declared retry-safe. The replay endpoint enforces the same classification server-side; external effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
-The History tab in Activity provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Proof is a core advanced service; command assertions still require exact operator-owned argument-vector allowlisting. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
+The History tab in Activity provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Runemark is a core advanced service; command assertions still require exact operator-owned argument-vector allowlisting through the compatibility `proof` configuration key. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
 
 Runtime errors return a stable request correlation ID in the `x-odinn-request-id`
 header and JSON body. Audit entries retain run, task/step, provider-attempt,

@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
@@ -1869,7 +1869,7 @@ const ADVANCED_CONSOLE_PAGES = [
     core: true,
     view: "lab-run-checks",
     title: "Run Checks",
-    technicalName: "Proof",
+    technicalName: ADVANCED_FEATURE_BRANDS.proof.name,
     summary: "Confirm that completed work produced the files, responses, or repository state you expected.",
     benefit: "Use this when an important run needs a clear pass-or-fail check.",
     steps: ["Choose a recent run", "Pick what should be true", "Review the results"]
@@ -1879,7 +1879,7 @@ const ADVANCED_CONSOLE_PAGES = [
     core: true,
     view: "lab-safety-preview",
     title: "Safety Preview",
-    technicalName: "Sentinel",
+    technicalName: ADVANCED_FEATURE_BRANDS.sentinel.name,
     summary: "Preview whether a planned action fits your safety rules before anything runs.",
     benefit: "Use this to understand why an action would be allowed or stopped.",
     steps: ["Describe the planned action", "Preview the decision", "Adjust the plan if needed"]
@@ -1888,7 +1888,7 @@ const ADVANCED_CONSOLE_PAGES = [
     key: "capabilities",
     view: "lab-temporary-access",
     title: "Temporary Access",
-    technicalName: "Capability Tokens",
+    technicalName: ADVANCED_FEATURE_BRANDS.capabilities.name,
     summary: "Grant narrow, short-lived permission for one specific action.",
     benefit: "Access expires automatically and can be revoked at any time.",
     steps: ["Choose an action", "Set a short expiry", "Copy the access pass once"]
@@ -1898,7 +1898,7 @@ const ADVANCED_CONSOLE_PAGES = [
     core: true,
     view: "lab-restore-points",
     title: "Restore Points",
-    technicalName: "Rewind",
+    technicalName: ADVANCED_FEATURE_BRANDS.rewind.name,
     summary: "Save selected workspace files and preview a restore before changing anything.",
     benefit: "Use this before risky local work or when you want an easy way back.",
     steps: ["Create a restore point", "Preview what would change", "Restore only when ready"]
@@ -1907,7 +1907,7 @@ const ADVANCED_CONSOLE_PAGES = [
     key: "capsules",
     view: "lab-portable-runs",
     title: "Portable Runs",
-    technicalName: "Capsules",
+    technicalName: ADVANCED_FEATURE_BRANDS.capsules.name,
     summary: "Package a completed run so it can be checked or replayed without live tools.",
     benefit: "Useful for sharing, archiving, and reproducing work safely.",
     steps: ["Choose a run", "Create a portable copy", "Check or replay the copy"]
@@ -1916,7 +1916,7 @@ const ADVANCED_CONSOLE_PAGES = [
     key: "counterfactual",
     view: "lab-scenario-compare",
     title: "Compare Approaches",
-    technicalName: "Counterfactuals",
+    technicalName: ADVANCED_FEATURE_BRANDS.counterfactual.name,
     summary: "Try multiple approaches in separate workspace copies and compare the outcomes.",
     benefit: "See the evidence side by side before choosing which result to keep.",
     steps: ["Create alternatives", "Run each approach", "Preview and choose a result"]
@@ -1926,7 +1926,7 @@ const ADVANCED_CONSOLE_PAGES = [
     core: true,
     view: "lab-model-routing",
     title: "Smart Routing",
-    technicalName: "Darwin Router",
+    technicalName: ADVANCED_FEATURE_BRANDS.darwin.name,
     summary: "Learn which configured model works best for different kinds of tasks.",
     benefit: "Recommendations improve as verified outcomes accumulate.",
     steps: ["Record an outcome", "Review what has been learned", "Ask for a recommendation"]
@@ -1943,7 +1943,7 @@ function experimentalConsolePages() {
       <section id="view-${feature.view}" class="view" data-experimental-page="${feature.key}">
         <div class="page oc-page">
           <div class="page-head">
-            <div><div class="section-kicker">${feature.core ? "Core capability" : "Optional plugin module"}</div><h1>${feature.title}</h1><p>${feature.summary}</p></div>
+            <div><div class="section-kicker">${feature.technicalName} · ${feature.core ? "Core capability" : "Optional plugin module"}</div><h1>${feature.title}</h1><p>${feature.summary}</p></div>
             <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
           </div>
           <div class="feature-hero panel">
@@ -4029,7 +4029,7 @@ function renderConsoleHtml(version = "development") {
                 <div class="grid-2"><div class="field"><label for="config-browser-allowed">Allowed domains</label><textarea id="config-browser-allowed" data-config-security-list="browser.allowedDomains" rows="4" placeholder="example.com"></textarea></div><div class="field"><label for="config-browser-blocked">Blocked domains</label><textarea id="config-browser-blocked" data-config-security-list="browser.blockedDomains" rows="4" placeholder="example.net"></textarea></div></div>
               </div>
               <div class="config-subsection">
-                <div><h3>Sentinel invariants</h3><p class="config-help">Optional rules enforced by the core runtime and shown by the safety preview.</p></div>
+                <div><h3>Gatewatch policy rules</h3><p class="config-help">Optional rules enforced by the core runtime and shown by the safety preview.</p></div>
                 <div class="grid-2"><div class="field"><label for="config-policy-version">Policy version</label><input id="config-policy-version" data-config-policy="version" type="number" min="1" step="1"></div><div class="field"><label for="config-policy-invariants-help">Invariant format</label><input id="config-policy-invariants-help" value="id · type · values · enforcement" readonly></div></div>
                 <div id="config-invariants" class="config-list"></div>
                 <button class="secondary" id="config-add-invariant" type="button">Add invariant</button>
@@ -4054,7 +4054,7 @@ function renderConsoleHtml(version = "development") {
             </div>
 
             <div class="panel config-section">
-              <div class="panel-head"><div><h2>Proof command allowlist</h2><p class="config-help">Exact executable argument vectors allowed for Proof checks. Put one argument on each line; the first line must be an absolute executable path.</p></div><button class="secondary" id="config-add-command" type="button">Add command</button></div>
+              <div class="panel-head"><div><h2>Runemark command allowlist</h2><p class="config-help">Exact executable argument vectors allowed for Runemark checks. Put one argument on each line; the first line must be an absolute executable path.</p></div><button class="secondary" id="config-add-command" type="button">Add command</button></div>
               <div id="config-proof-commands" class="config-list"></div>
             </div>
 
@@ -4151,6 +4151,7 @@ function renderConsoleHtml(version = "development") {
   <div class="toast-region" id="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
   <script>
     const $ = (id) => document.getElementById(id);
+    const advancedFeatureBrands = ${JSON.stringify(ADVANCED_FEATURE_BRANDS)};
     const state = {
       status: null,
       runs: [],
@@ -4198,7 +4199,7 @@ function renderConsoleHtml(version = "development") {
       proof: {
         core: true,
         title: "Run Checks",
-        technicalName: "Proof",
+        technicalName: advancedFeatureBrands.proof.name,
         view: "lab-run-checks",
         summary: "Confirm that a completed run produced the result you expected.",
         endpoint: "/proof",
@@ -4210,7 +4211,7 @@ function renderConsoleHtml(version = "development") {
       sentinel: {
         core: true,
         title: "Safety Preview",
-        technicalName: "Sentinel",
+        technicalName: advancedFeatureBrands.sentinel.name,
         view: "lab-safety-preview",
         summary: "Preview whether a planned action fits your safety rules.",
         endpoint: "/policy/evaluate",
@@ -4220,7 +4221,7 @@ function renderConsoleHtml(version = "development") {
       },
       capabilities: {
         title: "Temporary Access",
-        technicalName: "Capability Tokens",
+        technicalName: advancedFeatureBrands.capabilities.name,
         view: "lab-temporary-access",
         summary: "Grant narrow, short-lived permission for one action.",
         endpoint: "/capabilities",
@@ -4234,7 +4235,7 @@ function renderConsoleHtml(version = "development") {
       rewind: {
         core: true,
         title: "Restore Points",
-        technicalName: "Rewind",
+        technicalName: advancedFeatureBrands.rewind.name,
         view: "lab-restore-points",
         summary: "Save selected files and preview a restore before changing anything.",
         endpoint: "/checkpoints · /rewind",
@@ -4246,7 +4247,7 @@ function renderConsoleHtml(version = "development") {
       },
       capsules: {
         title: "Portable Runs",
-        technicalName: "Capsules",
+        technicalName: advancedFeatureBrands.capsules.name,
         view: "lab-portable-runs",
         summary: "Package a completed run so it can be checked or replayed later.",
         endpoint: "/capsules",
@@ -4258,7 +4259,7 @@ function renderConsoleHtml(version = "development") {
       },
       counterfactual: {
         title: "Compare Approaches",
-        technicalName: "Counterfactuals",
+        technicalName: advancedFeatureBrands.counterfactual.name,
         view: "lab-scenario-compare",
         summary: "Try multiple approaches in separate workspace copies and compare the outcomes.",
         endpoint: "/counterfactual",
@@ -4273,7 +4274,7 @@ function renderConsoleHtml(version = "development") {
       darwin: {
         core: true,
         title: "Smart Routing",
-        technicalName: "Darwin Router",
+        technicalName: advancedFeatureBrands.darwin.name,
         view: "lab-model-routing",
         summary: "Learn which configured model works best for different kinds of work.",
         endpoint: "/routing",
@@ -5444,8 +5445,8 @@ function renderConsoleHtml(version = "development") {
         if (input) input.checked = memory[key] !== false;
       }
       $("config-providers").innerHTML = Object.entries(value.providers || {}).map(([name, provider]) => renderProviderForm(name, provider)).join("") || '<div class="empty-state"><strong>No providers configured</strong><span>Add a provider to make model conversations available.</span></div>';
-      $("config-invariants").innerHTML = (Array.isArray(policy.invariants) ? policy.invariants : []).map(renderInvariantForm).join("") || '<div class="empty-state"><strong>No Sentinel invariants</strong><span>Add a rule only when you need a policy check beyond the default capability controls.</span></div>';
-      $("config-proof-commands").innerHTML = (Array.isArray(value.proof?.allowedCommands) ? value.proof.allowedCommands : []).map(renderProofCommand).join("") || '<div class="empty-state"><strong>No Proof commands allowed</strong><span>Proof command checks remain unavailable until you add an exact executable argument vector.</span></div>';
+      $("config-invariants").innerHTML = (Array.isArray(policy.invariants) ? policy.invariants : []).map(renderInvariantForm).join("") || '<div class="empty-state"><strong>No Gatewatch rules</strong><span>Add a rule only when you need a policy check beyond the default capability controls.</span></div>';
+      $("config-proof-commands").innerHTML = (Array.isArray(value.proof?.allowedCommands) ? value.proof.allowedCommands : []).map(renderProofCommand).join("") || '<div class="empty-state"><strong>No Runemark commands allowed</strong><span>Runemark command checks remain unavailable until you add an exact executable argument vector.</span></div>';
       $("config-field-count").textContent = "All supported fields shown; unknown settings are preserved.";
     }
 

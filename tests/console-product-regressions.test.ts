@@ -148,11 +148,11 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     ]);
     assert.match(config, /Everything Ódinn can configure/);
     assert.match(config, /Model providers/);
-    assert.match(config, /Sentinel invariants/);
+    assert.match(config, /Gatewatch policy rules/);
     assert.match(config, /Optional plugin modules/);
     for (const plugin of ["capabilities", "capsules", "counterfactual"]) assert.match(config, new RegExp(`data-config-experimental="${plugin}"`));
     for (const core of ["proof", "sentinel", "rewind", "darwin"]) assert.doesNotMatch(config, new RegExp(`data-config-experimental="${core}"`));
-    assert.match(config, /Proof command allowlist/);
+    assert.match(config, /Runemark command allowlist/);
     assert.match(config, /data-config-security="web\.requireApproval"/u);
     assert.match(config, /data-config-security="web\.allowDownloads"/u);
     assert.match(config, /data-config-security="web\.allowUploads"/u);
@@ -227,6 +227,9 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     assert.match(experiments, /Runs quietly in the background/);
     assert.match(experiments, /Core capability/);
     assert.match(experiments, /Optional plugin module/);
+    for (const brand of ["Runemark", "Gatewatch", "Norn Restore", "Raven Route", "Rune Key", "Saga Archive", "Worldtree Paths"]) {
+      assert.match(experiments, new RegExp(brand));
+    }
     assert.doesNotMatch(experiments, /release blocker|release-blocker|review queue|content-addressed artifact store/i);
     assert.doesNotMatch(html, /id="view-experiments"/);
 

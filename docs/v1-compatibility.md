@@ -183,16 +183,19 @@ because source code or TypeScript exports are visible.
 
 ### Advanced services and experimental modules
 
-Proof, Sentinel, Rewind, and Darwin are core advanced runtime services and do
-not require feature flags. Their documented CLI and gateway surfaces remain
-experimental interfaces unless another row in this policy explicitly marks
-them stable; core placement is an implementation and availability decision,
-not a public-SDK compatibility promise.
+Runemark, Gatewatch, Norn Restore, and Raven Route are core advanced runtime
+services and do not require feature flags. The existing Proof, Sentinel,
+Rewind, and Darwin technical identifiers remain compatible. Their documented
+CLI and gateway surfaces remain experimental interfaces unless another row in
+this policy explicitly marks them stable; core placement is an implementation
+and availability decision, not a public-SDK compatibility promise.
 
-Capsules, Capability Tokens, Counterfactual, Agent SDK packages, Skill SDK
+Saga Archive, Rune Key, Worldtree Paths, Agent SDK packages, Skill SDK
 packages, third-party extensions, MCP packages, multi-user hosting, and
-unconfined process execution are optional experimental interfaces. They remain
-outside normal v1 compatibility and migration guarantees.
+unconfined process execution are optional experimental interfaces. The
+existing Capsule, Capability Token, and Counterfactual technical identifiers
+remain compatible. These surfaces remain outside normal v1 compatibility and
+migration guarantees.
 
 For configuration compatibility, old `experimental.proof`,
 `experimental.sentinel`, `experimental.rewind`, and `experimental.darwin`

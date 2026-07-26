@@ -37,6 +37,9 @@ test("experimental CLI exposes three optional plugin modules while automatic imp
   for (const feature of ["capabilities", "capsules", "counterfactual", "self-improvement"]) {
     assert.match(help.stdout, new RegExp(feature));
   }
+  for (const brand of ["Rune Key", "Saga Archive", "Worldtree Paths"]) {
+    assert.match(help.stdout, new RegExp(brand));
+  }
   for (const coreFeature of ["proof", "sentinel", "rewind", "darwin"]) assert.doesNotMatch(help.stdout, new RegExp(`^\\s+${coreFeature}\\s`, "m"));
   assert.match(help.stdout, /three optional runtime plugin flags are off by default/);
   assert.match(help.stdout, /Automatic improvement runs by default/);
@@ -50,6 +53,9 @@ test("experimental CLI exposes three optional plugin modules while automatic imp
   assert.ok(initial.features.filter((feature: any) => feature.id !== "self-improvement").every((feature: any) => feature.enabled === false));
   assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").enabled, true);
   assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").mode, "auto");
+  assert.equal(initial.features.find((feature: any) => feature.id === "capabilities").label, "Rune Key — Scoped temporary access");
+  assert.equal(initial.features.find((feature: any) => feature.id === "capsules").label, "Saga Archive — Portable run bundles");
+  assert.equal(initial.features.find((feature: any) => feature.id === "counterfactual").label, "Worldtree Paths — Scenario comparison");
 
   const missingConfirmation = invoke(workspace, ["experimental", "enable", "capabilities", "--state", state]);
   assert.equal(missingConfirmation.status, 1);
