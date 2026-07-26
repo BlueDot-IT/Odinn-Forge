@@ -112,6 +112,13 @@ test("gateway supervises configured channels without exposing credentials", asyn
         enabled: true,
         tokenEnv: "ODINN_TEST_MISSING_TELEGRAM_TOKEN",
         allowlist: ["telegram:100"]
+      },
+      community: {
+        type: "discord",
+        enabled: true,
+        tokenEnv: "ODINN_TEST_MISSING_DISCORD_TOKEN",
+        allowlist: ["discord:100"],
+        requireMention: true
       }
     }
   }));
@@ -127,6 +134,10 @@ test("gateway supervises configured channels without exposing credentials", asyn
     assert.equal(result.channels[0].credentialConfigured, true);
     assert.equal(result.channels[0].credentialPresent, false);
     assert.match(result.channels[0].error, /credential is unavailable/);
+    const discord = result.channels.find((channel: any) => channel.name === "community");
+    assert.equal(discord.type, "discord");
+    assert.equal(discord.running, false);
+    assert.equal(discord.credentialPresent, false);
     const diagnostics = await getJson(`${base}/diagnostics`);
     assert.ok(diagnostics.channels.every((channel: any) => channel.credentialPresent === false));
   } finally {

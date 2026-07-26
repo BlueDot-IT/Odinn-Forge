@@ -49,7 +49,7 @@ have separate support boundaries.
   succeeded.
 
 Experimental messaging-channel foundations are under development, beginning
-with a Telegram adapter. They are not yet part of the supported v1 operator
+with Telegram and Discord adapters. They are not yet part of the supported v1 operator
 workflow; see [`docs/channels.md`](docs/channels.md).
 
 Ódinn is not a finished industry-specific business suite. It is a general

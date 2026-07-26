@@ -959,3 +959,20 @@ test("CLI configures Telegram channels using environment-only credentials", asyn
   assert.equal(config.channels.personal.token, undefined);
   assert.deepEqual(config.channels.personal.allowlist, ["telegram:100", "telegram:-200"]);
 });
+
+test("CLI configures Discord channels as mention-only by default", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-discord-channel-"));
+  const add = spawnSync("node", [
+    "apps/cli/src/cli.ts", "config", "channel", "add", "discord", "community",
+    "--state", state,
+    "--token-env", "ODINN_TEST_DISCORD_TOKEN",
+    "--allowlist", "discord:100,discord:800"
+  ], { cwd: root, encoding: "utf8" });
+  assert.equal(add.status, 0, add.stderr || add.stdout);
+  const channel = JSON.parse(add.stdout).channel;
+  assert.equal(channel.type, "discord");
+  assert.equal(channel.requireMention, true);
+  const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
+  assert.equal(config.channels.community.tokenEnv, "ODINN_TEST_DISCORD_TOKEN");
+  assert.equal(config.channels.community.requireMention, true);
+});

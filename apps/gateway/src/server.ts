@@ -9,6 +9,7 @@ import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 import { ChannelRouter, FileSessionBindingStore, GatewayChannelHandler, createAllowlistPolicy } from "@odinn/channels";
 import { TelegramChannelAdapter } from "@odinn/channel-telegram";
+import { DiscordChannelAdapter } from "@odinn/channel-discord";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
@@ -1543,7 +1544,8 @@ function validateGatewayConfig(config: any) {
       for (const key of ["type", "tokenEnv", "defaultModel"]) {
         if (channel[key] !== undefined && typeof channel[key] !== "string") throw new GatewayError(400, `config.channels.${name}.${key} must be a string`);
       }
-      if (channel.type !== undefined && channel.type !== "telegram") throw new GatewayError(400, `config.channels.${name}.type must be telegram`);
+      if (channel.type !== undefined && !["telegram", "discord"].includes(channel.type)) throw new GatewayError(400, `config.channels.${name}.type must be telegram or discord`);
+      assertOptionalConfigBoolean(channel, "requireMention", `config.channels.${name}`);
       if (channel.token !== undefined || channel.botToken !== undefined) throw new GatewayError(400, `config.channels.${name} must reference a tokenEnv instead of storing a bot token`);
       if (channel.tokenEnv !== undefined && !/^[A-Z_][A-Z0-9_]{1,127}$/u.test(channel.tokenEnv)) {
         throw new GatewayError(400, `config.channels.${name}.tokenEnv must be an uppercase environment variable name`);
@@ -1809,6 +1811,7 @@ function createChannelSupervisor({ config, state, gatewayToken }: any) {
     tokenEnv: String(value.tokenEnv ?? ""),
     allowlist: Array.isArray(value.allowlist) ? value.allowlist : [],
     defaultModel: typeof value.defaultModel === "string" ? value.defaultModel : "",
+    requireMention: value.requireMention !== false,
     running: false,
     error: ""
   }));
@@ -1835,11 +1838,18 @@ function createChannelSupervisor({ config, state, gatewayToken }: any) {
         try {
           const token = channel.tokenEnv ? process.env[channel.tokenEnv] : "";
           if (!token) throw new Error(`channel credential is unavailable in ${channel.tokenEnv || "an environment variable"}`);
-          const adapter = new TelegramChannelAdapter({
-            token,
-            accountId: channel.name,
-            onError(error) { channel.error = error instanceof Error ? error.message : String(error); }
-          });
+          const adapter = channel.type === "discord"
+            ? new DiscordChannelAdapter({
+              token,
+              accountId: channel.name,
+              requireMention: channel.requireMention,
+              onError(error) { channel.error = error instanceof Error ? error.message : String(error); }
+            })
+            : new TelegramChannelAdapter({
+              token,
+              accountId: channel.name,
+              onError(error) { channel.error = error instanceof Error ? error.message : String(error); }
+            });
           const handler = new GatewayChannelHandler({
             baseUrl,
             token: gatewayToken,
@@ -4110,7 +4120,7 @@ function renderConsoleHtml(version = "development") {
             </div>
 
             <div class="panel config-section">
-              <div class="panel-head"><div><h2>Messaging channels</h2><p class="config-help">Connect Ódinn to approved chat accounts. Bot tokens stay in environment variables and changes require a restart.</p></div><button class="secondary" id="config-add-channel" type="button">Add Telegram</button></div>
+              <div class="panel-head"><div><h2>Messaging channels</h2><p class="config-help">Connect Ódinn to approved chat accounts. Bot tokens stay in environment variables and changes require a restart.</p></div><button class="secondary" id="config-add-channel" type="button">Add channel</button></div>
               <div id="config-channels" class="config-list"></div>
             </div>
 
@@ -5502,15 +5512,16 @@ function renderConsoleHtml(version = "development") {
     function renderChannelForm(name, channel = {}) {
       return \`
         <article class="config-card" data-channel-card data-original-name="\${escapeHtml(name)}">
-          <div class="config-card-head"><div><h3>Telegram channel</h3><p>Only allowlisted Telegram user or chat identifiers can reach this bot.</p></div><button class="danger-button" data-remove-channel type="button">Remove channel</button></div>
+          <div class="config-card-head"><div><h3>Messaging channel</h3><p>Only allowlisted user or conversation identifiers can reach this bot.</p></div><button class="danger-button" data-remove-channel type="button">Remove channel</button></div>
           <div class="grid-2">
             <div class="field"><label>Channel name</label><input data-channel-field="name" value="\${escapeHtml(name)}" placeholder="personal" autocomplete="off"></div>
-            <div class="field"><label>Type</label><input value="telegram" disabled><input data-channel-field="type" value="telegram" type="hidden"></div>
+            <div class="field"><label>Type</label><select data-channel-field="type">\${renderOptions(["telegram", "discord"], channel.type || "telegram")}</select></div>
             <div class="field"><label>Bot token environment variable</label><input data-channel-field="tokenEnv" value="\${escapeHtml(channel.tokenEnv || "")}" placeholder="ODINN_TELEGRAM_BOT_TOKEN" autocomplete="off"></div>
             <div class="field"><label>Default model override</label><input data-channel-field="defaultModel" value="\${escapeHtml(channel.defaultModel || "")}" placeholder="provider:model" autocomplete="off"></div>
           </div>
-          <div class="field"><label>Allowlist</label><textarea data-channel-field="allowlist" rows="4" placeholder="telegram:123456789&#10;telegram:-1001234567890">\${escapeHtml(Array.isArray(channel.allowlist) ? channel.allowlist.join("\\n") : "")}</textarea><span class="config-help">One Telegram user or chat entry per line. Empty means nobody is allowed.</span></div>
+          <div class="field"><label>Allowlist</label><textarea data-channel-field="allowlist" rows="4" placeholder="discord:123456789&#10;telegram:123456789">\${escapeHtml(Array.isArray(channel.allowlist) ? channel.allowlist.join("\\n") : "")}</textarea><span class="config-help">One platform user or conversation entry per line. Empty means nobody is allowed.</span></div>
           <label class="switch-label"><input data-channel-field="enabled" type="checkbox"\${channel.enabled === true ? " checked" : ""}> Enable after gateway restart</label>
+          <label class="switch-label"><input data-channel-field="requireMention" type="checkbox"\${channel.requireMention !== false ? " checked" : ""}> Require an @mention in server channels (Discord)</label>
         </article>\`;
     }
 
@@ -5649,8 +5660,9 @@ function renderConsoleHtml(version = "development") {
         if (!name) throw new Error("Every messaging channel needs a name.");
         if (channels[name]) throw new Error("Messaging channel names must be unique: " + name);
         channels[name] = {
-          type: "telegram",
+          type: card.querySelector('[data-channel-field="type"]').value,
           enabled: card.querySelector('[data-channel-field="enabled"]').checked,
+          requireMention: card.querySelector('[data-channel-field="requireMention"]').checked,
           tokenEnv: card.querySelector('[data-channel-field="tokenEnv"]').value.trim(),
           allowlist: configLines(card.querySelector('[data-channel-field="allowlist"]').value),
           ...(card.querySelector('[data-channel-field="defaultModel"]').value.trim() ? { defaultModel: card.querySelector('[data-channel-field="defaultModel"]').value.trim() } : {})
