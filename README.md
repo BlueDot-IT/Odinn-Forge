@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/BlueDot-IT/Odinn-Forge/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/BlueDot-IT/Odinn-Forge"></a>
+  <a href="https://www.npmjs.com/package/@bluedot-it/odinn"><img alt="npm version" src="https://img.shields.io/npm/v/@bluedot-it/odinn"></a>
   <a href="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/security.yml"><img alt="Security" src="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/security.yml/badge.svg?branch=main"></a>
   <a href="https://www.bestpractices.dev/projects/13830"><img alt="OpenSSF Best Practices" src="https://www.bestpractices.dev/projects/13830/badge"></a>

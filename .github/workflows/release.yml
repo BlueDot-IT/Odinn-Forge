@@ -80,6 +80,16 @@ jobs:
       - run: pnpm release:checksums
       - run: node scripts/release/verify.ts
       - run: pnpm release:install-smoke
+      - name: Publish npm package
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          package="@bluedot-it/odinn@$version"
+          if npm view "$package" version >/dev/null 2>&1; then
+            echo "$package is already published"
+          else
+            npm publish "dist/package-stage/odinn-v$version" --access public --provenance
+          fi
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-path: dist/release/*

@@ -45,6 +45,7 @@ test("operator-created tags hand releases to the protected workflow", async () =
   assert.match(release, /\*-\*\) prerelease=\(--prerelease\)/);
   assert.match(preflight, /releaseTag !== expected/);
   assert.match(preflight, /tagCommit\.stdout\.trim\(\) !== headCommit\.stdout\.trim\(\)/);
+  assert.match(release, /npm publish "dist\/package-stage\/odinn-v\$version" --access public --provenance/);
 });
 
 test("dispatched release pull requests receive dependency and title checks", async () => {
@@ -166,6 +167,11 @@ test("release packaging removes stale assets before creating a version", async (
   assert.match(packaging, /distribution: "compiled"/);
   assert.match(packaging, /for \(const directory of \["cli", "gateway", "workers", "install"\]/);
   assert.match(packaging, /join\(packageRoot, "node_modules", "playwright-core"\)/);
+  assert.match(packaging, /name: "@bluedot-it\/odinn"/);
+  assert.match(packaging, /private: false/);
+  assert.match(packaging, /access: "public"/);
+  assert.match(packaging, /odinn: "bin\/odinn\.js"/);
+  assert.match(packaging, /#!\/usr\/bin\/env node/);
 
   const build = await read("scripts/build-production.ts");
   for (const entrypoint of [

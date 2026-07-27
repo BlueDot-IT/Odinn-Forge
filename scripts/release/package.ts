@@ -104,18 +104,29 @@ for (const path of [
 }
 
 const productionPackage = {
-  name: pkg.name,
+  name: "@bluedot-it/odinn",
   version: pkg.version,
   description: pkg.description,
-  private: true,
+  private: false,
   type: "module",
   bin: {
-    odinn: "./bin/odinn",
-    "odinn-gateway": "./bin/odinn-gateway"
+    odinn: "bin/odinn.js",
+    "odinn-gateway": "bin/odinn-gateway.js"
   },
   engines: { node: ">=24.0.0" },
   dependencies: { "playwright-core": "1.61.1" },
-  license: pkg.license
+  license: pkg.license,
+  repository: {
+    type: "git",
+    url: "git+https://github.com/BlueDot-IT/Odinn-Forge.git"
+  },
+  homepage: "https://github.com/BlueDot-IT/Odinn-Forge#readme",
+  bugs: {
+    url: "https://github.com/BlueDot-IT/Odinn-Forge/issues"
+  },
+  publishConfig: {
+    access: "public"
+  }
 };
 await writeFile(join(packageRoot, "package.json"), `${JSON.stringify(productionPackage, null, 2)}\n`);
 
@@ -142,10 +153,14 @@ const windowsLauncher = (entry: string) =>
 await mkdir(join(packageRoot, "bin"), { recursive: true });
 await writeFile(join(packageRoot, "bin", "odinn"), unixLauncher("dist/cli/index.js"), { mode: 0o755 });
 await writeFile(join(packageRoot, "bin", "odinn-gateway"), unixLauncher("dist/gateway/server.js"), { mode: 0o755 });
+await writeFile(join(packageRoot, "bin", "odinn.js"), "#!/usr/bin/env node\nawait import('../dist/cli/index.js');\n", { mode: 0o755 });
+await writeFile(join(packageRoot, "bin", "odinn-gateway.js"), "#!/usr/bin/env node\nawait import('../dist/gateway/server.js');\n", { mode: 0o755 });
 await writeFile(join(packageRoot, "bin", "odinn.cmd"), windowsLauncher("dist/cli/index.js"));
 await writeFile(join(packageRoot, "bin", "odinn-gateway.cmd"), windowsLauncher("dist/gateway/server.js"));
 await chmod(join(packageRoot, "bin", "odinn"), 0o755).catch(() => undefined);
 await chmod(join(packageRoot, "bin", "odinn-gateway"), 0o755).catch(() => undefined);
+await chmod(join(packageRoot, "bin", "odinn.js"), 0o755).catch(() => undefined);
+await chmod(join(packageRoot, "bin", "odinn-gateway.js"), 0o755).catch(() => undefined);
 
 await mkdir(join(packageRoot, "install"), { recursive: true });
 await writeFile(
