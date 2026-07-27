@@ -222,6 +222,8 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /data-chat-prompt/);
     assert.match(html, /composer-footer/);
     assert.match(html, /renderMarkdown/);
+    assert.match(html, /\uE000ODINNCODE/);
+    assert.doesNotMatch(html, /__ODINN_CODE_/);
     assert.match(html, /memory-tree/);
     assert.match(html, /memory-namespace/);
     assert.match(html, /Web tools/);

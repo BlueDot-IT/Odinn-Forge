@@ -11,8 +11,8 @@ type DiscordToolOptions = {
 export const DISCORD_AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "discord.listChannels", description: "List channels visible to a configured Discord bot in a guild.", parameters: { type: "object", properties: { guildId: { type: "string" }, accountId: { type: "string" } }, required: ["guildId"] } } },
   { type: "function", function: { name: "discord.readMessages", description: "Read recent messages from a Discord channel visible to a configured bot.", parameters: { type: "object", properties: { channelId: { type: "string" }, limit: { type: "integer" }, before: { type: "string" }, after: { type: "string" }, accountId: { type: "string" } }, required: ["channelId"] } } },
-  { type: "function", function: { name: "discord.sendMessage", description: "Send a Discord message after explicit user approval.", parameters: { type: "object", properties: { channelId: { type: "string" }, content: { type: "string" }, replyToId: { type: "string" }, accountId: { type: "string" } }, required: ["channelId", "content"] } } },
-  { type: "function", function: { name: "discord.addReaction", description: "Add a reaction to a Discord message after explicit user approval.", parameters: { type: "object", properties: { channelId: { type: "string" }, messageId: { type: "string" }, emoji: { type: "string" }, accountId: { type: "string" } }, required: ["channelId", "messageId", "emoji"] } } },
+  { type: "function", function: { name: "discord.sendMessage", description: "Send a Discord message.", parameters: { type: "object", properties: { channelId: { type: "string" }, content: { type: "string" }, replyToId: { type: "string" }, accountId: { type: "string" } }, required: ["channelId", "content"] } } },
+  { type: "function", function: { name: "discord.addReaction", description: "Add a reaction to a Discord message.", parameters: { type: "object", properties: { channelId: { type: "string" }, messageId: { type: "string" }, emoji: { type: "string" }, accountId: { type: "string" } }, required: ["channelId", "messageId", "emoji"] } } },
   { type: "function", function: { name: "discord.createThread", description: "Create a Discord thread after explicit user approval.", parameters: { type: "object", properties: { channelId: { type: "string" }, name: { type: "string" }, messageId: { type: "string" }, autoArchiveDuration: { type: "integer", enum: [60, 1440, 4320, 10080] }, accountId: { type: "string" } }, required: ["channelId", "name"] } } }
 ] as const;
 
@@ -30,7 +30,7 @@ export function createDiscordAgentTools({ config = {}, approvalStore, fetch = gl
       if (input.after) query.set("after", snowflake(input.after, "after"));
       return discordRequest(fetch, account.token, "GET", `/channels/${snowflake(input.channelId, "channelId")}/messages?${query}`);
     }
-    if (context.request?.actor !== "user-approved") {
+    if (tool === "discord.createThread" && context.request?.actor !== "user-approved") {
       const summary = discordMutationSummary(tool, input);
       const approvalId = approvalStore.create({
         type: "approval.required",

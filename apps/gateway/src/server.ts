@@ -4499,7 +4499,7 @@ function renderConsoleHtml(version = "development") {
       const code = [];
       const codeSpan = new RegExp(String.fromCharCode(96) + "([^" + String.fromCharCode(96) + "\\n]+)" + String.fromCharCode(96), "g");
       text = text.replace(codeSpan, (_, content) => {
-        const key = "__ODINN_CODE_" + code.length + "__";
+        const key = "\uE000ODINNCODE" + code.length + "\uE001";
         code.push("<code>" + content + "</code>");
         return key;
       });
@@ -4516,7 +4516,7 @@ function renderConsoleHtml(version = "development") {
       text = text.replace(/~~([^~\\n]+)~~/g, "<del>$1</del>");
       text = text.replace(/(^|[^*])\\*([^*\\n]+)\\*(?!\\*)/g, "$1<em>$2</em>");
       text = text.replace(/(^|[^_])_([^_\\n]+)_(?!_)/g, "$1<em>$2</em>");
-      return text.replace(/__ODINN_CODE_(\\d+)__/g, (_, index) => code[Number(index)] || "");
+      return text.replace(/\uE000ODINNCODE(\\d+)\uE001/g, (_, index) => code[Number(index)] || "");
     }
 
     function renderMarkdown(source) {

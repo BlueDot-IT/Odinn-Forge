@@ -46,7 +46,7 @@ test("Discord agent read tools use the configured bot account", async () => {
   }
 });
 
-test("Discord agent mutations require approval before external state changes", async () => {
+test("Discord messages and reactions execute without per-action approval", async () => {
   const original = process.env.ODINN_TEST_DISCORD_TOKEN;
   process.env.ODINN_TEST_DISCORD_TOKEN = "test-token";
   let requests = 0;
@@ -63,20 +63,38 @@ test("Discord agent mutations require approval before external state changes", a
     }
   });
   try {
-    const pending = await registry.get("discord.sendMessage").execute({ channelId: "123", content: "hello" });
+    const sent = await registry.get("discord.sendMessage").execute({ channelId: "123", content: "hello" });
+    assert.equal(sent.id, "456");
+    assert.equal(requests, 1);
+    await registry.get("discord.addReaction").execute({ channelId: "123", messageId: "456", emoji: "👍" });
+    assert.equal(requests, 2);
+    assert.equal(approvalStore.list().length, 0);
+    assert.equal(toolSafetyDescriptor("discord.sendMessage", registry.get("discord.sendMessage")).requiresApproval, false);
+    assert.equal(toolSafetyDescriptor("discord.addReaction", registry.get("discord.addReaction")).requiresApproval, false);
+  } finally {
+    if (original === undefined) delete process.env.ODINN_TEST_DISCORD_TOKEN;
+    else process.env.ODINN_TEST_DISCORD_TOKEN = original;
+  }
+});
+
+test("Discord thread creation retains explicit approval", async () => {
+  const original = process.env.ODINN_TEST_DISCORD_TOKEN;
+  process.env.ODINN_TEST_DISCORD_TOKEN = "test-token";
+  let requests = 0;
+  const approvalStore = createApprovalStore();
+  const registry = createBuiltInRegistry({
+    config: configuredDiscord(),
+    approvalStore,
+    discordFetch: async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ id: "thread-1" }), { status: 200 });
+    }
+  });
+  try {
+    const pending = await registry.get("discord.createThread").execute({ channelId: "123", name: "Review" });
     assert.equal(pending.type, "approval.required");
     assert.equal(requests, 0);
     assert.equal(approvalStore.list().length, 1);
-    const bypass = await registry.get("discord.sendMessage").execute({ channelId: "123", content: "hello", confirmed: true });
-    assert.equal(bypass.type, "approval.required");
-    assert.equal(requests, 0);
-    const sent = await registry.get("discord.sendMessage").execute(
-      { channelId: "123", content: "hello", confirmed: true },
-      { request: { actor: "user-approved" } }
-    );
-    assert.equal(sent.id, "456");
-    assert.equal(requests, 1);
-    assert.equal(toolSafetyDescriptor("discord.sendMessage", registry.get("discord.sendMessage")).requiresApproval, true);
   } finally {
     if (original === undefined) delete process.env.ODINN_TEST_DISCORD_TOKEN;
     else process.env.ODINN_TEST_DISCORD_TOKEN = original;
