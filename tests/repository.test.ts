@@ -35,17 +35,19 @@ test("required CI/CD workflows exist", async () => {
   }
 });
 
-test("operator-created tags hand releases to the protected workflow", async () => {
+test("published GitHub releases hand npm publication to the protected workflow", async () => {
   const release = await read(".github/workflows/release.yml");
   const preflight = await read("scripts/release/preflight.ts");
 
-  assert.match(release, /^\s{2}push:\s*\n\s{4}tags:\s*\n\s{6}- "v\*"/m);
+  assert.match(release, /^\s{2}release:\s*\n\s{4}types:\s*\n\s{6}- published/m);
   assert.match(release, /^\s{2}workflow_dispatch:/m);
+  assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \|\| github\.event\.release\.tag_name \}\}/);
+  assert.match(release, /npm publish "dist\/package-stage\/odinn-v\$version" --access public --provenance/);
+  assert.match(release, /gh release view "\$TAG" --json isDraft/);
   assert.doesNotMatch(release, /^\s{2}workflow_call:/m);
-  assert.match(release, /\*-\*\) prerelease=\(--prerelease\)/);
+  assert.match(release, /test "\$is_draft" = "false"/);
   assert.match(preflight, /releaseTag !== expected/);
   assert.match(preflight, /tagCommit\.stdout\.trim\(\) !== headCommit\.stdout\.trim\(\)/);
-  assert.match(release, /npm publish "dist\/package-stage\/odinn-v\$version" --access public --provenance/);
 });
 
 test("dispatched release pull requests receive dependency and title checks", async () => {
