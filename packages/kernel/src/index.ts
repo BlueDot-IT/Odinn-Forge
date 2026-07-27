@@ -46,7 +46,7 @@ export { createApprovalStore } from "./approvals.ts";
 export type { ApprovalAction, ApprovalStore } from "./approvals.ts";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
-export { AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";
+export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";
 export type { AgentManifest } from "./agents.ts";
 
 

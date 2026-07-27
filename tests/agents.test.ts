@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
+  AGENT_BOOTSTRAP_FILE,
   AGENT_IDENTITY_FILES,
   AGENT_SDK_VERSION,
   ensureMainAgent,
@@ -33,17 +34,35 @@ test("first setup creates the main agent from the Agent SDK contract", async () 
     await access(join(state, "agents", "main", file));
     assert.equal((await stat(join(state, "agents", "main", file))).mode & 0o777, 0o600);
   }
+  await access(join(state, "agents", "main", AGENT_BOOTSTRAP_FILE));
+  assert.equal((await stat(join(state, "agents", "main", AGENT_BOOTSTRAP_FILE))).mode & 0o777, 0o600);
 });
 
-test("agent identity is local mutable state and is loaded independently of a provider", async () => {
+test("pending bootstrap is loaded before provider-independent identity context", async () => {
   const state = join(await mkdtemp(join(tmpdir(), "odinn-agent-identity-")), "state");
   await ensureMainAgent(state);
   await writeFile(join(state, "agents", "main", "IDENTITY.md"), "# Identity\n\nName: Morrow\n", { mode: 0o600 });
 
   const loaded = await loadAgent(state);
   assert.equal(loaded.manifest.model.default, "");
+  assert.equal(loaded.bootstrapPending, true);
+  assert.ok(loaded.systemPrompt.indexOf("## BOOTSTRAP.md") < loaded.systemPrompt.indexOf("## IDENTITY.md"));
+  assert.match(loaded.systemPrompt, /begin a natural identity conversation/i);
   assert.match(loaded.systemPrompt, /Name: Morrow/);
   assert.match(loaded.systemPrompt, /## SOUL\.md/);
+});
+
+test("completed bootstrap is not recreated on restart", async () => {
+  const state = join(await mkdtemp(join(tmpdir(), "odinn-agent-bootstrap-complete-")), "state");
+  await ensureMainAgent(state);
+  const bootstrapPath = join(state, "agents", "main", AGENT_BOOTSTRAP_FILE);
+  await rm(bootstrapPath);
+
+  await ensureMainAgent(state);
+  await assert.rejects(access(bootstrapPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+  const loaded = await loadAgent(state);
+  assert.equal(loaded.bootstrapPending, false);
+  assert.doesNotMatch(loaded.systemPrompt, /## BOOTSTRAP\.md — required first-run identity workflow/);
 });
 
 test("Agent SDK validation rejects identity paths that escape the agent directory", () => {

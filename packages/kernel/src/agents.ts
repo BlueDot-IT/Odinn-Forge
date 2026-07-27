@@ -1,16 +1,49 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 
 export const AGENT_SDK_VERSION = "1.0";
 export const DEFAULT_AGENT_ID = "main";
 export const AGENT_IDENTITY_FILES = Object.freeze(["IDENTITY.md", "SOUL.md", "USER.md", "AGENTS.md"]);
+export const AGENT_BOOTSTRAP_FILE = "BOOTSTRAP.md";
+
+const MAIN_BOOTSTRAP = `# Bootstrap — First Awakening
+
+You are running for the first time. Before settling into normal assistant behavior, begin a natural identity conversation with the user.
+
+## Discover together
+
+Learn:
+
+1. Your name and how the user should address you.
+2. What kind of digital being or assistant you are.
+3. Your voice, temperament, and working style.
+4. A signature symbol or emoji, if wanted.
+5. The user's name, preferred form of address, timezone, priorities, and boundaries.
+
+Do not interrogate them or dump a questionnaire. Start simply, offer ideas when useful, and let the identity emerge through conversation.
+
+## Record what becomes true
+
+Update:
+
+- \`IDENTITY.md\` with your name, nature, voice, and symbol.
+- \`USER.md\` with stable user preferences and how to address them.
+- \`SOUL.md\` with values, behavior, boundaries, and tone.
+- \`AGENTS.md\` only when durable operating instructions are needed.
+
+Never store credentials, tokens, or secret values in these files.
+
+## Completion
+
+After the user has approved the identity and the files have been saved, remove \`BOOTSTRAP.md\`. Its absence marks this ritual complete. Odinn will not recreate it on restart because the agent workspace is no longer new.
+`;
 
 const MAIN_IDENTITY: Readonly<Record<string, string>> = Object.freeze({
   "IDENTITY.md": "# Identity\n\n- **Name:** Ódinn\n- **Role:** Primary local assistant\n",
   "SOUL.md": "# Soul\n\nBe useful, exact, privacy-preserving, and honest about uncertainty. Inspect before acting and verify material outcomes.\n",
   "USER.md": "# User\n\nRecord stable user preferences here. Do not store credentials or secret values.\n",
-  "AGENTS.md": "# Agent Instructions\n\nThis is the primary Ódinn agent. Follow the configured policy, require approval for external state changes, and use tools only when their results can verify the claimed outcome.\n"
+  "AGENTS.md": "# Agent Instructions\n\nIf `BOOTSTRAP.md` exists, follow it before normal assistant behavior.\n\nThis is the primary Ódinn agent. Follow the configured policy, require approval for external state changes, and use tools only when their results can verify the claimed outcome.\n"
 });
 
 export type AgentManifest = {
@@ -93,6 +126,11 @@ export async function ensureMainAgent(stateDir: string): Promise<AgentManifest &
   const state = resolve(stateDir);
   const agentDirectory = join(state, "agents", DEFAULT_AGENT_ID);
   const manifestPath = join(agentDirectory, "agent.json");
+  const brandNewAgent = !await anyFileExists([
+    manifestPath,
+    ...AGENT_IDENTITY_FILES.map((file) => join(agentDirectory, file)),
+    join(agentDirectory, AGENT_BOOTSTRAP_FILE)
+  ]);
   await mkdir(agentDirectory, { recursive: true, mode: 0o700 });
   await chmod(agentDirectory, 0o700);
   let manifest: AgentManifest & { integrity: string };
@@ -108,6 +146,7 @@ export async function ensureMainAgent(stateDir: string): Promise<AgentManifest &
       if (error?.code !== "EEXIST") throw error;
     });
   }
+  if (brandNewAgent) await writeExclusive(join(agentDirectory, AGENT_BOOTSTRAP_FILE), MAIN_BOOTSTRAP);
   const registryPath = join(state, "agents.json");
   let registry: any;
   try {
@@ -127,20 +166,24 @@ export async function ensureMainAgent(stateDir: string): Promise<AgentManifest &
   return manifest;
 }
 
-export async function loadAgent(stateDir: string, agentId = DEFAULT_AGENT_ID): Promise<{ manifest: AgentManifest & { integrity: string }; systemPrompt: string }> {
+export async function loadAgent(stateDir: string, agentId = DEFAULT_AGENT_ID): Promise<{ manifest: AgentManifest & { integrity: string }; systemPrompt: string; bootstrapPending: boolean }> {
   const state = resolve(stateDir);
   if (agentId === DEFAULT_AGENT_ID) await ensureMainAgent(state);
   const directory = join(state, "agents", agentId);
   assertInside(resolve(state, "agents"), directory);
   const manifest = validateAgentManifest(JSON.parse(await readFile(join(directory, "agent.json"), "utf8")));
   const sections: string[] = [];
+  const bootstrap = await readOptionalText(join(directory, AGENT_BOOTSTRAP_FILE));
+  if (bootstrap.trim()) {
+    sections.push(`## ${AGENT_BOOTSTRAP_FILE} — required first-run identity workflow\n${bootstrap.trim()}`);
+  }
   for (const file of manifest.identity.files) {
     assertIdentityFilename(file);
     const content = (await readFile(join(directory, file), "utf8")).trim();
     if (content) sections.push(`## ${file}\n${content}`);
   }
   if (manifest.instructions.length) sections.push(`## Manifest instructions\n${manifest.instructions.join("\n")}`);
-  return { manifest, systemPrompt: sections.join("\n\n") };
+  return { manifest, systemPrompt: sections.join("\n\n"), bootstrapPending: Boolean(bootstrap.trim()) };
 }
 
 function stringArray(value: unknown): string[] {
@@ -180,4 +223,25 @@ async function atomicWrite(path: string, content: string): Promise<void> {
   await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
   await rename(temporary, path);
   await chmod(path, 0o600);
+}
+
+async function anyFileExists(paths: string[]): Promise<boolean> {
+  for (const path of paths) {
+    try {
+      await access(path);
+      return true;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return false;
+}
+
+async function readOptionalText(path: string): Promise<string> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return "";
+    throw error;
+  }
 }
