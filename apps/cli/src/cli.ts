@@ -3050,7 +3050,7 @@ async function readConfig(state: any) {
     return config;
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
-    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
+    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
     configBaselines.set(config, null);
     return config;
   }
@@ -3067,6 +3067,7 @@ async function ensureConfig(state: any) {
       auditLog: "audit.jsonl",
       providers: {},
       channels: {},
+      plugins: { entries: {} },
       defaultModel: "",
       experimental: normalizeExperimentalFlags(),
       selfImprovement: normalizeSelfImprovementConfig()
@@ -3085,6 +3086,7 @@ async function saveConfig(state: any, config: any) {
     auditLog: config.auditLog ?? "audit.jsonl",
     providers: config.providers ?? {},
     channels: config.channels ?? {},
+    plugins: config.plugins ?? { entries: {} },
     experimental: normalizeExperimentalFlags(config.experimental),
     selfImprovement: normalizeSelfImprovementConfig(config.selfImprovement),
     runtime: config.runtime ?? {},

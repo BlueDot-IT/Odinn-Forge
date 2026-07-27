@@ -64,6 +64,8 @@ export function createDefaultPolicy(overrides: PolicyOverrides = {}): RuntimePol
     "web.read",
     "browser.read",
     "browser.act",
+    "discord.read",
+    "discord.write",
     "session.read",
     "session.write",
     "goal.read",

@@ -34,6 +34,8 @@ test("first setup creates the main agent from the Agent SDK contract", async () 
     await access(join(state, "agents", "main", file));
     assert.equal((await stat(join(state, "agents", "main", file))).mode & 0o777, 0o600);
   }
+  assert.equal(await readFile(join(state, "agents", "main", "IDENTITY.md"), "utf8"), "");
+  assert.equal(await readFile(join(state, "agents", "main", "SOUL.md"), "utf8"), "");
   await access(join(state, "agents", "main", AGENT_BOOTSTRAP_FILE));
   assert.equal((await stat(join(state, "agents", "main", AGENT_BOOTSTRAP_FILE))).mode & 0o777, 0o600);
 });
@@ -49,7 +51,7 @@ test("pending bootstrap is loaded before provider-independent identity context",
   assert.ok(loaded.systemPrompt.indexOf("## BOOTSTRAP.md") < loaded.systemPrompt.indexOf("## IDENTITY.md"));
   assert.match(loaded.systemPrompt, /begin a natural identity conversation/i);
   assert.match(loaded.systemPrompt, /Name: Morrow/);
-  assert.match(loaded.systemPrompt, /## SOUL\.md/);
+  assert.doesNotMatch(loaded.systemPrompt, /## SOUL\.md/);
 });
 
 test("completed bootstrap is not recreated on restart", async () => {

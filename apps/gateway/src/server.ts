@@ -1471,7 +1471,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
         if (readError?.code !== "ENOENT") throw readError;
       }
       await mkdir(state, { recursive: true });
-      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await chmod(path, 0o600);
       return config;
@@ -1530,6 +1530,37 @@ function validateGatewayConfig(config: any) {
         throw new GatewayError(400, `config.channels.${name}.tokenEnv must be an uppercase environment variable name`);
       }
       if (channel.allowlist !== undefined) assertConfigStringArray(channel.allowlist, `config.channels.${name}.allowlist`);
+    }
+  }
+  if (config.plugins !== undefined) {
+    assertConfigRecord(config.plugins, "config.plugins");
+    assertConfigRecord(config.plugins.entries ?? {}, "config.plugins.entries");
+    for (const [id, entry] of Object.entries(config.plugins.entries ?? {}) as Array<[string, any]>) {
+      if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(id)) throw new GatewayError(400, `config.plugins.entries contains an invalid plugin id: ${id}`);
+      assertConfigRecord(entry, `config.plugins.entries.${id}`);
+      assertOptionalConfigBoolean(entry, "enabled", `config.plugins.entries.${id}`);
+      if (entry.config !== undefined) assertConfigRecord(entry.config, `config.plugins.entries.${id}.config`);
+      if (id !== "discord" || entry.config === undefined) continue;
+      const discord = entry.config;
+      if (discord.accounts !== undefined) {
+        assertConfigRecord(discord.accounts, "config.plugins.entries.discord.config.accounts");
+        for (const [accountId, account] of Object.entries(discord.accounts) as Array<[string, any]>) {
+          if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(accountId)) throw new GatewayError(400, `config.plugins.entries.discord.config.accounts contains an invalid account id: ${accountId}`);
+          assertConfigRecord(account, `config.plugins.entries.discord.config.accounts.${accountId}`);
+          assertOptionalConfigBoolean(account, "enabled", `config.plugins.entries.discord.config.accounts.${accountId}`);
+          if (account.tokenEnv !== undefined && (typeof account.tokenEnv !== "string" || !/^[A-Z_][A-Z0-9_]{1,127}$/u.test(account.tokenEnv))) {
+            throw new GatewayError(400, `config.plugins.entries.discord.config.accounts.${accountId}.tokenEnv must be an uppercase environment variable name`);
+          }
+        }
+      }
+      if (discord.tools !== undefined) {
+        assertConfigRecord(discord.tools, "config.plugins.entries.discord.config.tools");
+        for (const [tool, enabled] of Object.entries(discord.tools)) {
+          if (!DISCORD_CONFIGURABLE_TOOLS.has(tool) || typeof enabled !== "boolean") {
+            throw new GatewayError(400, `config.plugins.entries.discord.config.tools contains an invalid tool setting: ${tool}`);
+          }
+        }
+      }
     }
   }
 
@@ -1630,6 +1661,14 @@ function validateGatewayConfig(config: any) {
     for (const key of ["autoRecall", "autoLearn", "autoCompact"]) assertOptionalConfigBoolean(config.memory, key, "config.memory");
   }
 }
+
+const DISCORD_CONFIGURABLE_TOOLS = new Set([
+  "discord.listChannels",
+  "discord.readMessages",
+  "discord.sendMessage",
+  "discord.addReaction",
+  "discord.createThread"
+]);
 
 function configFingerprint(contents: string | Buffer) {
   return createHash("sha256").update(contents).digest("hex");

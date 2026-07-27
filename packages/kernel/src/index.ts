@@ -20,6 +20,7 @@ import { browserAction, browserOpen, browserRecoveryResolve, browserRecoveryStat
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
+import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
@@ -50,11 +51,11 @@ export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_
 export type { AgentManifest } from "./agents.ts";
 
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll }: any = {}) {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch }: any = {}) {
   const root = resolve(workspaceRoot);
   const recordStore = new FileRecordStore(join(resolve(stateDir), "records.jsonl"));
   const modelConfig = normalizeModelConfig(config);
-  return new Map([
+  const registry = new Map([
     ["job.healthcheck", {
       capability: "job.healthcheck",
       description: "Return deterministic local runtime health.",
@@ -408,12 +409,14 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       execute: async (input: any) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config })
     }]
   ]);
+  for (const [name, tool] of createDiscordAgentTools({ config, approvalStore, fetch: discordFetch })) registry.set(name, tool);
+  return registry;
 }
 
 
 const AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "memory.recall", description: "Recall durable user and project context relevant to the current task.", parameters: { type: "object", properties: { query: { type: "string" }, kind: { type: "string" }, limit: { type: "integer" } }, required: ["query"] } } },
-  { type: "function", function: { name: "memory.remember", description: "Store an explicit user-approved fact. Only use this when the user asks to remember something or clearly states a durable preference or fact.", parameters: { type: "object", properties: { text: { type: "string" }, kind: { type: "string" }, subject: { type: "string" }, tags: { type: "array", items: { type: "string" } }, expiresAt: { type: "string" } }, required: ["text"] } } },
+  { type: "function", function: { name: "memory.remember", description: "Store an explicit user-approved fact. Only use this when the user asks to remember something or clearly states a durable preference or fact.", parameters: { type: "object", properties: { text: { type: "string" }, kind: { type: "string", enum: ["project", "person", "artifact", "correction", "procedure", "decision", "preference", "system"] }, subject: { type: "string" }, tags: { type: "array", items: { type: "string" } }, expiresAt: { type: "string" } }, required: ["text"] } } },
   { type: "function", function: { name: "memory.browse", description: "Browse durable context namespaces before opening a specific memory.", parameters: { type: "object", properties: { namespace: { type: "string" } } } } },
   { type: "function", function: { name: "web.search", description: "Search the public web.", parameters: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] } } },
   { type: "function", function: { name: "web.fetch", description: "Read a public web page.", parameters: { type: "object", properties: { url: { type: "string" }, maxChars: { type: "integer" } }, required: ["url"] } } },
@@ -423,7 +426,8 @@ const AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "browser.click", description: "Click a control; Ódinn Forge will ask for approval before changing external state.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } } } },
   { type: "function", function: { name: "browser.type", description: "Fill a field; Ódinn Forge will ask for approval before submitting anything.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] } } },
   { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn Forge will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
-  ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } }
+  ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } },
+  ...DISCORD_AGENT_TOOL_SCHEMAS
 ];
 
 async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt }: any = {}) {

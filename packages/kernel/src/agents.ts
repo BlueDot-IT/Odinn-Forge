@@ -40,8 +40,8 @@ After the user has approved the identity and the files have been saved, remove \
 `;
 
 const MAIN_IDENTITY: Readonly<Record<string, string>> = Object.freeze({
-  "IDENTITY.md": "# Identity\n\n- **Name:** Ódinn\n- **Role:** Primary local assistant\n",
-  "SOUL.md": "# Soul\n\nBe useful, exact, privacy-preserving, and honest about uncertainty. Inspect before acting and verify material outcomes.\n",
+  "IDENTITY.md": "",
+  "SOUL.md": "",
   "USER.md": "# User\n\nRecord stable user preferences here. Do not store credentials or secret values.\n",
   "AGENTS.md": "# Agent Instructions\n\nIf `BOOTSTRAP.md` exists, follow it before normal assistant behavior.\n\nThis is the primary Ódinn agent. Follow the configured policy, require approval for external state changes, and use tools only when their results can verify the claimed outcome.\n"
 });

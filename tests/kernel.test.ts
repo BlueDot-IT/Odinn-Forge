@@ -110,6 +110,7 @@ test("kernel routes model.chat through an OpenAI-compatible provider", async () 
     stateDir: join(root, ".odinn"),
     config: {
       defaultModel: "test:test-model",
+      plugins: { entries: { discord: { enabled: true, config: { accounts: {} } } } },
       providers: {
         test: {
           type: "openai-compatible",
@@ -727,6 +728,7 @@ test("agent auto-learns explicit facts and recalls them into later model context
     stateDir: join(root, ".odinn"),
     config: {
       defaultModel: "test:test-model",
+      plugins: { entries: { discord: { enabled: true, config: { accounts: {} } } } },
       providers: {
         test: {
           type: "openai-compatible",
@@ -758,6 +760,13 @@ test("agent auto-learns explicit facts and recalls them into later model context
     });
     assert.equal(learned.output.memory.suggested, 1);
     assert.equal(learned.output.memory.learned, 0);
+    const rememberTool = requests[0].tools.find((tool: any) => tool.function.name.endsWith("remember"));
+    assert.deepEqual(rememberTool.function.parameters.properties.kind.enum, [
+      "project", "person", "artifact", "correction", "procedure", "decision", "preference", "system"
+    ]);
+    const agentToolNames = requests[0].tools.map((tool: any) => tool.function.name);
+    assert.ok(agentToolNames.some((name: string) => name.includes("discord") && name.includes("readMessages")), agentToolNames.join(", "));
+    assert.ok(agentToolNames.some((name: string) => name.includes("discord") && name.includes("sendMessage")), agentToolNames.join(", "));
     const candidates = await runTask({
       task: { id: "run_agent_memory_candidates", tool: "memory.candidates", input: { status: "pending" }, actor: "test" },
       auditStore,
