@@ -19,6 +19,7 @@ import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web
 import { browserAction, browserOpen, browserRecoveryResolve, browserRecoveryStatus, browserSnapshot, browserTabs, closeBrowserManagers } from "./browser.ts";
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
+import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
@@ -45,6 +46,8 @@ export { createApprovalStore } from "./approvals.ts";
 export type { ApprovalAction, ApprovalStore } from "./approvals.ts";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
+export { AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";
+export type { AgentManifest } from "./agents.ts";
 
 
 export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll }: any = {}) {
@@ -145,6 +148,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       description: "Run a bounded model/tool loop with web and browser capabilities.",
       execute: async (input: any, context: any) => runAgent(modelConfig, input, {
         stateDir,
+        defaultAgentId: config.defaultAgentId,
         memoryStore: recordStore,
         registry: context.registry,
         runTool: context.runTool,
@@ -422,8 +426,9 @@ const AGENT_TOOL_SCHEMAS = [
   ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } }
 ];
 
-async function runAgent(modelConfig: any, input: any = {}, { stateDir, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt }: any = {}) {
+async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt }: any = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
+  const agent = await loadAgent(stateDir, cleanString(input.agentId, defaultAgentId || DEFAULT_AGENT_ID));
   const memoryOptions = normalizeMemoryOptions(input.memory);
   const policyAllows = (toolName: string, toolInput: any = {}) => evaluateTaskPolicy({
     policy,
@@ -448,7 +453,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, memorySto
   const recalled = memoryStore && canRecallMemory && memoryOptions.autoRecall && latestUserMessage?.content
     ? await runMemoryTool("memory.recall", { query: latestUserMessage.content, limit: memoryOptions.maxRecall, ...memoryScope }, "automatic memory recall")
     : { memories: [] };
-  const systemMessage = "You are Ódinn Forge. Use web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.";
+  const systemMessage = `${agent.systemPrompt}\n\n## Runtime safety contract\nUse web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.`.trim();
   const existingSystem = messages.find((message: any) => message.role === "system");
   if (existingSystem) existingSystem.content = `${systemMessage}\n${existingSystem.content || ""}`.trim();
   else messages.unshift({ role: "system", content: systemMessage });
@@ -460,7 +465,8 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, memorySto
   let aggregateUsage;
   for (let turn = 0; turn < maxTurns; turn += 1) {
     throwIfAborted(signal);
-    const result: any = await chatWithModel(modelConfig, { model: input.model, messages, tools: availableTools, stream: true }, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
+    const selectedModel = input.model || agent.manifest.model.default || undefined;
+    const result: any = await chatWithModel(modelConfig, { model: selectedModel, messages, tools: availableTools, stream: true }, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
     aggregateUsage = mergeUsage(aggregateUsage, result.usage);
     if (!result.toolCalls?.length) return { ...result, ...(aggregateUsage ? { usage: aggregateUsage } : {}), memory: { recalled: recalled.memories.length, suggested: learned.suggested.length, learned: 0, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 } };
     messages.push({ role: "assistant", content: result.content || "", tool_calls: result.toolCalls });
