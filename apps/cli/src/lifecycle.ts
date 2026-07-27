@@ -16,7 +16,7 @@ import {
 } from "@odinn/kernel";
 
 const DEFAULT_PREFIX = join(homedir(), ".local", "share", "odinn");
-const DEFAULT_RELEASE_API = "https://api.github.com/repos/jason-allen-oneal/Odinn/releases/latest";
+const DEFAULT_RELEASE_API = "https://api.github.com/repos/BlueDot-IT/Odinn-Forge/releases/latest";
 const MAX_METADATA_BYTES = 2 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024;
 

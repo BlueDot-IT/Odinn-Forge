@@ -220,3 +220,21 @@ test("obsolete technical identifiers are absent from canonical metadata", async 
     assert.doesNotMatch(content, /\.othin(?:[/\\]|$)/i);
   }
 });
+
+test("active repository links target the BlueDot organization", async () => {
+  const canonicalRepository = "BlueDot-IT/Odinn-Forge";
+  const retiredRepository = "jason-allen-oneal/Odinn";
+  for (const file of [
+    "README.md",
+    "SECURITY.md",
+    "docs/user-guide.md",
+    "docs/repository-policy.md",
+    ".github/ISSUE_TEMPLATE/config.yml",
+    "apps/cli/src/lifecycle.ts",
+    "scripts/repository/configure-github.ts",
+  ]) {
+    const content = await read(file);
+    assert.match(content, new RegExp(canonicalRepository.replace("/", "\\/")));
+    assert.doesNotMatch(content, new RegExp(retiredRepository.replace("/", "\\/")));
+  }
+});

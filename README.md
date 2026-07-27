@@ -3,12 +3,11 @@
 ![Ódinn Forge — your AI assistant, on your computer](docs/odinn-header.png)
 
 <p align="center">
-  <a href="https://github.com/jason-allen-oneal/Odinn/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jason-allen-oneal/Odinn"></a>
-  <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml"><img alt="Security" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml/badge.svg?branch=main"></a>
-  <a href="https://www.bestpractices.dev/projects/13830"><img alt="OpenSSF Best Practices" src="https://www.bestpractices.dev/projects/13830/badge"></a>
-  <a href="https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml"><img alt="Package Integrity" src="https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml/badge.svg?branch=main"></a>
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/jason-allen-oneal/Odinn"></a>
+  <a href="https://github.com/BlueDot-IT/Odinn-Forge/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/BlueDot-IT/Odinn-Forge"></a>
+  <a href="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/security.yml"><img alt="Security" src="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/security.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/package-integrity.yml"><img alt="Package Integrity" src="https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/package-integrity.yml/badge.svg?branch=main"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/BlueDot-IT/Odinn-Forge"></a>
 </p>
 
 > **Your AI assistant, on your computer, under your control.**
@@ -103,7 +102,7 @@ assistant followed the expected path.
 ### Install a release
 
 Download the latest package from
-[GitHub Releases](https://github.com/jason-allen-oneal/Odinn/releases), then
+[GitHub Releases](https://github.com/BlueDot-IT/Odinn-Forge/releases), then
 follow the platform instructions in the [user guide](docs/user-guide.md).
 Release packages contain the built application and its runtime dependencies;
 normal installation does not require pnpm or a source checkout.
@@ -270,7 +269,7 @@ odinn doctor          # Create a safe diagnostic summary
 
 ## Documentation
 
-- [Latest release](https://github.com/jason-allen-oneal/Odinn/releases/latest) —
+- [Latest release](https://github.com/BlueDot-IT/Odinn-Forge/releases/latest) —
   download the current supported release
 - [v1 compatibility policy](docs/v1-compatibility.md) — the stable product
   promise and its boundaries
@@ -283,7 +282,7 @@ odinn doctor          # Create a safe diagnostic summary
   experimental, provider-dependent, or unsupported
 - [Interface reference](docs/interface-reference.md) — CLI and authenticated
   loopback gateway inputs and outputs
-- [Report a bug or request a feature](https://github.com/jason-allen-oneal/Odinn/issues/new/choose)
+- [Report a bug or request a feature](https://github.com/BlueDot-IT/Odinn-Forge/issues/new/choose)
 - [Contributing guide](CONTRIBUTING.md) — development setup, pull requests,
   validation, and releases
 

@@ -50,8 +50,8 @@ Replace `<tag>` with the exact release tag shown on the Releases page:
 
 ```bash
 tag=<tag>
-curl -fLO "https://github.com/jason-allen-oneal/Odinn/releases/download/$tag/odinn-$tag.tar.gz"
-curl -fLO "https://github.com/jason-allen-oneal/Odinn/releases/download/$tag/SHA256SUMS.txt"
+curl -fLO "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$tag/odinn-$tag.tar.gz"
+curl -fLO "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$tag/SHA256SUMS.txt"
 grep "  odinn-$tag.tar.gz$" SHA256SUMS.txt | sha256sum -c -
 tar -xzf "odinn-$tag.tar.gz"
 cd "odinn-$tag"
@@ -84,8 +84,8 @@ Replace `<tag>` with the published tag:
 ```powershell
 $Tag = "<tag>"
 $Archive = "odinn-$Tag.zip"
-Invoke-WebRequest "https://github.com/jason-allen-oneal/Odinn/releases/download/$Tag/$Archive" -OutFile $Archive
-Invoke-WebRequest "https://github.com/jason-allen-oneal/Odinn/releases/download/$Tag/SHA256SUMS.txt" -OutFile SHA256SUMS.txt
+Invoke-WebRequest "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$Tag/$Archive" -OutFile $Archive
+Invoke-WebRequest "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$Tag/SHA256SUMS.txt" -OutFile SHA256SUMS.txt
 $Expected = ((Select-String -Path SHA256SUMS.txt -Pattern "  $([regex]::Escape($Archive))$").Line -split "  ")[0]
 $Actual = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($Actual -ne $Expected) { throw "checksum mismatch for $Archive" }

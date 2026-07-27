@@ -24,6 +24,6 @@ commit; this snapshot does not close the stable-release security gate.
 | Maintained | Age-bound; not evidence of maintainer inactivity. The repository was created on July 12, 2026, so the check cannot clear its 90-day age guard before October 10, 2026. | Re-run on or after October 10, 2026, with continued maintenance activity. |
 | CII Best Practices | Deferred during prerelease; unresolved. No OpenSSF Best Practices badge is claimed, and this disposition does not treat the gap as fixed. | Reconsider badge enrollment after prerelease stabilization. |
 
-The live [Scorecard result](https://api.scorecard.dev/projects/github.com/jason-allen-oneal/Odinn)
-and GitHub's [security overview](https://github.com/jason-allen-oneal/Odinn/security)
+The live [Scorecard result](https://api.scorecard.dev/projects/github.com/BlueDot-IT/Odinn-Forge)
+and GitHub's [security overview](https://github.com/BlueDot-IT/Odinn-Forge/security)
 remain the authoritative current status.

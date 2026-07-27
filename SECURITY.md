@@ -9,7 +9,7 @@ published `v1.x` release.
 
 Do not open a public issue for a suspected vulnerability.
 
-Report it through [GitHub private vulnerability reporting](https://github.com/jason-allen-oneal/Odinn/security/advisories/new). Include:
+Report it through [GitHub private vulnerability reporting](https://github.com/BlueDot-IT/Odinn-Forge/security/advisories/new). Include:
 
 - A concise description of the issue
 - Affected commit, tag, or package version

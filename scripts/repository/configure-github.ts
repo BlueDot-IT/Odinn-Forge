@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 
-const repository = process.argv[2] ?? "jason-allen-oneal/Odinn";
+const repository = process.argv[2] ?? "BlueDot-IT/Odinn-Forge";
 const ownerUserId = Number(process.argv[3] ?? "8335428");
 
 function gh(endpoint: any, method: any = "GET", body: any = undefined) {
