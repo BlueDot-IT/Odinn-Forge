@@ -102,6 +102,38 @@ test("gateway diagnostics expose safe state and errors carry correlation metadat
   }
 });
 
+test("gateway supervises configured channels without exposing credentials", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-channels-"));
+  await writeFile(join(stateDir, "config.json"), JSON.stringify({
+    version: 1,
+    channels: {
+      personal: {
+        type: "telegram",
+        enabled: true,
+        tokenEnv: "ODINN_TEST_MISSING_TELEGRAM_TOKEN",
+        allowlist: ["telegram:100"]
+      }
+    }
+  }));
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await new Promise((resolveWait) => setImmediate(resolveWait));
+    const result = await getJson(`${base}/channels`);
+    assert.equal(result.ok, true);
+    assert.equal(result.channels[0].name, "personal");
+    assert.equal(result.channels[0].running, false);
+    assert.equal(result.channels[0].credentialConfigured, true);
+    assert.equal(result.channels[0].credentialPresent, false);
+    assert.match(result.channels[0].error, /credential is unavailable/);
+    const diagnostics = await getJson(`${base}/diagnostics`);
+    assert.ok(diagnostics.channels.every((channel: any) => channel.credentialPresent === false));
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
 test("gateway permits capability inspection and revocation after the feature is disabled", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-cleanup-"));
   const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-workspace-"));

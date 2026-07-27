@@ -48,6 +48,10 @@ have separate support boundaries.
 - Keep an activity trail so you can see what ran, when it ran, and whether it
   succeeded.
 
+Experimental messaging-channel foundations are under development, beginning
+with a Telegram adapter. They are not yet part of the supported v1 operator
+workflow; see [`docs/channels.md`](docs/channels.md).
+
 Ódinn is not a finished industry-specific business suite. It is a general
 assistant you can connect to the models and tools that make sense for your
 work.

@@ -936,3 +936,26 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   assert.equal(learned.status, 0, learned.stderr || learned.stdout);
   assert.equal(JSON.parse(learned.stdout).applied.length, 0);
 });
+
+test("CLI configures Telegram channels using environment-only credentials", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-channel-"));
+  const add = spawnSync("node", [
+    "apps/cli/src/cli.ts", "config", "channel", "add", "telegram", "personal",
+    "--state", state,
+    "--token-env", "ODINN_TEST_TELEGRAM_TOKEN",
+    "--allowlist", "telegram:100,telegram:-200"
+  ], { cwd: root, encoding: "utf8" });
+  assert.equal(add.status, 0, add.stderr || add.stdout);
+  assert.equal(JSON.parse(add.stdout).channel.enabled, false);
+
+  const enable = spawnSync("node", [
+    "apps/cli/src/cli.ts", "config", "channel", "enable", "personal", "--state", state
+  ], { cwd: root, encoding: "utf8" });
+  assert.equal(enable.status, 0, enable.stderr || enable.stdout);
+  assert.equal(JSON.parse(enable.stdout).channel.enabled, true);
+
+  const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
+  assert.equal(config.channels.personal.tokenEnv, "ODINN_TEST_TELEGRAM_TOKEN");
+  assert.equal(config.channels.personal.token, undefined);
+  assert.deepEqual(config.channels.personal.allowlist, ["telegram:100", "telegram:-200"]);
+});

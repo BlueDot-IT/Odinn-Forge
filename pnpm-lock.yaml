@@ -30,6 +30,12 @@ importers:
         specifier: 8.64.0
         version: 8.64.0(eslint@10.7.0)(typescript@5.9.3)
 
+  adapters/channels/telegram:
+    dependencies:
+      '@odinn/channels':
+        specifier: workspace:*
+        version: link:../../../packages/channels
+
   apps/cli:
     dependencies:
       '@odinn/gateway':
@@ -44,6 +50,12 @@ importers:
 
   apps/gateway:
     dependencies:
+      '@odinn/channel-telegram':
+        specifier: workspace:*
+        version: link:../../adapters/channels/telegram
+      '@odinn/channels':
+        specifier: workspace:*
+        version: link:../../packages/channels
       '@odinn/kernel':
         specifier: workspace:*
         version: link:../../packages/kernel
@@ -53,6 +65,8 @@ importers:
       '@odinn/store-file':
         specifier: workspace:*
         version: link:../../packages/store-file
+
+  packages/channels: {}
 
   packages/kernel:
     dependencies:

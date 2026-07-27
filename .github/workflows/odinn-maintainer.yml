@@ -49,7 +49,7 @@ jobs:
       count: ${{ steps.targets.outputs.count }}
     steps:
       - id: targets
-        uses: jason-allen-oneal/odinn-maintainer/.github/actions/targets@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
+        uses: BlueDot-IT/odinn-maintainer/.github/actions/targets@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
         with:
           github-read-token: ${{ github.token }}
           include-issues: "true"
@@ -57,7 +57,7 @@ jobs:
   plan:
     name: "Plan ${{ matrix.target.kind }} #${{ matrix.target.number }}"
     needs: discover
-    if: needs.discover.outputs.count != '0'
+    if: needs.discover.outputs.count != '0' && vars.ODINN_MAINTAINER_ENABLED == 'true'
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -73,7 +73,7 @@ jobs:
       pull-requests: read
     steps:
       - id: maintainer
-        uses: jason-allen-oneal/odinn-maintainer/.github/actions/plan@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
+        uses: BlueDot-IT/odinn-maintainer/.github/actions/plan@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
         with:
           github-read-token: ${{ github.token }}
           oauth-json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
@@ -96,7 +96,7 @@ jobs:
   apply:
     name: "Apply ${{ matrix.target.kind }} #${{ matrix.target.number }}"
     needs: [discover, plan]
-    if: always() && needs.discover.outputs.count != '0' && needs.plan.result == 'success'
+    if: always() && needs.discover.outputs.count != '0' && vars.ODINN_MAINTAINER_ENABLED == 'true' && needs.plan.result == 'success'
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -120,7 +120,7 @@ jobs:
           path: ${{ runner.temp }}/odinn-maintainer-plan
       - id: maintainer
         if: steps.download.outcome == 'success'
-        uses: jason-allen-oneal/odinn-maintainer/.github/actions/apply@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
+        uses: BlueDot-IT/odinn-maintainer/.github/actions/apply@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
         with:
           github-token: ${{ github.token }}
           plan-path: ${{ runner.temp }}/odinn-maintainer-plan/plan.json

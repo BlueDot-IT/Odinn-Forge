@@ -84,6 +84,35 @@ test("security coverage completes before Scorecard evaluates it", async () => {
   );
 });
 
+test("security scanning is license-independent and optional maintenance is explicitly enabled", async () => {
+  const security = await read(".github/workflows/security.yml");
+  assert.match(
+    security,
+    /codeql:[\s\S]*?permissions:\s*\n\s+actions: read\s*\n\s+contents: read/u,
+  );
+  assert.match(security, /output: \$\{\{ runner\.temp \}\}\/codeql-results/u);
+  assert.match(security, /upload: false/u);
+  assert.match(security, /name: codeql-results-\$\{\{ github\.sha \}\}/u);
+  assert.doesNotMatch(security, /security-events: write/u);
+  assert.doesNotMatch(security, /github\/codeql-action\/upload-sarif/u);
+  assert.doesNotMatch(security, /gitleaks\/gitleaks-action/u);
+  assert.match(
+    security,
+    /ghcr\.io\/gitleaks\/gitleaks@sha256:[a-f0-9]{64}/u,
+  );
+  assert.match(security, /detect --source \. --redact --no-banner --verbose/u);
+
+  const maintainer = await read(".github/workflows/odinn-maintainer.yml");
+  assert.match(
+    maintainer,
+    /needs\.discover\.outputs\.count != '0' && vars\.ODINN_MAINTAINER_ENABLED == 'true'/u,
+  );
+  assert.match(
+    maintainer,
+    /vars\.ODINN_MAINTAINER_ENABLED == 'true' && needs\.plan\.result == 'success'/u,
+  );
+});
+
 test("user documentation and reporting surfaces ship in the release tree", async () => {
   for (const path of [
     "docs/user-guide.md",
