@@ -8,6 +8,7 @@ import {
   type ChannelAdapter, type InboundChannelMessage, type OutboundChannelMessage
 } from "../packages/channels/src/index.ts";
 import { normalizeTelegramUpdate } from "../adapters/channels/telegram/src/index.ts";
+import { DiscordChannelAdapter, normalizeDiscordMessage } from "../adapters/channels/discord/src/index.ts";
 
 function message(overrides: Partial<InboundChannelMessage> = {}): InboundChannelMessage {
   return {
@@ -98,4 +99,101 @@ test("channel text splitting preserves Unicode and prefers word boundaries", () 
   assert.deepEqual(splitChannelText("alpha beta gamma", 10), ["alpha", "beta gamma"]);
   assert.deepEqual(splitChannelText("🪁🪁🪁", 2), ["🪁🪁", "🪁"]);
   assert.throws(() => splitChannelText("text", 0), /positive integer/);
+});
+
+test("Discord messages require mentions in guilds and normalize DMs", () => {
+  const guildMessage = {
+    id: "900",
+    channel_id: "800",
+    guild_id: "700",
+    content: "<@600> hello Odinn",
+    timestamp: "2026-07-26T12:00:00.000Z",
+    author: { id: "500", username: "jason", global_name: "Jason", bot: false },
+    mentions: [{ id: "600" }]
+  };
+  const normalized = normalizeDiscordMessage(guildMessage, { accountId: "community", botUserId: "600" });
+  assert.equal(normalized?.text, "hello Odinn");
+  assert.equal(normalized?.address.conversationKind, "channel");
+  assert.equal(normalized?.metadata?.guildId, "700");
+  assert.equal(normalizeDiscordMessage({ ...guildMessage, mentions: [] }, { botUserId: "600" }), undefined);
+  const direct = normalizeDiscordMessage({
+    ...guildMessage, guild_id: undefined, content: "hello in a DM", mentions: []
+  }, { botUserId: "600" });
+  assert.equal(direct?.address.conversationKind, "direct");
+  assert.equal(direct?.text, "hello in a DM");
+});
+
+test("Discord replies disable mention parsing and respect the 2000-character limit", async () => {
+  const requests: Array<{ url: string; body: any }> = [];
+  const adapter = new DiscordChannelAdapter({
+    token: "test-token",
+    fetch: async (input, init) => {
+      requests.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ id: String(requests.length) }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+  });
+  await adapter.send({
+    address: { channel: "discord", accountId: "community", conversationId: "800", conversationKind: "channel" },
+    text: "x".repeat(2_001),
+    replyToId: "900"
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].body.content.length, 2_000);
+  assert.deepEqual(requests[0].body.allowed_mentions, { parse: [], replied_user: false });
+  assert.equal(requests[0].body.message_reference.message_id, "900");
+  assert.equal(requests[1].body.message_reference, undefined);
+});
+
+test("Discord Gateway identifies and delivers normalized message events", async () => {
+  class FixtureSocket {
+    readonly listeners = new Map<string, Array<(event: any) => void>>();
+    readonly sent: any[] = [];
+    addEventListener(type: string, listener: (event: any) => void) {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+    send(data: string) { this.sent.push(JSON.parse(data)); }
+    close() { this.emit("close", {}); }
+    emit(type: string, event: any) {
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
+    }
+  }
+  const socket = new FixtureSocket();
+  const delivered: InboundChannelMessage[] = [];
+  const adapter = new DiscordChannelAdapter({
+    token: "test-token",
+    retryDelayMs: 100,
+    fetch: async () => new Response(JSON.stringify({ url: "wss://gateway.discord.test" }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    }),
+    socketFactory: () => socket
+  });
+  await adapter.start(async (input) => { delivered.push(input); });
+  await new Promise((resolveWait) => setImmediate(resolveWait));
+  socket.emit("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }) });
+  socket.emit("message", { data: JSON.stringify({ op: 0, t: "READY", s: 1, d: { user: { id: "600" } } }) });
+  socket.emit("message", { data: JSON.stringify({ op: 1, d: null }) });
+  socket.emit("message", { data: JSON.stringify({
+    op: 0,
+    t: "MESSAGE_CREATE",
+    s: 2,
+    d: {
+      id: "900",
+      channel_id: "800",
+      guild_id: "700",
+      content: "<@600> hello",
+      timestamp: "2026-07-26T12:00:00.000Z",
+      author: { id: "500", username: "jason", bot: false },
+      mentions: [{ id: "600" }]
+    }
+  }) });
+  await new Promise((resolveWait) => setImmediate(resolveWait));
+  assert.equal(socket.sent[0].op, 2);
+  assert.equal(socket.sent[0].d.intents, 37_377);
+  assert.deepEqual(socket.sent[1], { op: 1, d: 1 });
+  assert.equal(delivered[0].text, "hello");
+  await adapter.stop();
 });

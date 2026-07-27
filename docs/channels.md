@@ -4,8 +4,9 @@ Messaging channels are an experimental interface. They connect external chat
 networks to the stable authenticated loopback gateway without giving transport
 adapters direct access to model providers, records, tools, or workspace files.
 
-The first reference adapter is Telegram. Future adapters should implement the
-same `ChannelAdapter` contract rather than duplicating conversation logic.
+Telegram and Discord are the first reference adapters. Future adapters should
+implement the same `ChannelAdapter` contract rather than duplicating
+conversation logic.
 
 ## Architecture
 
@@ -53,3 +54,30 @@ effect after the gateway restarts.
 
 The operator workflow remains an experimental interface and is outside the v1
 compatibility promise.
+
+## Configure Discord
+
+Create an application and bot in the Discord Developer Portal. Enable the
+Message Content privileged Gateway intent on the Bot page, invite the bot with
+View Channel, Send Messages, and Read Message History permissions, and keep its
+token in an environment variable.
+
+```sh
+export ODINN_DISCORD_BOT_TOKEN="..."
+odinn config channel add discord community \
+  --token-env ODINN_DISCORD_BOT_TOKEN \
+  --allowlist discord:123456789
+odinn config channel enable community
+odinn start
+```
+
+Discord server messages require an `@mention` by default, even in an
+allowlisted channel. Direct messages do not. Use `--require-mention false` only
+when the bot should process every message from an allowlisted server channel.
+Outbound replies disable Discord mention parsing so model-generated text cannot
+unexpectedly ping users or roles.
+
+Discord Gateway behavior follows the official
+[Gateway documentation](https://docs.discord.com/developers/events/gateway),
+and replies follow the official
+[message resource](https://docs.discord.com/developers/resources/message).

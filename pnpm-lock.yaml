@@ -30,6 +30,12 @@ importers:
         specifier: 8.64.0
         version: 8.64.0(eslint@10.7.0)(typescript@5.9.3)
 
+  adapters/channels/discord:
+    dependencies:
+      '@odinn/channels':
+        specifier: workspace:*
+        version: link:../../../packages/channels
+
   adapters/channels/telegram:
     dependencies:
       '@odinn/channels':
@@ -50,6 +56,9 @@ importers:
 
   apps/gateway:
     dependencies:
+      '@odinn/channel-discord':
+        specifier: workspace:*
+        version: link:../../adapters/channels/discord
       '@odinn/channel-telegram':
         specifier: workspace:*
         version: link:../../adapters/channels/telegram

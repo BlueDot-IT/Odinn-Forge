@@ -388,7 +388,7 @@ function usage() {
   odinn extension run --id <id> --input-json <json> [--capability <capability>] [--capability-token <token>] [--state .odinn]
   odinn config model default <provider:model> [--state .odinn]
   odinn config model list [--state .odinn]
-  odinn config channel add telegram <name> --token-env <ENV_NAME> --allowlist <telegram:user-or-chat-id,...> [--model <provider:model>] [--state .odinn]
+  odinn config channel add telegram|discord <name> --token-env <ENV_NAME> --allowlist <channel:user-or-chat-id,...> [--model <provider:model>] [--require-mention true|false] [--state .odinn]
   odinn config channel list [--state .odinn]
   odinn config channel enable|disable|remove <name> [--state .odinn]
   odinn status [--state .odinn]
@@ -1213,6 +1213,7 @@ function summarizeChannelConfig(config: any) {
     credentialPresent: Boolean(value.tokenEnv && process.env[value.tokenEnv]),
     tokenEnv: value.tokenEnv ?? "",
     allowlistEntries: Array.isArray(value.allowlist) ? value.allowlist.length : 0,
+    requireMention: value.type === "discord" ? value.requireMention !== false : undefined,
     defaultModel: value.defaultModel ?? ""
   }));
 }
@@ -1565,7 +1566,7 @@ async function configCommand(args: any) {
     if (subcommand === "add") {
       const type = rest[0];
       const name = rest[1];
-      if (type !== "telegram" || !name) throw new Error("config channel add requires telegram <name>");
+      if (!["telegram", "discord"].includes(type) || !name) throw new Error("config channel add requires telegram|discord <name>");
       if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name)) throw new Error("channel name contains unsupported characters");
       const tokenEnv = option(rest, "--token-env", "");
       if (!/^[A-Z_][A-Z0-9_]{1,127}$/u.test(tokenEnv)) throw new Error("config channel add requires --token-env <UPPERCASE_ENV_NAME>");
@@ -1574,6 +1575,7 @@ async function configCommand(args: any) {
         enabled: false,
         tokenEnv,
         allowlist: splitCsv(option(rest, "--allowlist", "")),
+        ...(type === "discord" ? { requireMention: parseBoolean(option(rest, "--require-mention", "true"), "--require-mention") } : {}),
         ...(option(rest, "--model", "") ? { defaultModel: option(rest, "--model") } : {})
       };
       await saveConfig(state, config);
