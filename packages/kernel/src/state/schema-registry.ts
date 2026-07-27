@@ -48,7 +48,7 @@ export const STATE_SCHEMA_OWNERS: Readonly<Record<StateSurface, StateSchemaOwner
   cron: { owner: "@odinn/gateway/cron", location: "cron-jobs.json", support: "stable", description: "Cron definitions and run metadata" },
   extensions: { owner: "@odinn/kernel/extensions", location: "extensions.json", support: "experimental", description: "Third-party extension registry" },
   skills: { owner: "@odinn/kernel/skills", location: "skills/registry.json", support: "experimental", description: "Skill package registry" },
-  agents: { owner: "@odinn/gateway/agents", location: "agents.json", support: "experimental", description: "Agent SDK package registry" },
+  agents: { owner: "@odinn/kernel/agents", location: "agents.json + agents/*", support: "stable", description: "Agent SDK registry, manifests, and provider-independent identity files" },
   hostMetadata: { owner: "@odinn/kernel/state", location: "state-schema.json", support: "internal", description: "Per-store schema snapshot and application compatibility metadata" },
   runtimeDatabase: { owner: "@odinn/store-sqlite", location: "db/odinn.sqlite", support: "stable", description: "Run ledger and runtime records" }
 });

@@ -254,6 +254,12 @@ test("gateway backs cron, Agent SDK packages, skills, and workshop with persiste
     assert.equal(cron.job.name, "Health wake");
     assert.equal((await getJson(`${base}/cron`)).jobs.length, 1);
 
+    const initialAgents = await getJson(`${base}/agents`);
+    assert.equal(initialAgents.sdkVersion, "1.0");
+    assert.ok(initialAgents.agents.some((agent: any) => agent.id === "main" && agent.kind === "runtime" && agent.primary));
+    await postJson(`${base}/agents/main/lifecycle`, { action: "disable" }, 409);
+    await postJson(`${base}/agents`, { sdkVersion: "1.0", id: "main", version: "2.0.0", name: "Replacement" }, 409);
+
     const manifest = { sdkVersion: "0.3", id: "fixture-agent", version: "1.0.0", name: "Fixture Agent", tools: ["job.healthcheck"] };
     assert.equal((await postJson(`${base}/agents/validate`, manifest)).manifest.validation.valid, true);
     assert.equal((await postJson(`${base}/agents`, manifest)).agent.status, "disabled");
@@ -738,13 +744,13 @@ async function getJson(url: any) {
   return response.json();
 }
 
-async function postJson(url: any, body: any) {
+async function postJson(url: any, body: any, expectedStatus = 200) {
   const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   });
-  assert.equal(response.status, 200);
+  assert.equal(response.status, expectedStatus);
   return response.json();
 }
 

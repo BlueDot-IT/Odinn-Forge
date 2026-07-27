@@ -97,6 +97,7 @@ test("non-interactive onboarding creates a permission-safe fresh state", async (
   assert.match(result.stdout, /needs an AI connection|setup required/i);
   assert.equal((await stat(state)).mode & 0o777, 0o700);
   assert.equal((await stat(join(state, "config.json"))).mode & 0o777, 0o600);
+  assert.equal((await stat(join(state, "agents", "main", "agent.json"))).mode & 0o777, 0o600);
 
   const raw = await readFile(join(state, "config.json"), "utf8");
   const config = JSON.parse(raw);

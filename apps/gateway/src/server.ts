@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 import { ChannelRouter, FileSessionBindingStore, GatewayChannelHandler, createAllowlistPolicy } from "@odinn/channels";
@@ -169,6 +169,7 @@ class AgentPackageStore {
     return pending;
   }
   async install(input: any) {
+    if (String(input?.id || "").trim() === "main") throw new GatewayError(409, "the primary main agent cannot be replaced by an SDK package");
     const manifest = validateAgentPackage(input);
     return this.mutate((agents) => {
       const current = agents.find((agent) => agent.id === manifest.id);
@@ -182,6 +183,7 @@ class AgentPackageStore {
     return this.mutate((agents) => {
       const agent = agents.find((item) => item.id === id);
       if (!agent) throw new GatewayError(404, "agent package not found");
+      if (agent.kind === "runtime" && agent.primary) throw new GatewayError(409, "the primary runtime agent cannot be disabled or quarantined");
       if (!['enable', 'disable', 'quarantine'].includes(action)) throw new GatewayError(400, "unsupported agent lifecycle action");
       agent.status = action === 'enable' ? 'enabled' : action === 'disable' ? 'disabled' : 'quarantined';
       agent.updatedAt = new Date().toISOString();
@@ -191,35 +193,11 @@ class AgentPackageStore {
 }
 
 function validateAgentPackage(input: any) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) throw new GatewayError(400, "agent package manifest must be an object");
-  const id = String(input.id || "").trim();
-  const version = String(input.version || "").trim();
-  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/u.test(id)) throw new GatewayError(400, "agent id must be lowercase and 2-64 characters");
-  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) throw new GatewayError(400, "agent version must be semantic");
-  const manifest = {
-    sdkVersion: String(input.sdkVersion || "0.3"), id, version,
-    name: String(input.name || id).slice(0, 120),
-    identity: input.identity && typeof input.identity === "object" ? input.identity : {},
-    instructions: Array.isArray(input.instructions) ? input.instructions.map(String) : [],
-    tools: Array.isArray(input.tools) ? input.tools.map(String) : [],
-    plugins: Array.isArray(input.plugins) ? input.plugins.map(String) : [],
-    secrets: Array.isArray(input.secrets) ? input.secrets.map(String) : [],
-    sandbox: input.sandbox && typeof input.sandbox === "object" ? input.sandbox : { mode: "workspace-write" },
-    network: input.network && typeof input.network === "object" ? input.network : { default: "deny", allow: [] },
-    schedules: Array.isArray(input.schedules) ? input.schedules : [],
-    channels: Array.isArray(input.channels) ? input.channels : [],
-    memory: input.memory && typeof input.memory === "object" ? input.memory : {},
-    tests: Array.isArray(input.tests) ? input.tests : []
-  };
-  const integrity = createHash("sha256").update(stableManifestJson(manifest)).digest("hex");
-  if (input.integrity && input.integrity !== integrity) throw new GatewayError(400, "agent package integrity mismatch");
-  return { ...manifest, integrity, validation: { valid: true, checkedAt: new Date().toISOString() } };
-}
-
-function stableManifestJson(value: any): string {
-  if (Array.isArray(value)) return `[${value.map(stableManifestJson).join(",")}]`;
-  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableManifestJson(value[key])}`).join(",")}}`;
-  return JSON.stringify(value) ?? "null";
+  try {
+    return { ...validateAgentManifest(input), tests: Array.isArray(input.tests) ? input.tests : [], validation: { valid: true, checkedAt: new Date().toISOString() } };
+  } catch (error) {
+    throw new GatewayError(400, error instanceof Error ? error.message : "agent manifest is invalid");
+  }
 }
 
 async function discoverSkills(root: string, state: string) {
@@ -519,6 +497,7 @@ export async function createGatewayServer({
   await ensureStateCompatibility(state, { applicationVersion: version, applicationCommit: await productCommit() });
   await ensureSecureStateDirectory(state);
   const config = await readConfig(state, { hosted });
+  await ensureMainAgent(state);
   const featureFlags = normalizeExperimentalFlags(config.experimental);
   const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags });
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
@@ -638,7 +617,7 @@ export async function createGatewayServer({
         return json(response, 200, { ok: true, channels: channelSupervisor.status() });
       }
       if (request.method === "GET" && url.pathname === "/agents") {
-        return json(response, 200, { agents: await agentStore.list(), sdkVersion: "0.3" });
+        return json(response, 200, { agents: await agentStore.list(), sdkVersion: AGENT_SDK_VERSION });
       }
       if (request.method === "POST" && url.pathname === "/agents/validate") {
         return json(response, 200, { ok: true, manifest: validateAgentPackage(await readJson(request, { maxBytes: requestMaxBytes })) });
@@ -6980,7 +6959,7 @@ function renderConsoleHtml(version = "development") {
     function readAgentManifestFields() {
       return {
         ...(state.agentManifestDraft || {}),
-        sdkVersion: "0.3",
+        sdkVersion: "${AGENT_SDK_VERSION}",
         id: $("agent-id").value.trim(),
         version: $("agent-version").value.trim(),
         name: $("agent-name").value.trim(),
