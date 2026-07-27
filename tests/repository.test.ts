@@ -80,7 +80,7 @@ test("security coverage completes before Scorecard evaluates it", async () => {
   assert.match(scorecard, /^    needs: codeql$/m);
   assert.match(
     scorecard,
-    /^    if: \$\{\{ !cancelled\(\) && github\.event_name != 'pull_request' && \(github\.event_name != 'workflow_dispatch' \|\| github\.ref_name == github\.event\.repository\.default_branch\) \}\}$/m,
+    /^    if: \$\{\{ !cancelled\(\) && github\.event\.repository\.private == false && github\.event_name != 'pull_request' && \(github\.event_name != 'workflow_dispatch' \|\| github\.ref_name == github\.event\.repository\.default_branch\) \}\}$/m,
   );
 });
 

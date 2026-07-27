@@ -162,7 +162,10 @@ jobs:
     # Scorecard only supports the repository default branch. Explicit release-PR
     # dispatches still run every merge-blocking security job against the supplied
     # commit, while Scorecard continues to run on main pushes and schedules.
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref_name == github.event.repository.default_branch) }}
+    # OpenSSF Scorecard's GitHub integration cannot query commit history for a
+    # private repository with GITHUB_TOKEN. The mandatory private-repo scans
+    # above still run; Scorecard activates automatically if the repo is public.
+    if: ${{ !cancelled() && github.event.repository.private == false && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref_name == github.event.repository.default_branch) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
