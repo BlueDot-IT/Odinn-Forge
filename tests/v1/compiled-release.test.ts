@@ -42,6 +42,8 @@ test("production package contains compiled runtime files and no workspace instal
   assert.equal(files.includes("pnpm-lock.yaml"), false);
 
   const productionPackage = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+  assert.equal(productionPackage.name, "@bluedot-it/odinn");
+  assert.equal(productionPackage.private, false);
   assert.equal(productionPackage.engines.node, ">=24.0.0");
   assert.deepEqual(productionPackage.dependencies, { "playwright-core": "1.61.1" });
   assert.equal(productionPackage.devDependencies, undefined);

@@ -147,7 +147,7 @@ for (const extension of ["zip", "tar.gz"]) {
     }
 
     const archivedPackage = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
-    if (archivedPackage.name !== "odinn"
+    if (archivedPackage.name !== "@bluedot-it/odinn"
       || archivedPackage.version !== pkg.version
       || archivedPackage.engines?.node !== ">=24.0.0"
       || archivedPackage.dependencies?.["playwright-core"] !== "1.61.1") {

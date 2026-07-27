@@ -20,7 +20,9 @@ async function install(operation: any) {
   const source = resolve(option("--source", process.cwd()));
   await validateSource(source);
   const pkg = JSON.parse(await readFile(join(source, "package.json"), "utf8"));
-  if (pkg.name !== "odinn") throw new Error("install source is not an Odinn Forge package");
+  if (pkg.name !== "odinn" && pkg.name !== "@bluedot-it/odinn") {
+    throw new Error("install source is not an Odinn Forge package");
+  }
   const releaseInfo = await readReleaseInfo(source);
   const compiled = releaseInfo.distribution === "compiled" && existsSync(join(source, "dist", "cli", "index.js"));
   const version = option("--version", pkg.version);

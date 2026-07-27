@@ -477,7 +477,8 @@ async function verifyExtractedPackage(packageRoot: string, manifest: ReleaseMani
   await validatePhysicalTree(packageRoot);
   const packageMetadata = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
   const releaseInfo = JSON.parse(await readFile(join(packageRoot, "release-info.json"), "utf8"));
-  if (packageMetadata.name !== "odinn" || packageMetadata.version !== manifest.version) {
+  const recognizedPackageName = packageMetadata.name === "odinn" || packageMetadata.name === "@bluedot-it/odinn";
+  if (!recognizedPackageName || packageMetadata.version !== manifest.version) {
     throw new Error("package metadata does not match the release manifest");
   }
   if (releaseInfo.name !== manifest.name

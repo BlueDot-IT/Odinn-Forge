@@ -171,6 +171,8 @@ test("release packaging removes stale assets before creating a version", async (
   assert.match(packaging, /join\(packageRoot, "node_modules", "playwright-core"\)/);
   assert.match(packaging, /name: "@bluedot-it\/odinn"/);
   assert.match(packaging, /private: false/);
+  const verification = await read("scripts/release/verify.ts");
+  assert.match(verification, /archivedPackage\.name !== "@bluedot-it\/odinn"/);
   assert.match(packaging, /access: "public"/);
   assert.match(packaging, /odinn: "bin\/odinn\.js"/);
   assert.match(packaging, /#!\/usr\/bin\/env node/);

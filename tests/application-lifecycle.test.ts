@@ -324,7 +324,7 @@ async function writeFakePackage(
   await mkdir(join(root, "dist", "cli"), { recursive: true });
   await mkdir(join(root, "dist", "gateway"), { recursive: true });
   await mkdir(join(root, "dist", "install"), { recursive: true });
-  await writeFile(join(root, "package.json"), `${JSON.stringify({ name: "odinn", version, type: "module" }, null, 2)}\n`);
+  await writeFile(join(root, "package.json"), `${JSON.stringify({ name: "@bluedot-it/odinn", version, type: "module" }, null, 2)}\n`);
   await writeFile(join(root, "release-info.json"), `${JSON.stringify({
     schemaVersion: 2,
     name: "odinn",
