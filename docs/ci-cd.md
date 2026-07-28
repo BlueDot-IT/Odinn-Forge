@@ -49,6 +49,22 @@ reopen state.
 
 Workflow Lint runs actionlint on every pull request and on workflow changes pushed to `main`. Pull Request Policy validates Conventional Commit syntax for pull-request titles. Merge Queue performs the full release-candidate suite for `merge_group` events.
 
+### Maintainer reconciliation
+
+The event-facing Odinn Maintainer workflow discovers a bounded target matrix and
+delegates each issue or pull request to a local reusable workflow. The reusable
+workflow holds one concurrency group for the complete plan-to-apply lifecycle:
+`repository-kind-number`. Scheduled sweeps, direct comments, pull-request
+events, and completed-workflow events therefore queue behind the same target
+lock instead of racing one another. Different targets can still reconcile in
+parallel.
+
+Planning and application remain separate jobs with separate permissions. The
+target lock uses `cancel-in-progress: false`, so a newer event does not cancel a
+plan or deterministic apply already in progress. GitHub retains at most one
+pending run for a concurrency group, so bursts coalesce to the newest pending
+event; that run re-fetches the complete live target state before planning.
+
 ### Version preparation
 
 Versions are prepared through ordinary reviewed pull requests. A release change
