@@ -7,7 +7,7 @@ import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, r
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -23,6 +23,9 @@ const INSTALL_METADATA_FILE = new URL(compiledRuntime ? "../../install-metadata.
 const configBaselines = new WeakMap<object, string | null>();
 if (rawArgs[0] === "--") rawArgs.shift();
 const [command, ...args] = rawArgs;
+const parentEnvironmentKeys = new Set(Object.keys(process.env));
+loadEnvironmentFiles({ workspaceRoot: invocationRoot(), stateDir: invocationRoot(), protectedKeys: parentEnvironmentKeys });
+loadEnvironmentFiles({ workspaceRoot: invocationRoot(), stateDir: stateDir(args), protectedKeys: parentEnvironmentKeys });
 
 const EXPERIMENTAL_HOME = [
   {

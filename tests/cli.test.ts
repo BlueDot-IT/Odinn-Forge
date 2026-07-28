@@ -976,4 +976,16 @@ test("CLI configures Discord channels as mention-only by default", async () => {
   const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
   assert.equal(config.channels.community.tokenEnv, "ODINN_TEST_DISCORD_TOKEN");
   assert.equal(config.channels.community.requireMention, true);
+
+  await writeFile(join(state, ".env"), "ODINN_TEST_DISCORD_TOKEN=loaded-from-state\n", { mode: 0o600 });
+  const listed = spawnSync("node", [
+    "apps/cli/src/cli.ts", "config", "channel", "list", "--state", state
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "ODINN_TEST_DISCORD_TOKEN"))
+  });
+  assert.equal(listed.status, 0, listed.stderr || listed.stdout);
+  assert.equal(JSON.parse(listed.stdout)[0].credentialPresent, true);
+  assert.doesNotMatch(listed.stdout, /loaded-from-state/);
 });
