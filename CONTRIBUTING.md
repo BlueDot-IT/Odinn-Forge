@@ -53,7 +53,9 @@ is known.
 
 ## Pull requests
 
-Use a focused branch and a Conventional Commit pull request title, for example:
+Contribute through pull requests. Do not push changes directly to `main` or
+another protected branch. Use a focused branch and a Conventional Commit pull
+request title, for example:
 
 ```text
 feat(gateway): add replayable event cursor
@@ -65,6 +67,11 @@ A pull request must use the repository template and explain the problem,
 implementation, compatibility impact, persistent-state or migration impact,
 security impact, exact validation, and rollback path. Each pull request must
 address one coherent area.
+
+You are responsible for every branch you create. After its pull request is
+merged or closed, promptly delete the branch from the remote and remove any
+corresponding local branch or worktree. Do not leave abandoned contribution
+branches behind.
 
 Do not mix feature work with migration work or broad refactoring with lifecycle
 behavior changes. A pull request that affects a stable interface or persistent
