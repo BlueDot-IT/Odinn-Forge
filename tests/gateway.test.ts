@@ -7,12 +7,13 @@ import { spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 
-const root = new URL("..", import.meta.url).pathname;
-const normalizedRoot = root.replace(/\/$/, "");
+const root = fileURLToPath(new URL("..", import.meta.url));
+const normalizedRoot = resolve(root);
 
 test("gateway exposes status, run execution, plans, and run summaries", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-"));
@@ -700,7 +701,7 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
       }]
     });
     assert.equal(branch.candidates.length, 2);
-    assert.ok(branch.candidates.every((candidate: any) => candidate.workspaceRoot.startsWith(`${workspaceRoot}/.odinn-worktrees/`)));
+    assert.ok(branch.candidates.every((candidate: any) => candidate.workspaceRoot.startsWith(`${join(workspaceRoot, ".odinn-worktrees")}${sep}`)));
     assert.equal((await getJson(`${base}/counterfactual/${branch.groupId}`)).candidates.length, 2);
     await rm(join(workspaceRoot, "branch-evidence.txt"));
     const executed = await postJson(`${base}/counterfactual/${branch.groupId}/execute`, {});

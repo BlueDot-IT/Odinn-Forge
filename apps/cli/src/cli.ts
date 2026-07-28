@@ -1975,7 +1975,7 @@ async function importFrameworkSkills(framework: any, root: any, state: any, dryR
   }
   return {
     directories: directories.map((directory: any) => directory.path),
-    skillCount: copied.filter((file: any) => file.source.endsWith("/SKILL.md")).length,
+    skillCount: copied.filter((file: any) => file.source.replaceAll("\\", "/").endsWith("/SKILL.md")).length,
     fileCount: copied.length
   };
 }

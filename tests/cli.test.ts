@@ -5,8 +5,9 @@ import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname;
+const root = fileURLToPath(new URL("..", import.meta.url));
 
 test("CLI advanced help exposes documented safety controls", () => {
   const help = spawnSync("node", ["apps/cli/src/cli.ts", "help", "--all"], {

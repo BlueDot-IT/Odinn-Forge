@@ -72,11 +72,12 @@ test("security coverage completes before Scorecard evaluates it", async () => {
     security,
     /^  cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}$/m,
   );
-  const scorecardStart = security.indexOf("\n  scorecard:\n");
+  const scorecardMatch = /\r?\n  scorecard:\r?\n/u.exec(security);
+  const scorecardStart = scorecardMatch?.index ?? -1;
   assert.notEqual(scorecardStart, -1, "security workflow must define the Scorecard job");
-  const scorecardHeader = "  scorecard:\n";
-  const scorecardTail = security.slice(scorecardStart + 1);
-  const nextJobOffset = scorecardTail.slice(scorecardHeader.length).search(/^  [A-Za-z0-9_-]+:\n/m);
+  const scorecardHeader = scorecardMatch?.[0].slice(1) ?? "";
+  const scorecardTail = security.slice(scorecardStart + (scorecardMatch?.[0].startsWith("\r\n") ? 2 : 1));
+  const nextJobOffset = scorecardTail.slice(scorecardHeader.length).search(/^  [A-Za-z0-9_-]+:\r?$/m);
   const scorecard = nextJobOffset === -1
     ? scorecardTail
     : scorecardTail.slice(0, scorecardHeader.length + nextJobOffset);
