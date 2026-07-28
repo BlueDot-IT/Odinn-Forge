@@ -106,14 +106,39 @@ test("security scanning is license-independent and optional maintenance is expli
   assert.match(security, /detect --source \. --redact --no-banner --verbose/u);
 
   const maintainer = await read(".github/workflows/odinn-maintainer.yml");
+  const maintainerTarget = await read(".github/workflows/odinn-maintainer-target.yml");
   assert.match(
     maintainer,
     /needs\.discover\.outputs\.count != '0' && vars\.ODINN_MAINTAINER_ENABLED == 'true'/u,
   );
   assert.match(
-    maintainer,
-    /vars\.ODINN_MAINTAINER_ENABLED == 'true' && needs\.plan\.result == 'success'/u,
+    maintainerTarget,
+    /always\(\) && needs\.plan\.result == 'success'/u,
   );
+});
+
+test("maintainer reconciliation serializes the exact target across every triggering run", async () => {
+  const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
+  const target = await read(".github/workflows/odinn-maintainer-target.yml");
+  const ciDocs = await read("docs/ci-cd.md");
+
+  assert.doesNotMatch(dispatcher, /^concurrency:/m);
+  assert.match(dispatcher, /uses: \.\/\.github\/workflows\/odinn-maintainer-target\.yml/u);
+  assert.match(dispatcher, /target_kind: \$\{\{ matrix\.target\.kind \}\}/u);
+  assert.match(dispatcher, /target_number: \$\{\{ matrix\.target\.number \}\}/u);
+  assert.match(dispatcher, /max-parallel: 5/u);
+
+  assert.match(target, /^\s{2}workflow_call:$/m);
+  assert.match(
+    target,
+    /group: odinn-maintainer-\$\{\{ github\.repository \}\}-\$\{\{ inputs\.target_kind \}\}-\$\{\{ inputs\.target_number \}\}/u,
+  );
+  assert.match(target, /cancel-in-progress: false/u);
+  assert.doesNotMatch(target, /group:[^\n]*(?:github\.run_id|github\.event)/u);
+  assert.match(target, /^  plan:$/m);
+  assert.match(target, /^  apply:\n    name:[\s\S]*?    needs: plan$/m);
+  assert.match(ciDocs, /bursts coalesce to the newest pending\s+event/u);
+  assert.match(ciDocs, /re-fetches the complete live target state/u);
 });
 
 test("user documentation and reporting surfaces ship in the release tree", async () => {
