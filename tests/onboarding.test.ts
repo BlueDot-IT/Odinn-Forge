@@ -266,17 +266,18 @@ test("recovery preserves live OAuth when preparation never reached its phase mar
 test("guided onboarding can launch a configured CLI-auth provider", async () => {
   const home = await mkdtemp(join(tmpdir(), "odinn-onboarding-cli-auth-home-"));
   const state = join(home, "state");
-  const fakeCli = join(home, "fake-antigravity");
-  await writeFile(fakeCli, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const fakeCli = join(home, process.platform === "win32" ? "fake-antigravity.mjs" : "fake-antigravity");
+  await writeFile(fakeCli, process.platform === "win32" ? "process.exit(0);\n" : "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   await chmod(fakeCli, 0o700);
   const result = await runCli(
     ["onboard", "--interactive", "--state", state],
     {
       env: {
         HOME: home,
+        USERPROFILE: home,
         HERMES_HOME: join(home, ".hermes"),
-        OPENCLAW_AUTH_PROFILES: "",
-        OPENCLAW_STATE_DIR: "",
+        OPENCLAW_AUTH_PROFILES: join(home, "missing-auth-profiles.json"),
+        OPENCLAW_STATE_DIR: join(home, "missing-openclaw-state"),
         ODINN_ANTIGRAVITY_CLI: fakeCli
       },
       input: "\n2\n3\n36\n\n5\n",
@@ -292,8 +293,8 @@ test("guided onboarding can launch a configured CLI-auth provider", async () => 
 test("non-interactive onboarding passes the configured provider to CLI auth", async () => {
   const home = await mkdtemp(join(tmpdir(), "odinn-onboarding-cli-auth-scripted-"));
   const state = join(home, "state");
-  const fakeCli = join(home, "fake-antigravity");
-  await writeFile(fakeCli, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const fakeCli = join(home, process.platform === "win32" ? "fake-antigravity.mjs" : "fake-antigravity");
+  await writeFile(fakeCli, process.platform === "win32" ? "process.exit(0);\n" : "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   await chmod(fakeCli, 0o700);
   const result = await runCli(
     ["onboard", "--provider", "antigravity", "--auth", "cli", "--state", state],
