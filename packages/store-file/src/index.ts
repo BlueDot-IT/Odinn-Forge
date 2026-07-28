@@ -48,15 +48,17 @@ async function applyWindowsAcl(path: string, directory: boolean) {
     "$current=[System.Security.Principal.WindowsIdentity]::GetCurrent().User",
     "$system=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
     "$admins=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')",
-    "$acl=Get-Acl -LiteralPath $path",
+    "$directory=$env:ODINN_ACL_DIRECTORY -eq '1'",
+    "$acl=if($directory){[System.IO.Directory]::GetAccessControl($path)}else{[System.IO.File]::GetAccessControl($path)}",
     "$acl.SetAccessRuleProtection($true,$false)",
-    "foreach($rule in @($acl.Access)){[void]$acl.RemoveAccessRuleSpecific($rule)}",
-    "$inheritance=if($env:ODINN_ACL_DIRECTORY -eq '1'){[System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'}else{[System.Security.AccessControl.InheritanceFlags]::None}",
+    "$rules=$acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])",
+    "foreach($rule in $rules){[void]$acl.RemoveAccessRuleSpecific($rule)}",
+    "$inheritance=if($directory){[System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'}else{[System.Security.AccessControl.InheritanceFlags]::None}",
     "foreach($sid in @($current,$system,$admins)){$rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,[System.Security.AccessControl.FileSystemRights]::FullControl,$inheritance,[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow);[void]$acl.AddAccessRule($rule)}",
     "$allowedOwners=@($current.Value,$system.Value,$admins.Value)",
-    "$owner=$acl.Owner.Translate([System.Security.Principal.SecurityIdentifier]).Value",
+    "$owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
     "if($allowedOwners -notcontains $owner){$acl.SetOwner($current)}",
-    "Set-Acl -LiteralPath $path -AclObject $acl"
+    "if($directory){[System.IO.Directory]::SetAccessControl($path,$acl)}else{[System.IO.File]::SetAccessControl($path,$acl)}"
   ].join("; ");
   await runWindowsPowerShell(script, {
     ODINN_ACL_PATH: path,
@@ -67,12 +69,15 @@ async function applyWindowsAcl(path: string, directory: boolean) {
 
 async function windowsOwnerOnly(path: string) {
   const script = [
-    "$acl=Get-Acl -LiteralPath $env:ODINN_ACL_PATH",
+    "$path=$env:ODINN_ACL_PATH",
+    "$acl=if([System.IO.Directory]::Exists($path)){[System.IO.Directory]::GetAccessControl($path)}elseif([System.IO.File]::Exists($path)){[System.IO.File]::GetAccessControl($path)}else{exit 1}",
     "$current=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$allowed=@($current,'S-1-5-18','S-1-5-32-544')",
-    "$owner=$acl.Owner.Translate([System.Security.Principal.SecurityIdentifier]).Value",
-    "$foreign=@($acl.Access | Where-Object AccessControlType -eq 'Allow' | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } | Where-Object { $allowed -notcontains $_ })",
-    "if ($acl.AreAccessRulesProtected -and $allowed -contains $owner -and $foreign.Count -eq 0) { exit 0 } else { exit 1 }"
+    "$owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+    "$foreign=0",
+    "$rules=$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])",
+    "foreach($rule in $rules){if($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $allowed -notcontains $rule.IdentityReference.Value){$foreign+=1}}",
+    "if ($acl.AreAccessRulesProtected -and $allowed -contains $owner -and $foreign -eq 0) { exit 0 } else { exit 1 }"
   ].join("; ");
   try {
     await runWindowsPowerShell(script, { ODINN_ACL_PATH: path });
