@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { normalizeAuditEvent, type AuditEvent, type JsonObject } from "@odinn/protocol";
@@ -16,42 +16,53 @@ type MutableResult<T> = T | Promise<T>;
 type NodeError = Error & { code?: string };
 const errorCode = (error: unknown) => (error as NodeError | undefined)?.code;
 const execFile = promisify(execFileCallback);
-let windowsPrincipalPromise: Promise<string> | undefined;
-const securedWindowsPaths = new Set<string>();
 const securingWindowsPaths = new Map<string, Promise<void>>();
 
-function windowsPrincipal() {
-  windowsPrincipalPromise ??= execFile("whoami.exe", [], { windowsHide: true })
-    .then(({ stdout }) => stdout.trim())
-    .then((principal) => {
-      if (!principal) throw new Error("could not resolve the current Windows account");
-      return principal;
-    });
-  return windowsPrincipalPromise;
+function windowsPowerShell() {
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot) throw new Error("SystemRoot is required to secure Windows state");
+  return join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+async function runWindowsPowerShell(script: string, environment: Record<string, string>) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  await execFile(windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+    windowsHide: true,
+    env: { ...process.env, ...environment }
+  });
 }
 
 async function secureWindowsPath(path: string, directory: boolean) {
   const key = `${directory ? "d" : "f"}:${resolve(path).toLowerCase()}`;
-  if (securedWindowsPaths.has(key)) return;
   const pending = securingWindowsPaths.get(key);
   if (pending) return pending;
   const operation = applyWindowsAcl(path, directory)
-    .then(() => { securedWindowsPaths.add(key); })
     .finally(() => { securingWindowsPaths.delete(key); });
   securingWindowsPaths.set(key, operation);
   return operation;
 }
 
 async function applyWindowsAcl(path: string, directory: boolean) {
-  const principal = await windowsPrincipal();
-  const rights = directory ? "(OI)(CI)F" : "F";
-  await execFile("icacls.exe", [
-    path,
-    "/inheritance:r",
-    "/grant:r", `${principal}:${rights}`,
-    "/grant:r", `*S-1-5-18:${rights}`,
-    "/grant:r", `*S-1-5-32-544:${rights}`
-  ], { windowsHide: true });
+  const script = [
+    "$path=$env:ODINN_ACL_PATH",
+    "$current=[System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+    "$system=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
+    "$admins=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')",
+    "$acl=Get-Acl -LiteralPath $path",
+    "$acl.SetAccessRuleProtection($true,$false)",
+    "foreach($rule in @($acl.Access)){[void]$acl.RemoveAccessRuleSpecific($rule)}",
+    "$inheritance=if($env:ODINN_ACL_DIRECTORY -eq '1'){[System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'}else{[System.Security.AccessControl.InheritanceFlags]::None}",
+    "foreach($sid in @($current,$system,$admins)){$rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,[System.Security.AccessControl.FileSystemRights]::FullControl,$inheritance,[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow);[void]$acl.AddAccessRule($rule)}",
+    "$allowedOwners=@($current.Value,$system.Value,$admins.Value)",
+    "$owner=$acl.Owner.Translate([System.Security.Principal.SecurityIdentifier]).Value",
+    "if($allowedOwners -notcontains $owner){$acl.SetOwner($current)}",
+    "Set-Acl -LiteralPath $path -AclObject $acl"
+  ].join("; ");
+  await runWindowsPowerShell(script, {
+    ODINN_ACL_PATH: path,
+    ODINN_ACL_DIRECTORY: directory ? "1" : "0"
+  });
+  if (!await windowsOwnerOnly(path)) throw new Error(`failed to establish an owner-only Windows ACL: ${path}`);
 }
 
 async function windowsOwnerOnly(path: string) {
@@ -59,17 +70,12 @@ async function windowsOwnerOnly(path: string) {
     "$acl=Get-Acl -LiteralPath $env:ODINN_ACL_PATH",
     "$current=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$allowed=@($current,'S-1-5-18','S-1-5-32-544')",
+    "$owner=$acl.Owner.Translate([System.Security.Principal.SecurityIdentifier]).Value",
     "$foreign=@($acl.Access | Where-Object AccessControlType -eq 'Allow' | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } | Where-Object { $allowed -notcontains $_ })",
-    "$parentProtected=$false",
-    "if (-not $acl.AreAccessRulesProtected) { $parent=Split-Path -Parent $env:ODINN_ACL_PATH; if ($parent) { $parentProtected=(Get-Acl -LiteralPath $parent).AreAccessRulesProtected } }",
-    "if (($acl.AreAccessRulesProtected -or $parentProtected) -and $foreign.Count -eq 0) { exit 0 } else { exit 1 }"
+    "if ($acl.AreAccessRulesProtected -and $allowed -contains $owner -and $foreign.Count -eq 0) { exit 0 } else { exit 1 }"
   ].join("; ");
-  const encoded = Buffer.from(script, "utf16le").toString("base64");
   try {
-    await execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
-      windowsHide: true,
-      env: { ...process.env, ODINN_ACL_PATH: path }
-    });
+    await runWindowsPowerShell(script, { ODINN_ACL_PATH: path });
     return true;
   } catch {
     return false;
@@ -78,27 +84,68 @@ async function windowsOwnerOnly(path: string) {
 
 async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>): Promise<T> {
   await ensureSecureStateDirectory(dirname(lockPath));
+  const token = randomUUID();
   const deadline = Date.now() + 30_000;
   while (true) {
     try {
-      await mkdir(lockPath, { mode: 0o700 });
+      const handle = await open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify({ token, pid: process.pid, createdAt: new Date().toISOString() })}\n`);
+      } finally {
+        await handle.close();
+      }
       break;
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
-      try {
-        if (Date.now() - (await stat(lockPath)).mtimeMs > 120_000) {
-          await rm(lockPath, { recursive: true, force: true });
-          continue;
-        }
-      } catch (statError) {
-        if (errorCode(statError) !== "ENOENT") throw statError;
-      }
+      if (await removeDeadOwnerLock(lockPath)) continue;
       if (Date.now() >= deadline) throw new Error(`timed out acquiring store lock: ${lockPath}`);
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
   try { return await operation(); }
-  finally { await rm(lockPath, { recursive: true, force: true }); }
+  finally { await removeOwnedLock(lockPath, token); }
+}
+
+async function removeDeadOwnerLock(lockPath: string) {
+  let raw: string;
+  try {
+    raw = await readFile(lockPath, "utf8");
+  } catch (error) {
+    return errorCode(error) === "ENOENT";
+  }
+  let owner: { pid?: unknown };
+  try {
+    owner = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!Number.isInteger(owner.pid) || Number(owner.pid) < 1 || processExists(Number(owner.pid))) return false;
+  try {
+    if (await readFile(lockPath, "utf8") !== raw) return false;
+    await rm(lockPath);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return true;
+    throw error;
+  }
+}
+
+async function removeOwnedLock(lockPath: string, token: string) {
+  try {
+    const owner = JSON.parse(await readFile(lockPath, "utf8"));
+    if (owner?.token === token) await rm(lockPath);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+}
+
+function processExists(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) !== "ESRCH";
+  }
 }
 
 export async function ensureSecureStateDirectory(path: string) {
@@ -125,28 +172,46 @@ async function replaceStoreFile(temporary: string, target: string) {
   }
 
   const backup = `${target}.replace-${process.pid}-${randomUUID()}.bak`;
-  let movedExisting = false;
+  let hadExisting = true;
   try {
-    await rename(target, backup);
-    movedExisting = true;
+    await stat(target);
   } catch (error) {
-    if (errorCode(error) !== "ENOENT") throw error;
+    if (errorCode(error) === "ENOENT") hadExisting = false;
+    else throw error;
   }
 
-  try {
+  if (!hadExisting) {
     await rename(temporary, target);
+    try {
+      await secureStoreFile(target);
+    } catch (error) {
+      await rm(target, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    return;
+  }
+
+  const replaceScript = "[System.IO.File]::Replace($env:ODINN_REPLACE_SOURCE,$env:ODINN_REPLACE_TARGET,$env:ODINN_REPLACE_BACKUP,$true)";
+  await runWindowsPowerShell(replaceScript, {
+    ODINN_REPLACE_SOURCE: temporary,
+    ODINN_REPLACE_TARGET: target,
+    ODINN_REPLACE_BACKUP: backup
+  });
+  try {
+    await secureStoreFile(target);
   } catch (error) {
-    if (movedExisting) {
-      try {
-        await rename(backup, target);
-      } catch (rollbackError) {
-        throw new AggregateError([error, rollbackError], `failed to replace and restore store file: ${target}`);
-      }
+    try {
+      await runWindowsPowerShell("[System.IO.File]::Replace($env:ODINN_REPLACE_BACKUP,$env:ODINN_REPLACE_TARGET,$null,$true)", {
+        ODINN_REPLACE_BACKUP: backup,
+        ODINN_REPLACE_TARGET: target
+      });
+      await secureStoreFile(target);
+    } catch (rollbackError) {
+      throw new AggregateError([error, rollbackError], `failed to secure and restore store file: ${target}`);
     }
     throw error;
   }
-
-  if (movedExisting) await rm(backup, { force: true });
+  await rm(backup, { force: true }).catch(() => undefined);
 }
 
 export async function isOwnerOnlyPath(path: string) {
@@ -533,7 +598,6 @@ export class FileJobStore {
       const temporary = join(dirname(this.path), `.${this.path.split(/[\\/]/).pop()}.${process.pid}.${Date.now()}.tmp`);
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
       await replaceStoreFile(temporary, this.path);
-      await secureStoreFile(this.path);
       return result;
     }));
     this.writeChain = operation.catch(() => undefined);
