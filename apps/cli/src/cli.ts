@@ -7,7 +7,7 @@ import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, r
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -1255,8 +1255,7 @@ async function doctor(args: any) {
     completed: jobs.filter((job) => job.status === "completed").length
   };
   const recovery = await readJsonIfPresent(join(state, "browser-recovery.json"), { status: "clear" });
-  let ownerOnly = false;
-  try { ownerOnly = ((await statPath(state)).mode & 0o077) === 0; } catch {}
+  const ownerOnly = await isOwnerOnlyPath(state);
   let version = "unknown";
   try { version = JSON.parse(readFileSync(PACKAGE_FILE, "utf8")).version ?? version; } catch {}
   let commit = process.env.ODINN_COMMIT ?? "";
@@ -3077,8 +3076,7 @@ async function readConfig(state: any) {
 async function ensureConfig(state: any) {
   return withStateMutationLock(state, async () => {
     const configPath = join(state, "config.json");
-    await mkdir(state, { recursive: true, mode: 0o700 });
-    await chmod(state, 0o700);
+    await ensureSecureStateDirectory(state);
     await writeFile(configPath, `${JSON.stringify({
       version: 1,
       policy: createDefaultPolicy(),
@@ -3112,8 +3110,7 @@ async function saveConfig(state: any, config: any) {
     ...(config.defaultModel ? { defaultModel: config.defaultModel } : {})
   }, null, 2)}\n`;
   await withStateMutationLock(state, async () => {
-    await mkdir(state, { recursive: true, mode: 0o700 });
-    await chmod(state, 0o700);
+    await ensureSecureStateDirectory(state);
     const expected = config && typeof config === "object" ? configBaselines.get(config) : undefined;
     if (expected !== undefined) {
       const current = await readFile(join(state, "config.json"), "utf8").then(contentFingerprint).catch((error: any) => {

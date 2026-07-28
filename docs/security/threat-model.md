@@ -23,7 +23,7 @@
 - Workspace reads resolve symlinks before opening files.
 - Job shutdown sets a stopping barrier before aborting work, preventing retry/requeue races. Only tools explicitly classified as safe and idempotent may retry; unsafe interrupted work requires operator review.
 - State directories and records are repaired to owner-only permissions; restores reject symlinks, hardlinks, and special files before copying; run IDs and job idempotency keys are bound to canonical request digests.
-- Signed audit appends use an interprocess lock so forked workers cannot create sibling successors from one previous signature.
+- Signed audit appends and job-state mutations use token-owned interprocess locks so forked workers cannot create sibling successors from one previous state. Locks are never reclaimed automatically: after a timeout, Odinn fails closed. An operator may remove a stale lock only after verifying that no Odinn process is using that store; automatic age- or PID-based deletion can race a new owner.
 - Browser mutations are journaled before execution. Unknown outcomes block further mutation until explicitly resolved.
 - Extensions and MCP adapters execute through the audited Gatewatch/Rune Key boundary; direct extension execution is rejected. Third-party extensions use the container adapter with a whole-bundle digest, read-only mount, no network, dropped capabilities, no-new-privileges, and CPU/memory/PID/filesystem limits. Explicit `unconfined-process` extensions remain trusted-code-only.
 - Full capsule replay requires a disposable workspace, complete non-redacted inputs, an audited executor, and explicit approval for external effects.

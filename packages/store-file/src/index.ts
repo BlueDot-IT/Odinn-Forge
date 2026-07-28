@@ -1,6 +1,8 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { execFile as execFileCallback } from "node:child_process";
+import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { normalizeAuditEvent, type AuditEvent, type JsonObject } from "@odinn/protocol";
 
 export const STORE_SCHEMA_VERSION = 1;
@@ -13,41 +15,185 @@ type JobState = { schemaVersion: number; jobs: Record<string, Job> };
 type MutableResult<T> = T | Promise<T>;
 type NodeError = Error & { code?: string };
 const errorCode = (error: unknown) => (error as NodeError | undefined)?.code;
+const execFile = promisify(execFileCallback);
+const securingWindowsPaths = new Map<string, Promise<void>>();
 
-async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>): Promise<T> {
+function windowsPowerShell() {
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot) throw new Error("SystemRoot is required to secure Windows state");
+  return join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+async function runWindowsPowerShell(script: string, environment: Record<string, string>) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  await execFile(windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+    windowsHide: true,
+    env: { ...process.env, ...environment }
+  });
+}
+
+async function secureWindowsPath(path: string, directory: boolean) {
+  const key = `${directory ? "d" : "f"}:${resolve(path).toLowerCase()}`;
+  const pending = securingWindowsPaths.get(key);
+  if (pending) return pending;
+  const operation = applyWindowsAcl(path, directory)
+    .finally(() => { securingWindowsPaths.delete(key); });
+  securingWindowsPaths.set(key, operation);
+  return operation;
+}
+
+async function applyWindowsAcl(path: string, directory: boolean) {
+  const script = [
+    "$path=$env:ODINN_ACL_PATH",
+    "$current=[System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+    "$system=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
+    "$admins=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')",
+    "$directory=$env:ODINN_ACL_DIRECTORY -eq '1'",
+    "$acl=if($directory){[System.IO.Directory]::GetAccessControl($path)}else{[System.IO.File]::GetAccessControl($path)}",
+    "$acl.SetAccessRuleProtection($true,$false)",
+    "$rules=$acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])",
+    "foreach($rule in $rules){[void]$acl.RemoveAccessRuleSpecific($rule)}",
+    "$inheritance=if($directory){[System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'}else{[System.Security.AccessControl.InheritanceFlags]::None}",
+    "foreach($sid in @($current,$system,$admins)){$rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,[System.Security.AccessControl.FileSystemRights]::FullControl,$inheritance,[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow);[void]$acl.AddAccessRule($rule)}",
+    "$allowedOwners=@($current.Value,$system.Value,$admins.Value)",
+    "$owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+    "if($allowedOwners -notcontains $owner){$acl.SetOwner($current)}",
+    "if($directory){[System.IO.Directory]::SetAccessControl($path,$acl)}else{[System.IO.File]::SetAccessControl($path,$acl)}"
+  ].join("; ");
+  await runWindowsPowerShell(script, {
+    ODINN_ACL_PATH: path,
+    ODINN_ACL_DIRECTORY: directory ? "1" : "0"
+  });
+  if (!await windowsOwnerOnly(path)) throw new Error(`failed to establish an owner-only Windows ACL: ${path}`);
+}
+
+async function windowsOwnerOnly(path: string) {
+  const script = [
+    "$path=$env:ODINN_ACL_PATH",
+    "$acl=if([System.IO.Directory]::Exists($path)){[System.IO.Directory]::GetAccessControl($path)}elseif([System.IO.File]::Exists($path)){[System.IO.File]::GetAccessControl($path)}else{exit 1}",
+    "$current=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$allowed=@($current,'S-1-5-18','S-1-5-32-544')",
+    "$owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+    "$foreign=0",
+    "$rules=$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])",
+    "foreach($rule in $rules){if($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $allowed -notcontains $rule.IdentityReference.Value){$foreign+=1}}",
+    "if ($acl.AreAccessRulesProtected -and $allowed -contains $owner -and $foreign -eq 0) { exit 0 } else { exit 1 }"
+  ].join("; ");
+  try {
+    await runWindowsPowerShell(script, { ODINN_ACL_PATH: path });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>, timeoutMs = 30_000): Promise<T> {
   await ensureSecureStateDirectory(dirname(lockPath));
-  const deadline = Date.now() + 30_000;
+  const token = randomUUID();
+  const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
-      await mkdir(lockPath, { mode: 0o700 });
+      const handle = await open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify({ token, pid: process.pid, createdAt: new Date().toISOString() })}\n`);
+      } finally {
+        await handle.close();
+      }
       break;
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
-      try {
-        if (Date.now() - (await stat(lockPath)).mtimeMs > 120_000) {
-          await rm(lockPath, { recursive: true, force: true });
-          continue;
-        }
-      } catch (statError) {
-        if (errorCode(statError) !== "ENOENT") throw statError;
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out acquiring store lock: ${lockPath}; verify that no Odinn process is using the store before manually removing this lock`);
       }
-      if (Date.now() >= deadline) throw new Error(`timed out acquiring store lock: ${lockPath}`);
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
   try { return await operation(); }
-  finally { await rm(lockPath, { recursive: true, force: true }); }
+  finally { await removeOwnedLock(lockPath, token); }
+}
+
+async function removeOwnedLock(lockPath: string, token: string) {
+  try {
+    const owner = JSON.parse(await readFile(lockPath, "utf8"));
+    if (owner?.token === token) await rm(lockPath);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
 }
 
 export async function ensureSecureStateDirectory(path: string) {
   await mkdir(path, { recursive: true, mode: 0o700 });
-  await chmod(path, 0o700);
+  if (process.platform === "win32") await secureWindowsPath(path, true);
+  else await chmod(path, 0o700);
   return path;
 }
 
 async function secureStoreFile(path: string) {
   await ensureSecureStateDirectory(dirname(path));
-  try { await chmod(path, 0o600); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+  try {
+    if (process.platform === "win32") await secureWindowsPath(path, false);
+    else await chmod(path, 0o600);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+}
+
+async function replaceStoreFile(temporary: string, target: string) {
+  if (process.platform !== "win32") {
+    await rename(temporary, target);
+    return;
+  }
+
+  const backup = `${target}.replace-${process.pid}-${randomUUID()}.bak`;
+  let hadExisting = true;
+  try {
+    await stat(target);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") hadExisting = false;
+    else throw error;
+  }
+
+  if (!hadExisting) {
+    await rename(temporary, target);
+    try {
+      await secureStoreFile(target);
+    } catch (error) {
+      await rm(target, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    return;
+  }
+
+  const replaceScript = "[System.IO.File]::Replace($env:ODINN_REPLACE_SOURCE,$env:ODINN_REPLACE_TARGET,$env:ODINN_REPLACE_BACKUP,$true)";
+  await runWindowsPowerShell(replaceScript, {
+    ODINN_REPLACE_SOURCE: temporary,
+    ODINN_REPLACE_TARGET: target,
+    ODINN_REPLACE_BACKUP: backup
+  });
+  try {
+    await secureStoreFile(target);
+  } catch (error) {
+    try {
+      await runWindowsPowerShell("[System.IO.File]::Replace($env:ODINN_REPLACE_BACKUP,$env:ODINN_REPLACE_TARGET,$null,$true)", {
+        ODINN_REPLACE_BACKUP: backup,
+        ODINN_REPLACE_TARGET: target
+      });
+      await secureStoreFile(target);
+    } catch (rollbackError) {
+      throw new AggregateError([error, rollbackError], `failed to secure and restore store file: ${target}`);
+    }
+    throw error;
+  }
+  await rm(backup, { force: true }).catch(() => undefined);
+}
+
+export async function isOwnerOnlyPath(path: string) {
+  if (process.platform === "win32") return windowsOwnerOnly(path);
+  try {
+    return ((await stat(path)).mode & 0o077) === 0;
+  } catch {
+    return false;
+  }
 }
 
 export class StoreCorruptionError extends Error {
@@ -317,11 +463,16 @@ export class FileRecordStore {
 
 export class FileJobStore {
   readonly path: string;
+  readonly lockPath: string;
+  readonly lockTimeoutMs: number;
   private writeChain: Promise<unknown>;
 
-  constructor(path: string) {
+  constructor(path: string, { lockTimeoutMs = 30_000 }: { lockTimeoutMs?: number } = {}) {
     if (!path) throw new Error("FileJobStore requires a path");
+    if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1) throw new Error("FileJobStore lock timeout must be a positive integer");
     this.path = path;
+    this.lockPath = `${path}.lock`;
+    this.lockTimeoutMs = lockTimeoutMs;
     this.writeChain = Promise.resolve();
   }
 
@@ -416,16 +567,15 @@ export class FileJobStore {
   }
 
   async mutate<T>(fn: (state: JobState) => MutableResult<T>): Promise<T> {
-    const operation = this.writeChain.then(async () => {
+    const operation = this.writeChain.then(() => withInterprocessLock(this.lockPath, async () => {
       const state = await this.readState();
       const result = await fn(state);
       await ensureSecureStateDirectory(dirname(this.path));
       const temporary = join(dirname(this.path), `.${this.path.split(/[\\/]/).pop()}.${process.pid}.${Date.now()}.tmp`);
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-      await rename(temporary, this.path);
-      await secureStoreFile(this.path);
+      await replaceStoreFile(temporary, this.path);
       return result;
-    });
+    }, this.lockTimeoutMs));
     this.writeChain = operation.catch(() => undefined);
     return operation;
   }

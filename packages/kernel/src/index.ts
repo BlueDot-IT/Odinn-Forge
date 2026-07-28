@@ -45,6 +45,7 @@ export { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryC
 export type { MemoryCommandInput, MemoryRecordStore } from "./memory.ts";
 export { createApprovalStore } from "./approvals.ts";
 export type { ApprovalAction, ApprovalStore } from "./approvals.ts";
+export { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
 export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";

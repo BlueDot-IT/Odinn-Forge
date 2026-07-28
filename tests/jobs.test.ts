@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
 import { JobSupervisor } from "../packages/kernel/src/jobs.ts";
-import { FileAuditStore, FileJobStore } from "../packages/store-file/src/index.ts";
+import { ensureSecureStateDirectory, FileAuditStore, FileJobStore, isOwnerOnlyPath } from "../packages/store-file/src/index.ts";
+
+const execFile = promisify(execFileCallback);
 
 async function waitFor(check: any, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
@@ -28,6 +32,7 @@ test("job supervisor persists completion and replays recovered work", async () =
   assert.equal(submitted.status, "queued");
   const completed = await waitFor(async () => (await supervisor.get("job_persisted"))?.status === "completed" ? supervisor.get("job_persisted") : undefined);
   assert.equal(completed.result.echoed, "ODINN_JOB_OK");
+  assert.equal(await isOwnerOnlyPath(store.path), true);
   await supervisor.shutdown();
 
   const recoveredStore = new FileJobStore(join(root, "jobs-recovered.json"));
@@ -146,4 +151,74 @@ test("independent audit store instances serialize one signed chain", async () =>
   assert.equal(verification.events, 40);
   assert.equal(verification.valid, true);
   assert.deepEqual(verification.failures, []);
+});
+
+test("independent job stores serialize asynchronous mutations without losing state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-job-store-concurrent-"));
+  const path = join(root, "jobs.json");
+  const left = new FileJobStore(path);
+  const right = new FileJobStore(path);
+  let releaseFirst!: () => void;
+  const firstCanFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let secondFinished = false;
+
+  const first = left.mutate(async (state: any) => {
+    await firstCanFinish;
+    state.jobs.first = {
+      id: "first", status: "queued", payload: {}, createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(), attempts: 0, timeoutMs: 1_000, retrySafe: true
+    };
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const second = right.create({ id: "second", status: "queued", payload: {} }).then(() => { secondFinished = true; });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(secondFinished, false);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual((await left.list()).map((job: any) => job.id).sort(), ["first", "second"]);
+});
+
+test("job stores fail closed on orphaned locks instead of reclaiming them automatically", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-job-store-orphan-lock-"));
+  const path = join(root, "jobs.json");
+  const store = new FileJobStore(path, { lockTimeoutMs: 25 });
+  await writeFile(store.lockPath, `${JSON.stringify({ token: "orphan", pid: 999_999_999, createdAt: "2000-01-01T00:00:00.000Z" })}\n`);
+  await assert.rejects(
+    () => store.create({ id: "blocked", status: "queued", payload: {} }),
+    /verify that no Odinn process is using the store before manually removing this lock/
+  );
+  assert.equal(await readFile(store.lockPath, "utf8").then((content) => JSON.parse(content).token), "orphan");
+});
+
+test("job store readers never observe an empty state while Windows-compatible replacement runs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-job-store-readers-"));
+  const store = new FileJobStore(join(root, "jobs.json"));
+  await store.create({ id: "persistent", status: "queued", payload: {} });
+  let emptyObservation = false;
+  let pendingWrites = 8;
+  const writes = Array.from({ length: 8 }, async (_, index) => {
+    await store.update("persistent", { status: index % 2 ? "running" : "queued" });
+  }).map((write) => write.finally(() => { pendingWrites -= 1; }));
+  const reader = (async () => {
+    while (pendingWrites > 0) {
+      if ((await store.list()).length === 0) emptyObservation = true;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  })();
+  await Promise.all(writes);
+  await reader;
+  assert.equal(emptyObservation, false);
+});
+
+test("Windows state hardening removes pre-existing explicit foreign grants", { skip: process.platform !== "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-windows-acl-"));
+  const systemRoot = process.env.SystemRoot;
+  assert.ok(systemRoot);
+  await execFile(join(systemRoot, "System32", "icacls.exe"), [
+    root,
+    "/grant", "*S-1-1-0:(OI)(CI)R"
+  ], { windowsHide: true });
+  assert.equal(await isOwnerOnlyPath(root), false);
+  await ensureSecureStateDirectory(root);
+  assert.equal(await isOwnerOnlyPath(root), true);
 });

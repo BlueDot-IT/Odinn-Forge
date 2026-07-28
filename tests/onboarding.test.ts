@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "../apps/cli/src/onboarding/apply.ts";
 import { decideGatewayAction, probeGateway } from "../apps/cli/src/onboarding/runtime.ts";
-import { PROVIDER_PRESETS, saveOAuthToken } from "../packages/kernel/src/index.ts";
+import { isOwnerOnlyPath, PROVIDER_PRESETS, saveOAuthToken } from "../packages/kernel/src/index.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const cli = ["apps/cli/src/cli.ts"];
@@ -96,9 +96,13 @@ test("non-interactive onboarding creates a permission-safe fresh state", async (
 
   assert.equal(result.code, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /needs an AI connection|setup required/i);
-  assert.equal((await stat(state)).mode & 0o777, 0o700);
-  assert.equal((await stat(join(state, "config.json"))).mode & 0o777, 0o600);
-  assert.equal((await stat(join(state, "agents", "main", "agent.json"))).mode & 0o777, 0o600);
+  if (process.platform === "win32") {
+    assert.equal(await isOwnerOnlyPath(state), true);
+  } else {
+    assert.equal((await stat(state)).mode & 0o777, 0o700);
+    assert.equal((await stat(join(state, "config.json"))).mode & 0o777, 0o600);
+    assert.equal((await stat(join(state, "agents", "main", "agent.json"))).mode & 0o777, 0o600);
+  }
 
   const raw = await readFile(join(state, "config.json"), "utf8");
   const config = JSON.parse(raw);

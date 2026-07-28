@@ -9,6 +9,7 @@ import {
   AGENT_IDENTITY_FILES,
   AGENT_SDK_VERSION,
   ensureMainAgent,
+  isOwnerOnlyPath,
   loadAgent,
   validateAgentManifest
 } from "../packages/kernel/src/index.ts";
@@ -28,16 +29,19 @@ test("first setup creates the main agent from the Agent SDK contract", async () 
   assert.equal(registry.defaultAgentId, "main");
   assert.equal(registry.agents[0].id, "main");
   assert.equal(registry.agents[0].status, "enabled");
-  assert.equal((await stat(join(state, "agents.json"))).mode & 0o777, 0o600);
-  assert.equal((await stat(join(state, "agents", "main"))).mode & 0o777, 0o700);
+  if (process.platform === "win32") assert.equal(await isOwnerOnlyPath(state), true);
+  else {
+    assert.equal((await stat(join(state, "agents.json"))).mode & 0o777, 0o600);
+    assert.equal((await stat(join(state, "agents", "main"))).mode & 0o777, 0o700);
+  }
   for (const file of AGENT_IDENTITY_FILES) {
     await access(join(state, "agents", "main", file));
-    assert.equal((await stat(join(state, "agents", "main", file))).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal((await stat(join(state, "agents", "main", file))).mode & 0o777, 0o600);
   }
   assert.equal(await readFile(join(state, "agents", "main", "IDENTITY.md"), "utf8"), "");
   assert.equal(await readFile(join(state, "agents", "main", "SOUL.md"), "utf8"), "");
   await access(join(state, "agents", "main", AGENT_BOOTSTRAP_FILE));
-  assert.equal((await stat(join(state, "agents", "main", AGENT_BOOTSTRAP_FILE))).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal((await stat(join(state, "agents", "main", AGENT_BOOTSTRAP_FILE))).mode & 0o777, 0o600);
 });
 
 test("pending bootstrap is loaded before provider-independent identity context", async () => {
