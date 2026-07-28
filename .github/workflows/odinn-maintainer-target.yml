@@ -71,7 +71,7 @@ jobs:
       pull-requests: read
     steps:
       - id: maintainer
-        uses: BlueDot-IT/odinn-maintainer/.github/actions/plan@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
+        uses: BlueDot-IT/odinn-maintainer/.github/actions/plan@f9b37ebf6e225572790b454f37af13e0ea767568 # v0.5.0
         with:
           github-read-token: ${{ github.token }}
           oauth-json: ${{ secrets.oauth_json }}
@@ -113,7 +113,7 @@ jobs:
           path: ${{ runner.temp }}/odinn-maintainer-plan
       - id: maintainer
         if: steps.download.outcome == 'success'
-        uses: BlueDot-IT/odinn-maintainer/.github/actions/apply@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
+        uses: BlueDot-IT/odinn-maintainer/.github/actions/apply@f9b37ebf6e225572790b454f37af13e0ea767568 # v0.5.0
         with:
           github-token: ${{ github.token }}
           plan-path: ${{ runner.temp }}/odinn-maintainer-plan/plan.json

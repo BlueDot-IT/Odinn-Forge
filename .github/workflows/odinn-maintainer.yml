@@ -45,7 +45,7 @@ jobs:
       count: ${{ steps.targets.outputs.count }}
     steps:
       - id: targets
-        uses: BlueDot-IT/odinn-maintainer/.github/actions/targets@e2e078dc86b124e2e0b912cf32c0de0945155d57 # v0.5.0
+        uses: BlueDot-IT/odinn-maintainer/.github/actions/targets@f9b37ebf6e225572790b454f37af13e0ea767568 # v0.5.0
         with:
           github-read-token: ${{ github.token }}
           include-issues: "true"
