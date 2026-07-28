@@ -551,10 +551,13 @@ export async function createGatewayServer({
         return image(response, 200, await readFile(join(PUBLIC_DIR, "odinn-logo.png")), "image/png");
       }
       if (request.method === "GET" && url.pathname === "/") {
-        return html(response, 200, renderConsoleHtml(version), {
-          "set-cookie": `odinn_gateway_token=${encodeURIComponent(gatewayToken)}; HttpOnly; SameSite=Strict; Path=/`,
-          "x-odinn-auth": "bootstrap-cookie"
-        });
+        const bootstrapHeaders = permitsGatewayTokenBootstrap(request, server)
+          ? {
+              "set-cookie": `odinn_gateway_token=${encodeURIComponent(gatewayToken)}; HttpOnly; SameSite=Strict; Path=/`,
+              "x-odinn-auth": "bootstrap-cookie"
+            }
+          : { "x-odinn-auth": "authentication-required" };
+        return html(response, 200, renderConsoleHtml(version), bootstrapHeaders);
       }
       if (process.env.ODINN_GATEWAY_AUTH !== "off" && !authorizedRequest(request, gatewayToken)) {
         return json(response, 401, { ok: false, error: "gateway authentication required" });
@@ -1331,6 +1334,17 @@ function validMutationOrigin(request: any, authentication: "bearer" | "cookie" |
 function validHostHeader(request: any) {
   const host = request.headers.host;
   return typeof host === "string" && validLoopbackHost(host);
+}
+
+function permitsGatewayTokenBootstrap(request: any, server: any) {
+  const address = server.address?.();
+  if (!address || typeof address === "string" || !validLoopbackAddress(address.address)) return false;
+  return validLoopbackAddress(request.socket?.localAddress);
+}
+
+function validLoopbackAddress(value: any) {
+  const address = String(value || "").trim().toLowerCase();
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
 function validLoopbackHost(value: any) {

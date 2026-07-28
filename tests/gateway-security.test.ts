@@ -87,6 +87,37 @@ test("gateway control surfaces require bootstrap authentication and reject cross
   }
 });
 
+test("remote gateway binding never bootstraps the control token through a spoofed loopback Host", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-remote-bootstrap-"));
+  const previousRemote = process.env.ODINN_ALLOW_REMOTE;
+  process.env.ODINN_ALLOW_REMOTE = "1";
+  const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  await new Promise((resolve: any) => server.listen(0, "0.0.0.0", resolve));
+  try {
+    const token = (await readFile(join(stateDir, "gateway.token"), "utf8")).trim();
+    const bootstrap: any = await requestRaw({
+      port: server.address().port,
+      path: "/",
+      headers: { host: `localhost:${server.address().port}` }
+    });
+    assert.equal(bootstrap.status, 200);
+    assert.equal(bootstrap.headers["set-cookie"], undefined);
+    assert.equal(bootstrap.headers["x-odinn-auth"], "authentication-required");
+    assert.equal(bootstrap.body.includes(token), false);
+
+    const status: any = await requestRaw({
+      port: server.address().port,
+      path: "/status",
+      headers: { host: `localhost:${server.address().port}` }
+    });
+    assert.equal(status.status, 401);
+  } finally {
+    if (previousRemote === undefined) delete process.env.ODINN_ALLOW_REMOTE;
+    else process.env.ODINN_ALLOW_REMOTE = previousRemote;
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
 test("approval records survive restart and claim idempotently", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-restart-"));
   const path = join(stateDir, "approvals.json");
@@ -153,8 +184,13 @@ test("configuration reads refuse symbolic-link swaps", { skip: process.platform 
 function requestRaw({ port, path, headers = {} }: any) {
   return new Promise((resolve: any, reject: any) => {
     const request = httpRequest({ host: "127.0.0.1", port, path, headers }, (response: any) => {
-      response.resume();
-      response.on("end", () => resolve({ status: response.statusCode }));
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString("utf8")
+      }));
     });
     request.on("error", reject);
     request.end();
