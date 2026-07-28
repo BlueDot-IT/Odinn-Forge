@@ -144,6 +144,39 @@ test("configuration API safely edits config.json and rejects stale writes", asyn
   }
 });
 
+test("proof raw evidence requires an explicit boolean configuration opt-in", async () => {
+  const initial = { version: 1, proof: { allowedCommands: [], includeRawEvidence: false } };
+  const gateway = await gatewayFixture("odinn-proof-evidence-config", initial);
+  try {
+    const loaded = await requestJson(`${gateway.base}/config`);
+    const enabled = await requestJson(`${gateway.base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        config: { ...initial, proof: { ...initial.proof, includeRawEvidence: true } },
+        fingerprint: loaded.fingerprint
+      })
+    });
+    assert.equal(enabled.config.proof.includeRawEvidence, true);
+    assert.equal(JSON.parse(await readFile(join(gateway.stateDir, "config.json"), "utf8")).proof.includeRawEvidence, true);
+
+    const current = await requestJson(`${gateway.base}/config`);
+    for (const invalidValue of ["true", 1, null]) {
+      const invalid = await requestJson(`${gateway.base}/config`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          config: { ...current.config, proof: { ...current.config.proof, includeRawEvidence: invalidValue } },
+          fingerprint: current.fingerprint
+        })
+      }, 400);
+      assert.match(invalid.error, /config\.proof\.includeRawEvidence must be true or false/u);
+    }
+  } finally {
+    await gateway.close();
+  }
+});
+
 test("audit query paginates and filters while usage shares its summary semantics", async () => {
   const gateway = await gatewayFixture("odinn-audit-surface", {
     selfImprovement: { enabled: false, mode: "disabled" }

@@ -2490,7 +2490,15 @@ async function run(args: any) {
   const contractPath = option(args, "--contract", "");
   if (contractPath) {
     const contract = parseStructuredDocument(await readFile(resolveInvocationPath(contractPath), "utf8"), contractPath);
-    const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+    const runtime = createDifferentiatedRuntime({
+      stateDir: state,
+      workspaceRoot,
+      featureFlags: normalizeExperimentalFlags(config.experimental),
+      proofOptions: {
+        allowedCommands: config.proof?.allowedCommands ?? [],
+        includeRawEvidence: config.proof?.includeRawEvidence === true
+      }
+    });
     try { result.proof = await runtime.proof.run(result.id, contract, { workspaceRoot }); }
     finally { runtime.ledger.close(); }
   }
@@ -2853,7 +2861,11 @@ async function runRecordTool(args: any, tool: any, input: any) {
 function runtimeFor(args: any) {
   const state = stateDir(args);
   const config = readConfigSync(state);
-  return { state, config, runtime: createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) }) };
+  const proofOptions = {
+    allowedCommands: config.proof?.allowedCommands ?? [],
+    includeRawEvidence: config.proof?.includeRawEvidence === true
+  };
+  return { state, config, runtime: createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental), proofOptions }) };
 }
 
 function readConfigSync(state: any) {
@@ -2874,7 +2886,12 @@ async function proof(args: any) {
       const contract = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path);
       if (contract.schemaVersion === 1) {
         if (contract.runId !== runId) throw new Error("proof contract runId must match the requested run");
-        await printJson(await new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: invocationRoot(), allowedCommands: config.proof?.allowedCommands ?? [] }).verify(contract));
+        await printJson(await new ProofVerifier({
+          runLedger: runtime.ledger,
+          allowedRoot: invocationRoot(),
+          allowedCommands: config.proof?.allowedCommands ?? [],
+          includeRawEvidence: config.proof?.includeRawEvidence === true
+        }).verify(contract));
       } else {
         await printJson(await runtime.proof.run(runId, contract, { workspaceRoot: invocationRoot() }));
       }
@@ -2977,7 +2994,8 @@ async function counterfactualCommand(args: any) {
               return new ProofVerifier({
                 runLedger: runtime.ledger,
                 allowedRoot: workspaceRoot,
-                allowedCommands: config.proof?.allowedCommands ?? []
+                allowedCommands: config.proof?.allowedCommands ?? [],
+                includeRawEvidence: config.proof?.includeRawEvidence === true
               }).verify({ ...contract, runId });
             }
             return runtime.proof.run(runId, contract, { workspaceRoot });

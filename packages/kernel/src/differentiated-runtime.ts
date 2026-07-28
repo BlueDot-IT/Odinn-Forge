@@ -4,7 +4,7 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createRunLedger, redact } from "./run-ledger.ts";
-import { ProofVerifier } from "./proof.ts";
+import { ProofVerifier, proofEvidenceView } from "./proof.ts";
 import { evaluatePolicyInvariants, normalizePolicyInvariants } from "@odinn/policy";
 import { ODINN_ERROR_CODES, OdinnRuntimeError } from "./runtime-errors.ts";
 import { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
@@ -168,11 +168,12 @@ function runProcess(command: string, args: string[], { cwd, timeoutMs = 120_000 
 
 export class ProofEngine {
   [key: string]: any;
-  constructor({ ledger, featureFlags = {}, allowExternalHttp = false, allowedCommands = [], maxOutputBytes, maxFileBytes, commandEnvironment }: AnyRecord = {}) {
+  constructor({ ledger, featureFlags = {}, allowExternalHttp = false, allowedCommands = [], maxOutputBytes, maxFileBytes, commandEnvironment, includeRawEvidence = false }: AnyRecord = {}) {
     this.ledger = ledger;
     this.featureFlags = featureFlags;
     this.allowExternalHttp = allowExternalHttp === true;
-    this.verifierOptions = { allowedCommands, maxOutputBytes, maxFileBytes, commandEnvironment };
+    this.includeRawEvidence = includeRawEvidence === true;
+    this.verifierOptions = { allowedCommands, maxOutputBytes, maxFileBytes, commandEnvironment, includeRawEvidence: this.includeRawEvidence };
   }
   async run(runId: string, contract: AnyRecord, { workspaceRoot = process.cwd() }: AnyRecord = {}) {
     if (contract?.schemaVersion === 1) {
@@ -195,9 +196,10 @@ export class ProofEngine {
       catch (error) { result = { status: "error", message: failureMessage(error), evidence: [] }; }
       const completedAt = now();
       const artifactIds: string[] = [];
-      if (result.stdout || result.stderr || result.body || result.evidence) artifactIds.push(this.ledger.artifacts.putJson(redact(result)).digest);
-      const row = { assertionId: assertion.id, status: result.status, startedAt, completedAt, evidenceArtifactIds: artifactIds, message: result.message ?? "", result };
-      this.ledger.database.transaction((db: any) => db.prepare(`INSERT OR REPLACE INTO assertion_results(id, contract_id, run_id, assertion_id, status, started_at, completed_at, evidence_artifact_ids_json, message, result_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomUUID(), id, runId, assertion.id, row.status, startedAt, completedAt, json(artifactIds), row.message, json(redact(result))));
+      if (this.includeRawEvidence && (result.stdout || result.stderr || result.body || result.evidence)) artifactIds.push(this.ledger.artifacts.putJson(redact(result)).digest);
+      const safeResult = proofEvidenceView(result, this.includeRawEvidence);
+      const row = { assertionId: assertion.id, status: result.status, startedAt, completedAt, evidenceArtifactIds: artifactIds, message: result.message ?? "", result: safeResult };
+      this.ledger.database.transaction((db: any) => db.prepare(`INSERT OR REPLACE INTO assertion_results(id, contract_id, run_id, assertion_id, status, started_at, completed_at, evidence_artifact_ids_json, message, result_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomUUID(), id, runId, assertion.id, row.status, startedAt, completedAt, json(artifactIds), row.message, json(safeResult)));
       this.ledger.appendEvent({ runId, type: "verification", payload: row });
       results.push(row);
     }

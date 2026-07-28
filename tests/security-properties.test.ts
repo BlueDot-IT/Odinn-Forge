@@ -132,6 +132,46 @@ test("property: nested secret keys and credential values are always redacted", (
   );
 });
 
+test("redaction removes common standalone, assigned, URL, and private-key credentials", () => {
+  const basicCredential = ["QWxhZGRp", "bjpvcGVu", "IHNlc2Ft", "ZQ=="].join("");
+  const samples = [
+    { input: "bearer abcdefghijklmnop", secret: "abcdefghijklmnop" },
+    { input: "Authorization: Bearer abcdefghijklmnop", secret: "abcdefghijklmnop" },
+    { input: `Authorization=Basic ${basicCredential}`, secret: basicCredential },
+    { input: "API_KEY=plain-assigned-secret", secret: "plain-assigned-secret" },
+    { input: "password: hunter2", secret: "hunter2" },
+    { input: "https://user:password@example.com/private", secret: "user:password" },
+    { input: `ghp_${"A".repeat(36)}`, secret: `ghp_${"A".repeat(36)}` },
+    { input: `github_pat_${"B".repeat(30)}`, secret: `github_pat_${"B".repeat(30)}` },
+    { input: `glpat-${"C".repeat(24)}`, secret: `glpat-${"C".repeat(24)}` },
+    { input: `npm_${"D".repeat(24)}`, secret: `npm_${"D".repeat(24)}` },
+    { input: `AKIA${"E".repeat(16)}`, secret: `AKIA${"E".repeat(16)}` },
+    { input: `AIza${"F".repeat(35)}`, secret: `AIza${"F".repeat(35)}` },
+    { input: `xoxb-${"1".repeat(12)}-${"G".repeat(20)}`, secret: `xoxb-${"1".repeat(12)}-${"G".repeat(20)}` },
+    { input: `sk_live_${"H".repeat(24)}`, secret: `sk_live_${"H".repeat(24)}` },
+    { input: `eyJ${"I".repeat(12)}.${"J".repeat(12)}.${"K".repeat(12)}`, secret: `eyJ${"I".repeat(12)}.${"J".repeat(12)}.${"K".repeat(12)}` },
+    { input: `${"L".repeat(24)}.ABCDEF.${"M".repeat(27)}`, secret: `${"L".repeat(24)}.ABCDEF.${"M".repeat(27)}` },
+    { input: "-----BEGIN PRIVATE KEY-----\nopaque-private-key-material\n-----END PRIVATE KEY-----", secret: "opaque-private-key-material" }
+  ];
+  const redacted = String(redact(`prefix ${samples.map(({ input }) => input).join(" ; ")} suffix`));
+
+  for (const { secret } of samples) assert.equal(redacted.includes(secret), false, `credential survived redaction: ${secret}`);
+  assert.match(redacted, /prefix/u);
+  assert.match(redacted, /suffix/u);
+  assert.match(redacted, /\[redacted\]/u);
+});
+
+test("redaction preserves ordinary identifiers and non-secret prose", () => {
+  const publicValues = [
+    "commit 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "request 123e4567-e89b-12d3-a456-426614174000",
+    `pk_live_${"P".repeat(24)}`,
+    "token budgeting is enabled",
+    "https://example.com/public/path"
+  ];
+  for (const value of publicValues) assert.equal(redact(value), value);
+});
+
 test("property: request input cannot broaden an explicit policy denial", () => {
   fc.assert(
     fc.property(identifierArbitrary, identifierArbitrary, jsonRecordArbitrary, (toolName, capability, generatedInput) => {
