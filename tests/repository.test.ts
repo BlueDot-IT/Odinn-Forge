@@ -141,6 +141,17 @@ test("maintainer reconciliation serializes the exact target across every trigger
   assert.match(ciDocs, /re-fetches the complete live target state/u);
 });
 
+test("maintainer actions pin the published v0.5.0 release commit", async () => {
+  const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
+  const target = await read(".github/workflows/odinn-maintainer-target.yml");
+  const releaseSha = "f9b37ebf6e225572790b454f37af13e0ea767568";
+  const pins = [...dispatcher.matchAll(/BlueDot-IT\/odinn-maintainer\/\.github\/actions\/[^@\s]+@([a-f0-9]{40}) # v0\.5\.0/gu)]
+    .concat([...target.matchAll(/BlueDot-IT\/odinn-maintainer\/\.github\/actions\/[^@\s]+@([a-f0-9]{40}) # v0\.5\.0/gu)]);
+
+  assert.equal(pins.length, 3);
+  assert.deepEqual(pins.map((match) => match[1]), [releaseSha, releaseSha, releaseSha]);
+});
+
 test("user documentation and reporting surfaces ship in the release tree", async () => {
   for (const path of [
     "docs/user-guide.md",
