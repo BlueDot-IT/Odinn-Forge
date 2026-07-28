@@ -4,6 +4,7 @@ import { chmod, cp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } fr
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
+import { assertReleaseCommit } from "./commit.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const dist = join(root, "dist");
@@ -66,9 +67,7 @@ async function copyFileOrDirectory(source: string, destination: string): Promise
 }
 
 const commit = currentCommit();
-if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== commit) {
-  throw new Error(`release package commit mismatch: GITHUB_SHA=${process.env.GITHUB_SHA} HEAD=${commit}`);
-}
+assertReleaseCommit(commit);
 if (compiledInfo.name !== pkg.name || compiledInfo.version !== pkg.version || compiledInfo.commit !== commit) {
   throw new Error("compiled production build metadata does not match the release package or commit");
 }

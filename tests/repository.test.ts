@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
+import { assertReleaseCommit, expectedReleaseCommit } from "../scripts/release/commit.ts";
 
 const read = (path: any) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
@@ -200,6 +201,8 @@ test("user documentation and reporting surfaces ship in the release tree", async
 
 test("release packaging removes stale assets before creating a version", async () => {
   const packaging = await read("scripts/release/package.ts");
+  assert.match(packaging, /assertReleaseCommit\(commit\)/);
+  assert.match(packaging, /from "\.\/commit\.ts"/);
   assert.match(packaging, /rm\(output, \{ recursive: true, force: true \}\)/);
   assert.ok(packaging.indexOf("rm(output") < packaging.indexOf("mkdir(output"));
   assert.doesNotMatch(packaging, /git archive/);
@@ -228,6 +231,28 @@ test("release packaging removes stale assets before creating a version", async (
   assert.match(installSmoke, /odinn-gateway/);
   assert.match(installSmoke, /"--version"/);
   assert.match(installSmoke, /\/diagnostics/);
+});
+
+test("release packaging trusts the checked-out tag declaration over ambient GitHub SHA", () => {
+  const tagCommit = "a".repeat(40);
+  const ambientBranchCommit = "b".repeat(40);
+
+  assert.equal(
+    expectedReleaseCommit({ ODINN_RELEASE_COMMIT: tagCommit, GITHUB_SHA: ambientBranchCommit }),
+    tagCommit,
+  );
+  assert.doesNotThrow(() => assertReleaseCommit(tagCommit, {
+    ODINN_RELEASE_COMMIT: tagCommit,
+    GITHUB_SHA: ambientBranchCommit,
+  }));
+  assert.throws(
+    () => assertReleaseCommit(tagCommit, { GITHUB_SHA: ambientBranchCommit }),
+    /release package commit mismatch/u,
+  );
+  assert.throws(
+    () => expectedReleaseCommit({ ODINN_RELEASE_COMMIT: "not-a-sha" }),
+    /full Git SHA/u,
+  );
 });
 
 test("third-party workflow actions are pinned to immutable commit SHAs", async () => {
