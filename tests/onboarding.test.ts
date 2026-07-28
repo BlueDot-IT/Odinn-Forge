@@ -6,13 +6,14 @@ import { access, chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "../apps/cli/src/onboarding/apply.ts";
 import { decideGatewayAction, probeGateway } from "../apps/cli/src/onboarding/runtime.ts";
 import { PROVIDER_PRESETS, saveOAuthToken } from "../packages/kernel/src/index.ts";
 
-const root = new URL("..", import.meta.url).pathname;
+const root = fileURLToPath(new URL("..", import.meta.url));
 const cli = ["apps/cli/src/cli.ts"];
 const testApiKeyEnv = "ODINN_ONBOARDING_TEST_API_KEY";
 
