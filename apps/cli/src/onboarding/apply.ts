@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { access, chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { withStateMutationLock } from "@odinn/kernel";
+import { ensureSecureStateDirectory, withStateMutationLock } from "@odinn/kernel";
 
 const TRANSACTION_PREFIX = ".onboarding-transaction-";
 const PHASE_FILE = "phase";
@@ -22,7 +22,7 @@ export async function createOnboardingDraft(targetState: string): Promise<Onboar
   const parent = dirname(targetState);
   await mkdir(parent, { recursive: true });
   const draftState = await mkdtemp(join(parent, `.${basename(targetState)}-onboarding-`));
-  await chmod(draftState, 0o700);
+  await ensureSecureStateDirectory(draftState);
   try {
     return await withStateMutationLock(targetState, async () => {
       await recoverInterruptedTransactionsUnlocked(targetState);
@@ -53,8 +53,7 @@ export async function commitOnboardingDraft(draft: OnboardingDraft): Promise<Com
       );
     }
 
-    await mkdir(draft.targetState, { recursive: true, mode: 0o700 });
-    await chmod(draft.targetState, 0o700);
+    await ensureSecureStateDirectory(draft.targetState);
     const backupPath = await backupCurrentState(draft.targetState);
     const transaction = await prepareTransaction(draft);
     try {

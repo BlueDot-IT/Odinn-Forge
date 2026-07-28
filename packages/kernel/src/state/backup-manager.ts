@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { backup as backupSqlite, DatabaseSync } from "node:sqlite";
-import { FileAuditStore } from "@odinn/store-file";
+import { FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
 import { withStateMutationLock } from "../state-mutation.ts";
 import { inspectStateSchemas, type StateInspection } from "./migration-manager.ts";
 import { STATE_SCHEMA_TARGETS, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
@@ -278,7 +278,7 @@ export async function stateLifecycleStatus(stateDir: string): Promise<{
     inspectionError = "state schema inspection failed: persistent data is invalid or unreadable";
   }
   let ownerOnly = false;
-  if (stateExists) ownerOnly = ((await stat(stateRoot)).mode & 0o077) === 0;
+  if (stateExists) ownerOnly = await isOwnerOnlyPath(stateRoot);
   let lastMigration: Record<string, unknown> | null = null;
   let historyError = "";
   try {

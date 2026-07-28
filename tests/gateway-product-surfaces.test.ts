@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
-import { createAuditStore } from "../packages/kernel/src/index.ts";
+import { createAuditStore, isOwnerOnlyPath } from "../packages/kernel/src/index.ts";
 import { FileJobStore } from "../packages/store-file/src/index.ts";
 
 const DEFAULT_PROJECT_ID = "project_default";
@@ -88,7 +88,8 @@ test("configuration API safely edits config.json and rejects stale writes", asyn
     assert.equal(saved.restartRequired, true);
     assert.match(saved.fingerprint, /^[a-f0-9]{64}$/);
     assert.deepEqual(JSON.parse(await readFile(join(gateway.stateDir, "config.json"), "utf8")), next);
-    assert.equal((await stat(join(gateway.stateDir, "config.json"))).mode & 0o777, 0o600);
+    if (process.platform === "win32") assert.equal(await isOwnerOnlyPath(gateway.stateDir), true);
+    else assert.equal((await stat(join(gateway.stateDir, "config.json"))).mode & 0o777, 0o600);
 
     const current = await requestJson(`${gateway.base}/config`);
     assert.equal(current.restartRequired, true);

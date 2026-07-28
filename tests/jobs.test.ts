@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { JobSupervisor } from "../packages/kernel/src/jobs.ts";
-import { FileAuditStore, FileJobStore } from "../packages/store-file/src/index.ts";
+import { FileAuditStore, FileJobStore, isOwnerOnlyPath } from "../packages/store-file/src/index.ts";
 
 async function waitFor(check: any, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
@@ -28,6 +28,7 @@ test("job supervisor persists completion and replays recovered work", async () =
   assert.equal(submitted.status, "queued");
   const completed = await waitFor(async () => (await supervisor.get("job_persisted"))?.status === "completed" ? supervisor.get("job_persisted") : undefined);
   assert.equal(completed.result.echoed, "ODINN_JOB_OK");
+  assert.equal(await isOwnerOnlyPath(store.path), true);
   await supervisor.shutdown();
 
   const recoveredStore = new FileJobStore(join(root, "jobs-recovered.json"));

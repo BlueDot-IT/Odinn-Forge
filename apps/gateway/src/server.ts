@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
-import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
+import { FileJobStore, ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import { ChannelRouter, FileSessionBindingStore, GatewayChannelHandler, createAllowlistPolicy } from "@odinn/channels";
 import { TelegramChannelAdapter } from "@odinn/channel-telegram";
 import { DiscordChannelAdapter } from "@odinn/channel-discord";
@@ -1930,8 +1930,7 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
   const pendingApprovals = approvalStore.list();
   let recovery: any = { status: "clear" };
   try { recovery = JSON.parse(await readFile(join(state, "browser-recovery.json"), "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") recovery = { status: "unavailable" }; }
-  let ownerOnly = false;
-  try { ownerOnly = ((await statPath(state)).mode & 0o077) === 0; } catch {}
+  const ownerOnly = await isOwnerOnlyPath(state);
   const normalized = normalizeModelConfig(config);
   let version = "unknown";
   try { version = JSON.parse(await readFile(PACKAGE_FILE, "utf8")).version ?? version; } catch {}

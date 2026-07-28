@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { access, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { ensureSecureStateDirectory } from "@odinn/store-file";
 
 export const AGENT_SDK_VERSION = "1.0";
 export const DEFAULT_AGENT_ID = "main";
@@ -124,6 +125,7 @@ export function defaultMainAgentManifest(): AgentManifest & { integrity: string 
 
 export async function ensureMainAgent(stateDir: string): Promise<AgentManifest & { integrity: string }> {
   const state = resolve(stateDir);
+  await ensureSecureStateDirectory(state);
   const agentDirectory = join(state, "agents", DEFAULT_AGENT_ID);
   const manifestPath = join(agentDirectory, "agent.json");
   const brandNewAgent = !await anyFileExists([

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
-import { createApprovalStore } from "../packages/kernel/src/index.ts";
+import { createApprovalStore, isOwnerOnlyPath } from "../packages/kernel/src/index.ts";
 
 test("gateway control surfaces require bootstrap authentication and reject cross-origin mutations", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-security-"));
@@ -139,8 +139,11 @@ test("gateway state files and directory are owner-only", async () => {
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   try {
     await stat(join(stateDir, "config.json"));
-    assert.equal((await stat(stateDir)).mode & 0o777, 0o700);
-    assert.equal((await stat(join(stateDir, "config.json"))).mode & 0o777, 0o600);
+    if (process.platform === "win32") assert.equal(await isOwnerOnlyPath(stateDir), true);
+    else {
+      assert.equal((await stat(stateDir)).mode & 0o777, 0o700);
+      assert.equal((await stat(join(stateDir, "config.json"))).mode & 0o777, 0o600);
+    }
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

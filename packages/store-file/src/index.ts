@@ -1,6 +1,8 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { execFile as execFileCallback } from "node:child_process";
 import { chmod, mkdir, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { normalizeAuditEvent, type AuditEvent, type JsonObject } from "@odinn/protocol";
 
 export const STORE_SCHEMA_VERSION = 1;
@@ -13,6 +15,66 @@ type JobState = { schemaVersion: number; jobs: Record<string, Job> };
 type MutableResult<T> = T | Promise<T>;
 type NodeError = Error & { code?: string };
 const errorCode = (error: unknown) => (error as NodeError | undefined)?.code;
+const execFile = promisify(execFileCallback);
+let windowsPrincipalPromise: Promise<string> | undefined;
+const securedWindowsPaths = new Set<string>();
+const securingWindowsPaths = new Map<string, Promise<void>>();
+
+function windowsPrincipal() {
+  windowsPrincipalPromise ??= execFile("whoami.exe", [], { windowsHide: true })
+    .then(({ stdout }) => stdout.trim())
+    .then((principal) => {
+      if (!principal) throw new Error("could not resolve the current Windows account");
+      return principal;
+    });
+  return windowsPrincipalPromise;
+}
+
+async function secureWindowsPath(path: string, directory: boolean) {
+  const key = `${directory ? "d" : "f"}:${resolve(path).toLowerCase()}`;
+  if (securedWindowsPaths.has(key)) return;
+  const pending = securingWindowsPaths.get(key);
+  if (pending) return pending;
+  const operation = applyWindowsAcl(path, directory)
+    .then(() => { securedWindowsPaths.add(key); })
+    .finally(() => { securingWindowsPaths.delete(key); });
+  securingWindowsPaths.set(key, operation);
+  return operation;
+}
+
+async function applyWindowsAcl(path: string, directory: boolean) {
+  const principal = await windowsPrincipal();
+  const rights = directory ? "(OI)(CI)F" : "F";
+  await execFile("icacls.exe", [
+    path,
+    "/inheritance:r",
+    "/grant:r", `${principal}:${rights}`,
+    "/grant:r", `*S-1-5-18:${rights}`,
+    "/grant:r", `*S-1-5-32-544:${rights}`
+  ], { windowsHide: true });
+}
+
+async function windowsOwnerOnly(path: string) {
+  const script = [
+    "$acl=Get-Acl -LiteralPath $env:ODINN_ACL_PATH",
+    "$current=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$allowed=@($current,'S-1-5-18','S-1-5-32-544')",
+    "$foreign=@($acl.Access | Where-Object AccessControlType -eq 'Allow' | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } | Where-Object { $allowed -notcontains $_ })",
+    "$parentProtected=$false",
+    "if (-not $acl.AreAccessRulesProtected) { $parent=Split-Path -Parent $env:ODINN_ACL_PATH; if ($parent) { $parentProtected=(Get-Acl -LiteralPath $parent).AreAccessRulesProtected } }",
+    "if (($acl.AreAccessRulesProtected -or $parentProtected) -and $foreign.Count -eq 0) { exit 0 } else { exit 1 }"
+  ].join("; ");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  try {
+    await execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+      windowsHide: true,
+      env: { ...process.env, ODINN_ACL_PATH: path }
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>): Promise<T> {
   await ensureSecureStateDirectory(dirname(lockPath));
@@ -41,13 +103,59 @@ async function withInterprocessLock<T>(lockPath: string, operation: () => Promis
 
 export async function ensureSecureStateDirectory(path: string) {
   await mkdir(path, { recursive: true, mode: 0o700 });
-  await chmod(path, 0o700);
+  if (process.platform === "win32") await secureWindowsPath(path, true);
+  else await chmod(path, 0o700);
   return path;
 }
 
 async function secureStoreFile(path: string) {
   await ensureSecureStateDirectory(dirname(path));
-  try { await chmod(path, 0o600); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+  try {
+    if (process.platform === "win32") await secureWindowsPath(path, false);
+    else await chmod(path, 0o600);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+}
+
+async function replaceStoreFile(temporary: string, target: string) {
+  if (process.platform !== "win32") {
+    await rename(temporary, target);
+    return;
+  }
+
+  const backup = `${target}.replace-${process.pid}-${randomUUID()}.bak`;
+  let movedExisting = false;
+  try {
+    await rename(target, backup);
+    movedExisting = true;
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+
+  try {
+    await rename(temporary, target);
+  } catch (error) {
+    if (movedExisting) {
+      try {
+        await rename(backup, target);
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], `failed to replace and restore store file: ${target}`);
+      }
+    }
+    throw error;
+  }
+
+  if (movedExisting) await rm(backup, { force: true });
+}
+
+export async function isOwnerOnlyPath(path: string) {
+  if (process.platform === "win32") return windowsOwnerOnly(path);
+  try {
+    return ((await stat(path)).mode & 0o077) === 0;
+  } catch {
+    return false;
+  }
 }
 
 export class StoreCorruptionError extends Error {
@@ -317,11 +425,13 @@ export class FileRecordStore {
 
 export class FileJobStore {
   readonly path: string;
+  readonly lockPath: string;
   private writeChain: Promise<unknown>;
 
   constructor(path: string) {
     if (!path) throw new Error("FileJobStore requires a path");
     this.path = path;
+    this.lockPath = `${path}.lock`;
     this.writeChain = Promise.resolve();
   }
 
@@ -416,16 +526,16 @@ export class FileJobStore {
   }
 
   async mutate<T>(fn: (state: JobState) => MutableResult<T>): Promise<T> {
-    const operation = this.writeChain.then(async () => {
+    const operation = this.writeChain.then(() => withInterprocessLock(this.lockPath, async () => {
       const state = await this.readState();
       const result = await fn(state);
       await ensureSecureStateDirectory(dirname(this.path));
       const temporary = join(dirname(this.path), `.${this.path.split(/[\\/]/).pop()}.${process.pid}.${Date.now()}.tmp`);
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-      await rename(temporary, this.path);
+      await replaceStoreFile(temporary, this.path);
       await secureStoreFile(this.path);
       return result;
-    });
+    }));
     this.writeChain = operation.catch(() => undefined);
     return operation;
   }
