@@ -62,8 +62,16 @@ Message Content privileged Gateway intent on the Bot page, invite the bot with
 View Channel, Send Messages, and Read Message History permissions, and keep its
 token in an environment variable.
 
+Ódinn loads `.env` from the workspace root and then `.env` from the selected
+state directory. State values override workspace-file values, while variables
+already supplied by the parent process always win. Environment filenames and
+variable names may appear in diagnostics, but credential values are never
+written into channel configuration or command output. Restrict credential files
+to the owning account (for example, `chmod 600 .odinn/.env`).
+
 ```sh
-export ODINN_DISCORD_BOT_TOKEN="..."
+printf 'ODINN_DISCORD_BOT_TOKEN=...\\n' > .odinn/.env
+chmod 600 .odinn/.env
 odinn config channel add discord community \
   --token-env ODINN_DISCORD_BOT_TOKEN \
   --allowlist discord:123456789

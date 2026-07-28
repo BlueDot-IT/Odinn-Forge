@@ -6,6 +6,8 @@ import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/p
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 export { SkillPackageStore, validateSkillPackage } from "./skill-packages.ts";
+export { loadEnvironmentFiles } from "./environment.ts";
+export type { EnvironmentLoadOptions, LoadedEnvironmentFile } from "./environment.ts";
 export { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
 export type { LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";

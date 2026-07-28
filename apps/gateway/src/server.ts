@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import { ChannelRouter, FileSessionBindingStore, GatewayChannelHandler, createAllowlistPolicy } from "@odinn/channels";
@@ -7341,11 +7341,15 @@ function invocationRoot() {
 }
 
 if (isGatewayEntrypoint()) {
+  const workspaceRoot = invocationRoot();
+  const parentEnvironmentKeys = new Set(Object.keys(process.env));
+  loadEnvironmentFiles({ workspaceRoot, stateDir: workspaceRoot, protectedKeys: parentEnvironmentKeys });
+  const stateDir = resolve(workspaceRoot, process.env.ODINN_STATE_DIR ?? ".odinn");
+  loadEnvironmentFiles({ workspaceRoot, stateDir, protectedKeys: parentEnvironmentKeys });
   const host = process.env.ODINN_HOST ?? "127.0.0.1";
   assertLoopbackHost(host);
   const port = Number.parseInt(process.env.ODINN_PORT ?? "18790", 10);
-  const stateDir = resolve(invocationRoot(), process.env.ODINN_STATE_DIR ?? ".odinn");
-  const server = await createGatewayServer({ stateDir, workspaceRoot: invocationRoot() });
+  const server = await createGatewayServer({ stateDir, workspaceRoot });
   let shuttingDown = false;
   const shutdown = () => {
     if (shuttingDown) return;
