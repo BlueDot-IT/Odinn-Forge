@@ -2375,7 +2375,8 @@ async function connectCliAuth(provider: any) {
   const command = process.env[provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"] || "agy";
   console.log(`Starting ${command}. Complete sign-in in the CLI, then exit it to finish onboarding.`);
   await new Promise((resolveExit: any, rejectExit: any) => {
-    const child = spawn(command, [], { stdio: "inherit" });
+    const nodeScript = process.platform === "win32" && /\.[cm]?[jt]s$/iu.test(command);
+    const child = spawn(nodeScript ? process.execPath : command, nodeScript ? [command] : [], { stdio: "inherit" });
     child.once("error", rejectExit);
     child.once("exit", (code: any, signal: any) => code === 0 ? resolveExit() : rejectExit(new Error(`${command} exited with ${code ?? signal}`)));
   });

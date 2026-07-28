@@ -451,10 +451,14 @@ async function resolveProviderBaseUrl(provider: any, stateDir: any) {
 
 async function chatWithAntigravity(provider: any, parsed: any, messages: any, input: any, signal?: AbortSignal) {
   const command = process.env[provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"] || "agy";
+  const commandArgs = ["--print", "--model", parsed.model];
+  const nodeScript = process.platform === "win32" && /\.[cm]?[jt]s$/iu.test(command);
+  const executable = nodeScript ? process.execPath : command;
+  const executableArgs = nodeScript ? [command, ...commandArgs] : commandArgs;
   const prompt = messages.map((message: any) => `${message.role}: ${message.content}`).join("\n\n");
   const timeoutMs = normalizeTimeout(input.timeoutMs);
   const content = await new Promise<string>((resolveOutput, rejectOutput) => {
-    const child = spawn(command, ["--print", "--model", parsed.model], {
+    const child = spawn(executable, executableArgs, {
       env: { PATH: process.env.PATH ?? "", ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
