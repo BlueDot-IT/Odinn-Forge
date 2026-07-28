@@ -3,6 +3,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { unzipSync, zipSync } from "fflate";
 import { createRunLedger, redact } from "./run-ledger.ts";
 import { ProofVerifier, proofEvidenceView } from "./proof.ts";
 import { evaluatePolicyInvariants, normalizePolicyInvariants } from "@odinn/policy";
@@ -26,6 +27,23 @@ function containsRedaction(value: unknown): boolean {
   return false;
 }
 function hash(value: string | Buffer) { return createHash("sha256").update(value).digest("hex"); }
+function capsuleArchiveEntries(path: string): Map<string, Buffer> {
+  let archive: Record<string, Uint8Array>;
+  try {
+    archive = unzipSync(readFileSync(path));
+  } catch {
+    throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
+  }
+  return new Map(Object.entries(archive).map(([name, bytes]) => [
+    name.replaceAll("\\", "/"),
+    Buffer.from(bytes)
+  ]));
+}
+function capsuleEntryText(entries: Map<string, Buffer>, name: string): string {
+  const entry = entries.get(name);
+  if (!entry) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule is missing ${name}`);
+  return entry.toString("utf8");
+}
 function parse(value: string | undefined | null, fallback: any = {}): any { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } }
 function odinnVersion() {
   const configured = process.env.ODINN_VERSION?.trim();
@@ -598,8 +616,13 @@ export class CapsuleManager {
       const files: string[] = []; for (const entryName of readdirSync(staging, { recursive: true })) { const name = String(entryName); if (name === "checksums.sha256") continue; const file = join(staging, name); if (lstatSync(file).isFile()) files.push(name.replaceAll("\\", "/")); }
       writeFileSync(join(staging, "checksums.sha256"), `${files.sort().map((name) => `${hash(readFileSync(join(staging, name)))}  ${name}`).join("\n")}\n`);
       mkdirSync(dirname(destination), { recursive: true });
-      const zipped = await runProcess("zip", ["-q", "-r", destination, "."], { cwd: staging, timeoutMs: 120_000 });
-      if (zipped.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", `zip failed: ${zipped.stderr}`);
+      const archiveEntries: Record<string, Uint8Array> = {};
+      for (const entryName of readdirSync(staging, { recursive: true })) {
+        const name = String(entryName).replaceAll("\\", "/");
+        const file = join(staging, String(entryName));
+        if (lstatSync(file).isFile()) archiveEntries[name] = readFileSync(file);
+      }
+      writeFileSync(destination, zipSync(archiveEntries, { level: 9 }), { flag: "wx", mode: 0o600 });
       const digest = hash(readFileSync(destination)); this.ledger.database.db.prepare("INSERT OR REPLACE INTO capsules(id, run_id, path, manifest_json, digest, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`capsule_${randomUUID()}`, runId, destination, json(manifest), digest, now()); this.ledger.appendEvent({ runId, type: "artifact-created", payload: { kind: "capsule", path: destination, digest } }); return { path: destination, digest, manifest };
     } finally { await rm(staging, { recursive: true, force: true }); }
   }
@@ -617,49 +640,35 @@ export class CapsuleManager {
     if (!existsSync(archive)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule not found");
     const recorded = this.ledger.database.db.prepare("SELECT digest FROM capsules WHERE path = ? ORDER BY created_at DESC LIMIT 1").get(archive);
     if (recorded && recorded.digest !== hash(readFileSync(archive))) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule archive digest changed", { path: archive });
-    const listing = await runProcess("unzip", ["-Z1", archive], { timeoutMs: 30_000 });
-    if (listing.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
-    const names = listing.stdout.split(/\r?\n/).filter(Boolean);
-    const normalizedNames = names.map((name) => name.replaceAll("\\", "/"));
+    const entries = capsuleArchiveEntries(archive);
+    const normalizedNames = [...entries.keys()];
     const seenNames = new Set<string>();
     for (const name of normalizedNames) {
       const segments = name.split("/").filter(Boolean);
-      if (!name || name.startsWith("/") || name.includes("\0") || /^[A-Za-z]:/.test(name) || segments.some((segment) => segment === "." || segment === "..") || seenNames.has(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule contains an unsafe or duplicate path", { name });
+      if (!name || name.endsWith("/") || name.startsWith("/") || name.includes("\0") || /^[A-Za-z]:/.test(name) || segments.some((segment) => segment === "." || segment === "..") || seenNames.has(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule contains an unsafe or duplicate path", { name });
       seenNames.add(name);
     }
-    const staging = join(this.root, `.verify-${randomUUID()}`);
-    mkdirSync(staging, { recursive: true });
-    try {
-      const extracted = await runProcess("unzip", ["-q", archive, "-d", staging], { timeoutMs: 60_000 });
-      if (extracted.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule extraction failed");
-      for (const name of normalizedNames) {
-        const target = join(staging, name);
-        if (!existsSync(target)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule entry was not extracted", { name });
-        if (lstatSync(target).isSymbolicLink()) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule contains a symbolic link", { name });
-      }
-      const required = ["manifest.json", "run.json", "events.jsonl", "environment.json", "checksums.sha256"];
-      for (const name of required) if (!seenNames.has(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule is missing ${name}`);
-      const manifest = parse(readFileSync(join(staging, "manifest.json"), "utf8"), null);
-      if (!manifest || manifest.formatVersion !== 1) throw new OdinnRuntimeError("CAPSULE_INVALID", "unsupported capsule version");
-      const checksumLines = readFileSync(join(staging, "checksums.sha256"), "utf8").split(/\r?\n/).filter(Boolean);
-      const checksummed = new Set<string>();
-      const failures: string[] = [];
-      for (const line of checksumLines) {
-        const match = line.match(/^([a-f0-9]{64})  (.+)$/);
-        const name = match?.[2]?.replaceAll("\\", "/");
-        if (!match || !name || checksummed.has(name) || !seenNames.has(name) || name === "checksums.sha256" || !existsSync(join(staging, name)) || !lstatSync(join(staging, name)).isFile() || hash(readFileSync(join(staging, name))) !== match[1]) failures.push(name ?? line);
-        else checksummed.add(name);
-      }
-      const expectedFiles = normalizedNames.filter((name) => name !== "checksums.sha256" && existsSync(join(staging, name)) && lstatSync(join(staging, name)).isFile());
-      for (const name of expectedFiles) if (!checksummed.has(name)) failures.push(name);
-      if (failures.length) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule checksum verification failed", { failures: [...new Set(failures)] });
-      return { valid: true, manifest, entries: normalizedNames };
-    } finally {
-      await rm(staging, { recursive: true, force: true });
+    const required = ["manifest.json", "run.json", "events.jsonl", "environment.json", "checksums.sha256"];
+    for (const name of required) if (!seenNames.has(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule is missing ${name}`);
+    const manifest = parse(capsuleEntryText(entries, "manifest.json"), null);
+    if (!manifest || manifest.formatVersion !== 1) throw new OdinnRuntimeError("CAPSULE_INVALID", "unsupported capsule version");
+    const checksumLines = capsuleEntryText(entries, "checksums.sha256").split(/\r?\n/).filter(Boolean);
+    const checksummed = new Set<string>();
+    const failures: string[] = [];
+    for (const line of checksumLines) {
+      const match = line.match(/^([a-f0-9]{64})  (.+)$/);
+      const name = match?.[2]?.replaceAll("\\", "/");
+      const entry = name ? entries.get(name) : undefined;
+      if (!match || !name || checksummed.has(name) || !seenNames.has(name) || name === "checksums.sha256" || !entry || hash(entry) !== match[1]) failures.push(name ?? line);
+      else checksummed.add(name);
     }
+    for (const name of normalizedNames) if (name !== "checksums.sha256" && !checksummed.has(name)) failures.push(name);
+    if (failures.length) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule checksum verification failed", { failures: [...new Set(failures)] });
+    return { valid: true, manifest, entries: normalizedNames };
   }
   async replay(path: string, { mode = "verification-only", workspace, executor, approveExternal = false }: AnyRecord = {}) {
     const verified = await this.verify(path);
+    const entries = capsuleArchiveEntries(resolve(path));
     if (!["verification-only", "tool-mocked", "full"].includes(mode)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", `unsupported replay mode: ${mode}`);
     if (mode === "full") {
       if (!workspace) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", "full replay requires a disposable workspace");
@@ -667,11 +676,8 @@ export class CapsuleManager {
       const target = resolve(workspace);
       if (target === resolve(this.ledger.workspaceRoot)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", "full replay refuses the original workspace");
       mkdirSync(target, { recursive: true });
-      const runJson = await runProcess("unzip", ["-p", resolve(path), "run.json"], { timeoutMs: 30_000 });
-      const eventsJson = await runProcess("unzip", ["-p", resolve(path), "events.jsonl"], { timeoutMs: 30_000 });
-      if (runJson.code !== 0 || eventsJson.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule is missing replay metadata");
-      const sourceRun = parse(runJson.stdout, null);
-      const requests = eventsJson.stdout.split(/\r?\n/).filter(Boolean).map((line) => parse(line, null)).filter((event) => event?.type === "tool-request");
+      const sourceRun = parse(capsuleEntryText(entries, "run.json"), null);
+      const requests = capsuleEntryText(entries, "events.jsonl").split(/\r?\n/).filter(Boolean).map((line) => parse(line, null)).filter((event) => event?.type === "tool-request");
       const replayRunId = `replay_${randomUUID()}`;
       this.ledger.ensureRun({ runId: replayRunId, objective: `full replay of ${sourceRun?.id ?? verified.manifest.runId}`, workspaceRoot: target });
       this.ledger.appendEvent({ runId: replayRunId, type: "capsule-replay-started", payload: { sourceRunId: sourceRun?.id ?? verified.manifest.runId, mode, taskCount: requests.length } });
@@ -681,10 +687,10 @@ export class CapsuleManager {
         const tool = event.payload?.toolName;
         const digest = event.payload?.inputDigest;
         if (!tool || !digest) throw new OdinnRuntimeError("CAPSULE_INVALID", "recorded tool request is missing replay metadata");
-        const artifact = await runProcess("unzip", ["-p", resolve(path), `artifacts/${digest}`], { timeoutMs: 30_000 });
-        if (artifact.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule is missing input artifact ${digest}`);
-        if (hash(artifact.stdout) !== digest) throw new OdinnRuntimeError("CAPSULE_TAMPERED", `tool ${tool} input artifact does not match its digest`);
-        const input = parse(artifact.stdout, null);
+        const artifact = entries.get(`artifacts/${digest}`);
+        if (!artifact) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule is missing input artifact ${digest}`);
+        if (hash(artifact) !== digest) throw new OdinnRuntimeError("CAPSULE_TAMPERED", `tool ${tool} input artifact does not match its digest`);
+        const input = parse(artifact.toString("utf8"), null);
         if (!isPlainRecord(input) || containsRedaction(input)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", `tool ${tool} requires redacted, missing, or invalid input`);
         const safety = event.payload?.safety ?? {};
         const external = safety.reversibility === "irreversible" || (safety.effects ?? []).some((effect: string) => ["network", "credential", "external-state"].includes(effect));
@@ -699,11 +705,8 @@ export class CapsuleManager {
     }
     if (mode === "verification-only") return { ...verified, mode, executed: false, contractIncluded: verified.entries.includes("contract.json"), message: "capsule integrity verified; run the included contract against a supplied workspace" };
 
-    const runJson = await runProcess("unzip", ["-p", resolve(path), "run.json"], { timeoutMs: 30_000 });
-    const eventsJson = await runProcess("unzip", ["-p", resolve(path), "events.jsonl"], { timeoutMs: 30_000 });
-    if (runJson.code !== 0 || eventsJson.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule is missing replay metadata");
-    const sourceRun = parse(runJson.stdout, null);
-    const recordedEvents = eventsJson.stdout.split(/\r?\n/).filter(Boolean).map((line) => parse(line, null)).filter(Boolean);
+    const sourceRun = parse(capsuleEntryText(entries, "run.json"), null);
+    const recordedEvents = capsuleEntryText(entries, "events.jsonl").split(/\r?\n/).filter(Boolean).map((line) => parse(line, null)).filter(Boolean);
     const replayRunId = `replay_${randomUUID()}`;
     this.ledger.ensureRun({ runId: replayRunId, objective: `tool-mocked replay of ${sourceRun?.id ?? verified.manifest.runId}`, modelId: verified.manifest.model?.modelId ?? "", providerId: verified.manifest.model?.provider ?? "", workspaceRoot: workspace ? resolve(workspace) : this.ledger.workspaceRoot });
     this.ledger.appendEvent({ runId: replayRunId, type: "capsule-replay-started", payload: { sourceRunId: sourceRun?.id ?? verified.manifest.runId, mode, eventCount: recordedEvents.length } });
