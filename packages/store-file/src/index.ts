@@ -82,10 +82,10 @@ async function windowsOwnerOnly(path: string) {
   }
 }
 
-async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>): Promise<T> {
+async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>, timeoutMs = 30_000): Promise<T> {
   await ensureSecureStateDirectory(dirname(lockPath));
   const token = randomUUID();
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
       const handle = await open(lockPath, "wx", 0o600);
@@ -97,37 +97,14 @@ async function withInterprocessLock<T>(lockPath: string, operation: () => Promis
       break;
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
-      if (await removeDeadOwnerLock(lockPath)) continue;
-      if (Date.now() >= deadline) throw new Error(`timed out acquiring store lock: ${lockPath}`);
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out acquiring store lock: ${lockPath}; verify that no Odinn process is using the store before manually removing this lock`);
+      }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
   try { return await operation(); }
   finally { await removeOwnedLock(lockPath, token); }
-}
-
-async function removeDeadOwnerLock(lockPath: string) {
-  let raw: string;
-  try {
-    raw = await readFile(lockPath, "utf8");
-  } catch (error) {
-    return errorCode(error) === "ENOENT";
-  }
-  let owner: { pid?: unknown };
-  try {
-    owner = JSON.parse(raw);
-  } catch {
-    return false;
-  }
-  if (!Number.isInteger(owner.pid) || Number(owner.pid) < 1 || processExists(Number(owner.pid))) return false;
-  try {
-    if (await readFile(lockPath, "utf8") !== raw) return false;
-    await rm(lockPath);
-    return true;
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return true;
-    throw error;
-  }
 }
 
 async function removeOwnedLock(lockPath: string, token: string) {
@@ -136,15 +113,6 @@ async function removeOwnedLock(lockPath: string, token: string) {
     if (owner?.token === token) await rm(lockPath);
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
-  }
-}
-
-function processExists(pid: number) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return errorCode(error) !== "ESRCH";
   }
 }
 
@@ -491,12 +459,15 @@ export class FileRecordStore {
 export class FileJobStore {
   readonly path: string;
   readonly lockPath: string;
+  readonly lockTimeoutMs: number;
   private writeChain: Promise<unknown>;
 
-  constructor(path: string) {
+  constructor(path: string, { lockTimeoutMs = 30_000 }: { lockTimeoutMs?: number } = {}) {
     if (!path) throw new Error("FileJobStore requires a path");
+    if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1) throw new Error("FileJobStore lock timeout must be a positive integer");
     this.path = path;
     this.lockPath = `${path}.lock`;
+    this.lockTimeoutMs = lockTimeoutMs;
     this.writeChain = Promise.resolve();
   }
 
@@ -599,7 +570,7 @@ export class FileJobStore {
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
       await replaceStoreFile(temporary, this.path);
       return result;
-    }));
+    }, this.lockTimeoutMs));
     this.writeChain = operation.catch(() => undefined);
     return operation;
   }

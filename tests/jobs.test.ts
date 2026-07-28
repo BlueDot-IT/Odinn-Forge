@@ -178,6 +178,18 @@ test("independent job stores serialize asynchronous mutations without losing sta
   assert.deepEqual((await left.list()).map((job: any) => job.id).sort(), ["first", "second"]);
 });
 
+test("job stores fail closed on orphaned locks instead of reclaiming them automatically", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-job-store-orphan-lock-"));
+  const path = join(root, "jobs.json");
+  const store = new FileJobStore(path, { lockTimeoutMs: 25 });
+  await writeFile(store.lockPath, `${JSON.stringify({ token: "orphan", pid: 999_999_999, createdAt: "2000-01-01T00:00:00.000Z" })}\n`);
+  await assert.rejects(
+    () => store.create({ id: "blocked", status: "queued", payload: {} }),
+    /verify that no Odinn process is using the store before manually removing this lock/
+  );
+  assert.equal(await readFile(store.lockPath, "utf8").then((content) => JSON.parse(content).token), "orphan");
+});
+
 test("job store readers never observe an empty state while Windows-compatible replacement runs", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-job-store-readers-"));
   const store = new FileJobStore(join(root, "jobs.json"));
