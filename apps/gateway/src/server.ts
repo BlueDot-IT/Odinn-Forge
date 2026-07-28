@@ -499,14 +499,18 @@ export async function createGatewayServer({
   const config = await readConfig(state, { hosted });
   await ensureMainAgent(state);
   const featureFlags = normalizeExperimentalFlags(config.experimental);
-  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags });
+  const proofOptions = {
+    allowedCommands: config.proof?.allowedCommands ?? [],
+    includeRawEvidence: config.proof?.includeRawEvidence === true
+  };
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags, proofOptions });
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore });
   const gatewayToken = await loadGatewayToken(state);
   const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
-  const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, allowedCommands: config.proof?.allowedCommands ?? [] });
+  const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
   const supervisor = new JobSupervisor({
     store: new FileJobStore(join(state, "jobs.json")),
     execute: isolatedTaskExecutor
@@ -757,7 +761,7 @@ export async function createGatewayServer({
               return new ProofVerifier({
                 runLedger: runtime.ledger,
                 allowedRoot: workspaceRoot,
-                allowedCommands: config.proof?.allowedCommands ?? []
+                ...proofOptions
               }).verify({ ...contract, runId });
             }
           },
@@ -1631,6 +1635,7 @@ function validateGatewayConfig(config: any) {
 
   if (config.proof !== undefined) {
     assertConfigRecord(config.proof, "config.proof");
+    assertOptionalConfigBoolean(config.proof, "includeRawEvidence", "config.proof");
     if (config.proof.allowedCommands !== undefined) {
       if (!Array.isArray(config.proof.allowedCommands) || config.proof.allowedCommands.some((command: any) =>
         !Array.isArray(command) || command.length === 0 || command.some((part: any) => typeof part !== "string") || !isAbsolute(command[0]))) {

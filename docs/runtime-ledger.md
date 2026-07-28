@@ -40,7 +40,7 @@ The three hard limits are:
 
 The core advanced services are available without feature flags:
 
-- [x] One gateway Runemark verification path with strict schema validation, exact operator-controlled command allowlists, minimal command environments, process-tree termination, file assertions, evidence artifacts, persisted assertion results, and verified/failed run transitions. Legacy arbitrary-command assertions are rejected.
+- [x] One gateway Runemark verification path with strict schema validation, exact operator-controlled command allowlists, minimal command environments, process-tree termination, file assertions, metadata-only persisted assertion results by default, operator-opt-in redacted evidence artifacts, and verified/failed run transitions. Legacy arbitrary-command assertions are rejected.
 - [x] Gatewatch policy validation and pre-operation invariant decisions for denied commands, allowed roots, and approval-required tools.
 - [x] Norn Restore snapshots with content-addressed file artifacts, dry-run previews, symlink rejection, bounded capture, exact selected-root restoration, and an automatic pre-restore recovery snapshot.
 - [x] Raven Route observations, automatic configured-model routing, Runemark promotion, transparent routing scores, uncertainty penalties, and human-readable selection reasons.

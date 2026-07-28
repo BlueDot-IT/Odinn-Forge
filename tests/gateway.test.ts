@@ -629,6 +629,7 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
       assertions: [{ id: "fixture", type: "file", path: "fixture.txt", expect: { exists: true, content: { contains: "before" } } }]
     });
     assert.equal(proof.status, "passed");
+    assert.deepEqual(proof.assertions[0].actual.content, { retained: false, bytes: 7 });
     assert.equal((await getJson(`${base}/proof/gateway-runtime-run`)).assertions.length, 1);
 
     const legacyProof = await fetch(`${base}/proof`, {

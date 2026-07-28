@@ -37,6 +37,38 @@ interface StoredArtifact { digest: string; path: string; mediaType: string; size
 interface ProofVerifierOptions {
   runLedger: RunLedger; allowedRoot?: string; maxOutputBytes?: number; maxFileBytes?: number;
   allowExternalHttp?: boolean; allowedCommands?: string[][]; commandEnvironment?: NodeJS.ProcessEnv;
+  includeRawEvidence?: boolean;
+}
+
+const RAW_EVIDENCE_KEYS = new Set(["stdout", "stderr", "content", "body", "evidence"]);
+
+function omittedEvidenceMetadata(value: unknown): JsonObject {
+  if (typeof value === "string") return { retained: false, bytes: Buffer.byteLength(value, "utf8") };
+  if (Array.isArray(value)) return { retained: false, items: value.length };
+  if (value && typeof value === "object") return { retained: false, fields: Object.keys(value).length };
+  return { retained: false };
+}
+
+function omitRawEvidence(raw: unknown, safe: unknown, omitAtThisLevel = true): unknown {
+  if (Array.isArray(raw) && Array.isArray(safe)) {
+    return raw.slice(0, safe.length).map((item, index) => omitRawEvidence(item, safe[index], omitAtThisLevel));
+  }
+  if (raw && safe && typeof raw === "object" && typeof safe === "object" && !Array.isArray(raw) && !Array.isArray(safe)) {
+    const output: JsonObject = {};
+    for (const [key, safeValue] of Object.entries(safe as JsonObject)) {
+      const rawValue = (raw as JsonObject)[key];
+      output[key] = omitAtThisLevel && RAW_EVIDENCE_KEYS.has(key)
+        ? omittedEvidenceMetadata(rawValue)
+        : omitRawEvidence(rawValue, safeValue, key === "actual" || key === "result");
+    }
+    return output;
+  }
+  return safe;
+}
+
+export function proofEvidenceView<T>(value: T, includeRawEvidence = false): T {
+  const safe = redact(value) as T;
+  return (includeRawEvidence ? safe : omitRawEvidence(value, safe)) as T;
 }
 
 const asObject = (value: unknown): JsonObject => value as JsonObject;
@@ -342,8 +374,9 @@ export class ProofVerifier {
   readonly allowExternalHttp: boolean;
   readonly allowedCommands: string[][];
   readonly commandEnvironment: NodeJS.ProcessEnv;
+  readonly includeRawEvidence: boolean;
 
-  constructor({ runLedger, allowedRoot, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxFileBytes = DEFAULT_MAX_FILE_BYTES, allowExternalHttp = false, allowedCommands = [], commandEnvironment }: ProofVerifierOptions) {
+  constructor({ runLedger, allowedRoot, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxFileBytes = DEFAULT_MAX_FILE_BYTES, allowExternalHttp = false, allowedCommands = [], commandEnvironment, includeRawEvidence = false }: ProofVerifierOptions) {
     if (!runLedger || typeof runLedger.getRun !== "function" || typeof runLedger.appendEvent !== "function") {
       throw new TypeError("ProofVerifier requires a RunLedger");
     }
@@ -359,12 +392,14 @@ export class ProofVerifier {
     if (!Array.isArray(allowedCommands) || allowedCommands.some((command) => !Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string") || !isAbsolute(command[0]))) {
       throw new TypeError("ProofVerifier allowedCommands must contain exact non-empty argument arrays with absolute executable paths");
     }
+    if (typeof includeRawEvidence !== "boolean") throw new TypeError("ProofVerifier includeRawEvidence must be a boolean");
     this.runLedger = runLedger;
     this.allowedRoot = resolve(allowedRoot ?? runLedger.workspaceRoot ?? process.cwd());
     this.maxOutputBytes = maxOutputBytes;
     this.maxFileBytes = maxFileBytes;
     this.allowExternalHttp = allowExternalHttp === true;
     this.allowedCommands = allowedCommands.map((command) => [...command]);
+    this.includeRawEvidence = includeRawEvidence;
     this.commandEnvironment = commandEnvironment ?? {
       PATH: process.env.PATH ?? "",
       ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {})
@@ -413,12 +448,13 @@ export class ProofVerifier {
       } catch (error) {
         result = this.failedResult(assertion, `assertion execution failed: ${errorMessage(error)}`, {});
       }
-      results.push(result);
       this.persistAssertion(contract.id, assertion, result, sequence + 1);
+      const visibleResult = proofEvidenceView(result, this.includeRawEvidence) as AssertionResult;
+      results.push(visibleResult);
       this.runLedger.appendEvent({
         runId: contract.runId,
         type: "assertion-result",
-        payload: { contractId: contract.id, assertionId: assertion.id, assertionType: assertion.type, status: result.status, message: result.message }
+        payload: { contractId: contract.id, assertionId: assertion.id, assertionType: assertion.type, status: visibleResult.status, message: visibleResult.message }
       });
     }
 
@@ -572,16 +608,17 @@ export class ProofVerifier {
     const stdout = result.actual.stdout;
     const stderr = result.actual.stderr;
     const content = result.actual.content;
-    const stdoutArtifact = typeof stdout === "string"
+    const stdoutArtifact = this.includeRawEvidence && typeof stdout === "string"
       ? this.runLedger.artifacts.put(String(redact(stdout)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
-    const stderrArtifact = typeof stderr === "string"
+    const stderrArtifact = this.includeRawEvidence && typeof stderr === "string"
       ? this.runLedger.artifacts.put(String(redact(stderr)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
-    const contentArtifact = typeof content === "string"
+    const contentArtifact = this.includeRawEvidence && typeof content === "string"
       ? this.runLedger.artifacts.put(String(redact(content)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
     const evidenceArtifactIds = [stdoutArtifact?.digest, stderrArtifact?.digest, contentArtifact?.digest].filter(Boolean);
+    const safeResult = proofEvidenceView({ sequence, type: assertion.type, expected: assertionExpectation(assertion), actual: result.actual }, this.includeRawEvidence);
     this.runLedger.database.transaction((db) => {
       if (stdoutArtifact) registerArtifact(db, stdoutArtifact, completedAt);
       if (stderrArtifact) registerArtifact(db, stderrArtifact, completedAt);
@@ -601,7 +638,7 @@ export class ProofVerifier {
         completedAt,
         JSON.stringify(evidenceArtifactIds),
         result.message,
-        JSON.stringify(redact({ sequence, type: assertion.type, expected: assertionExpectation(assertion), actual: result.actual }))
+        JSON.stringify(safeResult)
       );
     });
   }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -8,6 +8,7 @@ import { createRunLedger } from "../packages/kernel/src/run-ledger.ts";
 import {
   PROOF_CONTRACT_SCHEMA_VERSION,
   ProofVerifier,
+  proofEvidenceView,
   validateProofContract,
   validateVerificationContract,
   verifyContract,
@@ -103,6 +104,9 @@ test("Proof verifies command exit/output and file assertions without invoking a 
     assert.equal(result.passed, true);
     assert.equal(result.assertions.length, 4);
     assert.ok(result.assertions.every((assertion: any) => assertion.passed));
+    assert.deepEqual(result.assertions[0].actual.stdout, { retained: false, bytes: 10 });
+    assert.deepEqual(result.assertions[0].actual.stderr, { retained: false, bytes: 6 });
+    assert.deepEqual(result.assertions[2].actual.content, { retained: false, bytes: 15 });
     await assert.rejects(access(injected), /ENOENT/);
 
     const persisted = ledger.database.db.prepare("SELECT * FROM verification_contracts WHERE id = ?").get("proof_pass");
@@ -116,8 +120,10 @@ test("Proof verifies command exit/output and file assertions without invoking a 
       .sort((left: any, right: any) => JSON.parse(left.result_json).sequence - JSON.parse(right.result_json).sequence);
     assert.equal(rows.length, 4);
     assert.deepEqual(rows.map((row: any) => row.status), ["passed", "passed", "passed", "passed"]);
-    assert.equal(JSON.parse(rows[0].evidence_artifact_ids_json).length, 2);
-    assert.ok(JSON.parse(rows[0].evidence_artifact_ids_json).every((digest: any) => /^[a-f0-9]{64}$/.test(digest)));
+    assert.equal(JSON.parse(rows[0].evidence_artifact_ids_json).length, 0);
+    assert.deepEqual(JSON.parse(rows[0].result_json).actual.stdout, { retained: false, bytes: 10 });
+    assert.deepEqual(JSON.parse(rows[0].result_json).actual.stderr, { retained: false, bytes: 6 });
+    assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM artifacts WHERE media_type = 'text/plain; charset=utf-8'").get().count, 0);
     assert.equal(ledger.getRun(runId).status, "verified");
     assert.deepEqual(ledger.getRun(runId).events.slice(-6).map((event: any) => event.type), [
       "verification-started",
@@ -130,6 +136,62 @@ test("Proof verifies command exit/output and file assertions without invoking a 
   } finally {
     ledger.close();
   }
+});
+
+test("Proof retains credential-redacted content only with explicit operator opt-in", async () => {
+  const { root, ledger, runId } = await fixture("run_proof_raw_opt_in");
+  const githubToken = `ghp_${"A".repeat(36)}`;
+  const outputCommand = [process.execPath, "-e", `process.stdout.write(${JSON.stringify(`SAFE ${githubToken}`)}); process.stderr.write('NOTICE')`];
+  try {
+    const result = await verifyContract(contract(runId, [{ id: "command", type: "command", command: outputCommand, expect: { stdout: { contains: "SAFE" }, stderr: { equals: "NOTICE" } } }], "proof_raw_opt_in"), {
+      runLedger: ledger,
+      allowedRoot: root,
+      allowedCommands: [outputCommand],
+      includeRawEvidence: true
+    });
+
+    assert.equal(result.passed, true);
+    assert.equal(result.assertions[0].actual.stdout, "SAFE [redacted]");
+    assert.equal(result.assertions[0].actual.stderr, "NOTICE");
+    assert.equal(JSON.stringify(result).includes(githubToken), false);
+    const row: any = ledger.database.db.prepare("SELECT evidence_artifact_ids_json, result_json FROM assertion_results WHERE contract_id = ?").get("proof_raw_opt_in");
+    const artifactIds = JSON.parse(row.evidence_artifact_ids_json);
+    assert.equal(artifactIds.length, 2);
+    assert.equal(row.result_json.includes(githubToken), false);
+    const artifactRows: any[] = ledger.database.db.prepare(`SELECT path FROM artifacts WHERE digest IN (${artifactIds.map(() => "?").join(",")})`).all(...artifactIds);
+    const evidence = (await Promise.all(artifactRows.map((artifact) => readFile(join(ledger.artifacts.root, artifact.path), "utf8")))).join("\n");
+    assert.equal(evidence.includes(githubToken), false);
+    assert.match(evidence, /\[redacted\]/u);
+  } finally {
+    ledger.close();
+  }
+});
+
+test("Proof rejects non-boolean raw-evidence configuration", async () => {
+  const { root, ledger } = await fixture("run_proof_raw_invalid");
+  try {
+    assert.throws(
+      () => new ProofVerifier({ runLedger: ledger, allowedRoot: root, includeRawEvidence: "true" as any }),
+      /includeRawEvidence must be a boolean/u
+    );
+  } finally {
+    ledger.close();
+  }
+});
+
+test("Proof evidence projection omits strict and legacy content without altering matcher definitions", () => {
+  const projected: any = proofEvidenceView({
+    status: "passed",
+    body: "HTTP_RESPONSE_BODY",
+    evidence: ["legacy detail"],
+    expected: { body: { contains: "expected body matcher" } },
+    actual: { path: "result.txt", content: "FILE_CONTENT" }
+  });
+
+  assert.deepEqual(projected.body, { retained: false, bytes: 18 });
+  assert.deepEqual(projected.evidence, { retained: false, items: 1 });
+  assert.deepEqual(projected.actual.content, { retained: false, bytes: 12 });
+  assert.deepEqual(projected.expected.body, { contains: "expected body matcher" });
 });
 
 test("Proof verifies HTTP and git assertions through bounded real operations", async () => {
