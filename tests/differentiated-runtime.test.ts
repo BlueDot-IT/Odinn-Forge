@@ -194,9 +194,17 @@ test("Darwin chooses a model using observed verification outcomes", async () => 
   const { runtime } = await fixture();
   try {
     runtime.ledger.ensureRun({ runId: "run-darwin-a", objective: "routing" }); runtime.ledger.ensureRun({ runId: "run-darwin-b", objective: "routing" });
+    let hydratedRun = false;
+    const getRun = runtime.ledger.getRun.bind(runtime.ledger);
+    runtime.ledger.getRun = (...args: any[]) => {
+      hydratedRun = true;
+      return getRun(...args);
+    };
     runtime.darwin.observe({ runId: "run-darwin-a", providerId: "p", modelId: "good", taskClass: "bug-fix", verified: true, durationMs: 10, toolCalls: 1 });
     runtime.darwin.observe({ runId: "run-darwin-b", providerId: "p", modelId: "bad", taskClass: "bug-fix", verified: false, durationMs: 1, toolCalls: 1, toolErrors: 1 });
     assert.equal(runtime.darwin.choose("bug-fix").model, "p:good");
+    assert.equal(hydratedRun, false);
+    runtime.ledger.getRun = getRun;
     assert.ok(runtime.ledger.getRun("run-darwin-a").events.some((event: any) => event.type === "model-observation" && event.payload.modelId === "good"));
   } finally { runtime.ledger.close(); }
 });

@@ -558,7 +558,7 @@ export class DarwinRouter {
         throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", `${field} is required for a model observation`);
       }
     }
-    if (!this.ledger.getRun(observation.runId)) {
+    if (!this.ledger.hasRun(observation.runId)) {
       throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "observation run not found", { runId: observation.runId });
     }
     const metric = (name: string, fallback = 0) => {
@@ -629,7 +629,10 @@ export class DarwinRouter {
   }
   recordDecision({ runId, taskClass = "general", model, source, reason, candidates = [] }: AnyRecord) {
     if (!runId) return;
-    if (!this.ledger.getRun(runId)) throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "routing decision run not found", { runId });
+    if (!this.ledger.hasRun(runId)) throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "routing decision run not found", { runId });
+    this.recordDecisionForExistingRun({ runId, taskClass, model, source, reason, candidates });
+  }
+  private recordDecisionForExistingRun({ runId, taskClass = "general", model, source, reason, candidates = [] }: AnyRecord) {
     this.ledger.appendEvent({
       runId,
       type: "model-routing-decision",
@@ -651,10 +654,10 @@ export class DarwinRouter {
   }
   choose(taskClass = "general", { pinnedModel, availableModels = [], runId }: AnyRecord = {}) {
     const decisionRunId = runId ?? `routing-${randomUUID()}`;
-    if (!this.ledger.getRun(decisionRunId)) this.ledger.ensureRun({ runId: decisionRunId, objective: `choose a model for ${taskClass}` });
+    if (!this.ledger.hasRun(decisionRunId)) this.ledger.ensureRun({ runId: decisionRunId, objective: `choose a model for ${taskClass}` });
     if (pinnedModel) {
       const result = { model: pinnedModel, reason: "user-pinned model", source: "pinned", taskClass, runId: decisionRunId };
-      this.recordDecision({ runId: decisionRunId, taskClass, model: result.model, source: result.source, reason: result.reason });
+      this.recordDecisionForExistingRun({ runId: decisionRunId, taskClass, model: result.model, source: result.source, reason: result.reason });
       return result;
     }
     const available = new Set(Array.isArray(availableModels) ? availableModels : []);
@@ -663,7 +666,7 @@ export class DarwinRouter {
       .map((row: AnyRecord) => ({ ...row, adjustedScore: row.score - row.uncertaintyPenalty }));
     stats.sort((a: AnyRecord, b: AnyRecord) => b.adjustedScore - a.adjustedScore);
     if (!stats[0]) {
-      this.recordDecision({ runId: decisionRunId, taskClass, model: null, source: "unavailable", reason: "no applicable observations for task class" });
+      this.recordDecisionForExistingRun({ runId: decisionRunId, taskClass, model: null, source: "unavailable", reason: "no applicable observations for task class" });
       throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "no observations for task class", { taskClass, runId: decisionRunId });
     }
     const result = {
@@ -675,7 +678,7 @@ export class DarwinRouter {
       explanation: `selected from ${stats[0].observations} observed runs; verified=${Number(stats[0].verified).toFixed(2)}, reliability=${Number(stats[0].reliability).toFixed(2)}`,
       candidates: stats
     };
-    this.recordDecision({ runId: decisionRunId, taskClass, model: result.model, source: result.source, reason: result.explanation, candidates: stats });
+    this.recordDecisionForExistingRun({ runId: decisionRunId, taskClass, model: result.model, source: result.source, reason: result.explanation, candidates: stats });
     return result;
   }
 }
