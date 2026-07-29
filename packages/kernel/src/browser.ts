@@ -349,14 +349,19 @@ export async function browserAction(stateDir: any, approvalStore: ApprovalStore,
     });
     return { type: "approval.required", approvalId, tool, summary: browserActionSummary(tool, input), expiresInSeconds: 300 };
   }
-  if (security.requireApproval !== false && !approvalStore.consume(execution.approvalId, {
-    tool,
-    runId: execution.runId,
-    input: normalizedInput
-  })) {
-    throw new Error("browser action approval is missing, expired, already used, or does not match this action");
+  if (security.requireApproval !== false) {
+    const approved = approvalStore.consume(execution.approvalId, {
+      tool,
+      runId: execution.runId,
+      input: normalizedInput
+    });
+    if (!approved) {
+      throw new Error("browser action approval is missing, expired, already used, or does not match this action");
+    }
+    input = approved.input ?? normalizedInput;
+  } else {
+    input = normalizedInput;
   }
-  input = normalizedInput;
   const manager = await getBrowserManager(stateDir);
   const unresolved = await manager.recovery();
   if (["executing", "unknown"].includes(unresolved.status)) {

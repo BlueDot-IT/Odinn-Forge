@@ -20,6 +20,9 @@ importers:
       eslint:
         specifier: 10.7.0
         version: 10.7.0
+      fflate:
+        specifier: 0.8.2
+        version: 0.8.2
       fast-check:
         specifier: 4.9.0
         version: 4.9.0
@@ -108,7 +111,11 @@ importers:
         specifier: workspace:*
         version: link:../protocol
 
-  packages/store-sqlite: {}
+  packages/store-sqlite:
+    dependencies:
+      '@odinn/protocol':
+        specifier: workspace:*
+        version: link:../protocol
 
 packages:
 

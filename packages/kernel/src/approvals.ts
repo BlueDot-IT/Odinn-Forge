@@ -1,8 +1,16 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { redactDurableValue } from "@odinn/protocol";
 
 type NodeError = Error & { code?: string };
+
+type StoredApprovalAction = ApprovalAction & {
+  bindingTag?: string;
+};
+
+const durableApprovalKeys = new Map<string, Buffer>();
+const volatileApprovalActions = new Map<string, Map<string, ApprovalAction>>();
 
 export type ApprovalAction = {
   id?: string;
@@ -12,7 +20,6 @@ export type ApprovalAction = {
   approvedAt?: string;
   runId?: string;
   accountId?: string;
-  bindingDigest?: string;
   tool: string;
   summary?: string;
   input?: Record<string, unknown>;
@@ -28,7 +35,12 @@ export interface ApprovalStore {
 }
 
 export function createApprovalStore({ path }: { path?: string } = {}): ApprovalStore {
-  const pending = new Map<string, ApprovalAction>();
+  const pending = new Map<string, StoredApprovalAction>();
+  const storeKey = path ?? `memory:${randomUUID()}`;
+  const bindingKey = durableApprovalKeys.get(storeKey) ?? randomBytes(32);
+  durableApprovalKeys.set(storeKey, bindingKey);
+  const volatile = volatileApprovalActions.get(storeKey) ?? new Map<string, ApprovalAction>();
+  volatileApprovalActions.set(storeKey, volatile);
   const withLock = <T>(operation: () => T): T => {
     if (!path) return operation();
     const lockPath = `${path}.lock`;
@@ -76,7 +88,11 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
       const records = Array.isArray(parsed) ? parsed : parsed?.schemaVersion === 1 && Array.isArray(parsed.approvals) ? parsed.approvals : [];
       pending.clear();
       for (const record of records) {
-        if (record && typeof record.id === "string") pending.set(record.id, record);
+        if (record && typeof record.id === "string") {
+          const sanitized = redactDurableValue(record, { toolName: typeof record.tool === "string" ? record.tool : undefined }) as StoredApprovalAction;
+          delete (sanitized as Record<string, unknown>).bindingDigest;
+          pending.set(record.id, sanitized);
+        }
       }
     } catch (error) {
       if ((error as NodeError | undefined)?.code !== "ENOENT") throw error;
@@ -93,7 +109,10 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
   const expire = () => {
     const now = Date.now();
     for (const [id, action] of pending) {
-      if (action.status === "pending" && Number(action.expiresAt) <= now) pending.delete(id);
+      if (action.status === "pending" && Number(action.expiresAt) <= now) {
+        pending.delete(id);
+        volatile.delete(id);
+      }
     }
   };
   return {
@@ -102,11 +121,13 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         refresh();
         const id = `approval_${randomUUID()}`;
         const normalized = normalizeApprovalAction(action);
-        const sanitized = { ...action, ...normalized };
+        const sanitized = redactDurableValue({ ...action, ...normalized }, { toolName: normalized.tool }) as ApprovalAction;
+        const bindingTag = approvalBindingTag(bindingKey, normalized);
+        volatile.set(id, normalized);
         pending.set(id, {
           id,
           ...sanitized,
-          bindingDigest: approvalBindingDigest(normalized),
+          bindingTag,
           status: "pending",
           createdAt: new Date().toISOString(),
           expiresAt: Date.now() + 300_000
@@ -122,13 +143,14 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         const key = String(id ?? "");
         const action = pending.get(key);
         if (!action || Number(action.expiresAt) <= Date.now()) {
+          volatile.delete(key);
           persist();
           return undefined;
         }
-        if (action.status === "approved") return action;
+        if (action.status === "approved") return publicApprovalAction(action);
         pending.set(key, { ...action, status: "approved", approvedAt: new Date().toISOString() });
         persist();
-        return pending.get(key);
+        return publicApprovalAction(pending.get(key)!);
       });
     },
     consume(id, expected) {
@@ -137,16 +159,25 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         expire();
         const key = String(id ?? "");
         const action = pending.get(key);
-        if (!action || action.status !== "approved" || Number(action.expiresAt) <= Date.now()) {
+        if (!action || Number(action.expiresAt) <= Date.now()) {
+          volatile.delete(key);
+          persist();
+          return undefined;
+        }
+        if (action.status !== "approved") {
           persist();
           return undefined;
         }
         const normalized = normalizeApprovalAction(expected);
-        const storedDigest = action.bindingDigest ?? approvalBindingDigest(normalizeApprovalAction(action));
-        if (storedDigest !== approvalBindingDigest(normalized)) return undefined;
+        const exact = volatile.get(key);
+        if (!exact || !action.bindingTag || !safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, exact))) return undefined;
+        const exactMatch = safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, normalized));
+        const redactedMatch = stableApprovalValue(normalizeApprovalAction(action)) === stableApprovalValue(normalized);
+        if (!exactMatch && !redactedMatch) return undefined;
         pending.delete(key);
+        volatile.delete(key);
         persist();
-        return action;
+        return { ...publicApprovalAction(action), ...exact };
       });
     },
     take(id) {
@@ -160,7 +191,7 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         persist();
         return Array.from(pending.values())
           .filter((action) => action.status === "pending")
-          .map(({ input, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
+          .map(({ input, bindingTag: _bindingTag, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
       });
     }
   };
@@ -212,13 +243,24 @@ function stableApprovalValue(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-function approvalBindingDigest(action: ApprovalAction): string {
-  return createHash("sha256").update(stableApprovalValue({
+function approvalBindingTag(key: Buffer, action: ApprovalAction): string {
+  return createHmac("sha256", key).update(stableApprovalValue({
     tool: action.tool,
     runId: action.runId ?? "",
     accountId: action.accountId ?? "",
     input: action.input ?? {}
-  })).digest("hex");
+  })).digest("base64url");
+}
+
+function publicApprovalAction(action: StoredApprovalAction): ApprovalAction {
+  const { bindingTag: _bindingTag, ...publicAction } = action;
+  return publicAction;
+}
+
+function safeEqualTag(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left, "base64url");
+  const rightBytes = Buffer.from(right, "base64url");
+  return leftBytes.byteLength === rightBytes.byteLength && timingSafeEqual(leftBytes, rightBytes);
 }
 
 function redactBrowserInput(input: Record<string, unknown> = {}) {

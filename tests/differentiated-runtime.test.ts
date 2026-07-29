@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, OdinnRuntimeError, ProofVerifier, SnapshotManager, runTask } from "../packages/kernel/src/index.ts";
+import { unzipSync } from "fflate";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, OdinnRuntimeError, ProofVerifier, SnapshotManager, runTask } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
 const flags = { capsules: true, capabilities: true, counterfactual: true };
@@ -132,6 +133,60 @@ test("capsules verify their checksums and detect tampering", async () => {
     assert.equal(executed[0].input.text, "capsule full replay");
     const bytes = await readFile(output); bytes[bytes.length - 1] ^= 1; await writeFile(output, bytes);
     await assert.rejects(runtime.capsules.verify(output), (error: any) => error.code === "CAPSULE_TAMPERED");
+  } finally { runtime.ledger.close(); }
+});
+
+test("sensitive tool input is absent from every durable file and capsule entry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-sensitive-durable-"));
+  const state = join(root, ".odinn");
+  const runtime = createDifferentiatedRuntime({
+    stateDir: state,
+    workspaceRoot: root,
+    featureFlags: { capsules: true }
+  });
+  const sentinel = "SENTINEL_DURABLE_BROWSER_VALUE_77d2";
+  const markedSentinel = "SENTINEL_EXPLICIT_SENSITIVE_INPUT_a193";
+  try {
+    const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
+    const auditStore = createAuditStore(join(state, "audit.jsonl"));
+    const result = await runTask({
+      task: {
+        id: "run-sensitive-capsule",
+        tool: "browser.type",
+        actor: "test",
+        input: {
+          selector: "#password",
+          value: sentinel,
+          metadata: {
+            label: "ordinary metadata remains available",
+            note: { sensitive: true, value: markedSentinel }
+          }
+        }
+      },
+      auditStore,
+      registry: createBuiltInRegistry({ workspaceRoot: root, stateDir: state, auditStore, approvalStore }),
+      runLedger: runtime.ledger
+    });
+    assert.equal(result.output.type, "approval.required");
+
+    const beforeExport = await readdir(state, { recursive: true, withFileTypes: true });
+    for (const entry of beforeExport) {
+      if (!entry.isFile()) continue;
+      const bytes = await readFile(join(entry.parentPath, entry.name));
+      for (const secret of [sentinel, markedSentinel]) {
+        assert.equal(bytes.includes(Buffer.from(secret)), false, `${join(entry.parentPath, entry.name)} retained ${secret}`);
+      }
+    }
+
+    const output = join(root, "sensitive.odinn");
+    await runtime.capsules.export("run-sensitive-capsule", { output });
+    const entries = unzipSync(await readFile(output));
+    assert.ok(Object.keys(entries).some((name) => name.startsWith("artifacts/")));
+    for (const [name, bytes] of Object.entries(entries)) {
+      for (const secret of [sentinel, markedSentinel]) {
+        assert.equal(Buffer.from(bytes).includes(Buffer.from(secret)), false, `${name} retained ${secret}`);
+      }
+    }
   } finally { runtime.ledger.close(); }
 });
 

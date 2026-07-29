@@ -3,7 +3,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { normalizeAuditEvent, type AuditEvent, type JsonObject } from "@odinn/protocol";
+import { normalizeAuditEvent, redactDurableValue, type AuditEvent, type JsonObject } from "@odinn/protocol";
 
 export const STORE_SCHEMA_VERSION = 1;
 
@@ -226,7 +226,8 @@ export class FileAuditStore {
 
   async append(event: unknown): Promise<AuditEvent> {
     const operation = this.writeChain.then(() => withInterprocessLock(this.lockPath, async () => {
-      const normalized = normalizeAuditEvent(event);
+      const candidate = normalizeAuditEvent(event);
+      const normalized = normalizeAuditEvent(redactDurableValue(candidate, { toolName: candidate.tool }));
       const keyring = await this.readKeyringUnlocked();
       const previous = await this.lastIntegrity();
       const unsigned = { ...normalized, data: { ...(normalized.data ?? {}) } };

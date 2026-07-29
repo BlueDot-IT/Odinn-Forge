@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { unzipSync, zipSync } from "fflate";
@@ -45,6 +45,21 @@ function capsuleEntryText(entries: Map<string, Buffer>, name: string): string {
   return entry.toString("utf8");
 }
 function parse(value: string | undefined | null, fallback: any = {}): any { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } }
+function redactArtifactBytes(bytes: Buffer, context: { toolName?: string; input?: boolean }) {
+  try {
+    return Buffer.from(json(redact(JSON.parse(bytes.toString("utf8")), context)));
+  } catch {
+    return bytes;
+  }
+}
+function replaceCapsuleDigests(value: any, digests: Map<string, string>): any {
+  if (typeof value === "string") return digests.get(value) ?? value;
+  if (Array.isArray(value)) return value.map((item) => replaceCapsuleDigests(item, digests));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceCapsuleDigests(item, digests)]));
+  }
+  return value;
+}
 function odinnVersion() {
   const configured = process.env.ODINN_VERSION?.trim();
   if (configured) return configured;
@@ -594,24 +609,30 @@ export class CapsuleManager {
       const storedPolicy = this.ledger.database.db.prepare("SELECT policy_json FROM policies WHERE run_id = ? ORDER BY created_at DESC LIMIT 1").get(runId);
       const effectiveContract = contract ?? parse(storedContract?.contract_json, null);
       const effectivePolicy = policy ?? parse(storedPolicy?.policy_json, null);
-      const manifest = { formatVersion: 1, odinnVersion: odinnVersion(), runId, createdAt: now(), sourcePlatform: `${process.platform}-${process.arch}`, model: { provider: run.providerId, modelId: run.modelId }, replayMode, redactions: ["api keys", "tokens", "cookies", "authorization headers"], requiredSecrets: [], checksumsFile: "checksums.sha256" };
+      const manifest = { formatVersion: 1, odinnVersion: odinnVersion(), runId, createdAt: now(), sourcePlatform: `${process.platform}-${process.arch}`, model: { provider: run.providerId, modelId: run.modelId }, replayMode, redactions: ["api keys", "tokens", "cookies", "authorization headers", "tool-declared sensitive input"], requiredSecrets: [], checksumsFile: "checksums.sha256" };
       writeFileSync(join(staging, "manifest.json"), `${json(manifest)}\n`);
-      writeFileSync(join(staging, "run.json"), `${json(redact(run))}\n`);
-      writeFileSync(join(staging, "events.jsonl"), `${(run.events ?? []).map((event: AnyRecord) => json(redact(event))).join("\n")}\n`);
       writeFileSync(join(staging, "environment.json"), `${json({ platform: process.platform, arch: process.arch, node: process.version })}\n`);
       writeFileSync(join(staging, "README.txt"), "This Odinn Forge capsule is content-addressed, redacted, and safe to inspect before replay.\n");
       if (effectiveContract) writeFileSync(join(staging, "contract.json"), `${json(redact(effectiveContract))}\n`);
       if (effectivePolicy) writeFileSync(join(staging, "policy.json"), `${json(redact(effectivePolicy))}\n`);
       const referenced = this.referencedArtifactRows(runId);
+      const artifactContexts = this.artifactRedactionContexts(runId);
+      const capsuleDigests = new Map<string, string>();
       for (const artifact of referenced) {
         const source = resolve(this.ledger.artifacts.root, artifact.path);
         if (!source.startsWith(`${resolve(this.ledger.artifacts.root)}${sep}`) || !existsSync(source)) continue;
-        const target = join(staging, "artifacts", artifact.digest);
-        copyFileSync(source, target);
+        const context = artifactContexts.get(artifact.digest) ?? {};
+        const bytes = redactArtifactBytes(readFileSync(source), context);
+        const safeDigest = hash(bytes);
+        capsuleDigests.set(artifact.digest, safeDigest);
+        writeFileSync(join(staging, "artifacts", safeDigest), bytes);
       }
-      const verification = this.ledger.database.db.prepare("SELECT * FROM assertion_results WHERE run_id = ? ORDER BY completed_at").all(runId).map((row: AnyRecord) => redact({ ...row, evidenceArtifactIds: parse(row.evidence_artifact_ids_json, []), result: parse(row.result_json) }));
+      const capsuleRun = replaceCapsuleDigests(redact(run), capsuleDigests);
+      writeFileSync(join(staging, "run.json"), `${json(capsuleRun)}\n`);
+      writeFileSync(join(staging, "events.jsonl"), `${(capsuleRun.events ?? []).map((event: AnyRecord) => json(event)).join("\n")}\n`);
+      const verification = this.ledger.database.db.prepare("SELECT * FROM assertion_results WHERE run_id = ? ORDER BY completed_at").all(runId).map((row: AnyRecord) => replaceCapsuleDigests(redact({ ...row, evidenceArtifactIds: parse(row.evidence_artifact_ids_json, []), result: parse(row.result_json) }), capsuleDigests));
       writeFileSync(join(staging, "verification", "results.json"), `${json(verification)}\n`);
-      const snapshots = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE run_id = ? ORDER BY created_at").all(runId).map((row: AnyRecord) => redact({ ...row, manifest: parse(row.manifest_json, {}) }));
+      const snapshots = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE run_id = ? ORDER BY created_at").all(runId).map((row: AnyRecord) => replaceCapsuleDigests(redact({ ...row, manifest: parse(row.manifest_json, {}) }), capsuleDigests));
       writeFileSync(join(staging, "snapshots", "index.json"), `${json(snapshots)}\n`);
       const files: string[] = []; for (const entryName of readdirSync(staging, { recursive: true })) { const name = String(entryName); if (name === "checksums.sha256") continue; const file = join(staging, name); if (lstatSync(file).isFile()) files.push(name.replaceAll("\\", "/")); }
       writeFileSync(join(staging, "checksums.sha256"), `${files.sort().map((name) => `${hash(readFileSync(join(staging, name)))}  ${name}`).join("\n")}\n`);
@@ -633,6 +654,25 @@ export class CapsuleManager {
     for (const row of this.ledger.database.db.prepare("SELECT evidence_artifact_ids_json FROM assertion_results WHERE run_id = ?").all(runId)) for (const digest of parse(row.evidence_artifact_ids_json, [])) if (typeof digest === "string") digests.add(digest);
     for (const row of this.ledger.database.db.prepare("SELECT se.artifact_digest FROM snapshot_entries se JOIN snapshots s ON s.id = se.snapshot_id WHERE s.run_id = ? AND se.artifact_digest IS NOT NULL").all(runId)) digests.add(row.artifact_digest);
     return [...digests].map((digest) => this.ledger.database.db.prepare("SELECT digest, path FROM artifacts WHERE digest = ?").get(digest)).filter(Boolean);
+  }
+  artifactRedactionContexts(runId: string) {
+    const contexts = new Map<string, { toolName?: string; input?: boolean }>();
+    const steps = this.ledger.database.db.prepare("SELECT input_digest, output_digest, metadata_json FROM run_steps WHERE run_id = ?").all(runId);
+    const addContext = (digest: unknown, context: { toolName?: string; input?: boolean }) => {
+      if (typeof digest !== "string") return;
+      const prior = contexts.get(digest);
+      contexts.set(digest, {
+        toolName: context.toolName ?? prior?.toolName,
+        input: context.input === true || prior?.input === true
+      });
+    };
+    for (const step of steps) {
+      const metadata = parse(step.metadata_json, {});
+      const toolName = typeof metadata.toolName === "string" ? metadata.toolName : undefined;
+      addContext(step.input_digest, { toolName, input: true });
+      addContext(step.output_digest, { toolName });
+    }
+    return contexts;
   }
   async verify(path: string) {
     requireExperimental(this.featureFlags, "capsules", this.ledger);
