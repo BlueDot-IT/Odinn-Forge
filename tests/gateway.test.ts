@@ -5,11 +5,13 @@ process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -244,6 +246,42 @@ test("gateway serves the local console shell", async () => {
   }
 });
 
+test("assistant Markdown images remain inert for every network-capable URL form", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-markdown-"));
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const html = await (await fetch(`http://127.0.0.1:${server.address().port}/`)).text();
+    const rendererStart = html.indexOf("function escapeHtml(value)");
+    const rendererEnd = html.indexOf("\n    function compactPath", rendererStart);
+    assert.ok(rendererStart >= 0 && rendererEnd > rendererStart, "console Markdown renderer source must be present");
+    const renderer = runInNewContext(`${html.slice(rendererStart, rendererEnd)}\n({ renderMarkdown });`);
+    const targets = [
+      "https://attacker.example/pixel",
+      "http://attacker.example/pixel",
+      "/same-site-secret",
+      "https://odinn.test/same-site-secret",
+      "http://localhost:8080/private",
+      "http://127.0.0.1:8080/private",
+      "http://10.0.0.8/private",
+      "http://172.16.0.8/private",
+      "http://192.168.0.8/private",
+      "https://user:password@attacker.example/pixel",
+      "data:image/svg+xml;base64,PHN2Zy8+",
+      "blob:https://odinn.test/00000000-0000-0000-0000-000000000000"
+    ];
+    for (const [index, target] of targets.entries()) {
+      const rendered = renderer.renderMarkdown(`![private image ${index}](${target})`);
+      assert.match(rendered, new RegExp(`\\[Image: private image ${index}\\]`), `alt text must survive for ${target}`);
+      assert.doesNotMatch(rendered, /<(?:img|iframe|object|embed|script|link|video|audio|source)\b/iu, `requesting element survived for ${target}`);
+      assert.doesNotMatch(rendered, /\b(?:src|srcset|href|poster|data)\s*=|url\s*\(/iu, `browser request primitive survived for ${target}`);
+      assert.doesNotMatch(rendered, /(?:https?:|data:|blob:|\/same-site-secret)/iu, `image target survived for ${target}`);
+    }
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
 test("gateway backs cron, Agent SDK packages, skills, and workshop with persisted APIs", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "odinn-console-data-"));
   const stateDir = join(workspace, ".odinn");
@@ -288,7 +326,9 @@ test("gateway stops browser state changes for explicit approval", async () => {
   try {
     const response = await postJson(`${base}/run`, {
       tool: "browser.click",
-      input: { selector: "button#send", tabId: "tab_test" }
+      input: { selector: "button#send", tabId: "tab_test", confirmed: true },
+      actor: "user-approved",
+      approvalId: "spoofed"
     });
     assert.equal(response.ok, true);
     assert.equal(response.output.type, "approval.required");
@@ -378,11 +418,22 @@ test("gateway blocks retries after an uncertain browser mutation until recovery 
   const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
   try { await access(chromiumPath); } catch { t.skip(`Chromium not available at ${chromiumPath}`); return; }
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-browser-recovery-"));
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
+    policy: { security: { browser: { allowPrivateNetwork: true } } }
+  }, null, 2)}\n`, { mode: 0o600 });
+  const fixture = createHttpServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end("<!doctype html><title>Browser recovery fixture</title><main>Stable fixture</main>");
+  });
+  await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+  const fixtureAddress = fixture.address();
+  if (!fixtureAddress || typeof fixtureAddress === "string") throw new Error("browser fixture did not bind a TCP port");
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
-    const opened = await postJson(`${base}/run`, { tool: "browser.open", input: { url: "https://example.com" } });
+    const opened = await postJson(`${base}/run`, { tool: "browser.open", input: { url: `http://127.0.0.1:${fixtureAddress.port}/` } });
     const requested = await postJson(`${base}/run`, { tool: "browser.click", input: { tabId: opened.output.id, snapshotId: opened.output.snapshotId, selector: "#definitely-missing" } });
     const failedResponse = await fetch(`${base}/approvals/${requested.output.approvalId}/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const failed = await failedResponse.json();
@@ -392,14 +443,19 @@ test("gateway blocks retries after an uncertain browser mutation until recovery 
     assert.match(failed.nextAction, /recovery/);
     const status = await postJson(`${base}/run`, { tool: "browser.recovery.status", input: {} });
     assert.equal(status.output.recovery.status, "unknown");
-    const blockedResponse = await fetch(`${base}/run`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.press", input: { tabId: opened.output.id, key: "Escape", confirmed: true } }) });
+    const spoofed = await postJson(`${base}/run`, { tool: "browser.press", input: { tabId: opened.output.id, key: "Escape", confirmed: true } });
+    assert.equal(spoofed.output.type, "approval.required");
+    const blockedResponse = await fetch(`${base}/approvals/${spoofed.output.approvalId}/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const blocked = await blockedResponse.json();
     assert.equal(blockedResponse.status, 400);
     assert.match(blocked.error, /uncertain outcome/);
     assert.equal(blocked.category, "browser-recovery");
     const resolved = await postJson(`${base}/run`, { tool: "browser.recovery.resolve", input: { outcome: "not-applied", note: "missing selector did not mutate the page" } });
     assert.equal(resolved.output.recovery.status, "resolved");
-  } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+    await new Promise((resolve: any) => fixture.close(() => resolve()));
+  }
 });
 
 test("gateway rejects invalid and oversized JSON bodies", async () => {

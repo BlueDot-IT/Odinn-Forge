@@ -938,7 +938,9 @@ export async function createGatewayServer({
         const pending = approvalStore.claim(id);
         if (!pending) return json(response, 404, { ok: false, error: "approval not found or expired" });
         return json(response, 200, await isolatedTaskExecutor({
-          task: { id: pending.runId ?? `approval:${id}`, tool: pending.tool, input: { ...pending.input, confirmed: true }, actor: "user-approved", reason: "explicit user approval" },
+          approvalId: id,
+          approvalRunId: pending.runId,
+          task: { id: `${pending.runId}:approval:${randomUUID()}`, tool: pending.tool, input: pending.input, actor: "approval-executor", reason: "explicit user approval" },
         }));
       }
       if (request.method === "GET" && url.pathname === "/memory") {
@@ -1222,7 +1224,7 @@ export async function createGatewayServer({
         const sendEvent = (event: string, value: any) => response.write(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
         try {
           const result = await executeTask({
-            task: { ...body, id: body.id ?? request.headers["idempotency-key"], actor: body.actor ?? "gateway" },
+            task: { id: body.id ?? request.headers["idempotency-key"], tool: body.tool, input: body.input, reason: body.reason, actor: "gateway" },
             auditStore,
             policy,
             registry,
@@ -1243,7 +1245,7 @@ export async function createGatewayServer({
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         quotaGate.checkTool(body.tool);
         const result = await runTask({
-          task: { ...body, id: body.id ?? request.headers["idempotency-key"], actor: body.actor ?? "gateway" },
+          task: { id: body.id ?? request.headers["idempotency-key"], tool: body.tool, input: body.input, reason: body.reason, actor: "gateway" },
           auditStore,
           policy,
           registry
@@ -4522,8 +4524,8 @@ function renderConsoleHtml(version = "development") {
         return key;
       });
       text = text.replace(/!\\[([^\\]]*)\\]\\(([^)\\s]+)(?:\\s+&quot;([^&]*)&quot;)?\\)/g, (_, alt, href, title) => {
-        const safe = safeHref(href);
-        return '<img class="markdown-inline-image" loading="lazy" alt="' + alt + '" src="' + escapeHtml(safe) + '"' + (title ? ' title="' + title + '"' : "") + ">";
+        const label = alt || "Image";
+        return '<span class="markdown-image-alt" role="img" aria-label="' + label + '"' + (title ? ' title="' + title + '"' : "") + ">[Image: " + label + "]</span>";
       });
       text = text.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)(?:\\s+&quot;([^&]*)&quot;)?\\)/g, (_, label, href, title) => {
         const safe = safeHref(href);

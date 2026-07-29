@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 type NodeError = Error & { code?: string };
@@ -11,6 +11,8 @@ export type ApprovalAction = {
   expiresAt?: number;
   approvedAt?: string;
   runId?: string;
+  accountId?: string;
+  bindingDigest?: string;
   tool: string;
   summary?: string;
   input?: Record<string, unknown>;
@@ -20,12 +22,53 @@ export type ApprovalAction = {
 export interface ApprovalStore {
   create(action: ApprovalAction): string;
   claim(id: unknown): ApprovalAction | undefined;
+  consume(id: unknown, action: ApprovalAction): ApprovalAction | undefined;
   take(id: unknown): ApprovalAction | undefined;
   list(): ApprovalAction[];
 }
 
 export function createApprovalStore({ path }: { path?: string } = {}): ApprovalStore {
   const pending = new Map<string, ApprovalAction>();
+  const withLock = <T>(operation: () => T): T => {
+    if (!path) return operation();
+    const lockPath = `${path}.lock`;
+    const token = randomUUID();
+    const acquire = (allowRecovery: boolean): void => {
+      try {
+        const descriptor = openSync(lockPath, "wx", 0o600);
+        try {
+          writeFileSync(descriptor, JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }));
+        } finally {
+          closeSync(descriptor);
+        }
+      } catch (error) {
+        const failure = error as NodeError;
+        if (failure.code !== "EEXIST") throw error;
+        if (allowRecovery && staleApprovalLock(lockPath)) {
+          try {
+            unlinkSync(lockPath);
+          } catch (unlinkError) {
+            if ((unlinkError as NodeError).code !== "ENOENT") throw unlinkError;
+          }
+          return acquire(false);
+        }
+        const busy = new Error("approval store is busy; refusing an unsafe concurrent claim") as NodeError;
+        busy.code = "APPROVAL_STORE_BUSY";
+        throw busy;
+      }
+    };
+    acquire(true);
+    try {
+      return operation();
+    } finally {
+      try {
+        const lease = JSON.parse(readFileSync(lockPath, "utf8"));
+        if (lease?.token === token) unlinkSync(lockPath);
+      } catch (error) {
+        if ((error as NodeError).code !== "ENOENT") throw error;
+      }
+    }
+  };
   const refresh = () => {
     if (!path) return;
     try {
@@ -55,42 +98,127 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
   };
   return {
     create(action) {
-      refresh();
-      const id = `approval_${randomUUID()}`;
-      pending.set(id, { id, ...action, status: "pending", createdAt: new Date().toISOString(), expiresAt: Date.now() + 300_000 });
-      persist();
-      return id;
+      return withLock(() => {
+        refresh();
+        const id = `approval_${randomUUID()}`;
+        const normalized = normalizeApprovalAction(action);
+        const sanitized = { ...action, ...normalized };
+        pending.set(id, {
+          id,
+          ...sanitized,
+          bindingDigest: approvalBindingDigest(normalized),
+          status: "pending",
+          createdAt: new Date().toISOString(),
+          expiresAt: Date.now() + 300_000
+        });
+        persist();
+        return id;
+      });
     },
     claim(id) {
-      refresh();
-      expire();
-      const key = String(id ?? "");
-      const action = pending.get(key);
-      if (!action || Number(action.expiresAt) <= Date.now()) {
+      return withLock(() => {
+        refresh();
+        expire();
+        const key = String(id ?? "");
+        const action = pending.get(key);
+        if (!action || Number(action.expiresAt) <= Date.now()) {
+          persist();
+          return undefined;
+        }
+        if (action.status === "approved") return action;
+        pending.set(key, { ...action, status: "approved", approvedAt: new Date().toISOString() });
         persist();
-        return undefined;
-      }
-      if (action.status === "approved") return action;
-      pending.set(key, { ...action, status: "approved", approvedAt: new Date().toISOString(), runId: action.runId ?? `approval:${key}` });
-      persist();
-      return pending.get(key);
+        return pending.get(key);
+      });
+    },
+    consume(id, expected) {
+      return withLock(() => {
+        refresh();
+        expire();
+        const key = String(id ?? "");
+        const action = pending.get(key);
+        if (!action || action.status !== "approved" || Number(action.expiresAt) <= Date.now()) {
+          persist();
+          return undefined;
+        }
+        const normalized = normalizeApprovalAction(expected);
+        const storedDigest = action.bindingDigest ?? approvalBindingDigest(normalizeApprovalAction(action));
+        if (storedDigest !== approvalBindingDigest(normalized)) return undefined;
+        pending.delete(key);
+        persist();
+        return action;
+      });
     },
     take(id) {
       const action = this.claim(id);
-      if (!action) return undefined;
-      pending.delete(String(id ?? ""));
-      persist();
-      return action;
+      return action ? this.consume(id, action) : undefined;
     },
     list() {
-      refresh();
-      expire();
-      persist();
-      return Array.from(pending.values())
-        .filter((action) => action.status === "pending")
-        .map(({ input, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
+      return withLock(() => {
+        refresh();
+        expire();
+        persist();
+        return Array.from(pending.values())
+          .filter((action) => action.status === "pending")
+          .map(({ input, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
+      });
     }
   };
+}
+
+function staleApprovalLock(path: string) {
+  try {
+    const lease = JSON.parse(readFileSync(path, "utf8"));
+    const ageMs = Date.now() - Number(lease?.createdAt ?? statSync(path).mtimeMs);
+    if (!Number.isInteger(lease?.pid) || lease.pid < 1 || ageMs < 5_000) return false;
+    try {
+      process.kill(lease.pid, 0);
+      return false;
+    } catch (error) {
+      return (error as NodeError).code === "ESRCH";
+    }
+  } catch {
+    try {
+      return Date.now() - statSync(path).mtimeMs >= 5_000;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function normalizeApprovalAction(action: ApprovalAction): ApprovalAction {
+  const input = normalizeApprovalInput(action.input);
+  return {
+    tool: String(action.tool ?? "").trim(),
+    runId: String(action.runId ?? "").trim(),
+    accountId: String(action.accountId ?? "").trim(),
+    input
+  };
+}
+
+function normalizeApprovalInput(input: Record<string, unknown> = {}): Record<string, unknown> {
+  const normalized = { ...input };
+  delete normalized.confirmed;
+  delete normalized.approvalId;
+  return normalized;
+}
+
+function stableApprovalValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableApprovalValue).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableApprovalValue(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function approvalBindingDigest(action: ApprovalAction): string {
+  return createHash("sha256").update(stableApprovalValue({
+    tool: action.tool,
+    runId: action.runId ?? "",
+    accountId: action.accountId ?? "",
+    input: action.input ?? {}
+  })).digest("hex");
 }
 
 function redactBrowserInput(input: Record<string, unknown> = {}) {

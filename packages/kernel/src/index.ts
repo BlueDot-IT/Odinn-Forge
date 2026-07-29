@@ -125,17 +125,17 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["browser.click", {
       capability: "browser.act",
       description: "Click a browser control after explicit user approval.",
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser)
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.type", {
       capability: "browser.act",
       description: "Fill a browser field after explicit user approval.",
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser)
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.press", {
       capability: "browser.act",
       description: "Press a browser key after explicit user approval.",
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser)
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.recovery.status", {
       capability: "browser.read",
@@ -517,7 +517,9 @@ export async function runTask({
   signal,
   runLedger,
   onModelDelta,
-  onProviderAttempt
+  onProviderAttempt,
+  trustedApprovalId,
+  trustedApprovalRunId
 }: any) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
@@ -642,6 +644,8 @@ export async function runTask({
       onProviderAttempt: async (attempt: any) => auditStore.append({ at: now(), runId: request.id, type: "provider.attempt", actor: request.actor, tool: request.tool, capability: tool.capability, decision: "allow", data: attempt }),
       runLedger,
       capability: capabilityClaims,
+      trustedApprovalId,
+      trustedApprovalRunId,
       runTool: (nestedTask: any) => runTask({
         task: { ...nestedTask, actor: nestedTask.actor ?? request.actor },
         auditStore,

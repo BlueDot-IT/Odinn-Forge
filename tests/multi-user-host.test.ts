@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -96,6 +96,105 @@ test("multi-user host rate limits repeated authentication failures", async () =>
     assert.equal(blocked.status, 429);
     assert.ok(Number(blocked.headers.get("retry-after")) >= 1);
   } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
+});
+
+test("multi-user host canonicalizes accepted login IDs before throttling", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-normalized-limit-"));
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-normalized-limit-user-"));
+  const password = await hashPassword("correct-password-long");
+  const publicOrigin = "https://odinn.test";
+  const server = await createMultiUserHost({
+    stateDir: root,
+    publicOrigin,
+    loginLimits: { maximumAttempts: 2, maximumAttemptsPerIp: 100, windowMs: 60_000 },
+    users: { schemaVersion: 1, users: [{ id: "alice", workspaceRoot: workspace, salt: password.salt, passwordHash: password.hash }] }
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const login = (userId: string, passwordValue: string) => fetch(`${base}/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: publicOrigin },
+    body: JSON.stringify({ userId, password: passwordValue })
+  });
+  try {
+    assert.equal((await login(" Alice ", "wrong-password-long")).status, 401);
+    assert.equal((await login("ALICE", "still-wrong-password")).status, 401);
+    assert.equal((await login("alice", "correct-password-long")).status, 429);
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+  }
+});
+
+test("multi-user host bounds unique-ID throttle persistence and applies per-IP admission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-cardinality-limit-"));
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-cardinality-limit-user-"));
+  const password = await hashPassword("correct-password-long");
+  const publicOrigin = "https://odinn.test";
+  const users = { schemaVersion: 1, users: [{ id: "alice", workspaceRoot: workspace, salt: password.salt, passwordHash: password.hash }] };
+  const options = {
+    stateDir: root,
+    publicOrigin,
+    loginLimits: { maximumAttempts: 100, maximumAttemptsPerIp: 1_000, maximumRecords: 8, windowMs: 60_000 },
+    users
+  };
+  const server = await createMultiUserHost(options);
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    let capacityRejected = false;
+    for (let index = 0; index < 60; index += 1) {
+      const response = await fetch(`${base}/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: publicOrigin },
+        body: JSON.stringify({ userId: `probe-${String(index).padStart(3, "0")}`, password: "wrong-password-long" })
+      });
+      assert.ok([401, 429].includes(response.status));
+      capacityRejected ||= response.status === 429;
+    }
+    assert.equal(capacityRejected, true, "new throttle identities must fail closed when the bounded store is full");
+    const attemptsPath = join(root, "login-attempts.json");
+    const persisted = JSON.parse(await readFile(attemptsPath, "utf8"));
+    assert.equal(persisted.schemaVersion, 2);
+    assert.ok(Object.keys(persisted.attempts).length <= 8, "persisted throttle record count must remain capped");
+    assert.ok((await stat(attemptsPath)).size < 4_096, "bounded records must produce a bounded small persistence file");
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+  }
+
+  const restarted = await createMultiUserHost(options);
+  await new Promise((resolve: any) => restarted.listen(0, "127.0.0.1", resolve));
+  try {
+    const persisted = JSON.parse(await readFile(join(root, "login-attempts.json"), "utf8"));
+    assert.ok(Object.keys(persisted.attempts).length <= 8, "restart must not expand persisted throttle cardinality");
+  } finally {
+    await new Promise((resolve: any) => restarted.close(() => resolve()));
+  }
+
+  const ipRoot = await mkdtemp(join(tmpdir(), "odinn-host-ip-limit-"));
+  const ipServer = await createMultiUserHost({
+    stateDir: ipRoot,
+    publicOrigin,
+    loginLimits: { maximumAttempts: 2, maximumAttemptsPerIp: 3, maximumRecords: 16, windowMs: 60_000 },
+    users
+  });
+  await new Promise((resolve: any) => ipServer.listen(0, "127.0.0.1", resolve));
+  const ipBase = `http://127.0.0.1:${ipServer.address().port}`;
+  const ipLogin = (userId: string, passwordValue = "wrong-password-long") => fetch(`${ipBase}/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: publicOrigin },
+    body: JSON.stringify({ userId, password: passwordValue })
+  });
+  try {
+    assert.equal((await ipLogin("probe-one")).status, 401);
+    assert.equal((await ipLogin("probe-two")).status, 401);
+    assert.equal((await ipLogin("alice", "correct-password-long")).status, 200);
+    assert.equal((await ipLogin("probe-three")).status, 401);
+    const blocked = await ipLogin("alice", "correct-password-long");
+    assert.equal(blocked.status, 429);
+    assert.ok(Number(blocked.headers.get("retry-after")) >= 1);
+  } finally {
+    await new Promise((resolve: any) => ipServer.close(() => resolve()));
+  }
 });
 
 test("multi-user host rejects tenant-controlled provider destinations and credentials", async () => {
