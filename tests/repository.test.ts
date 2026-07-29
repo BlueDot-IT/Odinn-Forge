@@ -154,17 +154,19 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
         "Dependency and lockfile audit",
         "Secret scan",
         "actionlint",
-        "Conventional title"
+        "Conventional title",
+        "Documentation impact"
       ]
     },
     required_pull_request_reviews: {
       required_approving_review_count: 1,
       dismiss_stale_reviews: true,
-      require_code_owner_reviews: true
+      require_code_owner_reviews: true,
+      require_last_push_approval: true
     },
     required_linear_history: { enabled: true },
     required_conversation_resolution: { enabled: true },
-    enforce_admins: { enabled: false },
+    enforce_admins: { enabled: true },
     allow_force_pushes: { enabled: false },
     allow_deletions: { enabled: false }
   };
@@ -173,7 +175,7 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
     name: "default",
     target: "branch",
     enforcement: "active",
-    bypass_actors: [{ actor_id: null, actor_type: "OrganizationAdmin", bypass_mode: "always" }],
+    bypass_actors: [],
     conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
     rules: [
       { type: "deletion" },
@@ -216,7 +218,19 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
     })
   }).status, 0);
   assert.notEqual(run(effective(), {
+    FAKE_BRANCH_PROTECTION: JSON.stringify({
+      ...branchProtection,
+      enforce_admins: { enabled: false }
+    })
+  }).status, 0);
+  assert.notEqual(run(effective(), {
     FAKE_RULESET: JSON.stringify({ ...ruleset, enforcement: "disabled" })
+  }).status, 0);
+  assert.notEqual(run(effective(), {
+    FAKE_RULESET: JSON.stringify({
+      ...ruleset,
+      bypass_actors: [{ actor_id: null, actor_type: "OrganizationAdmin", bypass_mode: "always" }]
+    })
   }).status, 0);
   assert.notEqual(run(effective({ protection_rules: [] })).status, 0);
   assert.notEqual(run(effective({

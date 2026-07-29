@@ -34,7 +34,8 @@ const requiredChecks = [
   "Dependency and lockfile audit",
   "Secret scan",
   "actionlint",
-  "Conventional title"
+  "Conventional title",
+  "Documentation impact"
 ];
 
 function isEnabled(value: any) {
@@ -69,12 +70,12 @@ gh("/branches/main/protection", "PUT", {
     strict: true,
     contexts: requiredChecks
   },
-  enforce_admins: false,
+  enforce_admins: true,
   required_pull_request_reviews: {
     dismiss_stale_reviews: true,
     require_code_owner_reviews: true,
     required_approving_review_count: 1,
-    require_last_push_approval: false
+    require_last_push_approval: true
   },
   restrictions: null,
   required_linear_history: true,
@@ -97,9 +98,10 @@ if (
   || protection.required_pull_request_reviews?.required_approving_review_count !== 1
   || protection.required_pull_request_reviews?.dismiss_stale_reviews !== true
   || protection.required_pull_request_reviews?.require_code_owner_reviews !== true
+  || protection.required_pull_request_reviews?.require_last_push_approval !== true
   || !isEnabled(protection.required_linear_history)
   || !isEnabled(protection.required_conversation_resolution)
-  || !isDisabled(protection.enforce_admins)
+  || !isEnabled(protection.enforce_admins)
   || !isDisabled(protection.allow_force_pushes)
   || !isDisabled(protection.allow_deletions)
 ) {
@@ -117,12 +119,11 @@ const defaultRuleset = Array.isArray(rulesets)
 if (!defaultRuleset?.id) {
   throw new Error("default branch ruleset verification failed: the expected ruleset does not exist");
 }
-const currentRuleset = JSON.parse(gh(`/rulesets/${defaultRuleset.id}`));
 gh(`/rulesets/${defaultRuleset.id}`, "PUT", {
   name: "default",
   target: "branch",
   enforcement: "active",
-  bypass_actors: Array.isArray(currentRuleset.bypass_actors) ? currentRuleset.bypass_actors : [],
+  bypass_actors: [],
   conditions: {
     ref_name: {
       include: ["~DEFAULT_BRANCH"],
@@ -144,6 +145,8 @@ const effectiveRuleTypes = new Set(
 );
 if (
   effectiveRuleset.enforcement !== "active"
+  || !Array.isArray(effectiveRuleset.bypass_actors)
+  || effectiveRuleset.bypass_actors.length !== 0
   || !effectiveRuleset.conditions?.ref_name?.include?.includes("~DEFAULT_BRANCH")
   || !effectiveRuleTypes.has("deletion")
   || !effectiveRuleTypes.has("non_fast_forward")
