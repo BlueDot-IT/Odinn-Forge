@@ -61,6 +61,39 @@ if [[ -z "$details" || "${details,,}" == *"replace this text"* ]]; then
   exit 1
 fi
 
+mentions_exact_path() {
+  local text="$1"
+  local path="$2"
+  awk -v text="$text" -v path="$path" '
+    function continues_path(character) {
+      return character ~ /[[:alnum:]_.\/-]/
+    }
+    function continues_after_path(text, absolute, path_length, character, following) {
+      character = substr(text, absolute + path_length, 1)
+      if (character != ".") {
+        return continues_path(character)
+      }
+      following = substr(text, absolute + path_length + 1, 1)
+      return continues_path(following)
+    }
+    BEGIN {
+      offset = 1
+      remaining = text
+      while ((position = index(remaining, path)) > 0) {
+        absolute = offset + position - 1
+        before = absolute > 1 ? substr(text, absolute - 1, 1) : ""
+        if ((before == "" || !continues_path(before)) &&
+            !continues_after_path(text, absolute, length(path))) {
+          exit 0
+        }
+        offset = absolute + 1
+        remaining = substr(text, offset)
+      }
+      exit 1
+    }
+  '
+}
+
 if [[ "$updated_count" -eq 1 ]]; then
   documentation_path_changed=0
   documentation_path_mentioned=0
@@ -71,7 +104,7 @@ if [[ "$updated_count" -eq 1 ]]; then
       "$normalized_changed_file" == *.md ||
       "$normalized_changed_file" == *.mdx ]]; then
       documentation_path_changed=1
-      if grep -Fq -- "$changed_file" <<< "$details"; then
+      if mentions_exact_path "$details" "$changed_file"; then
         documentation_path_mentioned=1
       fi
     fi

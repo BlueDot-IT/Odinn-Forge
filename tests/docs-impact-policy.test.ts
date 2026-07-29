@@ -83,13 +83,18 @@ test("rejects an updated declaration without a documentation path", async () => 
 });
 
 test("rejects updated details that do not identify a changed documentation path", async () => {
-  const result = await runPolicy(body("updated", "Updated docs/not-actually-changed.md."), [
-    "src/config.ts",
-    "docs/configuration.md",
-  ]);
-
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /identify at least one changed documentation path/);
+  for (const details of [
+    "Updated docs/not-actually-changed.md.",
+    "Updated docs/configuration.md.bak.",
+    "Updated backup/docs/configuration.md.",
+  ]) {
+    const result = await runPolicy(body("updated", details), [
+      "src/config.ts",
+      "docs/configuration.md",
+    ]);
+    assert.equal(result.status, 1, `expected rejection for: ${details}`);
+    assert.match(result.stderr, /identify at least one changed documentation path/);
+  }
 });
 
 test("rejects a generic documentation-not-required assertion", async () => {
