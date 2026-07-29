@@ -333,18 +333,30 @@ async function browserPageSnapshot(page: any) {
   return { snapshotId, text, links };
 }
 
-export async function browserAction(stateDir: any, approvalStore: ApprovalStore, tool: any, input: any = {}, security: any = {}) {
-  if (security.requireApproval !== false && input.confirmed !== true) {
+export async function browserAction(stateDir: any, approvalStore: ApprovalStore, tool: any, input: any = {}, security: any = {}, execution: any = {}) {
+  const normalizedInput = { ...input };
+  delete normalizedInput.confirmed;
+  delete normalizedInput.approvalId;
+  if (security.requireApproval !== false && !execution?.approvalId) {
     const approvalId = approvalStore.create({
       type: "approval.required",
       tool,
+      runId: execution?.runId,
       summary: browserActionSummary(tool, input),
       expectedUrl: input.expectedUrl,
       snapshotId: input.snapshotId,
-      input: { ...input, confirmed: true }
+      input: normalizedInput
     });
     return { type: "approval.required", approvalId, tool, summary: browserActionSummary(tool, input), expiresInSeconds: 300 };
   }
+  if (security.requireApproval !== false && !approvalStore.consume(execution.approvalId, {
+    tool,
+    runId: execution.runId,
+    input: normalizedInput
+  })) {
+    throw new Error("browser action approval is missing, expired, already used, or does not match this action");
+  }
+  input = normalizedInput;
   const manager = await getBrowserManager(stateDir);
   const unresolved = await manager.recovery();
   if (["executing", "unknown"].includes(unresolved.status)) {

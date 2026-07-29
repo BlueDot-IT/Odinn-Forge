@@ -26,13 +26,14 @@ env:
 jobs:
   verify:
     name: Verify release candidate
+    needs: release-policy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.release-policy.outputs.release_commit }}
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -51,20 +52,48 @@ jobs:
       - run: pnpm benchmark:ci
       - run: node scripts/ci/audit.ts high
 
-  source-package:
-    name: Build release assets
-    needs: verify
+  release-policy:
+    name: Validate published release and tag
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    outputs:
+      release_commit: ${{ steps.release.outputs.commit }}
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_TAG }}
+      - name: Validate existing published release and tag
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          test -n "$TAG"
+          tag_commit="$(git rev-list -n 1 "refs/tags/$TAG")"
+          test "$tag_commit" = "$(git rev-parse HEAD)"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          jq -e --arg tag "$TAG" \
+            '.tag_name == $tag and .draft == false' \
+            <<<"$release"
+          echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
+
+  source-package:
+    name: Build release assets
+    needs:
+      - release-policy
+      - verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release-policy.outputs.release_commit }}
       - name: Record checked-out release commit
         shell: bash
         run: echo "ODINN_RELEASE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
@@ -90,19 +119,12 @@ jobs:
       - run: pnpm release:checksums
       - run: node scripts/release/verify.ts
       - run: pnpm release:install-smoke
-      - name: Publish npm package
-        shell: bash
-        run: |
-          version="$(node -p "require('./package.json').version")"
-          package="@bluedot-it/odinn@$version"
-          if npm view "$package" version >/dev/null 2>&1; then
-            echo "$package is already published"
-          else
-            npm publish "dist/package-stage/odinn-v$version" --access public --provenance
-          fi
-      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          subject-path: dist/release/*
+          name: odinn-npm-package
+          path: dist/package-stage/odinn-v*
+          if-no-files-found: error
+          retention-days: 1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: odinn-release-assets
@@ -110,36 +132,74 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish-assets:
-    name: Publish GitHub release assets
-    needs: source-package
+  publish-release:
+    name: Publish npm package and release assets
+    needs:
+      - release-policy
+      - source-package
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
+          ref: ${{ needs.release-policy.outputs.release_commit }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: odinn-npm-package
+          path: dist/npm-package
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: odinn-release-assets
           path: release-assets
-      - name: Resolve and verify tag
+      - name: Revalidate published release and exact tag commit
         id: tag
         shell: bash
         env:
+          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           git fetch --tags --force
-          git rev-parse --verify "refs/tags/$TAG"
+          test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false' <<<"$release"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        with:
+          subject-path: release-assets/*
+      - name: Publish npm package
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          package="@bluedot-it/odinn@$version"
+          mapfile -t package_manifests < <(find dist/npm-package -type f -name package.json -print)
+          test "${#package_manifests[@]}" -eq 1
+          package_dir="$(dirname "${package_manifests[0]}")"
+          test "$(node -p "require('./${package_manifests[0]}').name")" = "@bluedot-it/odinn"
+          test "$(node -p "require('./${package_manifests[0]}').version")" = "$version"
+          if npm view "$package" version >/dev/null 2>&1; then
+            echo "$package is already published"
+          else
+            npm publish "$package_dir" --access public --provenance
+          fi
       - name: Verify published release and upload assets
         shell: bash
         env:
+          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
+          git fetch --tags --force
+          test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
           is_draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
           test "$is_draft" = "false"
           gh release upload "$TAG" release-assets/* --clobber

@@ -8,7 +8,7 @@ let shuttingDown = false;
 interface BrowserWorkerMessage {
   type?: "task" | "shutdown";
   id?: string;
-  payload?: { task?: unknown };
+  payload?: { approvalId?: string; approvalRunId?: string; task?: unknown };
   stateDir?: string;
   workspaceRoot?: string;
   config?: { auditLog?: string; experimental?: unknown };
@@ -34,7 +34,7 @@ async function handle(message: BrowserWorkerMessage) {
       const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
       const registry = createBuiltInRegistry({ workspaceRoot, stateDir, config, approvalStore });
       runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
-      const result = await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: undefined });
+      const result = await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: undefined, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId });
       process.send?.({ id: message.id, ok: true, result });
     } catch (error) {
       process.send?.({ id: message.id, ok: false, error: messageError(error) });

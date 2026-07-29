@@ -49,9 +49,12 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
     const active = [];
     for (const user of records.users ?? []) {
       if (user.disabled) continue;
-      active.push({ ...user, workspaceRoot: await realpath(resolve(user.workspaceRoot)) });
+      const id = normalizeAcceptedUserId(user.id);
+      if (!id || id !== user.id) throw new Error("host user ids must be canonical lowercase identifiers");
+      active.push({ ...user, id, workspaceRoot: await realpath(resolve(user.workspaceRoot)) });
     }
     assertNonOverlappingWorkspaces(active);
+    if (new Set(active.map((user: any) => user.id)).size !== active.length) throw new Error("duplicate host user id");
     usersById = new Map(active.map((user: any) => [user.id, user]));
     return usersById;
   };
@@ -64,27 +67,75 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
   const attemptsPath = join(root, "login-attempts.json");
   const loginAttempts: Map<string, any> = new Map();
   const sessionKey = randomBytes(32);
-  const maximumLoginAttempts = Math.max(1, Number(loginLimits.maximumAttempts ?? 5));
-  const loginWindowMs = Math.max(1_000, Number(loginLimits.windowMs ?? 5 * 60 * 1000));
+  const maximumLoginAttempts = boundedInteger(loginLimits.maximumAttempts, 5, 1, 1_000);
+  const maximumIpLoginAttempts = boundedInteger(loginLimits.maximumAttemptsPerIp, Math.max(50, maximumLoginAttempts * 20), maximumLoginAttempts, 100_000);
+  const maximumLoginAttemptRecords = boundedInteger(loginLimits.maximumRecords, 1_000, 4, 10_000);
+  const maximumGlobalLoginAttempts = boundedInteger(
+    loginLimits.maximumAttemptsGlobal,
+    Math.max(200, maximumIpLoginAttempts * 10),
+    maximumIpLoginAttempts,
+    1_000_000
+  );
+  const loginWindowMs = boundedInteger(loginLimits.windowMs, 5 * 60 * 1000, 1_000, 24 * 60 * 60 * 1000);
+  const sweepLoginAttempts = (now = Date.now()) => {
+    let changed = false;
+    for (const [key, value] of loginAttempts) {
+      if (!Number.isInteger(value?.count) || value.count < 1 || !Number.isFinite(value?.resetAt) || value.resetAt <= now) {
+        loginAttempts.delete(key);
+        changed = true;
+      }
+    }
+    return changed;
+  };
+  const trimLoginAttempts = () => {
+    if (loginAttempts.size <= maximumLoginAttemptRecords) return false;
+    const retained = Array.from(loginAttempts.entries())
+      .sort((left, right) =>
+        Number(right[1]?.count ?? 0) - Number(left[1]?.count ?? 0)
+        || Number(right[1]?.updatedAt ?? 0) - Number(left[1]?.updatedAt ?? 0)
+      )
+      .slice(0, maximumLoginAttemptRecords);
+    loginAttempts.clear();
+    for (const [key, value] of retained) loginAttempts.set(key, value);
+    return true;
+  };
   try {
     const persisted = JSON.parse(await readFile(attemptsPath, "utf8"));
-    if (persisted?.schemaVersion !== 1 || !persisted.attempts || typeof persisted.attempts !== "object") throw new Error("invalid login attempt store");
+    if (![1, 2].includes(persisted?.schemaVersion) || !persisted.attempts || typeof persisted.attempts !== "object") throw new Error("invalid login attempt store");
     for (const [key, value] of Object.entries(persisted.attempts) as any) {
-      if (Number.isInteger(value?.count) && value.count > 0 && Number(value.resetAt) > Date.now()) loginAttempts.set(key, value);
+      if (Number.isInteger(value?.count) && value.count > 0 && Number(value.resetAt) > Date.now()) {
+        const persistedKey = persisted.schemaVersion === 1 ? migrateLegacyLoginAttemptKey(key) : String(key).slice(0, 256);
+        if (!persistedKey) continue;
+        loginAttempts.set(persistedKey, {
+          count: value.count,
+          resetAt: Number(value.resetAt),
+          updatedAt: Number(value.updatedAt) || Date.now()
+        });
+      }
     }
+    trimLoginAttempts();
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
   }
-  let attemptWriteChain: Promise<unknown> = Promise.resolve();
+  let attemptWritePromise: Promise<void> | undefined;
+  let attemptWriteDirty = false;
   const persistLoginAttempts = () => {
-    const operation = attemptWriteChain.then(async () => {
-      const temporary = `${attemptsPath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
-      await writeFile(temporary, `${JSON.stringify({ schemaVersion: 1, attempts: Object.fromEntries(loginAttempts) }, null, 2)}\n`, { mode: 0o600 });
-      await rename(temporary, attemptsPath);
-      await chmod(attemptsPath, 0o600);
-    });
-    attemptWriteChain = operation.catch(() => undefined);
-    return operation;
+    attemptWriteDirty = true;
+    if (!attemptWritePromise) {
+      attemptWritePromise = (async () => {
+        while (attemptWriteDirty) {
+          attemptWriteDirty = false;
+          const snapshot = `${JSON.stringify({ schemaVersion: 2, attempts: Object.fromEntries(loginAttempts) })}\n`;
+          const temporary = `${attemptsPath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
+          await writeFile(temporary, snapshot, { mode: 0o600 });
+          await rename(temporary, attemptsPath);
+          await chmod(attemptsPath, 0o600);
+        }
+      })().finally(() => {
+        attemptWritePromise = undefined;
+      });
+    }
+    return attemptWritePromise;
   };
 
   async function tenant(user: any) {
@@ -111,6 +162,10 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
     }
   }, Math.min(tenantIdleMs, 60_000));
   evictionTimer.unref();
+  const loginAttemptSweepTimer = setInterval(() => {
+    if (sweepLoginAttempts()) void persistLoginAttempts().catch(() => undefined);
+  }, Math.min(loginWindowMs, 60_000));
+  loginAttemptSweepTimer.unref();
 
   const handler = async (request: any, response: any) => {
     try {
@@ -122,27 +177,45 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
       if (request.method === "GET" && request.url === "/auth/login") return loginPage(response);
       if (request.method === "POST" && request.url === "/auth/login") {
         const body = await readBody(request);
-        const userId = String(body.userId || "");
-        const attemptKey = `${request.socket.remoteAddress || "unknown"}:${userId}`;
         const now = Date.now();
+        const swept = sweepLoginAttempts(now);
+        const normalizedUserId = normalizeAcceptedUserId(body.userId);
+        const clientIp = normalizeClientIp(request.socket.remoteAddress);
+        const attemptKey = `pair:${clientIp}:${normalizedUserId ?? "<invalid>"}`;
+        const ipAttemptKey = `ip:${clientIp}`;
+        const globalAttemptKey = "global";
         const attempt = loginAttempts.get(attemptKey);
-        if (attempt && attempt.resetAt > now && attempt.count >= maximumLoginAttempts) {
-          response.setHeader("retry-after", String(Math.max(1, Math.ceil((attempt.resetAt - now) / 1000))));
+        const ipAttempt = loginAttempts.get(ipAttemptKey);
+        const globalAttempt = loginAttempts.get(globalAttemptKey);
+        const blocked = globalAttempt?.count >= maximumGlobalLoginAttempts
+          ? globalAttempt
+          : attempt?.count >= maximumLoginAttempts
+            ? attempt
+            : ipAttempt?.count >= maximumIpLoginAttempts
+            ? ipAttempt
+            : undefined;
+        if (blocked) {
+          if (swept) await persistLoginAttempts();
+          response.setHeader("retry-after", String(Math.max(1, Math.ceil((blocked.resetAt - now) / 1000))));
           return send(response, 429, { error: "too many authentication attempts" });
         }
-        if (attempt?.resetAt <= now) {
-          loginAttempts.delete(attemptKey);
-          await persistLoginAttempts();
-        }
-        const user = usersById.get(userId);
+        const user = normalizedUserId ? usersById.get(normalizedUserId) : undefined;
         if (!user || !await verifyPassword(String(body.password || ""), user)) {
-          const current = loginAttempts.get(attemptKey);
-          loginAttempts.set(attemptKey, { count: (current?.count ?? 0) + 1, resetAt: current?.resetAt ?? now + loginWindowMs });
+          const requiredRecords = [attemptKey, ipAttemptKey, globalAttemptKey]
+            .filter((key) => !loginAttempts.has(key)).length;
+          if (loginAttempts.size + requiredRecords > maximumLoginAttemptRecords) {
+            if (swept) await persistLoginAttempts();
+            response.setHeader("retry-after", String(Math.max(1, Math.ceil(loginWindowMs / 1000))));
+            return send(response, 429, { error: "authentication throttle capacity reached" });
+          }
+          incrementLoginAttempt(loginAttempts, attemptKey, now, loginWindowMs);
+          incrementLoginAttempt(loginAttempts, ipAttemptKey, now, loginWindowMs);
+          incrementLoginAttempt(loginAttempts, globalAttemptKey, now, loginWindowMs);
           await persistLoginAttempts();
           return send(response, 401, { error: "invalid credentials" });
         }
-        loginAttempts.delete(attemptKey);
-        await persistLoginAttempts();
+        const pairAttemptCleared = loginAttempts.delete(attemptKey);
+        if (pairAttemptCleared || swept) await persistLoginAttempts();
         const id = randomBytes(32).toString("base64url");
         const expiresAt = Date.now() + 8 * 60 * 60 * 1000;
         sessions.set(id, { userId: user.id, expiresAt });
@@ -177,10 +250,46 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
   const close = server.close.bind(server);
   server.close = (callback: any) => {
     clearInterval(evictionTimer);
+    clearInterval(loginAttemptSweepTimer);
     void Promise.allSettled([...tenants.values()].map(({ gateway }: any) => new Promise((done: any) => gateway.close(() => done())))).then(() => close(callback));
     return server;
   };
   return server;
+}
+
+function boundedInteger(value: any, fallback: number, minimum: number, maximum: number) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
+}
+
+function normalizeAcceptedUserId(value: any) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9_-]{1,63}$/.test(normalized) ? normalized : null;
+}
+
+function normalizeClientIp(value: any) {
+  const normalized = String(value || "unknown").trim().toLowerCase().replace(/^::ffff:/u, "");
+  return /^[a-f0-9:.]{1,64}$/u.test(normalized) ? normalized : "unknown";
+}
+
+function migrateLegacyLoginAttemptKey(value: any) {
+  const key = String(value);
+  const separator = key.lastIndexOf(":");
+  if (separator < 1) return null;
+  const userId = normalizeAcceptedUserId(key.slice(separator + 1));
+  if (!userId) return null;
+  return `pair:${normalizeClientIp(key.slice(0, separator))}:${userId}`;
+}
+
+function incrementLoginAttempt(attempts: Map<string, any>, key: string, now: number, windowMs: number) {
+  const current = attempts.get(key);
+  attempts.delete(key);
+  attempts.set(key, {
+    count: (current?.count ?? 0) + 1,
+    resetAt: current?.resetAt ?? now + windowMs,
+    updatedAt: now
+  });
 }
 
 export async function addHostUser({ stateDir = ".odinn-host", id, password, workspaceRoot }: any) {
