@@ -68,6 +68,27 @@ implementation, compatibility impact, persistent-state or migration impact,
 security impact, exact validation, and rollback path. Each pull request must
 address one coherent area.
 
+Every pull request must also declare its documentation impact. Select exactly
+one outcome in the pull request template and provide concrete details:
+
+- `Documentation updated` requires at least one changed Markdown/MDX file or a
+  file under `docs/`, and the details must identify the relevant paths.
+- `Documentation not required` requires a specific rationale. This is
+  appropriate for changes such as internal refactors, focused tests, or fixes
+  that do not change user, operator, contributor, API, configuration, security,
+  installation, upgrade, or troubleshooting behavior.
+
+User-visible and operator-visible behavior changes require documentation.
+Selecting `Documentation not required` does not waive reviewer enforcement of
+that requirement.
+
+Maintainers may enable auto-merge for routine pull requests after the required
+independent approval is recorded. The authoring agent must not queue
+auto-merge for changes to security boundaries, credentials, repository
+permissions, deployment infrastructure, or releases; those require explicit
+maintainer confirmation. Auto-merge must never bypass required checks or
+reviews.
+
 You are responsible for every branch you create. After its pull request is
 merged or closed, promptly delete the branch from the remote and remove any
 corresponding local branch or worktree. Do not leave abandoned contribution
