@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./gateway-v2": "./src/gateway-v2.ts",
+    "./gateway-v2/client": "./src/gateway-v2-client.ts",
+    "./gateway-v2/schema": "./src/gateway-v2-schema.ts",
+    "./gateway-v2/schema.json": "./gateway-v2.schema.json"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
