@@ -137,7 +137,26 @@ when p95 exceeds the 2-second budget. The local Forgejo integration runner
 executes inside nested Docker and uses a documented 4-second cold-start
 allowance; all other workflows retain the 2-second default. Set
 `ODINN_BENCHMARK_P95_MAX_MS` only when diagnosing a slower host; do not use it
-to hide a release regression.
+to hide a release regression. It then runs the observational assurance
+microbenchmarks described below.
+
+`benchmark:assurance` measures the synchronous paths added by the core advanced
+services: ordinary tool dispatch with zero, one, three, and ten Gatewatch
+invariants, pinned Raven Route selection, and evidence-based selection over
+100, 1,000, and 10,000 observations. The report includes p50, p95, and maximum
+latency plus the p95 difference between zero-invariant and three-invariant
+dispatch.
+
+```bash
+pnpm benchmark:assurance
+```
+
+Use `ODINN_ASSURANCE_BENCHMARK_SAMPLES` and
+`ODINN_ASSURANCE_BENCHMARK_WARMUPS` to adjust the bounded sample counts during
+diagnosis. These measurements are initially observational: the existing
+packaged-gateway threshold remains the only enforced latency budget until
+stable baselines from CI and representative operator hardware establish
+portable regression limits.
 
 To inspect release output without publishing:
 
