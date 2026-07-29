@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@odinn/channels": "workspace:*"
+    "@odinn/channels": "workspace:*",
+    "grammy": "1.45.1"
   }
 }

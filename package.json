@@ -8,6 +8,11 @@
     "odinn": "./apps/cli/src/cli.ts"
   },
   "packageManager": "pnpm@10.14.0",
+  "pnpm": {
+    "overrides": {
+      "uuid@<11.1.1": "11.1.1"
+    }
+  },
   "engines": {
     "node": ">=24.0.0"
   },

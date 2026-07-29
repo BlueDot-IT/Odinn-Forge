@@ -148,6 +148,55 @@ test("gateway supervises configured channels without exposing credentials", asyn
   }
 });
 
+test("gateway exposes only provider-authenticated channel webhook routes before control-plane auth", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-whatsapp-"));
+  const environment = {
+    ODINN_TEST_WHATSAPP_ACCESS_TOKEN: process.env.ODINN_TEST_WHATSAPP_ACCESS_TOKEN,
+    ODINN_TEST_WHATSAPP_APP_SECRET: process.env.ODINN_TEST_WHATSAPP_APP_SECRET,
+    ODINN_TEST_WHATSAPP_VERIFY_TOKEN: process.env.ODINN_TEST_WHATSAPP_VERIFY_TOKEN
+  };
+  process.env.ODINN_TEST_WHATSAPP_ACCESS_TOKEN = "access-token";
+  process.env.ODINN_TEST_WHATSAPP_APP_SECRET = "app-secret";
+  process.env.ODINN_TEST_WHATSAPP_VERIFY_TOKEN = "verify-token";
+  await writeFile(join(stateDir, "config.json"), JSON.stringify({
+    version: 1,
+    channels: {
+      business: {
+        type: "whatsapp",
+        enabled: true,
+        tokenEnv: "ODINN_TEST_WHATSAPP_ACCESS_TOKEN",
+        appSecretEnv: "ODINN_TEST_WHATSAPP_APP_SECRET",
+        verifyTokenEnv: "ODINN_TEST_WHATSAPP_VERIFY_TOKEN",
+        phoneNumberId: "123",
+        allowlist: ["whatsapp:15550002222"]
+      }
+    }
+  }));
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await new Promise((resolveWait) => setImmediate(resolveWait));
+    const verified = await fetch(
+      `${base}/channels/webhook/whatsapp/business?hub.mode=subscribe&hub.verify_token=verify-token&hub.challenge=challenge`
+    );
+    assert.equal(verified.status, 200);
+    assert.equal(await verified.text(), "challenge");
+    const rejected = await fetch(
+      `${base}/channels/webhook/whatsapp/business?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=challenge`
+    );
+    assert.equal(rejected.status, 403);
+    const unknown = await fetch(`${base}/channels/webhook/whatsapp/missing`);
+    assert.equal(unknown.status, 404);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+    for (const [key, value] of Object.entries(environment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("gateway permits capability inspection and revocation after the feature is disabled", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-cleanup-"));
   const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-workspace-"));

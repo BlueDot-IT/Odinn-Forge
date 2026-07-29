@@ -1,5 +1,5 @@
 {
-  "name": "@odinn/channel-discord",
+  "name": "@odinn/channel-slack",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@odinn/channels": "workspace:*",
-    "discord.js": "14.27.0"
+    "@slack/bolt": "5.0.0",
+    "undici": "7.29.0"
   }
 }

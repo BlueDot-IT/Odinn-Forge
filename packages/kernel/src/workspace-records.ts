@@ -26,6 +26,7 @@ export type SessionCommandInput = {
   tags?: unknown;
   model?: unknown;
   provider?: unknown;
+  externalId?: unknown;
   limit?: unknown;
 };
 
@@ -117,7 +118,15 @@ export async function appendSessionMessage(store: WorkspaceRecordStore, input: S
   const role = cleanString(input.role, "user");
   if (!SESSION_ROLES.has(role)) throw new Error(`session role must be one of: ${Array.from(SESSION_ROLES).join(", ")}`);
   const content = cleanRequired(input.content, "session.message requires content");
-  const session = reduceSessions(await store.readAll()).find((entry) => entry.id === sessionId);
+  const records = await store.readAll();
+  const externalId = cleanString(input.externalId, "");
+  if (externalId) {
+    const existing = records.find((entry: any) => (
+      entry.type === "message.appended" && entry.sessionId === sessionId && entry.externalId === externalId
+    ));
+    if (existing) return existing;
+  }
+  const session = reduceSessions(records).find((entry) => entry.id === sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
   if (session.status !== "open") throw new Error(`session is not open: ${sessionId}`);
   const model = cleanString(input.model, "");
@@ -130,6 +139,7 @@ export async function appendSessionMessage(store: WorkspaceRecordStore, input: S
     content,
     actor: cleanString(input.actor, "local"),
     source: cleanString(input.source, "local"),
+    ...(externalId ? { externalId } : {}),
     ...(model ? { model } : {}),
     ...(provider ? { provider } : {})
   });

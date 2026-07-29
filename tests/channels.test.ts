@@ -4,11 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  ChannelAdmissionError, ChannelRouter, FileSessionBindingStore, channelConversationKey, createAllowlistPolicy, splitChannelText,
-  type ChannelAcknowledgement, type ChannelAdapter, type InboundChannelMessage, type OutboundChannelMessage
+  ChannelAdmissionError, ChannelRetryableError, ChannelRouter, FileChannelDedupeStore, FileSessionBindingStore,
+  channelConversationKey, createAllowlistPolicy, splitChannelText,
+  type ChannelAcknowledgement, type ChannelAdapter, type ChannelStartContext,
+  type InboundChannelMessage, type OutboundChannelMessage
 } from "../packages/channels/src/index.ts";
-import { normalizeTelegramUpdate } from "../adapters/channels/telegram/src/index.ts";
-import { DiscordChannelAdapter, normalizeDiscordMessage } from "../adapters/channels/discord/src/index.ts";
+import {
+  TelegramChannelAdapter, normalizeTelegramCallbackQuery, normalizeTelegramUpdate
+} from "../adapters/channels/telegram/src/index.ts";
+import {
+  DiscordChannelAdapter, createDiscordAccessPolicy, discordChannelPlugin,
+  normalizeDiscordInteraction, normalizeDiscordMessage
+} from "../adapters/channels/discord/src/index.ts";
 
 function message(overrides: Partial<InboundChannelMessage> = {}): InboundChannelMessage {
   return {
@@ -22,14 +29,30 @@ function message(overrides: Partial<InboundChannelMessage> = {}): InboundChannel
 }
 class FixtureAdapter implements ChannelAdapter {
   readonly id = "fixture";
+  readonly channel = "fixture";
+  readonly accountId = "default";
+  readonly capabilities = { chatTypes: ["direct" as const], streaming: true, edits: true };
   readonly sent: OutboundChannelMessage[] = [];
+  readonly edits: Array<{ messageId: string; message: OutboundChannelMessage }> = [];
   readonly acknowledgements: Array<{ id: string; acknowledgement: ChannelAcknowledgement }> = [];
-  deliver?: (message: InboundChannelMessage) => Promise<void>;
-  async start(deliver: (message: InboundChannelMessage) => Promise<void>): Promise<void> { this.deliver = deliver; }
+  deliver?: (message: InboundChannelMessage) => Promise<boolean>;
+  async start(context: ChannelStartContext): Promise<void> { this.deliver = context.deliver; }
   async stop(): Promise<void> {}
-  async send(output: OutboundChannelMessage): Promise<void> { this.sent.push(output); }
+  async send(output: OutboundChannelMessage) {
+    this.sent.push(output);
+    return {
+      status: "sent" as const,
+      messageIds: [String(this.sent.length)],
+      conversationId: output.address.conversationId,
+      sentChunks: 1,
+      totalChunks: 1
+    };
+  }
   async acknowledge(input: InboundChannelMessage, acknowledgement: ChannelAcknowledgement): Promise<void> {
     this.acknowledgements.push({ id: input.id, acknowledgement });
+  }
+  async edit(_address: InboundChannelMessage["address"], messageId: string, output: OutboundChannelMessage): Promise<void> {
+    this.edits.push({ messageId, message: output });
   }
 }
 
@@ -130,7 +153,8 @@ test("channel router bounds retained work while preserving per-conversation seri
     id: "14",
     address: { ...message().address, conversationId: "202" }
   }));
-  await Promise.all([rejectedConversation, rejectedGlobal]);
+  assert.equal(await rejectedConversation, false);
+  assert.equal(await rejectedGlobal, false);
   await new Promise((resolveWait) => setImmediate(resolveWait));
 
   assert.deepEqual(events, ["start:10", "start:13"]);
@@ -141,7 +165,7 @@ test("channel router bounds retained work while preserving per-conversation seri
   assert.ok(events.indexOf("end:10") < events.indexOf("start:11"));
   assert.ok(events.indexOf("start:11") < events.indexOf("end:11"));
 
-  await adapter.deliver?.(message({ id: "12" }));
+  assert.equal(await adapter.deliver?.(message({ id: "12" })), true);
   assert.equal(events.at(-2), "start:12", "a rejected message must remain eligible for later delivery");
 });
 
@@ -163,9 +187,9 @@ test("channel router rate-limits each sender with bounded admission state", asyn
 
   await adapter.deliver?.(message({ id: "10" }));
   await adapter.deliver?.(message({ id: "11" }));
-  await adapter.deliver?.(message({ id: "12" }));
+  assert.equal(await adapter.deliver?.(message({ id: "12" })), false);
   await adapter.deliver?.(message({ id: "13", sender: { id: "101" } }));
-  await adapter.deliver?.(message({ id: "14", sender: { id: "102" } }));
+  assert.equal(await adapter.deliver?.(message({ id: "14", sender: { id: "102" } })), false);
 
   assert.deepEqual(handled, ["10", "11", "13"]);
   assert.deepEqual(errors.map(({ id }) => id), ["12", "14"]);
@@ -178,6 +202,97 @@ test("channel router rate-limits each sender with bounded admission state", asyn
   await adapter.deliver?.(message({ id: "12" }));
   await adapter.deliver?.(message({ id: "14", sender: { id: "102" } }));
   assert.deepEqual(handled, ["10", "11", "13", "12", "14"]);
+});
+
+test("channel router retries transient failures and releases exhausted deliveries", async () => {
+  const adapter = new FixtureAdapter();
+  let attempts = 0;
+  const errors: string[] = [];
+  const router = new ChannelRouter({
+    async handle() {
+      attempts += 1;
+      if (attempts < 3) throw new ChannelRetryableError("gateway unavailable");
+      return "recovered";
+    }
+  }, {
+    maxAttempts: 3,
+    retryDelayMs: 10,
+    onError(error) { errors.push(error instanceof Error ? error.message : String(error)); }
+  });
+  await router.attach(adapter);
+  await adapter.deliver?.(message());
+  assert.equal(attempts, 3);
+  assert.equal(adapter.sent[0]?.text, "recovered");
+  assert.deepEqual(errors, []);
+
+  const exhausted = new ChannelRouter({
+    async handle() { throw new ChannelRetryableError("still unavailable"); }
+  }, { maxAttempts: 2, retryDelayMs: 10 });
+  await exhausted.attach(adapter);
+  await adapter.deliver?.(message({ id: "20" }));
+  await adapter.deliver?.(message({ id: "20" }));
+  assert.equal(adapter.acknowledgements.filter((entry) => entry.id === "20" && entry.acknowledgement === "failed").length, 2);
+});
+
+test("channel delivery retries reuse the completed model response", async () => {
+  const adapter = new FixtureAdapter();
+  let sendAttempts = 0;
+  adapter.send = async (output) => {
+    sendAttempts += 1;
+    if (sendAttempts === 1) throw new ChannelRetryableError("transport unavailable");
+    adapter.sent.push(output);
+    return {
+      status: "sent",
+      messageIds: ["sent"],
+      conversationId: output.address.conversationId,
+      sentChunks: 1,
+      totalChunks: 1
+    };
+  };
+  let modelRuns = 0;
+  const router = new ChannelRouter({
+    async handle() {
+      modelRuns += 1;
+      return "one model result";
+    }
+  }, { retryDelayMs: 10 });
+  await router.attach(adapter);
+  await adapter.deliver?.(message({ id: "25" }));
+  assert.equal(sendAttempts, 2);
+  assert.equal(modelRuns, 1);
+  assert.equal(adapter.sent[0].text, "one model result");
+});
+
+test("channel router streams drafts through one message and finalizes by editing", async () => {
+  const adapter = new FixtureAdapter();
+  const router = new ChannelRouter({
+    async handle(_input, context) {
+      await context.onDelta?.("partial ");
+      await context.onDelta?.("reply");
+      return "partial reply";
+    }
+  });
+  await router.attach(adapter);
+  await adapter.deliver?.(message({ id: "30" }));
+  assert.equal(adapter.sent.length, 1);
+  assert.equal(adapter.sent[0].text, "partial ");
+  assert.equal(adapter.sent[0].replyToId, "30");
+  assert.equal(adapter.edits.at(-1)?.message.text, "partial reply");
+});
+
+test("file channel dedupe survives restarts and permits released claims", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-dedupe-"));
+  const path = join(directory, "dedupe.json");
+  const first = new FileChannelDedupeStore(path);
+  assert.equal(await first.claim("discord:home:10"), true);
+  await first.commit("discord:home:10");
+  const second = new FileChannelDedupeStore(path);
+  assert.equal(await second.claim("discord:home:10"), false);
+  assert.equal(await second.claim("discord:home:11"), true);
+  await second.release("discord:home:11");
+  assert.equal(await second.claim("discord:home:11"), true);
+  const persisted = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(persisted.schemaVersion, 1);
 });
 
 test("file session bindings isolate channel conversations", async () => {
@@ -208,6 +323,71 @@ test("Telegram updates normalize into the shared channel shape", () => {
   assert.deepEqual(normalized?.metadata, { updateId: 900 });
 });
 
+test("Telegram adapter supports rich delivery, reactions, typing, edits, and components", async () => {
+  const calls: Array<{ method: string; args: any[] }> = [];
+  const handlers = new Map<string, (context: any) => Promise<void> | void>();
+  const fakeBot = {
+    botInfo: { id: 600, username: "odinn_bot" },
+    api: new Proxy({}, {
+      get(_target, method: string) {
+        return async (...args: any[]) => {
+          calls.push({ method, args });
+          if (method === "sendMessage" || method === "sendDocument") return { message_id: calls.length };
+          if (method === "getMe") return { id: 600, username: "odinn_bot" };
+          return true;
+        };
+      }
+    }),
+    on(filter: string | string[], handler: (context: any) => Promise<void> | void) {
+      for (const entry of Array.isArray(filter) ? filter : [filter]) handlers.set(entry, handler);
+    },
+    catch() {},
+    async start(options: any) { await options.onStart(this.botInfo); },
+    async stop() {}
+  };
+  const adapter = new TelegramChannelAdapter({
+    token: "test-token",
+    nativeCommands: true,
+    botFactory: () => fakeBot as any
+  });
+  const controller = new AbortController();
+  await adapter.start({ signal: controller.signal, async deliver() { return true; }, updateStatus() {} });
+  const address = {
+    channel: "telegram",
+    accountId: "personal",
+    conversationId: "-200",
+    conversationKind: "group" as const,
+    threadId: "7"
+  };
+  const receipt = await adapter.send({
+    address,
+    text: "hello",
+    components: [{ type: "button", customId: "confirm", label: "Confirm" }]
+  });
+  assert.equal(receipt.status, "sent");
+  assert.equal(calls.find((call) => call.method === "sendMessage")?.args[2].reply_markup.inline_keyboard[0][0].callback_data, "confirm");
+  const inbound = message({ id: "10", address });
+  await adapter.acknowledge(inbound, "processing");
+  await adapter.sendTyping(address);
+  await adapter.edit(address, "11", { address, text: "updated" });
+  await adapter.delete(address, "11");
+  assert.ok(calls.some((call) => call.method === "setMessageReaction"));
+  assert.ok(calls.some((call) => call.method === "sendChatAction"));
+  assert.ok(calls.some((call) => call.method === "editMessageText"));
+  assert.ok(calls.some((call) => call.method === "deleteMessage"));
+  assert.ok(calls.some((call) => call.method === "setMyCommands"));
+  assert.equal(normalizeTelegramCallbackQuery({
+    update_id: 901,
+    callback_query: {
+      id: "callback-1",
+      data: "confirm",
+      from: { id: 100, first_name: "Jason" },
+      message: { message_id: 10, chat: { id: -200, type: "supergroup" } }
+    }
+  })?.text, "Telegram component selected: confirm");
+  await adapter.stop();
+});
+
 test("channel text splitting preserves Unicode and prefers word boundaries", () => {
   assert.deepEqual(splitChannelText("alpha beta gamma", 10), ["alpha", "beta gamma"]);
   assert.deepEqual(splitChannelText("🪁🪁🪁", 2), ["🪁🪁", "🪁"]);
@@ -236,99 +416,238 @@ test("Discord messages require mentions in guilds and normalize DMs", () => {
   assert.equal(direct?.text, "hello in a DM");
 });
 
-test("Discord replies disable mention parsing and respect the 2000-character limit", async () => {
-  const requests: Array<{ url: string; body: any }> = [];
-  const adapter = new DiscordChannelAdapter({
-    token: "test-token",
-    fetch: async (input, init) => {
-      requests.push({ url: String(input), body: JSON.parse(String(init?.body)) });
-      return new Response(JSON.stringify({ id: String(requests.length) }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
+test("Discord plugin enforces DM, guild, channel, role, and mention policy", async () => {
+  const config = discordChannelPlugin.normalizeAccountConfig("home", {
+    enabled: true,
+    tokenEnv: "DISCORD_BOT_TOKEN",
+    dmPolicy: "allowlist",
+    groupPolicy: "allowlist",
+    allowlist: ["discord:500"],
+    guilds: {
+      "700": {
+        requireMention: true,
+        roles: ["900"],
+        channels: {
+          "800": { enabled: true, requireMention: true },
+          "801": { enabled: false }
+        }
+      }
     }
   });
-  await adapter.send({
-    address: { channel: "discord", accountId: "community", conversationId: "800", conversationKind: "channel" },
-    text: "x".repeat(2_001),
-    replyToId: "900"
+  const policy = createDiscordAccessPolicy(config);
+  const guildMessage = message({
+    address: { channel: "discord", accountId: "home", conversationId: "800", conversationKind: "channel" },
+    sender: { id: "501" },
+    metadata: { guildId: "700", roleIds: ["900"], mentionedBot: true }
   });
-  assert.equal(requests.length, 2);
-  assert.equal(requests[0].body.content.length, 2_000);
-  assert.deepEqual(requests[0].body.allowed_mentions, { parse: [], replied_user: false });
-  assert.equal(requests[0].body.message_reference.message_id, "900");
-  assert.equal(requests[1].body.message_reference, undefined);
+  assert.equal(await policy.allows(guildMessage), true);
+  assert.equal(await policy.allows({ ...guildMessage, metadata: { guildId: "700", roleIds: ["900"] } }), false);
+  assert.equal(await policy.allows({
+    ...guildMessage,
+    address: { ...guildMessage.address, conversationId: "801" }
+  }), false);
+  assert.equal(await policy.allows({
+    ...guildMessage,
+    address: { ...guildMessage.address, conversationId: "999" }
+  }), false);
+  assert.equal(await policy.allows(message({
+    address: { channel: "discord", accountId: "home", conversationId: "500", conversationKind: "direct" },
+    sender: { id: "500" }
+  })), true);
+  assert.equal(await policy.allows(message({
+    address: { channel: "discord", accountId: "home", conversationId: "501", conversationKind: "direct" },
+    sender: { id: "501" }
+  })), false);
+});
+
+test("Discord replies disable mention parsing and respect the 2000-character limit", async () => {
+  const sent: any[] = [];
+  const client = fixtureDiscordClient({
+    channel: {
+      isTextBased: () => true,
+      async send(body: any) {
+        sent.push(body);
+        return { id: String(sent.length) };
+      }
+    }
+  });
+  const adapter = new DiscordChannelAdapter({
+    token: "test-token",
+    clientFactory: () => client
+  });
+  const controller = new AbortController();
+  await adapter.start({ signal: controller.signal, deliver: async () => true, updateStatus() {} });
+  try {
+    const receipt = await adapter.send({
+      address: { channel: "discord", accountId: "community", conversationId: "800", conversationKind: "channel" },
+      text: "x".repeat(2_001),
+      replyToId: "900"
+    });
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0].content.length, 2_000);
+    assert.deepEqual(sent[0].reply, { messageReference: "900", failIfNotExists: false });
+    assert.equal(sent[1].reply, undefined);
+    assert.deepEqual(receipt.messageIds, ["1", "2"]);
+  } finally {
+    await adapter.stop();
+  }
 });
 
 test("Discord acknowledgements replace the processing reaction with a terminal reaction", async () => {
-  const requests: Array<{ method: string; url: string }> = [];
+  const reactions: string[] = [];
+  const removals: string[] = [];
+  const target = {
+    reactions: {
+      resolve(emoji: string) {
+        return { users: { async remove() { removals.push(emoji); } } };
+      }
+    },
+    async react(emoji: string) { reactions.push(emoji); }
+  };
+  const client = fixtureDiscordClient({
+    channel: {
+      messages: { async fetch() { return target; } }
+    }
+  });
   const adapter = new DiscordChannelAdapter({
     token: "test-token",
-    fetch: async (input, init) => {
-      requests.push({ method: String(init?.method), url: String(input) });
-      return new Response(null, { status: 204 });
-    }
+    clientFactory: () => client
   });
   const input = message({
     id: "900",
     address: { channel: "discord", accountId: "community", conversationId: "800", conversationKind: "channel" }
   });
 
-  await adapter.acknowledge(input, "processing");
-  await adapter.acknowledge(input, "succeeded");
-
-  assert.deepEqual(requests.map((entry) => entry.method), ["PUT", "DELETE", "PUT"]);
-  assert.match(requests[0].url, /reactions\/%F0%9F%91%80\/@me$/u);
-  assert.match(requests[2].url, /reactions\/%E2%9C%85\/@me$/u);
+  const controller = new AbortController();
+  await adapter.start({ signal: controller.signal, deliver: async () => true, updateStatus() {} });
+  try {
+    await adapter.acknowledge(input, "processing");
+    await adapter.acknowledge(input, "succeeded");
+    assert.deepEqual(reactions, ["👀", "✅"]);
+    assert.deepEqual(removals, ["👀"]);
+  } finally {
+    await adapter.stop();
+  }
 });
 
-test("Discord Gateway identifies and delivers normalized message events", async () => {
-  class FixtureSocket {
-    readonly listeners = new Map<string, Array<(event: any) => void>>();
-    readonly sent: any[] = [];
-    addEventListener(type: string, listener: (event: any) => void) {
-      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
-    }
-    send(data: string) { this.sent.push(JSON.parse(data)); }
-    close() { this.emit("close", {}); }
-    emit(type: string, event: any) {
-      for (const listener of this.listeners.get(type) ?? []) listener(event);
-    }
-  }
-  const socket = new FixtureSocket();
+test("Discord client lifecycle reports ready state and delivers normalized message events", async () => {
+  const client = fixtureDiscordClient();
   const delivered: InboundChannelMessage[] = [];
+  const states: string[] = [];
   const adapter = new DiscordChannelAdapter({
     token: "test-token",
-    retryDelayMs: 100,
-    fetch: async () => new Response(JSON.stringify({ url: "wss://gateway.discord.test" }), {
-      status: 200,
-      headers: { "content-type": "application/json" }
-    }),
-    socketFactory: () => socket
+    clientFactory: () => client
   });
-  await adapter.start(async (input) => { delivered.push(input); });
+  const controller = new AbortController();
+  await adapter.start({
+    signal: controller.signal,
+    async deliver(input) { delivered.push(input); return true; },
+    updateStatus(status) { if (status.state) states.push(status.state); }
+  });
+  client.emit("messageCreate", {
+    id: "900",
+    channelId: "800",
+    guildId: "700",
+    content: "<@600> hello",
+    createdTimestamp: Date.parse("2026-07-26T12:00:00.000Z"),
+    author: { id: "500", username: "jason", bot: false },
+    mentions: [{ id: "600" }]
+  });
   await new Promise((resolveWait) => setImmediate(resolveWait));
-  socket.emit("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }) });
-  socket.emit("message", { data: JSON.stringify({ op: 0, t: "READY", s: 1, d: { user: { id: "600" } } }) });
-  socket.emit("message", { data: JSON.stringify({ op: 1, d: null }) });
-  socket.emit("message", { data: JSON.stringify({
-    op: 0,
-    t: "MESSAGE_CREATE",
-    s: 2,
-    d: {
-      id: "900",
-      channel_id: "800",
-      guild_id: "700",
-      content: "<@600> hello",
-      timestamp: "2026-07-26T12:00:00.000Z",
-      author: { id: "500", username: "jason", bot: false },
-      mentions: [{ id: "600" }]
-    }
-  }) });
-  await new Promise((resolveWait) => setImmediate(resolveWait));
-  assert.equal(socket.sent[0].op, 2);
-  assert.equal(socket.sent[0].d.intents, 37_377);
-  assert.deepEqual(socket.sent[1], { op: 1, d: 1 });
+  assert.deepEqual(states.slice(0, 2), ["starting", "connected"]);
   assert.equal(delivered[0].text, "hello");
   await adapter.stop();
 });
+
+test("Discord native commands and components enter the shared router and use interaction replies", async () => {
+  const commands: unknown[][] = [];
+  const edits: any[] = [];
+  const client = fixtureDiscordClient({
+    application: {
+      id: "601",
+      commands: { async set(value: unknown[]) { commands.push(value); } }
+    }
+  });
+  const adapter = new DiscordChannelAdapter({
+    token: "test-token",
+    nativeCommands: true,
+    clientFactory: () => client
+  });
+  const controller = new AbortController();
+  await adapter.start({
+    signal: controller.signal,
+    async deliver(input) {
+      await adapter.send({ address: input.address, text: `reply:${input.text}`, replyToId: input.id });
+      return true;
+    },
+    updateStatus() {}
+  });
+  const interaction = {
+    id: "950",
+    channelId: "800",
+    guildId: "700",
+    commandName: "odinn",
+    user: { id: "500", username: "jason", globalName: "Jason" },
+    member: { roles: { cache: new Map([["900", {}]]) } },
+    options: { getString() { return "run diagnostics"; } },
+    isChatInputCommand() { return true; },
+    isButton() { return false; },
+    isStringSelectMenu() { return false; },
+    async deferReply() {},
+    async editReply(body: any) { edits.push(body); return { id: "951" }; },
+    async followUp() { throw new Error("unexpected follow-up"); }
+  };
+  client.emit("interactionCreate", interaction);
+  await new Promise((resolveWait) => setImmediate(resolveWait));
+  assert.equal(commands.length, 1);
+  assert.equal(edits[0].content, "reply:run diagnostics");
+  const normalized = normalizeDiscordInteraction({
+    ...interaction,
+    id: "952",
+    isChatInputCommand() { return false; },
+    isButton() { return true; },
+    customId: "confirm"
+  });
+  assert.equal(normalized?.text, "Discord component selected: confirm");
+  assert.deepEqual(normalized?.metadata?.roleIds, ["900"]);
+  await adapter.stop();
+});
+
+function fixtureDiscordClient({
+  channel = {} as any,
+  application = { id: "601" } as any
+}: {
+  channel?: any;
+  application?: any;
+} = {}) {
+  const listeners = new Map<string, Array<(...args: any[]) => void>>();
+  return {
+    user: { id: "600", username: "Odinn" },
+    application,
+    ws: { ping: 10 },
+    channels: {
+      async fetch() { return channel; }
+    },
+    on(event: string, listener: (...args: any[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+      return this;
+    },
+    once(event: string, listener: (...args: any[]) => void) {
+      const wrapper = (...args: any[]) => {
+        listeners.set(event, (listeners.get(event) ?? []).filter((entry) => entry !== wrapper));
+        listener(...args);
+      };
+      listeners.set(event, [...(listeners.get(event) ?? []), wrapper]);
+      return this;
+    },
+    async login() {
+      this.emit("clientReady", this);
+      return "test-token";
+    },
+    async destroy() {},
+    isReady() { return true; },
+    emit(event: string, ...args: any[]) {
+      for (const listener of listeners.get(event) ?? []) listener(...args);
+    }
+  };
+}

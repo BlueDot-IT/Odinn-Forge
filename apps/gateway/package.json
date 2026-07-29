@@ -12,7 +12,10 @@
   },
   "dependencies": {
     "@odinn/channel-discord": "workspace:*",
+    "@odinn/channel-slack": "workspace:*",
+    "@odinn/channel-teams": "workspace:*",
     "@odinn/channel-telegram": "workspace:*",
+    "@odinn/channel-whatsapp": "workspace:*",
     "@odinn/channels": "workspace:*",
     "@odinn/kernel": "workspace:*",
     "@odinn/policy": "workspace:*",

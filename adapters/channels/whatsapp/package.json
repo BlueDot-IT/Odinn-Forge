@@ -1,5 +1,5 @@
 {
-  "name": "@odinn/channel-discord",
+  "name": "@odinn/channel-whatsapp",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -10,7 +10,6 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@odinn/channels": "workspace:*",
-    "discord.js": "14.27.0"
+    "@odinn/channels": "workspace:*"
   }
 }
