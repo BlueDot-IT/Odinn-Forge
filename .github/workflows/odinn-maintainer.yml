@@ -16,6 +16,7 @@ on:
     types: [completed]
   schedule:
     - cron: "17 */6 * * *"
+    - cron: "41 5 * * *"
   workflow_dispatch:
     inputs:
       kind:
@@ -34,6 +35,7 @@ permissions: {}
 jobs:
   discover:
     name: Discover reconciliation targets
+    if: github.event_name != 'schedule' || github.event.schedule == '17 */6 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -78,5 +80,18 @@ jobs:
       allow_close: ${{ vars.ODINN_MAINTAINER_ALLOW_CLOSE || 'false' }}
       allow_merge: ${{ vars.ODINN_MAINTAINER_ALLOW_MERGE || 'false' }}
       allow_repair: ${{ vars.ODINN_MAINTAINER_ALLOW_REPAIR || 'false' }}
+    secrets:
+      oauth_json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
+
+  remediate-security:
+    name: Codex Security remediation
+    if: github.event_name == 'schedule' && github.event.schedule == '41 5 * * *'
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    uses: BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml@59376dfaaaee551203897d7cbd4ec2b98ee33f73 # remediation-v1
+    with:
+      target_ref: main
     secrets:
       oauth_json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}

@@ -354,6 +354,40 @@ test("maintainer reconciliation serializes the exact target across every trigger
   assert.match(ciDocs, /re-fetches the complete live target state/u);
 });
 
+test("daily Codex remediation is isolated, pinned, and draft-only", async () => {
+  const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
+  const ciDocs = await read("docs/ci-cd.md");
+  const remediationSha = "59376dfaaaee551203897d7cbd4ec2b98ee33f73";
+
+  assert.deepEqual(
+    [...dispatcher.matchAll(/^\s+- cron: "([^"]+)"$/gmu)].map((match) => match[1]),
+    ["17 */6 * * *", "41 5 * * *"],
+  );
+  assert.match(
+    dispatcher,
+    /discover:[\s\S]*?if: github\.event_name != 'schedule' \|\| github\.event\.schedule == '17 \*\/6 \* \* \*'/u,
+  );
+  assert.match(
+    dispatcher,
+    /remediate-security:[\s\S]*?if: github\.event_name == 'schedule' && github\.event\.schedule == '41 5 \* \* \*'/u,
+  );
+  assert.match(
+    dispatcher,
+    new RegExp(
+      `uses: BlueDot-IT/odinn-maintainer/\\.github/workflows/codex-security-remediation\\.yml@${remediationSha}`,
+      "u",
+    ),
+  );
+  assert.match(
+    dispatcher,
+    /remediate-security:[\s\S]*?permissions:\s*\n\s+actions: write\s*\n\s+contents: write\s*\n\s+pull-requests: write/u,
+  );
+  assert.match(dispatcher, /target_ref: main/u);
+  assert.match(dispatcher, /oauth_json: \$\{\{ secrets\.ODINN_OPENAI_OAUTH_JSON \}\}/u);
+  assert.match(ciDocs, /creates only a\s+draft pull request and never merges it/u);
+  assert.match(ciDocs, /scan and patch steps receive OAuth without a repository write credential/u);
+});
+
 test("maintainer actions pin the published v0.5.0 release commit", async () => {
   const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
   const target = await read(".github/workflows/odinn-maintainer-target.yml");
