@@ -492,6 +492,10 @@ export class RunLedger {
     return { ...this.hydrateRun(row), steps, events };
   }
 
+  hasRun(runId: string) {
+    return Boolean(this.database.db.prepare("SELECT 1 FROM runs WHERE id = ?").get(runId));
+  }
+
   verify(runId: string) {
     const events = this.database.db.prepare("SELECT * FROM ledger_events WHERE run_id = ? ORDER BY sequence").all(runId) as SqlRow[];
     let previousHash = null;

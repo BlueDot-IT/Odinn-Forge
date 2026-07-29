@@ -27,6 +27,8 @@ test("Phase 0 records a real tool call as a durable redacted hash chain", async 
     assert.equal(run.steps[0].type, "tool-request");
     assert.equal(run.steps[0].status, "succeeded");
     assert.deepEqual(run.events.map((event: any) => event.type), ["tool-request", "policy-check", "tool-result"]);
+    assert.equal(ledger.hasRun("run_phase0_echo"), true);
+    assert.equal(ledger.hasRun("run_phase0_missing"), false);
     assert.equal(ledger.verify("run_phase0_echo").valid, true);
     assert.ok(run.steps[0].input_digest);
 
