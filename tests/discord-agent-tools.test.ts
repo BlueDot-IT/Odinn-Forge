@@ -189,3 +189,47 @@ test("legacy Discord channel config continues to activate the tool plugin", () =
   });
   assert.equal(registry.has("discord.readMessages"), true);
 });
+
+test("expanded Discord actions preserve read/write gates and native poll payloads", async () => {
+  const original = process.env.ODINN_TEST_DISCORD_TOKEN;
+  process.env.ODINN_TEST_DISCORD_TOKEN = "test-token";
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const approvalStore = createApprovalStore();
+  const registry = createBuiltInRegistry({
+    config: configuredDiscord(),
+    approvalStore,
+    discordFetch: async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ id: "poll-1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+  });
+  try {
+    await registry.get("discord.listPins").execute({ channelId: "123" });
+    assert.equal(calls[0].url, "https://discord.com/api/v10/channels/123/pins");
+    assert.equal(registry.get("discord.listPins").capability, "discord.read");
+    const input = {
+      channelId: "123",
+      question: "Deploy?",
+      answers: ["Yes", "No"],
+      durationHours: 12
+    };
+    const pending = await registry.get("discord.sendPoll").execute(input, { request: { id: "run-poll" } });
+    assert.equal(pending.type, "approval.required");
+    assert.equal(calls.length, 1);
+    approvalStore.claim(pending.approvalId);
+    await registry.get("discord.sendPoll").execute(input, {
+      request: { id: "run-poll" },
+      trustedApprovalId: pending.approvalId
+    });
+    const payload = JSON.parse(String(calls[1].init.body));
+    assert.equal(payload.poll.question.text, "Deploy?");
+    assert.deepEqual(payload.poll.answers.map((answer: any) => answer.poll_media.text), ["Yes", "No"]);
+    assert.equal(registry.get("discord.sendPoll").capability, "discord.write");
+  } finally {
+    if (original === undefined) delete process.env.ODINN_TEST_DISCORD_TOKEN;
+    else process.env.ODINN_TEST_DISCORD_TOKEN = original;
+  }
+});

@@ -7,9 +7,14 @@ import { fileURLToPath } from "node:url";
 import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
-import { ChannelRouter, FileSessionBindingStore, GatewayChannelHandler, createAllowlistPolicy } from "@odinn/channels";
-import { TelegramChannelAdapter } from "@odinn/channel-telegram";
-import { DiscordChannelAdapter } from "@odinn/channel-discord";
+import {
+  ChannelPluginRegistry,
+  ChannelRouter,
+  FileChannelDedupeStore,
+  FileSessionBindingStore,
+  GatewayChannelHandler,
+  createAllowlistPolicy
+} from "@odinn/channels";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
@@ -489,7 +494,8 @@ export async function createGatewayServer({
   workspaceRoot = process.cwd(),
   requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
   quotas = {},
-  hosted = false
+  hosted = false,
+  channelPluginLoader = loadChannelPlugin
 }: any = {}) {
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
@@ -521,7 +527,13 @@ export async function createGatewayServer({
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
   const skillStore = new SkillPackageStore(state);
   const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
-  const channelSupervisor = createChannelSupervisor({ config, state, gatewayToken });
+  const channelSupervisor = await createChannelSupervisor({
+    config,
+    state,
+    gatewayToken,
+    requestMaxBytes,
+    loadPlugin: channelPluginLoader
+  });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry });
   await supervisor.start();
   const cronTimer = setInterval(() => runDueCronJobs(cronStore, isolatedTaskExecutor).catch(() => undefined), 30_000);
@@ -562,6 +574,10 @@ export async function createGatewayServer({
             }
           : { "x-odinn-auth": "authentication-required" };
         return html(response, 200, renderConsoleHtml(version), bootstrapHeaders);
+      }
+      if (url.pathname.startsWith("/channels/webhook/")) {
+        if (await channelSupervisor.handleWebhook(request, response, url)) return;
+        return json(response, 404, { ok: false, error: "channel webhook not found" });
       }
       if (process.env.ODINN_GATEWAY_AUTH !== "off" && !authorizedRequest(request, gatewayToken)) {
         return json(response, 401, { ok: false, error: "gateway authentication required" });
@@ -1524,6 +1540,29 @@ function assertOptionalConfigBoolean(record: any, key: string, label: string) {
   }
 }
 
+function validateDiscordGuildConfig(value: any, label: string) {
+  assertConfigRecord(value, label);
+  for (const [guildId, guild] of Object.entries(value) as Array<[string, any]>) {
+    if (!/^\d{1,20}$/u.test(guildId)) throw new GatewayError(400, `${label} contains an invalid guild id`);
+    assertConfigRecord(guild, `${label}.${guildId}`);
+    assertOptionalConfigBoolean(guild, "requireMention", `${label}.${guildId}`);
+    for (const key of ["users", "roles"]) {
+      if (guild[key] !== undefined) assertConfigStringArray(guild[key], `${label}.${guildId}.${key}`);
+    }
+    if (guild.channels === undefined) continue;
+    assertConfigRecord(guild.channels, `${label}.${guildId}.channels`);
+    for (const [channelId, channel] of Object.entries(guild.channels) as Array<[string, any]>) {
+      if (!/^\d{1,20}$/u.test(channelId)) throw new GatewayError(400, `${label}.${guildId}.channels contains an invalid channel id`);
+      assertConfigRecord(channel, `${label}.${guildId}.channels.${channelId}`);
+      assertOptionalConfigBoolean(channel, "enabled", `${label}.${guildId}.channels.${channelId}`);
+      assertOptionalConfigBoolean(channel, "requireMention", `${label}.${guildId}.channels.${channelId}`);
+      for (const key of ["users", "roles"]) {
+        if (channel[key] !== undefined) assertConfigStringArray(channel[key], `${label}.${guildId}.channels.${channelId}.${key}`);
+      }
+    }
+  }
+}
+
 function validateGatewayConfig(config: any) {
   assertConfigObject(config);
   if (config.version !== undefined && config.version !== 1) {
@@ -1541,14 +1580,65 @@ function validateGatewayConfig(config: any) {
       if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name)) throw new GatewayError(400, `config.channels contains an invalid channel name: ${name}`);
       assertConfigRecord(channel, `config.channels.${name}`);
       assertOptionalConfigBoolean(channel, "enabled", `config.channels.${name}`);
-      for (const key of ["type", "tokenEnv", "defaultModel"]) {
+      for (const key of [
+        "type", "tokenEnv", "defaultModel", "appTokenEnv", "appIdEnv", "tenantIdEnv",
+        "appSecretEnv", "verifyTokenEnv", "phoneNumberId", "apiVersion"
+      ]) {
         if (channel[key] !== undefined && typeof channel[key] !== "string") throw new GatewayError(400, `config.channels.${name}.${key} must be a string`);
       }
-      if (channel.type !== undefined && !["telegram", "discord"].includes(channel.type)) throw new GatewayError(400, `config.channels.${name}.type must be telegram or discord`);
-      assertOptionalConfigBoolean(channel, "requireMention", `config.channels.${name}`);
+      if (channel.type !== undefined && !["telegram", "discord", "slack", "teams", "whatsapp"].includes(channel.type)) {
+        throw new GatewayError(400, `config.channels.${name}.type must be telegram, discord, slack, teams, or whatsapp`);
+      }
+      for (const key of ["requireMention", "nativeCommands", "nativeCommandEphemeral"]) {
+        assertOptionalConfigBoolean(channel, key, `config.channels.${name}`);
+      }
+      if (channel.historyLimit !== undefined && (!Number.isSafeInteger(channel.historyLimit) || channel.historyLimit < 1 || channel.historyLimit > 200)) {
+        throw new GatewayError(400, `config.channels.${name}.historyLimit must be an integer from 1 through 200`);
+      }
+      if (channel.pollTimeoutSeconds !== undefined && (!Number.isSafeInteger(channel.pollTimeoutSeconds) || channel.pollTimeoutSeconds < 1 || channel.pollTimeoutSeconds > 50)) {
+        throw new GatewayError(400, `config.channels.${name}.pollTimeoutSeconds must be an integer from 1 through 50`);
+      }
+      const nativeCommandPattern = channel.type === "slack"
+        ? /^\/[a-z0-9_-]{1,31}$/u
+        : channel.type === "telegram"
+        ? /^[a-z][a-z0-9_]{0,31}$/u
+        : /^[a-z0-9_-]{1,32}$/u;
+      if (channel.nativeCommandName !== undefined && (
+        typeof channel.nativeCommandName !== "string" || !nativeCommandPattern.test(channel.nativeCommandName)
+      )) {
+        throw new GatewayError(400, `config.channels.${name}.nativeCommandName is invalid`);
+      }
+      for (const key of ["dmPolicy", "groupPolicy"]) {
+        if (channel[key] !== undefined && !["disabled", "allowlist", "open"].includes(channel[key])) {
+          throw new GatewayError(400, `config.channels.${name}.${key} must be disabled, allowlist, or open`);
+        }
+      }
+      if (channel.allowBots !== undefined && ![true, false, "mentions"].includes(channel.allowBots)) {
+        throw new GatewayError(400, `config.channels.${name}.allowBots must be true, false, or mentions`);
+      }
+      if (channel.acknowledgementEmoji !== undefined) {
+        assertConfigRecord(channel.acknowledgementEmoji, `config.channels.${name}.acknowledgementEmoji`);
+        for (const key of ["processing", "succeeded", "failed"]) {
+          if (channel.acknowledgementEmoji[key] !== undefined && typeof channel.acknowledgementEmoji[key] !== "string") {
+            throw new GatewayError(400, `config.channels.${name}.acknowledgementEmoji.${key} must be a string`);
+          }
+        }
+      }
+      if (channel.guilds !== undefined) validateDiscordGuildConfig(channel.guilds, `config.channels.${name}.guilds`);
       if (channel.token !== undefined || channel.botToken !== undefined) throw new GatewayError(400, `config.channels.${name} must reference a tokenEnv instead of storing a bot token`);
       if (channel.tokenEnv !== undefined && !/^[A-Z_][A-Z0-9_]{1,127}$/u.test(channel.tokenEnv)) {
         throw new GatewayError(400, `config.channels.${name}.tokenEnv must be an uppercase environment variable name`);
+      }
+      for (const key of ["appTokenEnv", "appIdEnv", "tenantIdEnv", "appSecretEnv", "verifyTokenEnv"]) {
+        if (channel[key] !== undefined && channel[key] !== "" && !/^[A-Z_][A-Z0-9_]{1,127}$/u.test(channel[key])) {
+          throw new GatewayError(400, `config.channels.${name}.${key} must be an uppercase environment variable name`);
+        }
+      }
+      if (channel.phoneNumberId !== undefined && channel.phoneNumberId !== "" && !/^\d{1,32}$/u.test(channel.phoneNumberId)) {
+        throw new GatewayError(400, `config.channels.${name}.phoneNumberId must be numeric`);
+      }
+      if (channel.apiVersion !== undefined && !/^v\d+\.\d+$/u.test(channel.apiVersion)) {
+        throw new GatewayError(400, `config.channels.${name}.apiVersion must look like v23.0`);
       }
       if (channel.allowlist !== undefined) assertConfigStringArray(channel.allowlist, `config.channels.${name}.allowlist`);
     }
@@ -1688,8 +1778,19 @@ const DISCORD_CONFIGURABLE_TOOLS = new Set([
   "discord.listChannels",
   "discord.readMessages",
   "discord.sendMessage",
+  "discord.editMessage",
+  "discord.deleteMessage",
   "discord.addReaction",
-  "discord.createThread"
+  "discord.removeReaction",
+  "discord.listReactions",
+  "discord.pinMessage",
+  "discord.unpinMessage",
+  "discord.listPins",
+  "discord.sendPoll",
+  "discord.createThread",
+  "discord.listThreads",
+  "discord.replyThread",
+  "discord.searchMessages"
 ]);
 
 function configFingerprint(contents: string | Buffer) {
@@ -1778,6 +1879,15 @@ async function writeEditableConfig(state: string, input: any, { hosted = false }
 }
 
 async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: any = {}) {
+  const raw = (await readRequestBuffer(request, { maxBytes })).toString("utf8");
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new GatewayError(400, "request body must be valid JSON");
+  }
+}
+
+async function readRequestBuffer(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: any = {}) {
   const chunks = [];
   let bytes = 0;
   for await (const chunk of request) {
@@ -1785,12 +1895,7 @@ async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: 
     if (bytes > maxBytes) throw new GatewayError(413, `request body exceeds ${maxBytes} bytes`);
     chunks.push(chunk);
   }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  try {
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    throw new GatewayError(400, "request body must be valid JSON");
-  }
+  return Buffer.concat(chunks);
 }
 
 function json(response: any, status: any, body: any) {
@@ -1843,81 +1948,181 @@ async function summarizeProviders(config: any, state: any) {
   }));
 }
 
-function createChannelSupervisor({ config, state, gatewayToken }: any) {
-  const configured = Object.entries(config.channels ?? {}).map(([name, value]: any) => ({
-    name,
-    type: value.type ?? "telegram",
-    enabled: value.enabled === true,
-    tokenEnv: String(value.tokenEnv ?? ""),
-    allowlist: Array.isArray(value.allowlist) ? value.allowlist : [],
-    defaultModel: typeof value.defaultModel === "string" ? value.defaultModel : "",
-    requireMention: value.requireMention !== false,
-    running: false,
-    error: ""
-  }));
-  const adapters: any[] = [];
+async function loadChannelPlugin(type: string) {
+  switch (type) {
+    case "telegram": return (await import("@odinn/channel-telegram")).telegramChannelPlugin;
+    case "discord": return (await import("@odinn/channel-discord")).discordChannelPlugin;
+    case "slack": return (await import("@odinn/channel-slack")).slackChannelPlugin;
+    case "teams": return (await import("@odinn/channel-teams")).teamsChannelPlugin;
+    case "whatsapp": return (await import("@odinn/channel-whatsapp")).whatsappChannelPlugin;
+    default: throw new Error(`unsupported channel plugin: ${type}`);
+  }
+}
+
+async function createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes, loadPlugin }: any) {
+  const configuredEntries = Object.entries(config.channels ?? {});
+  const configuredTypes = [...new Set(configuredEntries.map(([, value]: any) => String(value?.type ?? "telegram")))];
+  const plugins = new ChannelPluginRegistry(await Promise.all(configuredTypes.map(loadPlugin)));
+  const dedupe = new FileChannelDedupeStore(join(state, "channel-dedupe.json"));
+  const configured = configuredEntries.map(([name, value]: any) => {
+    const type = String(value?.type ?? "telegram");
+    const plugin = plugins.get(type);
+    const accountConfig = plugin.normalizeAccountConfig(name, value);
+    return {
+      name,
+      type,
+      plugin,
+      config: accountConfig,
+      status: {
+        channel: type,
+        accountId: name,
+        state: "stopped",
+        error: ""
+      } as any
+    };
+  });
+  const runtimes: Array<{ adapter: any; router: ChannelRouter; healthTimer?: NodeJS.Timeout }> = [];
+  const webhooks = new Map<string, { adapter: any; requestMode: "buffer" | "raw-stream" }>();
   let started = false;
   return {
     status() {
       return configured.map((channel) => ({
         name: channel.name,
         type: channel.type,
-        enabled: channel.enabled,
-        running: channel.running,
-        credentialConfigured: Boolean(channel.tokenEnv),
-        credentialPresent: Boolean(channel.tokenEnv && process.env[channel.tokenEnv]),
-        allowlistEntries: channel.allowlist.length,
-        error: channel.error
+        enabled: channel.config.enabled,
+        running: channel.status.state === "connected" || channel.status.state === "starting" || channel.status.state === "degraded",
+        state: channel.status.state,
+        credentialConfigured: channelCredentialEnvironments(channel.config).every(Boolean),
+        credentialPresent: channelCredentialEnvironments(channel.config).every((name) => Boolean(process.env[name])),
+        allowlistEntries: channel.config.allowlist.length,
+        capabilities: channel.plugin.capabilities,
+        error: channel.status.error ?? "",
+        connectedAt: channel.status.connectedAt,
+        lastEventAt: channel.status.lastEventAt,
+        reconnectAttempts: channel.status.reconnectAttempts,
+        latencyMs: channel.status.latencyMs,
+        details: channel.status.details
       }));
+    },
+    async handleWebhook(request: any, response: any, url: URL) {
+      const webhook = webhooks.get(url.pathname);
+      if (!webhook?.adapter.handleWebhook) return false;
+      const body = webhook.requestMode === "buffer"
+        ? await readRequestBuffer(request, { maxBytes: requestMaxBytes })
+        : undefined;
+      const result = await webhook.adapter.handleWebhook({
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body,
+        rawRequest: request,
+        rawResponse: response
+      });
+      if (!response.writableEnded && result) {
+        response.writeHead(result.status, {
+          "content-type": "text/plain; charset=utf-8",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          ...result.headers
+        });
+        response.end(result.body ?? "");
+      }
+      return true;
     },
     async start(baseUrl: string) {
       if (started) return;
       started = true;
       for (const channel of configured) {
-        if (!channel.enabled) continue;
+        if (!channel.config.enabled) continue;
         try {
-          const token = channel.tokenEnv ? process.env[channel.tokenEnv] : "";
-          if (!token) throw new Error(`channel credential is unavailable in ${channel.tokenEnv || "an environment variable"}`);
-          const adapter = channel.type === "discord"
-            ? new DiscordChannelAdapter({
-              token,
-              accountId: channel.name,
-              requireMention: channel.requireMention,
-              onError(error) { channel.error = error instanceof Error ? error.message : String(error); }
-            })
-            : new TelegramChannelAdapter({
-              token,
-              accountId: channel.name,
-              onError(error) { channel.error = error instanceof Error ? error.message : String(error); }
-            });
+          const validation = channel.plugin.validateAccountConfig(channel.name, channel.config);
+          if (validation.some((message) => !/denies all inbound messages/iu.test(message))) {
+            throw new Error(validation.join("; "));
+          }
+          const token = channel.config.tokenEnv ? process.env[channel.config.tokenEnv] : "";
+          if (!token) throw new Error(`channel credential is unavailable in ${channel.config.tokenEnv || "an environment variable"}`);
+          const credentials = Object.fromEntries(Object.entries(channel.config.credentialEnvs ?? {}).map(([key, environmentName]) => [
+            key,
+            process.env[String(environmentName)] ?? ""
+          ]));
+          const missingCredential = Object.entries(channel.config.credentialEnvs ?? {}).find(([, environmentName]) => (
+            !process.env[String(environmentName)]
+          ));
+          if (missingCredential) throw new Error(`channel credential is unavailable in ${String(missingCredential[1])}`);
+          const adapter = channel.plugin.createAdapter({
+            accountId: channel.name,
+            config: channel.config,
+            credential: token,
+            credentials,
+            onError(error) {
+              channel.status.error = error instanceof Error ? error.message : String(error);
+            }
+          });
           const handler = new GatewayChannelHandler({
             baseUrl,
             token: gatewayToken,
             bindings: new FileSessionBindingStore(join(state, "channel-bindings.json")),
-            ...(channel.defaultModel ? { defaultModel: channel.defaultModel } : {})
+            ...(channel.config.defaultModel ? { defaultModel: channel.config.defaultModel } : {}),
+            ...(channel.config.historyLimit ? { historyLimit: channel.config.historyLimit } : {})
           });
           const router = new ChannelRouter(handler, {
-            access: createAllowlistPolicy(channel.allowlist),
+            access: channel.plugin.createAccessPolicy?.(channel.config) ?? createAllowlistPolicy(channel.config.allowlist),
+            dedupe,
             onError(error) {
-              channel.error = error instanceof Error ? error.message : String(error);
+              channel.status.error = error instanceof Error ? error.message : String(error);
             }
           });
-          await router.attach(adapter);
-          adapters.push(adapter);
-          channel.running = true;
-          channel.error = "";
+          await router.attach(adapter, (patch) => {
+            channel.status = { ...channel.status, ...patch };
+          });
+          const runtime: { adapter: any; router: ChannelRouter; healthTimer?: NodeJS.Timeout } = { adapter, router };
+          const probe = adapter.probe?.bind(adapter);
+          if (probe) {
+            runtime.healthTimer = setInterval(() => {
+              void probe().then((status: any) => {
+                channel.status = { ...channel.status, ...status };
+              }).catch((error: unknown) => {
+                channel.status = {
+                  ...channel.status,
+                  state: "degraded",
+                  error: error instanceof Error ? error.message : String(error)
+                };
+              });
+            }, 30_000);
+            runtime.healthTimer.unref?.();
+          }
+          runtimes.push(runtime);
+          const webhookPath = channel.plugin.webhookPath?.(channel.name, channel.config);
+          if (webhookPath && adapter.handleWebhook) {
+            webhooks.set(webhookPath, {
+              adapter,
+              requestMode: channel.plugin.webhookRequestMode ?? "buffer"
+            });
+          }
+          channel.status.error = "";
         } catch (error) {
-          channel.running = false;
-          channel.error = error instanceof Error ? error.message : String(error);
+          channel.status.state = "failed";
+          channel.status.error = error instanceof Error ? error.message : String(error);
         }
       }
     },
     async stop() {
       started = false;
-      await Promise.allSettled(adapters.splice(0).map((adapter) => adapter.stop()));
-      for (const channel of configured) channel.running = false;
+      await Promise.allSettled(runtimes.splice(0).map(({ adapter, router, healthTimer }) => {
+        if (healthTimer) clearInterval(healthTimer);
+        return router.stop([adapter]);
+      }));
+      for (const channel of configured) channel.status.state = "stopped";
+      webhooks.clear();
     }
   };
+}
+
+function channelCredentialEnvironments(config: any): string[] {
+  return [
+    String(config.tokenEnv ?? ""),
+    ...Object.values(config.credentialEnvs ?? {}).map(String)
+  ].filter(Boolean);
 }
 
 async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor }: any) {
@@ -5563,13 +5768,27 @@ function renderConsoleHtml(version = "development") {
           <div class="config-card-head"><div><h3>Messaging channel</h3><p>Only allowlisted user or conversation identifiers can reach this bot.</p></div><button class="danger-button" data-remove-channel type="button">Remove channel</button></div>
           <div class="grid-2">
             <div class="field"><label>Channel name</label><input data-channel-field="name" value="\${escapeHtml(name)}" placeholder="personal" autocomplete="off"></div>
-            <div class="field"><label>Type</label><select data-channel-field="type">\${renderOptions(["telegram", "discord"], channel.type || "telegram")}</select></div>
+            <div class="field"><label>Type</label><select data-channel-field="type">\${renderOptions(["telegram", "discord", "slack", "teams", "whatsapp"], channel.type || "telegram")}</select></div>
             <div class="field"><label>Bot token environment variable</label><input data-channel-field="tokenEnv" value="\${escapeHtml(channel.tokenEnv || "")}" placeholder="ODINN_TELEGRAM_BOT_TOKEN" autocomplete="off"></div>
+            <div class="field"><label>Slack app token environment</label><input data-channel-field="appTokenEnv" value="\${escapeHtml(channel.appTokenEnv || "")}" placeholder="ODINN_SLACK_APP_TOKEN" autocomplete="off"></div>
+            <div class="field"><label>Teams app ID environment</label><input data-channel-field="appIdEnv" value="\${escapeHtml(channel.appIdEnv || "")}" placeholder="ODINN_TEAMS_APP_ID" autocomplete="off"></div>
+            <div class="field"><label>Teams tenant ID environment</label><input data-channel-field="tenantIdEnv" value="\${escapeHtml(channel.tenantIdEnv || "")}" placeholder="ODINN_TEAMS_TENANT_ID" autocomplete="off"></div>
+            <div class="field"><label>WhatsApp app secret environment</label><input data-channel-field="appSecretEnv" value="\${escapeHtml(channel.appSecretEnv || "")}" placeholder="ODINN_WHATSAPP_APP_SECRET" autocomplete="off"></div>
+            <div class="field"><label>WhatsApp verify token environment</label><input data-channel-field="verifyTokenEnv" value="\${escapeHtml(channel.verifyTokenEnv || "")}" placeholder="ODINN_WHATSAPP_VERIFY_TOKEN" autocomplete="off"></div>
+            <div class="field"><label>WhatsApp phone number ID</label><input data-channel-field="phoneNumberId" value="\${escapeHtml(channel.phoneNumberId || "")}" autocomplete="off"></div>
+            <div class="field"><label>WhatsApp Graph API version</label><input data-channel-field="apiVersion" value="\${escapeHtml(channel.apiVersion || "v23.0")}" autocomplete="off"></div>
             <div class="field"><label>Default model override</label><input data-channel-field="defaultModel" value="\${escapeHtml(channel.defaultModel || "")}" placeholder="provider:model" autocomplete="off"></div>
+            <div class="field"><label>History limit</label><input data-channel-field="historyLimit" type="number" min="1" max="200" value="\${escapeHtml(channel.historyLimit || 40)}"></div>
+            <div class="field"><label>Native command name</label><input data-channel-field="nativeCommandName" value="\${escapeHtml(channel.nativeCommandName || "odinn")}" autocomplete="off"></div>
+            <div class="field"><label>Discord DM policy</label><select data-channel-field="dmPolicy">\${renderOptions(["disabled", "allowlist", "open"], channel.dmPolicy || "allowlist")}</select></div>
+            <div class="field"><label>Discord server policy</label><select data-channel-field="groupPolicy">\${renderOptions(["disabled", "allowlist", "open"], channel.groupPolicy || "allowlist")}</select></div>
+            <div class="field"><label>Discord bot messages</label><select data-channel-field="allowBots">\${renderOptions(["false", "mentions", "true"], String(channel.allowBots ?? false))}</select></div>
           </div>
           <div class="field"><label>Allowlist</label><textarea data-channel-field="allowlist" rows="4" placeholder="discord:123456789&#10;telegram:123456789">\${escapeHtml(Array.isArray(channel.allowlist) ? channel.allowlist.join("\\n") : "")}</textarea><span class="config-help">One platform user or conversation entry per line. Empty means nobody is allowed.</span></div>
+          <div class="field"><label>Discord guild policy JSON</label><textarea data-channel-field="guilds" rows="7" spellcheck="false">\${escapeHtml(JSON.stringify(channel.guilds || {}, null, 2))}</textarea><span class="config-help">Optional guild, channel, user, role, and mention rules keyed by numeric Discord IDs.</span></div>
           <label class="switch-label"><input data-channel-field="enabled" type="checkbox"\${channel.enabled === true ? " checked" : ""}> Enable after gateway restart</label>
-          <label class="switch-label"><input data-channel-field="requireMention" type="checkbox"\${channel.requireMention !== false ? " checked" : ""}> Require an @mention in server channels (Discord)</label>
+          <label class="switch-label"><input data-channel-field="requireMention" type="checkbox"\${channel.requireMention !== false ? " checked" : ""}> Require an @mention in group/server channels</label>
+          <label class="switch-label"><input data-channel-field="nativeCommands" type="checkbox"\${channel.nativeCommands === true ? " checked" : ""}> Register native bot commands</label>
         </article>\`;
     }
 
@@ -5707,11 +5926,32 @@ function renderConsoleHtml(version = "development") {
         const name = card.querySelector('[data-channel-field="name"]').value.trim();
         if (!name) throw new Error("Every messaging channel needs a name.");
         if (channels[name]) throw new Error("Messaging channel names must be unique: " + name);
+        let guilds;
+        try {
+          guilds = JSON.parse(card.querySelector('[data-channel-field="guilds"]').value || "{}");
+        } catch {
+          throw new Error("Discord guild policy must be valid JSON for channel " + name + ".");
+        }
+        const allowBots = card.querySelector('[data-channel-field="allowBots"]').value;
         channels[name] = {
           type: card.querySelector('[data-channel-field="type"]').value,
           enabled: card.querySelector('[data-channel-field="enabled"]').checked,
           requireMention: card.querySelector('[data-channel-field="requireMention"]').checked,
+          nativeCommands: card.querySelector('[data-channel-field="nativeCommands"]').checked,
+          nativeCommandName: card.querySelector('[data-channel-field="nativeCommandName"]').value.trim() || "odinn",
+          historyLimit: Number(card.querySelector('[data-channel-field="historyLimit"]').value || 40),
+          dmPolicy: card.querySelector('[data-channel-field="dmPolicy"]').value,
+          groupPolicy: card.querySelector('[data-channel-field="groupPolicy"]').value,
+          allowBots: allowBots === "mentions" ? "mentions" : allowBots === "true",
+          ...(Object.keys(guilds).length ? { guilds } : {}),
           tokenEnv: card.querySelector('[data-channel-field="tokenEnv"]').value.trim(),
+          appTokenEnv: card.querySelector('[data-channel-field="appTokenEnv"]').value.trim(),
+          appIdEnv: card.querySelector('[data-channel-field="appIdEnv"]').value.trim(),
+          tenantIdEnv: card.querySelector('[data-channel-field="tenantIdEnv"]').value.trim(),
+          appSecretEnv: card.querySelector('[data-channel-field="appSecretEnv"]').value.trim(),
+          verifyTokenEnv: card.querySelector('[data-channel-field="verifyTokenEnv"]').value.trim(),
+          phoneNumberId: card.querySelector('[data-channel-field="phoneNumberId"]').value.trim(),
+          apiVersion: card.querySelector('[data-channel-field="apiVersion"]').value.trim() || "v23.0",
           allowlist: configLines(card.querySelector('[data-channel-field="allowlist"]').value),
           ...(card.querySelector('[data-channel-field="defaultModel"]').value.trim() ? { defaultModel: card.querySelector('[data-channel-field="defaultModel"]').value.trim() } : {})
         };

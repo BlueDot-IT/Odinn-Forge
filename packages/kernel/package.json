@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@odinn/channel-discord": "workspace:*",
     "@odinn/policy": "workspace:*",
     "@odinn/protocol": "workspace:*",
     "@odinn/store-file": "workspace:*",

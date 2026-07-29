@@ -2,24 +2,134 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
+export * from "./plugin.ts";
+
 export type ChannelConversationKind = "direct" | "group" | "channel" | "thread";
 export interface ChannelAddress { channel: string; accountId: string; conversationId: string; conversationKind: ChannelConversationKind; threadId?: string }
 export interface ChannelSender { id: string; displayName?: string; username?: string }
-export interface InboundChannelMessage { id: string; address: ChannelAddress; sender: ChannelSender; text: string; receivedAt: string; replyToId?: string; metadata?: Record<string, unknown> }
-export interface OutboundChannelMessage { address: ChannelAddress; text: string; replyToId?: string }
+export interface ChannelAttachment {
+  id?: string;
+  filename?: string;
+  contentType?: string;
+  size?: number;
+  url?: string;
+  path?: string;
+  description?: string;
+}
+export interface ChannelComponent {
+  type: "button";
+  customId: string;
+  label: string;
+  style?: "primary" | "secondary" | "success" | "danger";
+  disabled?: boolean;
+}
+export interface InboundChannelMessage {
+  id: string;
+  address: ChannelAddress;
+  sender: ChannelSender;
+  text: string;
+  receivedAt: string;
+  replyToId?: string;
+  attachments?: ChannelAttachment[];
+  metadata?: Record<string, unknown>;
+}
+export interface OutboundChannelMessage {
+  address: ChannelAddress;
+  text?: string;
+  replyToId?: string;
+  attachments?: ChannelAttachment[];
+  components?: ChannelComponent[];
+  silent?: boolean;
+  suppressEmbeds?: boolean;
+}
+export interface ChannelCapabilities {
+  chatTypes: ChannelConversationKind[];
+  reactions?: boolean;
+  replies?: boolean;
+  typing?: boolean;
+  threads?: boolean;
+  media?: boolean;
+  edits?: boolean;
+  deletes?: boolean;
+  components?: boolean;
+  nativeCommands?: boolean;
+  streaming?: boolean;
+}
+export type ChannelConnectionState = "stopped" | "starting" | "connected" | "degraded" | "failed";
+export interface ChannelStatus {
+  channel: string;
+  accountId: string;
+  state: ChannelConnectionState;
+  connectedAt?: string;
+  lastEventAt?: string;
+  reconnectAttempts?: number;
+  latencyMs?: number;
+  error?: string;
+  details?: Record<string, unknown>;
+}
+export interface ChannelDeliveryReceipt {
+  status: "sent" | "partial" | "failed";
+  messageIds: string[];
+  conversationId: string;
+  sentChunks: number;
+  totalChunks: number;
+}
 export type ChannelAcknowledgement = "processing" | "succeeded" | "failed";
+export interface ChannelStartContext {
+  signal: AbortSignal;
+  deliver(message: InboundChannelMessage): Promise<boolean>;
+  updateStatus(status: Partial<ChannelStatus>): void;
+}
+export interface ChannelWebhookRequest {
+  method?: string;
+  url?: string;
+  headers?: Record<string, string | string[] | undefined>;
+  body?: Buffer;
+  rawRequest?: unknown;
+  rawResponse?: unknown;
+}
+export interface ChannelWebhookResponse {
+  status: number;
+  headers?: Record<string, string>;
+  body?: string | Buffer;
+}
 export interface ChannelAdapter {
   readonly id: string;
-  start(deliver: (message: InboundChannelMessage) => Promise<void>): Promise<void>;
+  readonly channel: string;
+  readonly accountId: string;
+  readonly capabilities: ChannelCapabilities;
+  start(context: ChannelStartContext): Promise<void>;
   stop(): Promise<void>;
-  send(message: OutboundChannelMessage): Promise<void>;
+  send(message: OutboundChannelMessage): Promise<ChannelDeliveryReceipt>;
   acknowledge?(message: InboundChannelMessage, acknowledgement: ChannelAcknowledgement): Promise<void>;
+  sendTyping?(address: ChannelAddress): Promise<void>;
+  edit?(address: ChannelAddress, messageId: string, message: OutboundChannelMessage): Promise<void>;
+  delete?(address: ChannelAddress, messageId: string): Promise<void>;
+  probe?(): Promise<ChannelStatus>;
+  handleWebhook?(request: ChannelWebhookRequest): Promise<ChannelWebhookResponse | void>;
 }
-export interface ChannelMessageHandler { handle(message: InboundChannelMessage): Promise<string | undefined> }
-export interface ChannelAccessPolicy { allows(message: InboundChannelMessage): boolean }
+export interface ChannelMessageHandlerContext {
+  signal: AbortSignal;
+  onDelta?(delta: string): void | Promise<void>;
+}
+export interface ChannelMessageHandler {
+  handle(message: InboundChannelMessage, context: ChannelMessageHandlerContext): Promise<string | undefined>;
+}
+export interface ChannelAccessPolicy { allows(message: InboundChannelMessage): boolean | Promise<boolean> }
+export interface ChannelDedupeStore {
+  claim(key: string): Promise<boolean>;
+  commit(key: string): Promise<void>;
+  release(key: string): Promise<void>;
+}
 export interface ChannelRouterOptions {
   access?: ChannelAccessPolicy;
+  dedupe?: ChannelDedupeStore;
   dedupeSize?: number;
+  dedupeTtlMs?: number;
+  maxConcurrency?: number;
+  maxQueueSize?: number;
+  maxAttempts?: number;
+  retryDelayMs?: number;
   maximumPendingGlobal?: number;
   maximumPendingPerConversation?: number;
   maximumMessagesPerSenderWindow?: number;
@@ -42,6 +152,156 @@ export class ChannelAdmissionError extends Error {
   }
 }
 
+export class ChannelRetryableError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ChannelRetryableError";
+  }
+}
+
+export class ChannelDeliveryError extends Error {
+  readonly receipt: ChannelDeliveryReceipt;
+
+  constructor(message: string, receipt: ChannelDeliveryReceipt, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ChannelDeliveryError";
+    this.receipt = receipt;
+  }
+}
+
+export class MemoryChannelDedupeStore implements ChannelDedupeStore {
+  readonly #entries = new Map<string, { state: "claimed" | "committed"; expiresAt: number }>();
+  readonly #maximum: number;
+  readonly #ttlMs: number;
+
+  constructor({ maximum = 5_000, ttlMs = 5 * 60_000 }: { maximum?: number; ttlMs?: number } = {}) {
+    this.#maximum = Math.max(1, maximum);
+    this.#ttlMs = Math.max(1_000, ttlMs);
+  }
+
+  async claim(key: string): Promise<boolean> {
+    this.#prune();
+    if (this.#entries.has(key)) return false;
+    this.#entries.set(key, { state: "claimed", expiresAt: Date.now() + this.#ttlMs });
+    this.#prune();
+    return true;
+  }
+
+  async commit(key: string): Promise<void> {
+    if (!this.#entries.has(key)) return;
+    this.#entries.set(key, { state: "committed", expiresAt: Date.now() + this.#ttlMs });
+  }
+
+  async release(key: string): Promise<void> {
+    if (this.#entries.get(key)?.state === "claimed") this.#entries.delete(key);
+  }
+
+  #prune(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.#entries) {
+      if (entry.expiresAt <= now) this.#entries.delete(key);
+    }
+    while (this.#entries.size > this.#maximum) {
+      const oldest = this.#entries.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.#entries.delete(oldest);
+    }
+  }
+}
+
+interface ChannelDedupeFileState {
+  schemaVersion: 1;
+  entries: Record<string, { state: "claimed" | "committed"; expiresAt: number }>;
+}
+
+export class FileChannelDedupeStore implements ChannelDedupeStore {
+  readonly #path: string;
+  readonly #claimTtlMs: number;
+  readonly #commitTtlMs: number;
+  readonly #maximum: number;
+  #queue: Promise<unknown> = Promise.resolve();
+
+  constructor(path: string, {
+    claimTtlMs = 2 * 60_000,
+    commitTtlMs = 5 * 60_000,
+    maximum = 10_000
+  }: { claimTtlMs?: number; commitTtlMs?: number; maximum?: number } = {}) {
+    this.#path = resolve(path);
+    this.#claimTtlMs = Math.max(1_000, claimTtlMs);
+    this.#commitTtlMs = Math.max(1_000, commitTtlMs);
+    this.#maximum = Math.max(1, maximum);
+  }
+
+  claim(key: string): Promise<boolean> {
+    return this.#mutate((state) => {
+      if (state.entries[key]) return false;
+      state.entries[key] = { state: "claimed", expiresAt: Date.now() + this.#claimTtlMs };
+      return true;
+    });
+  }
+
+  commit(key: string): Promise<void> {
+    return this.#mutate((state) => {
+      if (state.entries[key]) {
+        state.entries[key] = { state: "committed", expiresAt: Date.now() + this.#commitTtlMs };
+      }
+    });
+  }
+
+  release(key: string): Promise<void> {
+    return this.#mutate((state) => {
+      if (state.entries[key]?.state === "claimed") delete state.entries[key];
+    });
+  }
+
+  #mutate<Result>(operation: (state: ChannelDedupeFileState) => Result): Promise<Result> {
+    const pending = this.#queue.then(async () => {
+      const state = await this.#read();
+      this.#prune(state);
+      const result = operation(state);
+      await this.#write(state);
+      return result;
+    });
+    this.#queue = pending.catch(() => undefined);
+    return pending;
+  }
+
+  async #read(): Promise<ChannelDedupeFileState> {
+    try {
+      const value = JSON.parse(await readFile(this.#path, "utf8")) as ChannelDedupeFileState;
+      if (value.schemaVersion !== 1 || !value.entries || typeof value.entries !== "object") {
+        throw new Error("unsupported channel dedupe state");
+      }
+      return value;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { schemaVersion: 1, entries: {} };
+      throw error;
+    }
+  }
+
+  async #write(state: ChannelDedupeFileState): Promise<void> {
+    await mkdir(dirname(this.#path), { recursive: true });
+    const temporary = `${this.#path}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    await rename(temporary, this.#path);
+    await chmod(this.#path, 0o600);
+  }
+
+  #prune(state: ChannelDedupeFileState): void {
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(state.entries)) {
+      if (!entry || entry.expiresAt <= now || !["claimed", "committed"].includes(entry.state)) {
+        delete state.entries[key];
+      }
+    }
+    const entries = Object.entries(state.entries).sort((left, right) => left[1].expiresAt - right[1].expiresAt);
+    while (entries.length > this.#maximum) {
+      const oldest = entries.shift();
+      if (oldest) delete state.entries[oldest[0]];
+    }
+  }
+}
+
 export function channelConversationKey(address: ChannelAddress): string {
   return [address.channel, address.accountId, address.conversationKind, address.conversationId, address.threadId ?? ""].map(encodeURIComponent).join(":");
 }
@@ -60,7 +320,10 @@ export function createAllowlistPolicy(entries: string[]): ChannelAccessPolicy {
 export class ChannelRouter {
   readonly #handler: ChannelMessageHandler;
   readonly #options: ChannelRouterOptions & {
-    dedupeSize: number;
+    maxConcurrency: number;
+    maxQueueSize: number;
+    maxAttempts: number;
+    retryDelayMs: number;
     maximumPendingGlobal: number;
     maximumPendingPerConversation: number;
     maximumMessagesPerSenderWindow: number;
@@ -68,17 +331,30 @@ export class ChannelRouter {
     senderWindowMs: number;
   };
   readonly #clock: () => number;
-  readonly #seen = new Set<string>();
-  readonly #queues = new Map<string, Promise<void>>();
+  readonly #dedupe: ChannelDedupeStore;
+  readonly #queues = new Map<string, Array<{
+    adapter: ChannelAdapter;
+    message: InboundChannelMessage;
+    deliveryKey: string;
+    resolve(): void;
+  }>>();
+  readonly #activeKeys = new Set<string>();
+  readonly #activeJobs = new Set<Promise<void>>();
   readonly #pendingByConversation = new Map<string, number>();
   readonly #senderWindows = new Map<string, { count: number; resetAt: number }>();
+  #active = 0;
+  #queued = 0;
   #pendingGlobal = 0;
+  #abort = new AbortController();
 
   constructor(handler: ChannelMessageHandler, options: ChannelRouterOptions = {}) {
     this.#handler = handler;
     this.#options = {
       ...options,
-      dedupeSize: boundedPositiveInteger(options.dedupeSize, 2_000),
+      maxConcurrency: Math.max(1, options.maxConcurrency ?? 8),
+      maxQueueSize: Math.max(1, options.maxQueueSize ?? 1_000),
+      maxAttempts: Math.max(1, options.maxAttempts ?? 3),
+      retryDelayMs: Math.max(10, options.retryDelayMs ?? 1_000),
       maximumPendingGlobal: boundedPositiveInteger(options.maximumPendingGlobal, 100),
       maximumPendingPerConversation: boundedPositiveInteger(options.maximumPendingPerConversation, 8),
       maximumMessagesPerSenderWindow: boundedPositiveInteger(options.maximumMessagesPerSenderWindow, 30),
@@ -86,67 +362,164 @@ export class ChannelRouter {
       senderWindowMs: boundedPositiveInteger(options.senderWindowMs, 60_000)
     };
     this.#clock = options.clock ?? Date.now;
+    this.#dedupe = options.dedupe ?? new MemoryChannelDedupeStore({
+      maximum: options.dedupeSize ?? 5_000,
+      ttlMs: options.dedupeTtlMs ?? 5 * 60_000
+    });
   }
 
-  attach(adapter: ChannelAdapter): Promise<void> {
-    return adapter.start((message) => this.#enqueue(adapter, message));
+  attach(adapter: ChannelAdapter, updateStatus: (status: Partial<ChannelStatus>) => void = () => {}): Promise<void> {
+    if (this.#abort.signal.aborted) this.#abort = new AbortController();
+    return adapter.start({
+      signal: this.#abort.signal,
+      deliver: (message) => this.#enqueue(adapter, message),
+      updateStatus
+    });
   }
 
-  async #enqueue(adapter: ChannelAdapter, message: InboundChannelMessage): Promise<void> {
+  async #enqueue(adapter: ChannelAdapter, message: InboundChannelMessage): Promise<boolean> {
     validateInboundMessage(message);
-    if (this.#options.access && !this.#options.access.allows(message)) return;
+    if (this.#options.access && !await this.#options.access.allows(message)) return false;
     const deliveryKey = `${message.address.channel}:${message.address.accountId}:${message.id}`;
-    if (this.#seen.has(deliveryKey)) return;
+    if (!await this.#dedupe.claim(deliveryKey)) return false;
     const conversationKey = channelConversationKey(message.address);
     const conversationPending = this.#pendingByConversation.get(conversationKey) ?? 0;
-    if (this.#pendingGlobal >= this.#options.maximumPendingGlobal) {
-      this.#options.onError?.(new ChannelAdmissionError("global", this.#options.maximumPendingGlobal), message);
-      return;
+    const admissionError = this.#pendingGlobal >= this.#options.maximumPendingGlobal
+      ? new ChannelAdmissionError("global", this.#options.maximumPendingGlobal)
+      : conversationPending >= this.#options.maximumPendingPerConversation
+        ? new ChannelAdmissionError("conversation", this.#options.maximumPendingPerConversation)
+        : this.#admitSender(message);
+    if (admissionError) {
+      await this.#dedupe.release(deliveryKey);
+      this.#options.onError?.(admissionError, message);
+      return false;
     }
-    if (conversationPending >= this.#options.maximumPendingPerConversation) {
-      this.#options.onError?.(new ChannelAdmissionError("conversation", this.#options.maximumPendingPerConversation), message);
-      return;
+    if (this.#queued >= this.#options.maxQueueSize) {
+      await this.#dedupe.release(deliveryKey);
+      throw new ChannelRetryableError(`channel ingress queue is full (${this.#queued}/${this.#options.maxQueueSize})`);
     }
-    const senderAdmissionError = this.#admitSender(message);
-    if (senderAdmissionError) {
-      this.#options.onError?.(senderAdmissionError, message);
-      return;
-    }
-    this.#remember(deliveryKey);
     this.#pendingGlobal += 1;
     this.#pendingByConversation.set(conversationKey, conversationPending + 1);
-    const previous = this.#queues.get(conversationKey) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(async () => {
-      await this.#acknowledge(adapter, message, "processing");
-      try {
-        const reply = await this.#handler.handle(message);
-        if (reply?.trim()) await adapter.send({ address: message.address, text: reply, replyToId: message.id });
-        await this.#acknowledge(adapter, message, "succeeded");
-      } catch (error) {
-        await this.#acknowledge(adapter, message, "failed");
-        throw error;
-      }
-    }).catch((error) => this.#options.onError?.(error, message)).finally(() => {
-      this.#pendingGlobal -= 1;
-      const remaining = (this.#pendingByConversation.get(conversationKey) ?? 1) - 1;
-      if (remaining > 0) this.#pendingByConversation.set(conversationKey, remaining);
-      else this.#pendingByConversation.delete(conversationKey);
-      if (this.#queues.get(conversationKey) === current) this.#queues.delete(conversationKey);
+    await new Promise<void>((resolveQueued) => {
+      const queue = this.#queues.get(conversationKey) ?? [];
+      queue.push({ adapter, message, deliveryKey, resolve: resolveQueued });
+      this.#queues.set(conversationKey, queue);
+      this.#queued += 1;
+      this.#drain();
     });
-    this.#queues.set(conversationKey, current);
-    await current;
+    return true;
   }
 
   async #acknowledge(adapter: ChannelAdapter, message: InboundChannelMessage, acknowledgement: ChannelAcknowledgement): Promise<void> {
     await adapter.acknowledge?.(message, acknowledgement).catch(() => undefined);
   }
 
-  #remember(key: string): void {
-    this.#seen.add(key);
-    while (this.#seen.size > this.#options.dedupeSize) {
-      const oldest = this.#seen.values().next().value;
-      if (typeof oldest !== "string") break;
-      this.#seen.delete(oldest);
+  #drain(): void {
+    while (this.#active < this.#options.maxConcurrency) {
+      const entry = [...this.#queues.entries()].find(([key, queue]) => queue.length > 0 && !this.#activeKeys.has(key));
+      if (!entry) break;
+      const [conversationKey, queue] = entry;
+      const job = queue.shift();
+      if (!job) continue;
+      this.#queued -= 1;
+      this.#active += 1;
+      this.#activeKeys.add(conversationKey);
+      const activeJob = this.#run(job).finally(() => {
+        job.resolve();
+        this.#active -= 1;
+        this.#pendingGlobal -= 1;
+        const remaining = (this.#pendingByConversation.get(conversationKey) ?? 1) - 1;
+        if (remaining > 0) this.#pendingByConversation.set(conversationKey, remaining);
+        else this.#pendingByConversation.delete(conversationKey);
+        this.#activeKeys.delete(conversationKey);
+        if (queue.length === 0) this.#queues.delete(conversationKey);
+        this.#activeJobs.delete(activeJob);
+        this.#drain();
+      });
+      this.#activeJobs.add(activeJob);
+    }
+  }
+
+  async #run({ adapter, message, deliveryKey }: {
+    adapter: ChannelAdapter;
+    message: InboundChannelMessage;
+    deliveryKey: string;
+  }): Promise<void> {
+    await this.#acknowledge(adapter, message, "processing");
+    let draftId: string | undefined;
+    let draftText = "";
+    let lastDraftUpdateAt = 0;
+    let reply: string | undefined;
+    let handlerCompleted = false;
+    const editDraft = adapter.edit?.bind(adapter);
+    for (let attempt = 1; attempt <= this.#options.maxAttempts; attempt += 1) {
+      try {
+        if (this.#abort.signal.aborted) throw new ChannelRetryableError("channel router stopped");
+        await adapter.sendTyping?.(message.address).catch(() => undefined);
+        if (!handlerCompleted) {
+          reply = await this.#handler.handle(message, {
+            signal: this.#abort.signal,
+            ...adapter.capabilities.streaming && editDraft ? {
+              onDelta: async (delta: string) => {
+                draftText += delta;
+                if (!draftText.trim()) return;
+                const now = Date.now();
+                if (!draftId) {
+                  const receipt = await adapter.send({
+                    address: message.address,
+                    text: draftText,
+                    replyToId: message.id,
+                    suppressEmbeds: true
+                  });
+                  draftId = receipt.messageIds[0];
+                  lastDraftUpdateAt = now;
+                } else if (now - lastDraftUpdateAt >= 750) {
+                  await editDraft(message.address, draftId, {
+                    address: message.address,
+                    text: draftText,
+                    suppressEmbeds: true
+                  });
+                  lastDraftUpdateAt = now;
+                }
+              }
+            } : {}
+          });
+          handlerCompleted = true;
+        }
+        if (reply?.trim()) {
+          if (draftId && editDraft) {
+            await editDraft(message.address, draftId, {
+              address: message.address,
+              text: reply,
+              suppressEmbeds: true
+            });
+          } else {
+            await adapter.send({
+                  address: message.address,
+              text: reply,
+              replyToId: message.id
+            });
+          }
+        }
+        await this.#acknowledge(adapter, message, "succeeded");
+        await this.#dedupe.commit(deliveryKey);
+        return;
+      } catch (error) {
+        const retryable = error instanceof ChannelRetryableError;
+        if (retryable && attempt < this.#options.maxAttempts && !this.#abort.signal.aborted) {
+          if (!handlerCompleted && draftId) {
+            draftText = "";
+            lastDraftUpdateAt = 0;
+          }
+          await delay(this.#options.retryDelayMs * 2 ** (attempt - 1), this.#abort.signal).catch(() => undefined);
+          continue;
+        }
+        await this.#acknowledge(adapter, message, "failed");
+        if (retryable) await this.#dedupe.release(deliveryKey);
+        else await this.#dedupe.commit(deliveryKey);
+        this.#options.onError?.(error, message);
+        return;
+      }
     }
   }
 
@@ -178,10 +551,22 @@ export class ChannelRouter {
     });
     return undefined;
   }
-}
 
-function boundedPositiveInteger(value: number | undefined, fallback: number): number {
-  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
+  async stop(adapters: ChannelAdapter[]): Promise<void> {
+    this.#abort.abort(new Error("channel router stopping"));
+    await Promise.allSettled(adapters.map((adapter) => adapter.stop()));
+    for (const queue of this.#queues.values()) {
+      for (const job of queue) {
+        await this.#dedupe.release(job.deliveryKey);
+        job.resolve();
+      }
+    }
+    this.#queues.clear();
+    this.#queued = 0;
+    this.#pendingGlobal = this.#active;
+    this.#pendingByConversation.clear();
+    await Promise.allSettled([...this.#activeJobs]);
+  }
 }
 
 export interface SessionBindingStore {
@@ -234,6 +619,7 @@ export interface GatewayChannelHandlerOptions {
   token: string;
   bindings: SessionBindingStore;
   defaultModel?: string;
+  historyLimit?: number;
   fetch?: typeof globalThis.fetch;
 }
 
@@ -242,6 +628,7 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
   readonly #token: string;
   readonly #bindings: SessionBindingStore;
   readonly #defaultModel?: string;
+  readonly #historyLimit: number;
   readonly #fetch: typeof globalThis.fetch;
 
   constructor(options: GatewayChannelHandlerOptions) {
@@ -252,55 +639,136 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
     this.#token = options.token;
     this.#bindings = options.bindings;
     this.#defaultModel = options.defaultModel;
+    this.#historyLimit = Math.max(1, Math.min(options.historyLimit ?? 40, 200));
     this.#fetch = options.fetch ?? globalThis.fetch;
   }
 
-  async handle(message: InboundChannelMessage): Promise<string> {
+  async handle(message: InboundChannelMessage, context: ChannelMessageHandlerContext): Promise<string> {
     let sessionId = await this.#bindings.get(message.address);
     if (!sessionId) {
       const created = await this.#request("/sessions", {
         title: channelSessionTitle(message), tags: ["channel", message.address.channel], source: `channel:${message.address.channel}`
-      });
+      }, context.signal);
       sessionId = requiredString(created.id, "gateway did not return a session identifier");
       await this.#bindings.set(message.address, sessionId);
     }
     await this.#request(`/sessions/${encodeURIComponent(sessionId)}/messages`, {
-      role: "user", content: message.text, source: `channel:${message.address.channel}`, actor: `channel:${message.address.channel}:${message.sender.id}`
-    });
-    const detail = await this.#get(`/sessions/${encodeURIComponent(sessionId)}`);
+      role: "user",
+      content: formatInboundChannelContent(message),
+      source: `channel:${message.address.channel}`,
+      actor: `channel:${message.address.channel}:${message.sender.id}`,
+      externalId: channelExternalMessageId(message, "user")
+    }, context.signal);
+    const detail = await this.#get(`/sessions/${encodeURIComponent(sessionId)}`, context.signal);
     const messages = Array.isArray(detail.messages)
-      ? detail.messages.filter(isChatMessage).map((entry) => ({ role: entry.role, content: entry.content }))
+      ? detail.messages.filter(isChatMessage).slice(-this.#historyLimit).map((entry) => ({ role: entry.role, content: entry.content }))
       : [];
-    const result = await this.#request("/run", {
+    const runBody = {
       tool: "agent.run",
       input: { sessionId, messages, ...this.#defaultModel ? { model: this.#defaultModel } : {} },
       actor: `channel:${message.address.channel}`
-    });
+    };
+    const result = context.onDelta
+      ? await this.#streamRequest("/run/stream", runBody, context.signal, context.onDelta)
+      : await this.#request("/run", runBody, context.signal);
     const output = result.output && typeof result.output === "object" ? result.output as Record<string, unknown> : {};
     const reply = requiredString(output.content, "gateway model run returned no assistant content");
     await this.#request(`/sessions/${encodeURIComponent(sessionId)}/messages`, {
       role: "assistant", content: reply, source: `channel:${message.address.channel}`,
+      externalId: channelExternalMessageId(message, "assistant"),
       ...typeof output.model === "string" ? { model: output.model } : {},
       ...typeof output.provider === "string" ? { provider: output.provider } : {}
-    });
+    }, context.signal);
     return reply;
   }
 
-  #get(path: string): Promise<Record<string, unknown>> {
-    return this.#call(path, { method: "GET" });
+  #get(path: string, signal: AbortSignal): Promise<Record<string, unknown>> {
+    return this.#call(path, { method: "GET" }, signal);
   }
 
-  #request(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.#call(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  #request(path: string, body: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>> {
+    return this.#call(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, signal);
   }
 
-  async #call(path: string, init: RequestInit): Promise<Record<string, unknown>> {
-    const response = await this.#fetch(`${this.#baseUrl}${path}`, {
-      ...init, headers: { ...init.headers, authorization: `Bearer ${this.#token}` }
-    });
+  async #call(path: string, init: RequestInit, signal: AbortSignal): Promise<Record<string, unknown>> {
+    let response: Response;
+    try {
+      response = await this.#fetch(`${this.#baseUrl}${path}`, {
+        ...init,
+        headers: { ...init.headers, authorization: `Bearer ${this.#token}` },
+        signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)])
+      });
+    } catch (error) {
+      throw new ChannelRetryableError(`gateway request failed: ${error instanceof Error ? error.message : String(error)}`, {
+        cause: error
+      });
+    }
     const value = await response.json().catch(() => ({})) as Record<string, unknown>;
-    if (!response.ok) throw new Error(typeof value.error === "string" ? value.error : `gateway request failed with ${response.status}`);
+    if (!response.ok) {
+      const message = typeof value.error === "string" ? value.error : `gateway request failed with ${response.status}`;
+      if ([408, 425, 429].includes(response.status) || response.status >= 500) {
+        throw new ChannelRetryableError(message);
+      }
+      throw new Error(message);
+    }
     return value;
+  }
+
+  async #streamRequest(
+    path: string,
+    body: Record<string, unknown>,
+    signal: AbortSignal,
+    onDelta: (delta: string) => void | Promise<void>
+  ): Promise<Record<string, unknown>> {
+    let response: Response;
+    try {
+      response = await this.#fetch(`${this.#baseUrl}${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.#token}`,
+          "content-type": "application/json",
+          accept: "text/event-stream"
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)])
+      });
+    } catch (error) {
+      throw new ChannelRetryableError(`gateway stream failed: ${error instanceof Error ? error.message : String(error)}`, {
+        cause: error
+      });
+    }
+    if (!response.ok || !response.body) {
+      const value = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const message = typeof value.error === "string" ? value.error : `gateway stream failed with ${response.status}`;
+      if ([408, 425, 429].includes(response.status) || response.status >= 500) throw new ChannelRetryableError(message);
+      throw new Error(message);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let result: Record<string, unknown> | undefined;
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const event = /^event:\s*(.+)$/mu.exec(block)?.[1] ?? "message";
+        const raw = /^data:\s*(.+)$/mu.exec(block)?.[1] ?? "{}";
+        const value = JSON.parse(raw) as Record<string, unknown>;
+        if (event === "delta" && typeof value.delta === "string") await onDelta(value.delta);
+        if (event === "result") result = value;
+        if (event === "error") {
+          const error = value.error;
+          throw new Error(typeof error === "string" ? error : "gateway stream failed");
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+    if (!result) throw new ChannelRetryableError("gateway stream ended without a result");
+    return result;
   }
 }
 
@@ -331,8 +799,32 @@ function validateInboundMessage(message: InboundChannelMessage): void {
   if (!message.sender.id.trim()) throw new Error("channel message requires a sender identifier");
 }
 function channelSessionTitle(message: InboundChannelMessage): string {
-  const sender = message.sender.displayName || message.sender.username || message.sender.id;
-  return `${message.address.channel}: ${sender}`.slice(0, 120);
+  return `${message.address.channel}: ${message.address.conversationKind} ${message.address.threadId ?? message.address.conversationId}`.slice(0, 120);
+}
+function formatInboundChannelContent(message: InboundChannelMessage): string {
+  const context = {
+    channel: message.address.channel,
+    accountId: message.address.accountId,
+    conversationId: message.address.conversationId,
+    conversationKind: message.address.conversationKind,
+    threadId: message.address.threadId,
+    messageId: message.id,
+    replyToId: message.replyToId,
+    sender: message.sender,
+    receivedAt: message.receivedAt,
+    attachments: message.attachments,
+    metadata: message.metadata
+  };
+  return `[Untrusted channel context]\n${JSON.stringify(context)}\n[/Untrusted channel context]\n\n${message.text}`;
+}
+function channelExternalMessageId(message: InboundChannelMessage, role: "user" | "assistant"): string {
+  return [
+    "channel",
+    role,
+    message.address.channel,
+    message.address.accountId,
+    message.id
+  ].map(encodeURIComponent).join(":");
 }
 function isChatMessage(value: unknown): value is { role: string; content: string } {
   if (!value || typeof value !== "object") return false;
@@ -342,4 +834,18 @@ function isChatMessage(value: unknown): value is { role: string; content: string
 function requiredString(value: unknown, message: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(message);
   return value;
+}
+
+function boundedPositiveInteger(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
+}
+
+function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolveDelay, reject) => {
+    const timer = setTimeout(resolveDelay, milliseconds);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    }, { once: true });
+  });
 }

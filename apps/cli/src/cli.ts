@@ -391,7 +391,7 @@ function usage() {
   odinn extension run --id <id> --input-json <json> [--capability <capability>] [--capability-token <token>] [--state .odinn]
   odinn config model default <provider:model> [--state .odinn]
   odinn config model list [--state .odinn]
-  odinn config channel add telegram|discord <name> --token-env <ENV_NAME> --allowlist <channel:user-or-chat-id,...> [--model <provider:model>] [--require-mention true|false] [--state .odinn]
+  odinn config channel add telegram|discord|slack|teams|whatsapp <name> --token-env <ENV_NAME> --allowlist <channel:user-or-chat-id,...> [--app-token-env <ENV>] [--app-id-env <ENV>] [--tenant-id-env <ENV>] [--app-secret-env <ENV>] [--verify-token-env <ENV>] [--phone-number-id <id>] [--api-version v23.0] [--model <provider:model>] [--history-limit 40] [--require-mention true|false] [--dm-policy disabled|allowlist|open] [--group-policy disabled|allowlist|open] [--allow-bots false|mentions|true] [--native-commands true|false] [--native-command-name odinn] [--state .odinn]
   odinn config channel list [--state .odinn]
   odinn config channel enable|disable|remove <name> [--state .odinn]
   odinn status [--state .odinn]
@@ -1219,7 +1219,13 @@ function summarizeChannelConfig(config: any) {
     credentialPresent: Boolean(value.tokenEnv && process.env[value.tokenEnv]),
     tokenEnv: value.tokenEnv ?? "",
     allowlistEntries: Array.isArray(value.allowlist) ? value.allowlist.length : 0,
-    requireMention: value.type === "discord" ? value.requireMention !== false : undefined,
+    requireMention: value.requireMention !== false,
+    historyLimit: value.historyLimit ?? 40,
+    dmPolicy: value.type === "discord" ? value.dmPolicy ?? "allowlist" : undefined,
+    groupPolicy: value.type === "discord" ? value.groupPolicy ?? "allowlist" : undefined,
+    allowBots: value.type === "discord" ? value.allowBots ?? false : undefined,
+    nativeCommands: value.nativeCommands === true,
+    nativeCommandName: value.nativeCommandName ?? "odinn",
     defaultModel: value.defaultModel ?? ""
   }));
 }
@@ -1571,16 +1577,55 @@ async function configCommand(args: any) {
     if (subcommand === "add") {
       const type = rest[0];
       const name = rest[1];
-      if (!["telegram", "discord"].includes(type) || !name) throw new Error("config channel add requires telegram|discord <name>");
+      if (!["telegram", "discord", "slack", "teams", "whatsapp"].includes(type) || !name) {
+        throw new Error("config channel add requires telegram|discord|slack|teams|whatsapp <name>");
+      }
       if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name)) throw new Error("channel name contains unsupported characters");
       const tokenEnv = option(rest, "--token-env", "");
       if (!/^[A-Z_][A-Z0-9_]{1,127}$/u.test(tokenEnv)) throw new Error("config channel add requires --token-env <UPPERCASE_ENV_NAME>");
+      const historyLimit = Number.parseInt(option(rest, "--history-limit", "40"), 10);
+      if (!Number.isSafeInteger(historyLimit) || historyLimit < 1 || historyLimit > 200) {
+        throw new Error("--history-limit requires an integer from 1 through 200");
+      }
+      const nativeCommandName = option(rest, "--native-command-name", type === "slack" ? "/odinn" : "odinn");
+      const validCommand = type === "slack"
+        ? /^\/[a-z0-9_-]{1,31}$/u.test(nativeCommandName)
+        : type === "discord"
+          ? /^[a-z0-9_-]{1,32}$/u.test(nativeCommandName)
+          : /^[a-z][a-z0-9_]{0,31}$/u.test(nativeCommandName);
+      if (!validCommand) throw new Error("--native-command-name is invalid for this channel");
+      const requireMention = parseBoolean(option(rest, "--require-mention", "true"), "--require-mention");
+      const nativeCommands = parseBoolean(option(rest, "--native-commands", "false"), "--native-commands");
+      const allowBotsChoice = parseChoice(option(rest, "--allow-bots", "false"), "--allow-bots", ["false", "mentions", "true"]);
+      const environmentOptions = Object.fromEntries([
+        ["appTokenEnv", "--app-token-env"],
+        ["appIdEnv", "--app-id-env"],
+        ["tenantIdEnv", "--tenant-id-env"],
+        ["appSecretEnv", "--app-secret-env"],
+        ["verifyTokenEnv", "--verify-token-env"]
+      ].flatMap(([key, flag]) => {
+        const value = option(rest, flag, "");
+        if (!value) return [];
+        if (!/^[A-Z_][A-Z0-9_]{1,127}$/u.test(value)) throw new Error(`${flag} requires an uppercase environment variable name`);
+        return [[key, value]];
+      }));
       config.channels[name] = {
         type,
         enabled: false,
         tokenEnv,
         allowlist: splitCsv(option(rest, "--allowlist", "")),
-        ...(type === "discord" ? { requireMention: parseBoolean(option(rest, "--require-mention", "true"), "--require-mention") } : {}),
+        historyLimit,
+        requireMention,
+        nativeCommands,
+        nativeCommandName,
+        ...environmentOptions,
+        ...(option(rest, "--phone-number-id", "") ? { phoneNumberId: option(rest, "--phone-number-id") } : {}),
+        ...(option(rest, "--api-version", "") ? { apiVersion: option(rest, "--api-version") } : {}),
+        ...(type === "discord" ? {
+          dmPolicy: parseChoice(option(rest, "--dm-policy", "allowlist"), "--dm-policy", ["disabled", "allowlist", "open"]),
+          groupPolicy: parseChoice(option(rest, "--group-policy", "allowlist"), "--group-policy", ["disabled", "allowlist", "open"]),
+          allowBots: allowBotsChoice === "mentions" ? "mentions" : allowBotsChoice === "true"
+        } : {}),
         ...(option(rest, "--model", "") ? { defaultModel: option(rest, "--model") } : {})
       };
       await saveConfig(state, config);
@@ -1591,7 +1636,11 @@ async function configCommand(args: any) {
       const name = rest[0];
       if (!name || !config.channels[name]) throw new Error(`channel not found: ${name || "(missing)"}`);
       if (subcommand === "enable") {
-        if (!config.channels[name].allowlist?.length) throw new Error("channel enable requires at least one allowlist entry");
+        const open = config.channels[name].dmPolicy === "open" || config.channels[name].groupPolicy === "open";
+        const scopedGuild = Object.keys(config.channels[name].guilds ?? {}).length > 0;
+        if (!config.channels[name].allowlist?.length && !open && !scopedGuild) {
+          throw new Error("channel enable requires an allowlist, an open policy, or a scoped Discord guild");
+        }
         config.channels[name].enabled = true;
       } else if (subcommand === "disable") {
         config.channels[name].enabled = false;
@@ -1725,6 +1774,12 @@ function parseBoolean(value: any, flag: any) {
   if (["true", "1", "yes", "on"].includes(String(value).toLowerCase())) return true;
   if (["false", "0", "no", "off"].includes(String(value).toLowerCase())) return false;
   throw new Error(`${flag} requires true or false`);
+}
+
+function parseChoice<Value extends string>(value: unknown, flag: string, choices: readonly Value[]): Value {
+  const normalized = String(value).toLowerCase();
+  if (choices.includes(normalized as Value)) return normalized as Value;
+  throw new Error(`${flag} requires ${choices.join(", ")}`);
 }
 
 async function authCommand(args: any) {
