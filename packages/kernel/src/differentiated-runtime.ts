@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { unzipSync, zipSync } from "fflate";
@@ -27,11 +27,43 @@ function containsRedaction(value: unknown): boolean {
   return false;
 }
 function hash(value: string | Buffer) { return createHash("sha256").update(value).digest("hex"); }
+const CAPSULE_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const CAPSULE_MAX_ENTRIES = 512;
+const CAPSULE_MAX_ENTRY_BYTES = 32 * 1024 * 1024;
+const CAPSULE_MAX_EXPANDED_BYTES = 128 * 1024 * 1024;
 function capsuleArchiveEntries(path: string): Map<string, Buffer> {
+  let compressed: Buffer;
+  try {
+    const metadata = statSync(path);
+    if (!metadata.isFile() || metadata.size > CAPSULE_MAX_ARCHIVE_BYTES) {
+      throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ARCHIVE_BYTES}-byte compressed-size limit`);
+    }
+    compressed = readFileSync(path);
+  } catch (error) {
+    if (error instanceof OdinnRuntimeError) throw error;
+    throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
+  }
+
   let archive: Record<string, Uint8Array>;
   try {
-    archive = unzipSync(readFileSync(path));
-  } catch {
+    let entries = 0;
+    let expandedBytes = 0;
+    // fflate invokes the filter from ZIP central-directory metadata before it
+    // allocates or inflates each entry. A metadata-only pass therefore admits
+    // the complete archive before any material expansion takes place.
+    unzipSync(compressed, {
+      filter: ({ originalSize }) => {
+        entries += 1;
+        expandedBytes += originalSize;
+        if (entries > CAPSULE_MAX_ENTRIES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ENTRIES}-entry limit`);
+        if (originalSize > CAPSULE_MAX_ENTRY_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule entry exceeds the ${CAPSULE_MAX_ENTRY_BYTES}-byte expanded-size limit`);
+        if (expandedBytes > CAPSULE_MAX_EXPANDED_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_EXPANDED_BYTES}-byte expanded-size limit`);
+        return false;
+      }
+    });
+    archive = unzipSync(compressed);
+  } catch (error) {
+    if (error instanceof OdinnRuntimeError) throw error;
     throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
   }
   return new Map(Object.entries(archive).map(([name, bytes]) => [
@@ -101,6 +133,27 @@ function isWithin(root: string, target: string) {
   const base = resolve(root);
   const resolvedTarget = resolve(target);
   return resolvedTarget === base || resolvedTarget.startsWith(`${base}${sep}`);
+}
+
+function assertCapsuleExportPath(root: string, target: string) {
+  const base = resolve(root);
+  const destination = resolve(target);
+  if (!isWithin(base, destination)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output escapes its allowed root");
+  const physicalBase = resolve(realpathSync(base));
+  const segments = relative(base, destination).split(sep).filter(Boolean);
+  let cursor = base;
+  for (const segment of segments) {
+    cursor = join(cursor, segment);
+    if (!existsSync(cursor)) break;
+    if (lstatSync(cursor).isSymbolicLink()) {
+      throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output cannot traverse a symbolic link", { path: target });
+    }
+    const physical = resolve(realpathSync(cursor));
+    if (!isWithin(physicalBase, physical)) {
+      throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output escapes its allowed root", { path: target });
+    }
+  }
+  return destination;
 }
 
 function isPlainRecord(value: unknown): value is AnyRecord {
@@ -601,8 +654,9 @@ export class CapsuleManager {
     const run = this.ledger.getRun(runId); if (!run) throw new OdinnRuntimeError("CAPSULE_INVALID", "run not found", { runId });
     const destination = resolve(output);
     const allowedRoots = [this.root, this.ledger.workspaceRoot].map((root) => resolve(root));
-    if (!allowedRoots.some((root) => destination === root || destination.startsWith(`${root}${sep}`))) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output must remain inside the workspace or .odinn/capsules directory", { output });
-    if (existsSync(destination) && lstatSync(destination).isSymbolicLink()) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output cannot be a symbolic link", { output });
+    const allowedRoot = allowedRoots.find((root) => isWithin(root, destination));
+    if (!allowedRoot) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output must remain inside the workspace or .odinn/capsules directory", { output });
+    assertCapsuleExportPath(allowedRoot, destination);
     const staging = join(this.root, `.staging-${randomUUID()}`); mkdirSync(join(staging, "artifacts"), { recursive: true }); mkdirSync(join(staging, "snapshots"), { recursive: true }); mkdirSync(join(staging, "verification"), { recursive: true });
     try {
       const storedContract = this.ledger.database.db.prepare("SELECT contract_json FROM verification_contracts WHERE run_id = ? ORDER BY created_at DESC LIMIT 1").get(runId);
@@ -637,6 +691,7 @@ export class CapsuleManager {
       const files: string[] = []; for (const entryName of readdirSync(staging, { recursive: true })) { const name = String(entryName); if (name === "checksums.sha256") continue; const file = join(staging, name); if (lstatSync(file).isFile()) files.push(name.replaceAll("\\", "/")); }
       writeFileSync(join(staging, "checksums.sha256"), `${files.sort().map((name) => `${hash(readFileSync(join(staging, name)))}  ${name}`).join("\n")}\n`);
       mkdirSync(dirname(destination), { recursive: true });
+      assertCapsuleExportPath(allowedRoot, destination);
       const archiveEntries: Record<string, Uint8Array> = {};
       for (const entryName of readdirSync(staging, { recursive: true })) {
         const name = String(entryName).replaceAll("\\", "/");

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { Worker } from "node:worker_threads";
 import { redact } from "@odinn/store-sqlite";
 import type { RunLedger } from "@odinn/store-sqlite";
 import type { JsonObject } from "@odinn/protocol";
@@ -22,6 +23,7 @@ const MATCHER_KEYS = new Set(["equals", "contains", "matches", "flags"]);
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const DEFAULT_MAX_FILE_BYTES = 1_000_000;
+const REGEX_EXECUTION_TIMEOUT_MS = 250;
 
 type NodeError = Error & { code?: string };
 type Matcher = { equals: string } | { contains: string } | { matches: string; flags?: string };
@@ -122,6 +124,7 @@ function normalizeMatcher(value: unknown, label: string): Matcher {
   if (operator === "matches") {
     const flags = value.flags === undefined ? "" : requiredString(value.flags, `${label}.flags`, 5, true);
     if (!/^(?!.*(.).*\1)[imsu]*$/.test(flags)) throw new TypeError(`${label}.flags may contain each of i, m, s, or u at most once`);
+    if (/\\(?:[1-9]|k[<{])/.test(pattern)) throw new TypeError(`${label}.matches cannot contain backreferences`);
     try { new RegExp(pattern, flags); } catch (error) { throw new TypeError(`${label}.matches is not a valid regular expression: ${errorMessage(error)}`); }
     return { matches: pattern, ...(flags ? { flags } : {}) };
   }
@@ -279,10 +282,38 @@ async function resolveAllowedPath(root: string, candidate: string): Promise<{ pa
   }
 }
 
-function matchesText(actual: string, matcher: Matcher) {
+async function matchesText(actual: string, matcher: Matcher) {
   if ("equals" in matcher) return actual === matcher.equals;
   if ("contains" in matcher) return actual.includes(matcher.contains);
-  return new RegExp(matcher.matches, matcher.flags ?? "").test(actual);
+  return await new Promise<boolean>((resolveMatch, rejectMatch) => {
+    const worker = new Worker(
+      `const { parentPort, workerData } = require("node:worker_threads");
+       try { parentPort.postMessage({ match: new RegExp(workerData.pattern, workerData.flags).test(workerData.actual) }); }
+       catch (error) { parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) }); }`,
+      { eval: true, workerData: { actual, pattern: matcher.matches, flags: matcher.flags ?? "" } }
+    );
+    let settled = false;
+    const finish = (error?: Error, matched?: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      void worker.terminate();
+      if (error) rejectMatch(error);
+      else resolveMatch(matched === true);
+    };
+    const deadline = setTimeout(
+      () => finish(new Error(`proof regular expression exceeded ${REGEX_EXECUTION_TIMEOUT_MS}ms execution limit`)),
+      REGEX_EXECUTION_TIMEOUT_MS
+    );
+    worker.once("message", (message: { match?: boolean; error?: string }) => {
+      if (message.error) finish(new Error(`proof regular expression failed: ${message.error}`));
+      else finish(undefined, message.match);
+    });
+    worker.once("error", (error) => finish(error));
+    worker.once("exit", (code) => {
+      if (!settled && code !== 0) finish(new Error(`proof regular expression worker exited with code ${code}`));
+    });
+  });
 }
 
 function isLoopbackUrl(value: string) {
@@ -512,8 +543,8 @@ export class ProofVerifier {
     if (actual.timedOut) failures.push(`command timed out after ${assertion.timeoutMs}ms`);
     if (actual.outputLimitExceeded) failures.push(`command output exceeded ${this.maxOutputBytes} bytes`);
     if (actual.exitCode !== assertion.expect.exitCode) failures.push(`expected exit code ${assertion.expect.exitCode}, received ${actual.exitCode ?? "none"}`);
-    if (assertion.expect.stdout && !matchesText(actual.stdout, assertion.expect.stdout)) failures.push("stdout did not match expectation");
-    if (assertion.expect.stderr && !matchesText(actual.stderr, assertion.expect.stderr)) failures.push("stderr did not match expectation");
+    if (assertion.expect.stdout && !await matchesText(actual.stdout, assertion.expect.stdout)) failures.push("stdout did not match expectation");
+    if (assertion.expect.stderr && !await matchesText(actual.stderr, assertion.expect.stderr)) failures.push("stderr did not match expectation");
     return {
       id: assertion.id,
       type: assertion.type,
@@ -553,7 +584,7 @@ export class ProofVerifier {
       }
       const content = await readFile(target.path, "utf8");
       actual.content = content;
-      if (!matchesText(content, assertion.expect.content)) return this.failedResult(assertion, "file content did not match expectation", actual);
+      if (!await matchesText(content, assertion.expect.content)) return this.failedResult(assertion, "file content did not match expectation", actual);
     }
     return this.passedResult(assertion, "file assertion passed", actual);
   }
@@ -568,7 +599,7 @@ export class ProofVerifier {
       const body = assertion.method === "HEAD" ? "" : (await response.text()).slice(0, this.maxOutputBytes);
       const failures: string[] = [];
       if (response.status !== assertion.expect.status) failures.push(`expected HTTP status ${assertion.expect.status}, received ${response.status}`);
-      if (assertion.expect.body && !matchesText(body, assertion.expect.body)) failures.push("HTTP response body did not match expectation");
+      if (assertion.expect.body && !await matchesText(body, assertion.expect.body)) failures.push("HTTP response body did not match expectation");
       return { id: assertion.id, type: assertion.type, status: failures.length ? "failed" : "passed", passed: failures.length === 0, message: failures.length ? failures.join("; ") : "HTTP assertion passed", expected: assertion.expect, actual: { status: response.status, body }, startedAt, completedAt: new Date().toISOString() };
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
