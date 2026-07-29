@@ -523,6 +523,13 @@ async function onboard(args: any) {
   }
   const configPath = await ensureConfig(state);
   await ensureMainAgent(state);
+  if (provider) {
+    await addProvider(state, args, provider);
+    const configured = normalizeModelConfig(await readConfig(state)).providers[provider];
+    if (configured?.auth.mode === "oauth") await connectOAuth(state, provider, args);
+    if (configured?.auth.mode === "device") await connectDeviceAuth(state, provider, args);
+    if (configured?.auth.mode === "cli") await connectCliAuth(configured);
+  }
   if (hasFlag(args, "--verify")) {
     const result = await verifyConfiguredModel(
       state,
@@ -536,13 +543,6 @@ async function onboard(args: any) {
     }
     console.log(result.message);
     return;
-  }
-  if (provider) {
-    await addProvider(state, args, provider);
-    const configured = normalizeModelConfig(await readConfig(state)).providers[provider];
-    if (configured?.auth.mode === "oauth") await connectOAuth(state, provider, args);
-    if (configured?.auth.mode === "device") await connectDeviceAuth(state, provider, args);
-    if (configured?.auth.mode === "cli") await connectCliAuth(configured);
   }
   const current = await status(args);
   const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));

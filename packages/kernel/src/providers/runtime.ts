@@ -5,7 +5,7 @@ import { join, relative, resolve } from "node:path";
 import { withStateMutationLock } from "../state-mutation.ts";
 
 type AnyRecord = Record<string, any>;
-type NodeError = Error & { code?: string };
+type NodeError = Error & { code?: string; details?: AnyRecord };
 
 const MAX_MODEL_RESPONSE_BYTES = 8 * 1024 * 1024;
 
@@ -406,7 +406,15 @@ export async function chatWithModel(modelConfig: any, input: any = {}, { stateDi
     if ((!content || !content.trim()) && !toolCalls.length) {
       const reasoning = payload?.choices?.[0]?.message?.reasoning;
       if (typeof reasoning === "string" && reasoning.trim()) {
-        throw new Error("model exhausted its output budget in reasoning before producing assistant content; increase maxTokens or use a non-reasoning model");
+        const error = new Error("model exhausted its output budget in reasoning before producing assistant content; increase maxTokens or use a non-reasoning model") as NodeError;
+        error.code = "MODEL_REASONING_BUDGET_EXHAUSTED";
+        error.details = {
+          providerId: parsed.provider,
+          modelId: parsed.model,
+          maxTokens: input.maxTokens === undefined ? undefined : normalizeMaxTokens(input.maxTokens),
+          nextAction: "Retry once with a larger response budget or use a non-reasoning model."
+        };
+        throw error;
       }
       throw new Error("model provider returned no assistant content");
     }
