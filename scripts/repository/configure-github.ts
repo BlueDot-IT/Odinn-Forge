@@ -37,6 +37,10 @@ const requiredChecks = [
   "Conventional title"
 ];
 
+function isEnabled(value: any) {
+  return value === true || value?.enabled === true;
+}
+
 console.log(`Configuring ${repository}`);
 
 gh("/actions/permissions/workflow", "PUT", {
@@ -77,6 +81,73 @@ gh("/branches/main/protection", "PUT", {
   lock_branch: false,
   allow_fork_syncing: true
 });
+
+const protection = JSON.parse(gh("/branches/main/protection"));
+const effectiveChecks = Array.isArray(protection.required_status_checks?.contexts)
+  ? protection.required_status_checks.contexts
+  : [];
+const missingChecks = requiredChecks.filter((check) => !effectiveChecks.includes(check));
+if (
+  protection.required_status_checks?.strict !== true
+  || missingChecks.length > 0
+  || protection.required_pull_request_reviews?.required_approving_review_count !== 1
+  || protection.required_pull_request_reviews?.dismiss_stale_reviews !== true
+  || protection.required_pull_request_reviews?.require_code_owner_reviews !== true
+  || !isEnabled(protection.required_linear_history)
+  || !isEnabled(protection.required_conversation_resolution)
+  || isEnabled(protection.allow_force_pushes)
+  || isEnabled(protection.allow_deletions)
+) {
+  throw new Error(
+    `main branch protection verification failed${missingChecks.length > 0
+      ? `: missing required checks ${missingChecks.join(", ")}`
+      : ""}`
+  );
+}
+
+const rulesets = JSON.parse(gh("/rulesets"));
+const defaultRuleset = Array.isArray(rulesets)
+  ? rulesets.find((ruleset: any) => ruleset?.name === "default" && ruleset?.target === "branch")
+  : undefined;
+if (!defaultRuleset?.id) {
+  throw new Error("default branch ruleset verification failed: the expected ruleset does not exist");
+}
+const currentRuleset = JSON.parse(gh(`/rulesets/${defaultRuleset.id}`));
+gh(`/rulesets/${defaultRuleset.id}`, "PUT", {
+  name: "default",
+  target: "branch",
+  enforcement: "active",
+  bypass_actors: Array.isArray(currentRuleset.bypass_actors) ? currentRuleset.bypass_actors : [],
+  conditions: {
+    ref_name: {
+      include: ["~DEFAULT_BRANCH"],
+      exclude: []
+    }
+  },
+  rules: [
+    { type: "deletion" },
+    { type: "non_fast_forward" },
+    { type: "required_linear_history" }
+  ]
+});
+
+const effectiveRuleset = JSON.parse(gh(`/rulesets/${defaultRuleset.id}`));
+const effectiveRuleTypes = new Set(
+  Array.isArray(effectiveRuleset.rules)
+    ? effectiveRuleset.rules.map((rule: any) => rule?.type)
+    : []
+);
+if (
+  effectiveRuleset.enforcement !== "active"
+  || !effectiveRuleset.conditions?.ref_name?.include?.includes("~DEFAULT_BRANCH")
+  || !effectiveRuleTypes.has("deletion")
+  || !effectiveRuleTypes.has("non_fast_forward")
+  || !effectiveRuleTypes.has("required_linear_history")
+) {
+  throw new Error(
+    "default branch ruleset verification failed: active deletion, non-fast-forward, and linear-history controls must be effective"
+  );
+}
 
 gh("/environments/release", "PUT", {
   wait_timer: 0,

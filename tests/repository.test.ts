@@ -79,6 +79,9 @@ test("published GitHub releases hand npm publication to the protected workflow",
 test("repository setup fails closed and verifies the effective release reviewer policy", async () => {
   const configure = await read("scripts/repository/configure-github.ts");
 
+  assert.match(configure, /main branch protection verification failed/);
+  assert.match(configure, /default branch ruleset verification failed/);
+  assert.match(configure, /enforcement: "active"/);
   assert.match(configure, /reviewers: \[\{ type: "User", id: ownerUserId \}\]/);
   assert.match(configure, /const releaseEnvironment = JSON\.parse\(gh\("\/environments\/release"\)\)/);
   assert.match(configure, /rule\?\.type === "required_reviewers"/);
@@ -99,7 +102,13 @@ if (endpoint.endsWith("/environments/release") && method === "PUT" && process.en
   process.stderr.write("reviewer policy rejected");
   process.exit(1);
 }
-if (endpoint.endsWith("/environments/release") && method === "GET") {
+if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
+  process.stdout.write(process.env.FAKE_BRANCH_PROTECTION || "{}");
+} else if (endpoint.endsWith("/rulesets") && method === "GET") {
+  process.stdout.write('[{"id":19858700,"name":"default","target":"branch"}]');
+} else if (endpoint.endsWith("/rulesets/19858700") && method === "GET") {
+  process.stdout.write(process.env.FAKE_RULESET || "{}");
+} else if (endpoint.endsWith("/environments/release") && method === "GET") {
   process.stdout.write(process.env.FAKE_RELEASE_ENVIRONMENT || "{}");
 } else {
   process.stdout.write("{}");
@@ -121,7 +130,56 @@ if (endpoint.endsWith("/environments/release") && method === "GET") {
     },
     ...overrides
   });
-  const run = (environment: Record<string, unknown>, extraEnv: Record<string, string> = {}) => spawnSync(
+  const branchProtection = {
+    required_status_checks: {
+      strict: true,
+      contexts: [
+        "Quality and unit tests",
+        "Platform test (ubuntu-latest)",
+        "Platform test (macos-latest)",
+        "Platform test (windows-latest)",
+        "Integration and inference protocol",
+        "Package smoke (ubuntu-latest)",
+        "Package smoke (macos-latest)",
+        "Package smoke (windows-latest)",
+        "Verify package (ubuntu-latest)",
+        "Verify package (macos-latest)",
+        "Verify package (windows-latest)",
+        "CodeQL",
+        "Dependency review",
+        "Dependency and lockfile audit",
+        "Secret scan",
+        "actionlint",
+        "Conventional title"
+      ]
+    },
+    required_pull_request_reviews: {
+      required_approving_review_count: 1,
+      dismiss_stale_reviews: true,
+      require_code_owner_reviews: true
+    },
+    required_linear_history: { enabled: true },
+    required_conversation_resolution: { enabled: true },
+    allow_force_pushes: { enabled: false },
+    allow_deletions: { enabled: false }
+  };
+  const ruleset = {
+    id: 19_858_700,
+    name: "default",
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [{ actor_id: null, actor_type: "OrganizationAdmin", bypass_mode: "always" }],
+    conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+    rules: [
+      { type: "deletion" },
+      { type: "non_fast_forward" },
+      { type: "required_linear_history" }
+    ]
+  };
+  const run = (
+    environment: Record<string, unknown>,
+    extraEnv: Record<string, string> = {}
+  ) => spawnSync(
     process.execPath,
     ["scripts/repository/configure-github.ts", "BlueDot-IT/Odinn-Forge", "8335428"],
     {
@@ -130,6 +188,8 @@ if (endpoint.endsWith("/environments/release") && method === "GET") {
       env: {
         ...process.env,
         PATH: `${bin}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
+        FAKE_BRANCH_PROTECTION: JSON.stringify(branchProtection),
+        FAKE_RULESET: JSON.stringify(ruleset),
         FAKE_RELEASE_ENVIRONMENT: JSON.stringify(environment),
         ...extraEnv
       }
@@ -137,6 +197,10 @@ if (endpoint.endsWith("/environments/release") && method === "GET") {
   );
 
   assert.notEqual(run(effective(), { FAKE_RELEASE_PUT_FAIL: "1" }).status, 0);
+  assert.notEqual(run(effective(), { FAKE_BRANCH_PROTECTION: "{}" }).status, 0);
+  assert.notEqual(run(effective(), {
+    FAKE_RULESET: JSON.stringify({ ...ruleset, enforcement: "disabled" })
+  }).status, 0);
   assert.notEqual(run(effective({ protection_rules: [] })).status, 0);
   assert.notEqual(run(effective({
     deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }
