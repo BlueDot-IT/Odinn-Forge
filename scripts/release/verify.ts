@@ -4,6 +4,7 @@ import { lstat, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -74,6 +75,37 @@ function run(command: string, args: string[]): void {
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(" ")} failed: ${result.error?.message || result.stderr || result.stdout}`);
   }
+}
+
+function retainsTypeScriptRuntimeReference(path: string, content: string): boolean {
+  const source = ts.createSourceFile(path, content, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
+  let found = false;
+  const isTypeScriptPath = (node: ts.Node | undefined): boolean =>
+    Boolean(node && ts.isStringLiteralLike(node) && /\.ts(?:[?#].*)?$/i.test(node.text));
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && isTypeScriptPath(node.moduleSpecifier)) {
+      found = true;
+      return;
+    }
+    if (ts.isCallExpression(node)
+      && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || (ts.isIdentifier(node.expression) && node.expression.text === "require"))
+      && isTypeScriptPath(node.arguments[0])) {
+      found = true;
+      return;
+    }
+    if (ts.isNewExpression(node)
+      && ts.isIdentifier(node.expression)
+      && node.expression.text === "URL"
+      && isTypeScriptPath(node.arguments?.[0])) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
 }
 
 async function walk(directory: string, prefix = ""): Promise<string[]> {
@@ -177,7 +209,7 @@ for (const extension of ["zip", "tar.gz"]) {
     }
     for (const path of files.filter((name) => name.endsWith(".js"))) {
       const content = await readFile(join(packageRoot, path), "utf8");
-      if (/(?:from\s*|import\s*\()\s*["'][^"']+\.ts["']|new URL\(\s*["'][^"']+\.ts["']/i.test(content)) {
+      if (retainsTypeScriptRuntimeReference(path, content)) {
         throw new Error(`${path} retains a runtime reference to TypeScript source`);
       }
     }

@@ -418,6 +418,7 @@ test("release packaging removes stale assets before creating a version", async (
     "packages/kernel/src/task-worker.ts",
     "packages/kernel/src/browser-worker.ts"
   ]) assert.match(build, new RegExp(entrypoint.replaceAll("/", "\\/")));
+  assert.match(build, /createRequire as __odinnCreateRequire/);
   assert.match(build, /sourcemap: "external"/);
 
   const installSmoke = await read("scripts/release/install-smoke.ts");

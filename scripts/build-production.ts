@@ -22,6 +22,9 @@ await rm(join(output, buildInfoFile), { force: true });
 
 await build({
   absWorkingDir: root,
+  banner: {
+    js: 'import { createRequire as __odinnCreateRequire } from "node:module"; const require = __odinnCreateRequire(import.meta.url);'
+  },
   bundle: true,
   define: { __ODINN_COMPILED__: "true" },
   entryPoints: {
