@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ChannelRouter, FileSessionBindingStore, channelConversationKey, createAllowlistPolicy, splitChannelText,
-  type ChannelAdapter, type InboundChannelMessage, type OutboundChannelMessage
+  type ChannelAcknowledgement, type ChannelAdapter, type InboundChannelMessage, type OutboundChannelMessage
 } from "../packages/channels/src/index.ts";
 import { normalizeTelegramUpdate } from "../adapters/channels/telegram/src/index.ts";
 import { DiscordChannelAdapter, normalizeDiscordMessage } from "../adapters/channels/discord/src/index.ts";
@@ -23,10 +23,14 @@ function message(overrides: Partial<InboundChannelMessage> = {}): InboundChannel
 class FixtureAdapter implements ChannelAdapter {
   readonly id = "fixture";
   readonly sent: OutboundChannelMessage[] = [];
+  readonly acknowledgements: Array<{ id: string; acknowledgement: ChannelAcknowledgement }> = [];
   deliver?: (message: InboundChannelMessage) => Promise<void>;
   async start(deliver: (message: InboundChannelMessage) => Promise<void>): Promise<void> { this.deliver = deliver; }
   async stop(): Promise<void> {}
   async send(output: OutboundChannelMessage): Promise<void> { this.sent.push(output); }
+  async acknowledge(input: InboundChannelMessage, acknowledgement: ChannelAcknowledgement): Promise<void> {
+    this.acknowledgements.push({ id: input.id, acknowledgement });
+  }
 }
 
 test("channel router enforces allowlists, deduplicates deliveries, and returns replies", async () => {
@@ -41,6 +45,33 @@ test("channel router enforces allowlists, deduplicates deliveries, and returns r
   await adapter.deliver?.(message({ id: "11", sender: { id: "blocked" } }));
   assert.deepEqual(handled, ["10"]);
   assert.deepEqual(adapter.sent.map((entry) => entry.text), ["reply:Hello"]);
+  assert.deepEqual(adapter.acknowledgements, [
+    { id: "10", acknowledgement: "processing" },
+    { id: "10", acknowledgement: "succeeded" }
+  ]);
+});
+
+test("channel acknowledgements report failures without changing delivery semantics", async () => {
+  const adapter = new FixtureAdapter();
+  const errors: string[] = [];
+  const router = new ChannelRouter({
+    async handle() { throw new Error("model failed"); }
+  }, {
+    onError(error) { errors.push(error instanceof Error ? error.message : String(error)); }
+  });
+  await router.attach(adapter);
+  await adapter.deliver?.(message());
+  assert.deepEqual(adapter.acknowledgements, [
+    { id: "10", acknowledgement: "processing" },
+    { id: "10", acknowledgement: "failed" }
+  ]);
+  assert.deepEqual(errors, ["model failed"]);
+
+  adapter.acknowledge = async () => { throw new Error("reaction denied"); };
+  const successful = new ChannelRouter({ async handle() { return "reply"; } });
+  await successful.attach(adapter);
+  await adapter.deliver?.(message({ id: "11" }));
+  assert.equal(adapter.sent.at(-1)?.text, "reply");
 });
 
 test("channel router serializes messages within a conversation", async () => {
@@ -145,6 +176,28 @@ test("Discord replies disable mention parsing and respect the 2000-character lim
   assert.deepEqual(requests[0].body.allowed_mentions, { parse: [], replied_user: false });
   assert.equal(requests[0].body.message_reference.message_id, "900");
   assert.equal(requests[1].body.message_reference, undefined);
+});
+
+test("Discord acknowledgements replace the processing reaction with a terminal reaction", async () => {
+  const requests: Array<{ method: string; url: string }> = [];
+  const adapter = new DiscordChannelAdapter({
+    token: "test-token",
+    fetch: async (input, init) => {
+      requests.push({ method: String(init?.method), url: String(input) });
+      return new Response(null, { status: 204 });
+    }
+  });
+  const input = message({
+    id: "900",
+    address: { channel: "discord", accountId: "community", conversationId: "800", conversationKind: "channel" }
+  });
+
+  await adapter.acknowledge(input, "processing");
+  await adapter.acknowledge(input, "succeeded");
+
+  assert.deepEqual(requests.map((entry) => entry.method), ["PUT", "DELETE", "PUT"]);
+  assert.match(requests[0].url, /reactions\/%F0%9F%91%80\/@me$/u);
+  assert.match(requests[2].url, /reactions\/%E2%9C%85\/@me$/u);
 });
 
 test("Discord Gateway identifies and delivers normalized message events", async () => {

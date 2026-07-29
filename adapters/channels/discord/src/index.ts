@@ -1,7 +1,12 @@
-import { type ChannelAdapter, type InboundChannelMessage, type OutboundChannelMessage, splitChannelText } from "@odinn/channels";
+import { type ChannelAcknowledgement, type ChannelAdapter, type InboundChannelMessage, type OutboundChannelMessage, splitChannelText } from "@odinn/channels";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const DISCORD_INTENTS = 1 | 512 | 4_096 | 32_768;
+const ACKNOWLEDGEMENT_EMOJI: Record<ChannelAcknowledgement, string> = {
+  processing: "👀",
+  succeeded: "✅",
+  failed: "❌"
+};
 
 interface SocketLike {
   addEventListener(type: string, listener: (event: any) => void): void;
@@ -70,6 +75,23 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         } : {}
       });
       first = false;
+    }
+  }
+
+  async acknowledge(message: InboundChannelMessage, acknowledgement: ChannelAcknowledgement): Promise<void> {
+    if (message.address.channel !== "discord") return;
+    const channelId = encodeURIComponent(message.address.conversationId);
+    const messageId = encodeURIComponent(message.id);
+    if (acknowledgement !== "processing") {
+      await this.#reaction(channelId, messageId, ACKNOWLEDGEMENT_EMOJI.processing, "DELETE").catch((error) => {
+        this.#onError?.(error);
+      });
+    }
+    try {
+      await this.#reaction(channelId, messageId, ACKNOWLEDGEMENT_EMOJI[acknowledgement], "PUT");
+    } catch (error) {
+      this.#onError?.(error);
+      throw error;
     }
   }
 
@@ -167,6 +189,19 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     const value = await response.json().catch(() => ({})) as Record<string, unknown>;
     if (!response.ok) throw new Error(discordError(value, response.status));
     return value;
+  }
+
+  async #reaction(channelId: string, messageId: string, emoji: string, method: "PUT" | "DELETE"): Promise<void> {
+    const response = await this.#fetch(
+      `${DISCORD_API}/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
+      {
+        method,
+        headers: { authorization: `Bot ${this.#token}` }
+      }
+    );
+    if (response.ok) return;
+    const value = await response.json().catch(() => ({})) as Record<string, unknown>;
+    throw new Error(discordError(value, response.status));
   }
 }
 

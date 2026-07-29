@@ -59,8 +59,8 @@ compatibility promise.
 
 Create an application and bot in the Discord Developer Portal. Enable the
 Message Content privileged Gateway intent on the Bot page, invite the bot with
-View Channel, Send Messages, and Read Message History permissions, and keep its
-token in an environment variable.
+View Channel, Send Messages, Read Message History, and Add Reactions
+permissions, and keep its token in an environment variable.
 
 Ódinn loads `.env` from the workspace root and then `.env` from the selected
 state directory. State values override workspace-file values, while variables
@@ -82,6 +82,9 @@ odinn start
 Discord server messages require an `@mention` by default, even in an
 allowlisted channel. Direct messages do not. Use `--require-mention false` only
 when the bot should process every message from an allowlisted server channel.
+Accepted messages receive `👀` while processing, replaced by `✅` after a
+successful reply or `❌` when processing fails. Reaction failures never block
+message handling or replies.
 Outbound replies disable Discord mention parsing so model-generated text cannot
 unexpectedly ping users or roles.
 

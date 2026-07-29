@@ -7,11 +7,13 @@ export interface ChannelAddress { channel: string; accountId: string; conversati
 export interface ChannelSender { id: string; displayName?: string; username?: string }
 export interface InboundChannelMessage { id: string; address: ChannelAddress; sender: ChannelSender; text: string; receivedAt: string; replyToId?: string; metadata?: Record<string, unknown> }
 export interface OutboundChannelMessage { address: ChannelAddress; text: string; replyToId?: string }
+export type ChannelAcknowledgement = "processing" | "succeeded" | "failed";
 export interface ChannelAdapter {
   readonly id: string;
   start(deliver: (message: InboundChannelMessage) => Promise<void>): Promise<void>;
   stop(): Promise<void>;
   send(message: OutboundChannelMessage): Promise<void>;
+  acknowledge?(message: InboundChannelMessage, acknowledgement: ChannelAcknowledgement): Promise<void>;
 }
 export interface ChannelMessageHandler { handle(message: InboundChannelMessage): Promise<string | undefined> }
 export interface ChannelAccessPolicy { allows(message: InboundChannelMessage): boolean }
@@ -53,16 +55,27 @@ export class ChannelRouter {
     const deliveryKey = `${message.address.channel}:${message.address.accountId}:${message.id}`;
     if (this.#seen.has(deliveryKey)) return;
     this.#remember(deliveryKey);
+    await this.#acknowledge(adapter, message, "processing");
     const conversationKey = channelConversationKey(message.address);
     const previous = this.#queues.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
-      const reply = await this.#handler.handle(message);
-      if (reply?.trim()) await adapter.send({ address: message.address, text: reply, replyToId: message.id });
+      try {
+        const reply = await this.#handler.handle(message);
+        if (reply?.trim()) await adapter.send({ address: message.address, text: reply, replyToId: message.id });
+        await this.#acknowledge(adapter, message, "succeeded");
+      } catch (error) {
+        await this.#acknowledge(adapter, message, "failed");
+        throw error;
+      }
     }).catch((error) => this.#options.onError?.(error, message)).finally(() => {
       if (this.#queues.get(conversationKey) === current) this.#queues.delete(conversationKey);
     });
     this.#queues.set(conversationKey, current);
     await current;
+  }
+
+  async #acknowledge(adapter: ChannelAdapter, message: InboundChannelMessage, acknowledgement: ChannelAcknowledgement): Promise<void> {
+    await adapter.acknowledge?.(message, acknowledgement).catch(() => undefined);
   }
 
   #remember(key: string): void {
