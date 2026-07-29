@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,7 +29,7 @@ async function execute(fx: Awaited<ReturnType<typeof fixture>>, id: string, tool
   });
 }
 
-async function modelFixture(responder?: (request: any, index: number) => any) {
+async function modelFixture(responder?: (request: any, index: number) => any, { providerId = "test" } = {}) {
   const requests: any[] = [];
   const provider = createHttpServer(async (request, response) => {
     let raw = "";
@@ -45,9 +45,9 @@ async function modelFixture(responder?: (request: any, index: number) => any) {
   const address = provider.address();
   if (!address || typeof address === "string") throw new Error("mock provider did not bind a TCP port");
   const fx = await fixture({
-    defaultModel: "test:test-model",
+    defaultModel: `${providerId}:test-model`,
     providers: {
-      test: {
+      [providerId]: {
         type: "openai-compatible",
         baseUrl: `http://127.0.0.1:${address.port}/v1`,
         models: ["test-model"]
@@ -386,6 +386,310 @@ test("agent.run aggregates provider usage across tool-calling model turns", asyn
     await fx.close();
   }
 });
+
+test("agent.run performs one auditable Ollama reasoning-budget recovery", async () => {
+  const fx = await modelFixture((request) => request.max_tokens < 900 ? {
+    id: "agent_reasoning_exhausted",
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "",
+        reasoning: "The model used the available output budget while reasoning."
+      }
+    }]
+  } : {
+    id: "agent_reasoning_recovered",
+    choices: [{ message: { role: "assistant", content: "- First\n- Second\n- Third" } }]
+  }, { providerId: "ollama" });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat"] });
+  try {
+    const result = await execute(fx, "agent_reasoning_budget_recovery", "agent.run", {
+      model: "ollama:test-model",
+      prompt: "Return exactly three bullets.",
+      maxTokens: 180,
+      retries: 0
+    }, policy);
+    assert.equal(result.output.content, "- First\n- Second\n- Third");
+    assert.deepEqual(fx.requests.map((request) => request.max_tokens), [180, 900]);
+    assert.deepEqual(result.output.modelRecovery, {
+      performed: true,
+      providerId: "ollama",
+      modelId: "test-model",
+      reason: "reasoning-budget-exhausted",
+      fromMaxTokens: 180,
+      toMaxTokens: 900
+    });
+    assert.deepEqual(result.output.answerShape, {
+      constraints: [{ type: "bullet-count", expected: 3, actual: 3, satisfied: true }],
+      warnings: []
+    });
+    const attempts = (await fx.auditStore.readRun("agent_reasoning_budget_recovery"))?.events
+      .filter((event: any) => event.type === "provider.attempt");
+    assert.ok(attempts?.some((event: any) =>
+      event.data.status === "budget-recovery"
+      && event.data.fromMaxTokens === 180
+      && event.data.toMaxTokens === 900));
+  } finally {
+    await fx.close();
+  }
+});
+
+test("agent.run reports explicit bullet-count mismatches without rewriting the answer", async () => {
+  const candidate = "- One\n- Two\n- Three\n- Pause all invoicing";
+  const fx = await modelFixture(() => ({
+    id: "agent_shape_mismatch",
+    choices: [{ message: { role: "assistant", content: candidate } }]
+  }));
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat"] });
+  try {
+    const result = await execute(fx, "agent_shape_mismatch", "agent.run", {
+      model: "test:test-model",
+      prompt: "Give exactly three bullets."
+    }, policy);
+    assert.equal(result.output.content, candidate);
+    assert.deepEqual(result.output.answerShape, {
+      constraints: [{ type: "bullet-count", expected: 3, actual: 4, satisfied: false }],
+      warnings: [{
+        code: "ANSWER_SHAPE_MISMATCH",
+        message: "The answer has 4 bullet points; the request explicitly required 3."
+      }]
+    });
+    assert.equal(fx.requests.length, 1);
+  } finally {
+    await fx.close();
+  }
+});
+
+test("agent.run emits ordered privacy-safe progress around browser work", async () => {
+  const fx = await modelFixture((_request, index) => index === 1 ? {
+    id: "agent_progress_browser",
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call_progress_browser",
+          type: "function",
+          function: { name: "browser_x2e_open", arguments: '{"url":"https://private.example/account"}' }
+        }]
+      }
+    }]
+  } : {
+    id: "agent_progress_final",
+    choices: [{ message: { role: "assistant", content: "Browser task complete." } }]
+  });
+  fx.registry.set("browser.open", {
+    capability: "browser.read",
+    description: "Open a URL and return its title, URL, visible text, links, and snapshot id. Use browser.snapshot only after the page changes.",
+    inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+    execute: async () => ({
+      id: "tab_progress",
+      url: "https://private.example/account",
+      title: "Private account",
+      text: "Sensitive page text",
+      links: [],
+      snapshotId: "snapshot_progress"
+    })
+  });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "browser.read"] });
+  const progress: any[] = [];
+  try {
+    const result = await runTask({
+      task: {
+        id: "agent_progress_browser",
+        tool: "agent.run",
+        input: { model: "test:test-model", prompt: "Open the page and report its title." },
+        actor: "test"
+      },
+      auditStore: fx.auditStore,
+      registry: fx.registry,
+      policy,
+      onAgentProgress: (event: any) => progress.push(event)
+    });
+    assert.equal(result.output.content, "Browser task complete.");
+    assert.deepEqual(progress.map((event) => event.stage), ["drafting-answer", "page-opened", "drafting-answer"]);
+    assert.equal(JSON.stringify(progress).includes("private.example"), false);
+    assert.equal(JSON.stringify(progress).includes("Sensitive page text"), false);
+    const recorded = (await fx.auditStore.readRun("agent_progress_browser"))?.events
+      .filter((event: any) => event.type === "agent.progress");
+    assert.deepEqual(recorded?.map((event: any) => event.data.stage), progress.map((event) => event.stage));
+  } finally {
+    await fx.close();
+  }
+});
+
+test("agent.run exposes registry-derived readText schema and permits one safe correction", async () => {
+  const fx = await modelFixture((_request, index) => index === 1 ? {
+    id: "agent_recovery_turn_1",
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call_missing",
+          type: "function",
+          function: { name: "workspace_x2e_readText", arguments: '{"query":"eval-fixture.txt"}' }
+        }]
+      }
+    }]
+  } : index === 2 ? {
+    id: "agent_recovery_turn_2",
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call_corrected_read",
+          type: "function",
+          function: { name: "workspace_x2e_readText", arguments: '{"path":"eval-fixture.txt","maxBytes":1024}' }
+        }]
+      }
+    }]
+  } : {
+    id: "agent_recovery_turn_3",
+    choices: [{ message: { role: "assistant", content: "GO: fixture is ready." } }]
+  });
+  await writeFile(join(fx.root, "eval-fixture.txt"), "status=ready\n", "utf8");
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "workspace.readText"] });
+  try {
+    const result = await execute(fx, "agent_tool_recovery", "agent.run", {
+      model: "test:test-model",
+      prompt: "Read eval-fixture.txt and give a go/no-go recommendation."
+    }, policy);
+    assert.equal(result.output.content, "GO: fixture is ready.");
+    const readSchema = fx.requests[0].tools.find((schema: any) => schema.function.name === "workspace_x2e_readText");
+    assert.equal(readSchema.function.description, "Read a UTF-8 text file confined to the workspace root.");
+    assert.deepEqual(readSchema.function.parameters.required, ["path"]);
+    assert.equal(readSchema.function.parameters.properties.maxBytes.type, "integer");
+    const failedToolResult = fx.requests[1].messages.find((message: any) => message.role === "tool" && message.tool_call_id === "call_missing");
+    assert.deepEqual(JSON.parse(failedToolResult.content), {
+      ok: false,
+      error: {
+        code: "TOOL_ERROR",
+        message: "The tool could not complete the requested operation. Inspect the input and try a valid alternative."
+      }
+    });
+    const correctedToolResult = fx.requests[2].messages.find((message: any) => message.role === "tool" && message.tool_call_id === "call_corrected_read");
+    assert.equal(JSON.parse(correctedToolResult.content).content, "status=ready\n");
+    assert.doesNotMatch(failedToolResult.content, new RegExp(fx.root.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+  } finally {
+    await fx.close();
+  }
+});
+
+test("agent.run permits at most one retry-safe tool correction", async () => {
+  const fx = await modelFixture((_request, index) => ({
+    id: `agent_safe_failure_${index}`,
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: `call_bad_read_${index}`,
+          type: "function",
+          function: { name: "workspace_x2e_readText", arguments: `{"query":"attempt-${index}"}` }
+        }]
+      }
+    }]
+  }));
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "workspace.readText"] });
+  try {
+    await assert.rejects(
+      execute(fx, "agent_safe_failure_limit", "agent.run", {
+        model: "test:test-model",
+        prompt: "Read the fixture."
+      }, policy),
+      /workspace\.readText requires path/u
+    );
+    assert.equal(fx.requests.length, 2);
+    assert.ok(fx.requests[1].messages.some((message: any) => message.tool_call_id === "call_bad_read_1"));
+  } finally {
+    await fx.close();
+  }
+});
+
+test("agent.run cancels sibling calls after a retry-safe read failure", async () => {
+  const fx = await modelFixture((_request, index) => index === 1 ? {
+    id: "agent_sibling_cancel_turn_1",
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "call_bad_read",
+            type: "function",
+            function: { name: "workspace_x2e_readText", arguments: '{"query":"fixture.txt"}' }
+          },
+          {
+            id: "call_unsafe_sibling",
+            type: "function",
+            function: { name: "browser_x2e_click", arguments: '{"selector":"#submit"}' }
+          }
+        ]
+      }
+    }]
+  } : {
+    id: "agent_sibling_cancel_turn_2",
+    choices: [{ message: { role: "assistant", content: "Stopped and corrected." } }]
+  });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "workspace.readText", "browser.act"] });
+  try {
+    const result = await execute(fx, "agent_sibling_cancel", "agent.run", {
+      model: "test:test-model",
+      prompt: "Read the fixture before doing anything else."
+    }, policy);
+    assert.equal(result.output.content, "Stopped and corrected.");
+    const cancelled = fx.requests[1].messages.find((message: any) => message.tool_call_id === "call_unsafe_sibling");
+    assert.deepEqual(JSON.parse(cancelled.content), {
+      ok: false,
+      error: {
+        code: "TOOL_CALL_CANCELLED",
+        message: "The tool call was not executed because an earlier retry-safe tool call requires correction."
+      }
+    });
+  } finally {
+    await fx.close();
+  }
+});
+
+for (const scenario of [{
+  label: "browser work",
+  tool: "browser_x2e_open",
+  arguments: "{}",
+  capability: "browser.read",
+  error: /browser\.open requires url/u
+}]) {
+  test(`agent.run does not expose failed ${scenario.label} to the model for retry`, async () => {
+    const fx = await modelFixture(() => ({
+      id: `agent_${scenario.tool}_failure`,
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "",
+          tool_calls: [{
+            id: `call_${scenario.tool}_failure`,
+            type: "function",
+            function: { name: scenario.tool, arguments: scenario.arguments }
+          }]
+        }
+      }]
+    }));
+    const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", scenario.capability] });
+    try {
+      await assert.rejects(
+        execute(fx, `agent_${scenario.tool}_failure`, "agent.run", {
+          model: "test:test-model",
+          prompt: "Perform the requested operation."
+        }, policy),
+        scenario.error
+      );
+      assert.equal(fx.requests.length, 1);
+    } finally {
+      await fx.close();
+    }
+  });
+}
 
 test("agent.run preserves aggregated usage when a later tool requires approval", async () => {
   const fx = await modelFixture((_request, index) => index === 1 ? {

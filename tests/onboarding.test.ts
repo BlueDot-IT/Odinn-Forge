@@ -60,6 +60,33 @@ async function configureMockProvider(state: string, baseUrl: string) {
   assert.equal(result.code, 0, result.stderr || result.stdout);
 }
 
+test("combined provider onboarding configures the requested model before verification", async () => {
+  const mock = await modelServer(200);
+  const state = await createStatePath("odinn-onboarding-configure-verify-");
+  try {
+    const result = await runCli([
+      "onboard",
+      "--provider", "onboarding-test",
+      "--base-url", mock.baseUrl,
+      "--model", "combined-model",
+      "--api-key-env", testApiKeyEnv,
+      "--verify",
+      "--non-interactive",
+      "--state", state
+    ], { env: { [testApiKeyEnv]: "combined-verification-key" } });
+
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /AI connection verified/i);
+    const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
+    assert.equal(config.defaultModel, "onboarding-test:combined-model");
+    assert.deepEqual(config.providers["onboarding-test"].models, ["combined-model"]);
+    assert.equal(mock.requests.length, 1);
+    assert.equal(mock.requests[0].authorization, "Bearer combined-verification-key");
+  } finally {
+    await mock.close();
+  }
+});
+
 async function modelServer(statusCode: number) {
   const requests: Array<{ url?: string; authorization?: string }> = [];
   const server = createServer(async (request, response) => {

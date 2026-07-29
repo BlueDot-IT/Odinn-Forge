@@ -78,6 +78,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["workspace.readText", {
       capability: "workspace.readText",
       description: "Read a UTF-8 text file confined to the workspace root.",
+      inputSchema: { type: "object", properties: { path: { type: "string" }, maxBytes: { type: "integer" } }, required: ["path"] },
       execute: async ({ path, maxBytes = 65_536 }: any) => {
         if (typeof path !== "string" || path.trim() === "") throw new Error("workspace.readText requires path");
         const realRoot = await realpath(root);
@@ -100,46 +101,55 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["web.search", {
       capability: "web.read",
       description: "Search the public web and return ranked results with snippets.",
+      inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] },
       execute: async (input: any) => withWebRequestSlot(() => searchWeb(input))
     }],
     ["web.fetch", {
       capability: "web.read",
       description: "Fetch and extract readable content from a public web page.",
+      inputSchema: { type: "object", properties: { url: { type: "string" }, maxChars: { type: "integer" } }, required: ["url"] },
       execute: async (input: any, context: any) => withWebRequestSlot(() => fetchWebPage(input, context.policy?.security?.web, resolveNetworkAddresses))
     }],
     ["browser.tabs", {
       capability: "browser.read",
       description: "List tabs in Ódinn Forge's persistent browser profile.",
+      inputSchema: { type: "object", properties: {} },
       execute: async (_input: any, context: any) => browserTabs(stateDir, context.policy?.security?.browser)
     }],
     ["browser.open", {
       capability: "browser.read",
-      description: "Open a URL in Ódinn Forge's persistent browser profile.",
+      description: "Open a URL and return its title, URL, visible text, links, and snapshot id. Use browser.snapshot only after the page changes.",
+      inputSchema: { type: "object", properties: { url: { type: "string" }, tabId: { type: "string" } }, required: ["url"] },
       execute: async (input: any, context: any) => browserOpen(stateDir, input, context.policy?.security?.browser, resolveNetworkAddresses)
     }],
     ["browser.snapshot", {
       capability: "browser.read",
       description: "Read the visible page, title, and links from a browser tab.",
+      inputSchema: { type: "object", properties: { tabId: { type: "string" } } },
       execute: async (input: any, context: any) => browserSnapshot(stateDir, input, context.policy?.security?.browser)
     }],
     ["browser.click", {
       capability: "browser.act",
       description: "Click a browser control after explicit user approval.",
+      inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } },
       execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.type", {
       capability: "browser.act",
       description: "Fill a browser field after explicit user approval.",
+      inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] },
       execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.press", {
       capability: "browser.act",
       description: "Press a browser key after explicit user approval.",
+      inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] },
       execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.recovery.status", {
       capability: "browser.read",
       description: "Inspect unresolved browser mutations after a crash, tab loss, or uncertain action outcome.",
+      inputSchema: { type: "object", properties: {} },
       execute: async () => browserRecoveryStatus(stateDir)
     }],
     ["browser.recovery.resolve", {
@@ -160,7 +170,8 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         policy: context.policy,
         signal: context.signal,
         onModelDelta: context.onModelDelta,
-        onProviderAttempt: context.onProviderAttempt
+        onProviderAttempt: context.onProviderAttempt,
+        onAgentProgress: context.onAgentProgress
       })
     }],
     ["model.chat", {
@@ -246,6 +257,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["memory.remember", {
       capability: "memory.write",
       description: "Store a typed, provenance-bearing memory record.",
+      inputSchema: { type: "object", properties: { text: { type: "string" }, kind: { type: "string", enum: ["project", "person", "artifact", "correction", "procedure", "decision", "preference", "system"] }, subject: { type: "string" }, tags: { type: "array", items: { type: "string" } }, expiresAt: { type: "string" } }, required: ["text"] },
       execute: async (input: any) => remember(recordStore, input)
     }],
     ["memory.suggest", {
@@ -271,11 +283,13 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["memory.recall", {
       capability: "memory.read",
       description: "Recall ranked memories relevant to the current task.",
+      inputSchema: { type: "object", properties: { query: { type: "string" }, kind: { type: "string" }, limit: { type: "integer" } }, required: ["query"] },
       execute: async (input: any) => recallMemory(recordStore, input)
     }],
     ["memory.browse", {
       capability: "memory.read",
       description: "Browse the hierarchical memory namespace.",
+      inputSchema: { type: "object", properties: { namespace: { type: "string" } } },
       execute: async (input: any) => browseMemory(recordStore, input)
     }],
     ["memory.open", {
@@ -412,28 +426,29 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       execute: async (input: any) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config })
     }]
   ]);
-  for (const [name, tool] of createDiscordAgentTools({ config, approvalStore, fetch: discordFetch })) registry.set(name, tool);
+  const discordSchemas = new Map(DISCORD_AGENT_TOOL_SCHEMAS.map((schema: any) => [schema.function.name, schema.function.parameters]));
+  for (const [name, tool] of createDiscordAgentTools({ config, approvalStore, fetch: discordFetch })) {
+    registry.set(name, { ...tool, inputSchema: discordSchemas.get(name) });
+  }
   return registry;
 }
 
 
-const AGENT_TOOL_SCHEMAS = [
-  { type: "function", function: { name: "memory.recall", description: "Recall durable user and project context relevant to the current task.", parameters: { type: "object", properties: { query: { type: "string" }, kind: { type: "string" }, limit: { type: "integer" } }, required: ["query"] } } },
-  { type: "function", function: { name: "memory.remember", description: "Store an explicit user-approved fact. Only use this when the user asks to remember something or clearly states a durable preference or fact.", parameters: { type: "object", properties: { text: { type: "string" }, kind: { type: "string", enum: ["project", "person", "artifact", "correction", "procedure", "decision", "preference", "system"] }, subject: { type: "string" }, tags: { type: "array", items: { type: "string" } }, expiresAt: { type: "string" } }, required: ["text"] } } },
-  { type: "function", function: { name: "memory.browse", description: "Browse durable context namespaces before opening a specific memory.", parameters: { type: "object", properties: { namespace: { type: "string" } } } } },
-  { type: "function", function: { name: "web.search", description: "Search the public web.", parameters: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] } } },
-  { type: "function", function: { name: "web.fetch", description: "Read a public web page.", parameters: { type: "object", properties: { url: { type: "string" }, maxChars: { type: "integer" } }, required: ["url"] } } },
-  { type: "function", function: { name: "browser.tabs", description: "List browser tabs.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "browser.open", description: "Open a page in the persistent browser profile.", parameters: { type: "object", properties: { url: { type: "string" }, tabId: { type: "string" } }, required: ["url"] } } },
-  { type: "function", function: { name: "browser.snapshot", description: "Read the current visible browser page.", parameters: { type: "object", properties: { tabId: { type: "string" } } } } },
-  { type: "function", function: { name: "browser.click", description: "Click a control; Ódinn Forge will ask for approval before changing external state.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } } } },
-  { type: "function", function: { name: "browser.type", description: "Fill a field; Ódinn Forge will ask for approval before submitting anything.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] } } },
-  { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn Forge will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
-  ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } },
-  ...DISCORD_AGENT_TOOL_SCHEMAS
-];
+function modelVisibleAgentToolSchemas(registry: any) {
+  return Array.from(registry?.entries?.() ?? []).flatMap(([name, tool]: any) => {
+    if (!tool?.inputSchema) return [];
+    return [{
+      type: "function",
+      function: {
+        name,
+        description: tool.description,
+        parameters: tool.inputSchema
+      }
+    }];
+  });
+}
 
-async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt }: any = {}) {
+async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt, onAgentProgress }: any = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const agent = await loadAgent(stateDir, cleanString(input.agentId, defaultAgentId || DEFAULT_AGENT_ID));
   const memoryOptions = normalizeMemoryOptions(input.memory);
@@ -457,43 +472,189 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
     ? await runMemoryTool("memory.compact", { sessionId: input.sessionId, messages }, "automatic session memory compaction")
     : undefined;
   const latestUserMessage = [...messages].reverse().find((message: any) => message.role === "user");
+  const recallStartedAt = Date.now();
+  if (memoryStore && canRecallMemory && memoryOptions.autoRecall && latestUserMessage?.content) {
+    await onAgentProgress?.({ stage: "recalling-memory", message: "Recalling relevant memory." });
+  }
   const recalled = memoryStore && canRecallMemory && memoryOptions.autoRecall && latestUserMessage?.content
     ? await runMemoryTool("memory.recall", { query: latestUserMessage.content, limit: memoryOptions.maxRecall, ...memoryScope }, "automatic memory recall")
     : { memories: [] };
+  if (memoryStore && canRecallMemory && memoryOptions.autoRecall && latestUserMessage?.content) {
+    await onAgentProgress?.({ stage: "memory-recalled", message: "Memory recall completed.", durationMs: Date.now() - recallStartedAt, count: recalled.memories.length });
+  }
   const systemMessage = `${agent.systemPrompt}\n\n## Runtime safety contract\nUse web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.`.trim();
   const existingSystem = messages.find((message: any) => message.role === "system");
   if (existingSystem) existingSystem.content = `${systemMessage}\n${existingSystem.content || ""}`.trim();
   else messages.unshift({ role: "system", content: systemMessage });
   if (recalled.memories.length) messages.splice(1, 0, { role: "system", content: formatMemoryContext(recalled.memories) });
   const maxTurns = Math.min(Math.max(Number(input.maxTurns) || 6, 1), 8);
-  const availableTools = AGENT_TOOL_SCHEMAS.filter((schema: any) => {
+  const availableTools = modelVisibleAgentToolSchemas(registry).filter((schema: any) => {
     return policyAllows(schema.function.name);
   });
   let aggregateUsage;
+  let toolRepairUsed = false;
+  let budgetRecoveryUsed = false;
+  let budgetRecovery;
   for (let turn = 0; turn < maxTurns; turn += 1) {
     throwIfAborted(signal);
+    await onAgentProgress?.({ stage: "drafting-answer", message: "Drafting the answer.", turn: turn + 1 });
     const selectedModel = input.model || agent.manifest.model.default || undefined;
-    const result: any = await chatWithModel(modelConfig, { model: selectedModel, messages, tools: availableTools, stream: true }, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
+    const modelRequest = {
+      model: selectedModel,
+      messages,
+      tools: availableTools,
+      stream: true,
+      ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens })
+    };
+    let result: any;
+    try {
+      result = await chatWithModel(modelConfig, modelRequest, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
+    } catch (error: any) {
+      const recovery = agentBudgetRecovery(error, selectedModel, input, budgetRecoveryUsed);
+      if (!recovery) throw error;
+      budgetRecoveryUsed = true;
+      budgetRecovery = recovery;
+      await onProviderAttempt?.({
+        attemptId: `budget_recovery_${randomUUID()}`,
+        providerId: recovery.providerId,
+        modelId: recovery.modelId,
+        status: "budget-recovery",
+        retryable: true,
+        fromMaxTokens: recovery.fromMaxTokens,
+        toMaxTokens: recovery.toMaxTokens,
+        reason: "reasoning-budget-exhausted"
+      });
+      result = await chatWithModel(modelConfig, {
+        ...modelRequest,
+        maxTokens: recovery.toMaxTokens
+      }, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
+    }
     aggregateUsage = mergeUsage(aggregateUsage, result.usage);
-    if (!result.toolCalls?.length) return { ...result, ...(aggregateUsage ? { usage: aggregateUsage } : {}), memory: { recalled: recalled.memories.length, suggested: learned.suggested.length, learned: 0, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 } };
+    if (!result.toolCalls?.length) {
+      return {
+        ...result,
+        ...(aggregateUsage ? { usage: aggregateUsage } : {}),
+        ...(budgetRecovery ? { modelRecovery: budgetRecovery } : {}),
+        ...answerShapeMetadata(latestUserMessage?.content, result.content),
+        memory: { recalled: recalled.memories.length, suggested: learned.suggested.length, learned: 0, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 }
+      };
+    }
     messages.push({ role: "assistant", content: result.content || "", tool_calls: result.toolCalls });
-    for (const call of result.toolCalls) {
+    for (const [callIndex, call] of result.toolCalls.entries()) {
       let args;
       try { args = JSON.parse(call.arguments || "{}"); } catch { args = {}; }
-      const nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
+      let nested;
+      try {
+        nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
+      } catch (error: any) {
+        throwIfAborted(signal);
+        const safety = toolSafetyDescriptor(call.name, registry?.get?.(call.name));
+        if (!safety.retrySafe || toolRepairUsed) throw error;
+        toolRepairUsed = true;
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify({
+            ok: false,
+            error: {
+              code: cleanString(error?.code, "TOOL_ERROR"),
+              message: agentToolFailureMessage(error)
+            }
+          })
+        });
+        for (const cancelled of result.toolCalls.slice(callIndex + 1)) {
+          messages.push({
+            role: "tool",
+            tool_call_id: cancelled.id,
+            content: JSON.stringify({
+              ok: false,
+              error: {
+                code: "TOOL_CALL_CANCELLED",
+                message: "The tool call was not executed because an earlier retry-safe tool call requires correction."
+              }
+            })
+          });
+        }
+        break;
+      }
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(nested.output) });
+      if (call.name === "browser.open") {
+        await onAgentProgress?.({
+          stage: "page-opened",
+          message: "Page opened and snapshot captured.",
+          tabId: cleanString(nested.output?.id, ""),
+          snapshotId: cleanString(nested.output?.snapshotId, "")
+        });
+      }
       if (nested.output?.type === "approval.required") {
         return {
           ...result,
           ...(aggregateUsage ? { usage: aggregateUsage } : {}),
           content: `I need your approval before I ${nested.output.summary.toLowerCase()}.`,
           pendingApproval: nested.output,
+          ...(budgetRecovery ? { modelRecovery: budgetRecovery } : {}),
           memory: { recalled: recalled.memories.length, suggested: learned.suggested.length, learned: 0, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 }
         };
       }
     }
   }
   throw new Error(`agent reached its ${maxTurns}-turn tool limit`);
+}
+
+function agentToolFailureMessage(error: any) {
+  if (error?.code === "ENOENT") return "The requested file or resource was not found. Inspect the workspace and try a valid path.";
+  if (error?.code === "EACCES" || error?.code === "EPERM") return "The requested operation was not permitted.";
+  return "The tool could not complete the requested operation. Inspect the input and try a valid alternative.";
+}
+
+function agentBudgetRecovery(error: any, selectedModel: any, input: any, alreadyUsed: boolean) {
+  if (alreadyUsed || input.reasoningBudgetRecovery === false || error?.code !== "MODEL_REASONING_BUDGET_EXHAUSTED") return undefined;
+  const modelRef = cleanString(selectedModel, "");
+  const separator = modelRef.indexOf(":");
+  const providerId = separator > 0 ? modelRef.slice(0, separator) : "";
+  if (providerId.toLowerCase() !== "ollama") return undefined;
+  const fromMaxTokens = Number.parseInt(String(input.maxTokens ?? ""), 10);
+  if (!Number.isFinite(fromMaxTokens) || fromMaxTokens < 1 || fromMaxTokens >= 4_096) return undefined;
+  const toMaxTokens = Math.min(4_096, Math.max(900, fromMaxTokens * 4, fromMaxTokens + 512));
+  return {
+    performed: true,
+    providerId,
+    modelId: separator > 0 ? modelRef.slice(separator + 1) : modelRef,
+    reason: "reasoning-budget-exhausted",
+    fromMaxTokens,
+    toMaxTokens
+  };
+}
+
+function answerShapeMetadata(request: any, content: any) {
+  const expected = requestedBulletCount(request);
+  if (!expected) return {};
+  const text = String(content ?? "");
+  const actual = text.split(/\r?\n/u).filter((line) => /^\s{0,3}[-*+]\s+\S/u.test(line)).length;
+  if (actual === expected) return {
+    answerShape: {
+      constraints: [{ type: "bullet-count", expected, actual, satisfied: true }],
+      warnings: []
+    }
+  };
+  return {
+    answerShape: {
+      constraints: [{ type: "bullet-count", expected, actual, satisfied: false }],
+      warnings: [{
+        code: "ANSWER_SHAPE_MISMATCH",
+        message: `The answer has ${actual} bullet points; the request explicitly required ${expected}.`
+      }]
+    }
+  };
+}
+
+function requestedBulletCount(value: any) {
+  const text = String(value ?? "");
+  const match = text.match(/\b(?:exactly\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:bullet|bullets|bullet\s+points?)\b/iu);
+  if (!match) return undefined;
+  const words: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+  const expected = words[match[1]!.toLowerCase()] ?? Number.parseInt(match[1]!, 10);
+  return Number.isFinite(expected) && expected > 0 ? expected : undefined;
 }
 
 function stableTaskValue(value: any): string {
@@ -518,6 +679,7 @@ export async function runTask({
   runLedger,
   onModelDelta,
   onProviderAttempt,
+  onAgentProgress,
   trustedApprovalId,
   trustedApprovalRunId
 }: any) {
@@ -642,6 +804,20 @@ export async function runTask({
       signal,
       onModelDelta,
       onProviderAttempt: async (attempt: any) => auditStore.append({ at: now(), runId: request.id, type: "provider.attempt", actor: request.actor, tool: request.tool, capability: tool.capability, decision: "allow", data: attempt }),
+      onAgentProgress: async (progress: any) => {
+        await auditStore.append({
+          at: now(),
+          runId: request.id,
+          type: "agent.progress",
+          actor: request.actor,
+          tool: request.tool,
+          capability: tool.capability,
+          decision: "allow",
+          message: cleanString(progress?.message, "Agent progress"),
+          data: safeAuditValue(progress)
+        });
+        await onAgentProgress?.(progress);
+      },
       runLedger,
       capability: capabilityClaims,
       trustedApprovalId,
@@ -655,7 +831,8 @@ export async function runTask({
         signal,
         runLedger: nestedTask.runLedger ?? runLedger,
         onModelDelta,
-        onProviderAttempt
+        onProviderAttempt,
+        onAgentProgress
       })
     });
     throwIfAborted(signal);
