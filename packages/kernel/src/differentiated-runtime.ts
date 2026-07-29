@@ -371,16 +371,20 @@ export class Sentinel {
   evaluate({ runId, stepId, toolName, input, policy, workspaceRoot = process.cwd() }: AnyRecord) {
     const normalizedPolicy = validatePolicy(policy);
     const policyId = policy.id ?? `policy_${runId}_${hash(json(redact(policy))).slice(0, 16)}`;
-    this.ledger.database.db.prepare("INSERT OR IGNORE INTO policies(id, run_id, policy_json, created_at) VALUES (?, ?, ?, ?)").run(policyId, runId, json(redact(policy)), now());
     const evaluations = evaluatePolicyInvariants({
       policy: normalizedPolicy as any,
       request: { tool: toolName, input },
       workspaceRoot
     }).map((result) => {
-      const evaluation = { id: randomUUID(), runId, stepId, policyId, ...result, input: redact({ toolName, input }), createdAt: now() };
-      this.ledger.database.db.prepare("INSERT INTO policy_evaluations(id, run_id, step_id, policy_id, invariant_id, decision, enforcement, reason, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(evaluation.id, runId, stepId ?? null, evaluation.policyId, evaluation.invariantId, evaluation.decision, evaluation.enforcement, evaluation.reason, json(evaluation.input), evaluation.createdAt);
-      this.ledger.appendEvent({ runId, type: "policy-check", payload: evaluation });
-      return evaluation;
+      return { id: randomUUID(), runId, stepId, policyId, ...result, input: redact({ toolName, input }), createdAt: now() };
+    });
+    this.ledger.database.transaction((db: AnyRecord) => {
+      db.prepare("INSERT OR IGNORE INTO policies(id, run_id, policy_json, created_at) VALUES (?, ?, ?, ?)").run(policyId, runId, json(redact(policy)), now());
+      const insertEvaluation = db.prepare("INSERT INTO policy_evaluations(id, run_id, step_id, policy_id, invariant_id, decision, enforcement, reason, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const evaluation of evaluations) {
+        insertEvaluation.run(evaluation.id, runId, stepId ?? null, evaluation.policyId, evaluation.invariantId, evaluation.decision, evaluation.enforcement, evaluation.reason, json(evaluation.input), evaluation.createdAt);
+        this.ledger.appendEventUnsafe(db, { runId, type: "policy-check", payload: evaluation, timestamp: evaluation.createdAt });
+      }
     });
     const blocked = evaluations.find((item) => ["block", "terminate", "rollback", "pause"].includes(item.decision));
     if (blocked) throw new OdinnRuntimeError("POLICY_VIOLATION", blocked.reason, { evaluation: blocked });

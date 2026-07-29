@@ -21,8 +21,28 @@ test("Sentinel blocks a denied command before execution and records the decision
   const { runtime } = await fixture();
   try {
     runtime.ledger.ensureRun({ runId: "run-sentinel", objective: "policy test" });
-    assert.throws(() => runtime.sentinel.evaluate({ runId: "run-sentinel", toolName: "process.exec", input: { command: "terraform apply" }, policy: { version: 1, invariants: [{ id: "deny", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] } }), (error: any) => error instanceof OdinnRuntimeError && error.code === "POLICY_VIOLATION");
-    assert.equal(runtime.ledger.database.db.prepare("SELECT COUNT(*) count FROM policy_evaluations WHERE run_id = ?").get("run-sentinel").count, 1);
+    let transactions = 0;
+    const transaction = runtime.ledger.database.transaction.bind(runtime.ledger.database);
+    runtime.ledger.database.transaction = (callback: any) => {
+      transactions += 1;
+      return transaction(callback);
+    };
+    assert.throws(() => runtime.sentinel.evaluate({
+      runId: "run-sentinel",
+      toolName: "process.exec",
+      input: { command: "terraform apply" },
+      policy: {
+        version: 1,
+        invariants: [
+          { id: "allow-unrelated", type: "command.deny-pattern", values: ["rm -rf"], enforcement: "block" },
+          { id: "deny", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }
+        ]
+      }
+    }), (error: any) => error instanceof OdinnRuntimeError && error.code === "POLICY_VIOLATION");
+    assert.equal(transactions, 1);
+    assert.equal(runtime.ledger.database.db.prepare("SELECT COUNT(*) count FROM policy_evaluations WHERE run_id = ?").get("run-sentinel").count, 2);
+    assert.equal(runtime.ledger.getRun("run-sentinel").events.filter((event: any) => event.type === "policy-check").length, 2);
+    assert.equal(runtime.ledger.verify("run-sentinel").valid, true);
   } finally { runtime.ledger.close(); }
 });
 
@@ -38,6 +58,37 @@ test("Sentinel applies typed invariants without matching command text in unrelat
       () => runtime.sentinel.evaluate({ runId: "sentinel-root", toolName: "workspace.readText", input: { path: "outside.txt" }, policy: rootPolicy, workspaceRoot: root }),
       (error: any) => error.code === "POLICY_VIOLATION"
     );
+  } finally { runtime.ledger.close(); }
+});
+
+test("Sentinel rolls back the complete evaluation batch when evidence persistence fails", async () => {
+  const { runtime } = await fixture();
+  try {
+    const runId = "sentinel-atomic-batch";
+    runtime.ledger.ensureRun({ runId, objective: "atomic policy evidence" });
+    const appendEventUnsafe = runtime.ledger.appendEventUnsafe.bind(runtime.ledger);
+    let events = 0;
+    runtime.ledger.appendEventUnsafe = (...args: any[]) => {
+      events += 1;
+      if (events === 2) throw new Error("injected policy evidence failure");
+      return appendEventUnsafe(...args);
+    };
+    assert.throws(() => runtime.sentinel.evaluate({
+      runId,
+      toolName: "text.echo",
+      input: { text: "safe" },
+      policy: {
+        version: 1,
+        invariants: [
+          { id: "first", type: "command.deny-pattern", values: ["never"], enforcement: "block" },
+          { id: "second", type: "command.deny-pattern", values: ["still-never"], enforcement: "block" }
+        ]
+      }
+    }), /injected policy evidence failure/);
+    runtime.ledger.appendEventUnsafe = appendEventUnsafe;
+    assert.equal(runtime.ledger.database.db.prepare("SELECT COUNT(*) count FROM policies WHERE run_id = ?").get(runId).count, 0);
+    assert.equal(runtime.ledger.database.db.prepare("SELECT COUNT(*) count FROM policy_evaluations WHERE run_id = ?").get(runId).count, 0);
+    assert.equal(runtime.ledger.getRun(runId).events.length, 0);
   } finally { runtime.ledger.close(); }
 });
 
