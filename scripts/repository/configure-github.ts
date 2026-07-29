@@ -34,8 +34,7 @@ const requiredChecks = [
   "Dependency and lockfile audit",
   "Secret scan",
   "actionlint",
-  "Conventional title",
-  "Documentation impact"
+  "Conventional title"
 ];
 
 function isEnabled(value: any) {

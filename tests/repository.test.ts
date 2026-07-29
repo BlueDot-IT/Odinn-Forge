@@ -154,8 +154,7 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
         "Dependency and lockfile audit",
         "Secret scan",
         "actionlint",
-        "Conventional title",
-        "Documentation impact"
+        "Conventional title"
       ]
     },
     required_pull_request_reviews: {
