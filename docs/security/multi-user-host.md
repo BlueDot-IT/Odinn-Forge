@@ -30,6 +30,16 @@ pnpm host:start
 
 A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is durably throttled per client address and user across restarts, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Public responses use generic errors while internal details remain in server logs. Sessions are intentionally held in memory, so a host restart signs every user out.
 
+Hosted sessions expire after eight hours and are swept from memory at least
+once per minute. The host retains at most five sessions per user and 500
+sessions globally by default. A login at the per-user limit replaces that
+user's oldest session; a new user login at the global limit fails closed until
+capacity is available. Operators can adjust the bounded defaults with
+`ODINN_HOST_SESSION_MAX_PER_USER`, `ODINN_HOST_SESSION_MAX_GLOBAL`,
+`ODINN_HOST_SESSION_DURATION_MS`, and `ODINN_HOST_SESSION_SWEEP_MS`.
+The global limit is always the hard ceiling. If the configured per-user limit
+is higher, the host clamps it to the global limit.
+
 ## Isolation boundary
 
 Every user receives a separate:

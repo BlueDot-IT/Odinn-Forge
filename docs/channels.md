@@ -27,6 +27,9 @@ owner-only, and written atomically.
 - External identifiers are opaque strings.
 - Adapters cannot invoke tools or providers directly.
 - Every account, conversation, and thread receives a distinct session binding.
+- The router admits at most 8 pending messages per conversation and 100
+  globally, rejecting excess work before it can invoke a model while
+  preserving per-conversation serialization.
 - Telegram uses long polling, avoiding a public inbound webhook.
 
 ## Configure Telegram

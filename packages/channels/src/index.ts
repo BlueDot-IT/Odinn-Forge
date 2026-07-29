@@ -17,7 +17,26 @@ export interface ChannelAdapter {
 }
 export interface ChannelMessageHandler { handle(message: InboundChannelMessage): Promise<string | undefined> }
 export interface ChannelAccessPolicy { allows(message: InboundChannelMessage): boolean }
-export interface ChannelRouterOptions { access?: ChannelAccessPolicy; dedupeSize?: number; onError?: (error: unknown, message: InboundChannelMessage) => void }
+export interface ChannelRouterOptions {
+  access?: ChannelAccessPolicy;
+  dedupeSize?: number;
+  maximumPendingGlobal?: number;
+  maximumPendingPerConversation?: number;
+  onError?: (error: unknown, message: InboundChannelMessage) => void;
+}
+
+export class ChannelAdmissionError extends Error {
+  readonly code = "CHANNEL_CAPACITY_REACHED";
+  readonly scope: "global" | "conversation";
+  readonly limit: number;
+
+  constructor(scope: "global" | "conversation", limit: number) {
+    super(`channel ${scope} pending-message limit reached (${limit})`);
+    this.name = "ChannelAdmissionError";
+    this.scope = scope;
+    this.limit = limit;
+  }
+}
 
 export function channelConversationKey(address: ChannelAddress): string {
   return [address.channel, address.accountId, address.conversationKind, address.conversationId, address.threadId ?? ""].map(encodeURIComponent).join(":");
@@ -36,13 +55,24 @@ export function createAllowlistPolicy(entries: string[]): ChannelAccessPolicy {
 
 export class ChannelRouter {
   readonly #handler: ChannelMessageHandler;
-  readonly #options: ChannelRouterOptions & { dedupeSize: number };
+  readonly #options: ChannelRouterOptions & {
+    dedupeSize: number;
+    maximumPendingGlobal: number;
+    maximumPendingPerConversation: number;
+  };
   readonly #seen = new Set<string>();
   readonly #queues = new Map<string, Promise<void>>();
+  readonly #pendingByConversation = new Map<string, number>();
+  #pendingGlobal = 0;
 
   constructor(handler: ChannelMessageHandler, options: ChannelRouterOptions = {}) {
     this.#handler = handler;
-    this.#options = { ...options, dedupeSize: Math.max(1, options.dedupeSize ?? 2_000) };
+    this.#options = {
+      ...options,
+      dedupeSize: boundedPositiveInteger(options.dedupeSize, 2_000),
+      maximumPendingGlobal: boundedPositiveInteger(options.maximumPendingGlobal, 100),
+      maximumPendingPerConversation: boundedPositiveInteger(options.maximumPendingPerConversation, 8)
+    };
   }
 
   attach(adapter: ChannelAdapter): Promise<void> {
@@ -54,9 +84,20 @@ export class ChannelRouter {
     if (this.#options.access && !this.#options.access.allows(message)) return;
     const deliveryKey = `${message.address.channel}:${message.address.accountId}:${message.id}`;
     if (this.#seen.has(deliveryKey)) return;
-    this.#remember(deliveryKey);
-    await this.#acknowledge(adapter, message, "processing");
     const conversationKey = channelConversationKey(message.address);
+    const conversationPending = this.#pendingByConversation.get(conversationKey) ?? 0;
+    if (this.#pendingGlobal >= this.#options.maximumPendingGlobal) {
+      this.#options.onError?.(new ChannelAdmissionError("global", this.#options.maximumPendingGlobal), message);
+      return;
+    }
+    if (conversationPending >= this.#options.maximumPendingPerConversation) {
+      this.#options.onError?.(new ChannelAdmissionError("conversation", this.#options.maximumPendingPerConversation), message);
+      return;
+    }
+    this.#remember(deliveryKey);
+    this.#pendingGlobal += 1;
+    this.#pendingByConversation.set(conversationKey, conversationPending + 1);
+    await this.#acknowledge(adapter, message, "processing");
     const previous = this.#queues.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
       try {
@@ -68,6 +109,10 @@ export class ChannelRouter {
         throw error;
       }
     }).catch((error) => this.#options.onError?.(error, message)).finally(() => {
+      this.#pendingGlobal -= 1;
+      const remaining = (this.#pendingByConversation.get(conversationKey) ?? 1) - 1;
+      if (remaining > 0) this.#pendingByConversation.set(conversationKey, remaining);
+      else this.#pendingByConversation.delete(conversationKey);
       if (this.#queues.get(conversationKey) === current) this.#queues.delete(conversationKey);
     });
     this.#queues.set(conversationKey, current);
@@ -86,6 +131,10 @@ export class ChannelRouter {
       this.#seen.delete(oldest);
     }
   }
+}
+
+function boundedPositiveInteger(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
 }
 
 export interface SessionBindingStore {

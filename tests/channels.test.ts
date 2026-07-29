@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  ChannelRouter, FileSessionBindingStore, channelConversationKey, createAllowlistPolicy, splitChannelText,
+  ChannelAdmissionError, ChannelRouter, FileSessionBindingStore, channelConversationKey, createAllowlistPolicy, splitChannelText,
   type ChannelAcknowledgement, type ChannelAdapter, type InboundChannelMessage, type OutboundChannelMessage
 } from "../packages/channels/src/index.ts";
 import { normalizeTelegramUpdate } from "../adapters/channels/telegram/src/index.ts";
@@ -96,6 +96,52 @@ test("channel router serializes messages within a conversation", async () => {
   releaseFirst?.();
   await Promise.all([first, second]);
   assert.deepEqual(events, ["start:10", "end:10", "start:11", "end:11"]);
+});
+
+test("channel router bounds retained work while preserving per-conversation serialization", async () => {
+  const adapter = new FixtureAdapter();
+  const events: string[] = [];
+  const errors: Array<{ error: unknown; id: string }> = [];
+  let releaseFirst: (() => void) | undefined;
+  const firstWait = new Promise<void>((resolveWait) => { releaseFirst = resolveWait; });
+  const router = new ChannelRouter({
+    async handle(input) {
+      events.push(`start:${input.id}`);
+      if (input.id === "10" || input.id === "13") await firstWait;
+      events.push(`end:${input.id}`);
+      return input.id;
+    }
+  }, {
+    maximumPendingGlobal: 3,
+    maximumPendingPerConversation: 2,
+    onError(error, input) { errors.push({ error, id: input.id }); }
+  });
+  await router.attach(adapter);
+
+  const first = adapter.deliver?.(message());
+  await new Promise((resolveWait) => setImmediate(resolveWait));
+  const second = adapter.deliver?.(message({ id: "11" }));
+  const rejectedConversation = adapter.deliver?.(message({ id: "12" }));
+  const otherConversation = adapter.deliver?.(message({
+    id: "13",
+    address: { ...message().address, conversationId: "201" }
+  }));
+  const rejectedGlobal = adapter.deliver?.(message({
+    id: "14",
+    address: { ...message().address, conversationId: "202" }
+  }));
+  await Promise.all([rejectedConversation, rejectedGlobal]);
+
+  assert.deepEqual(events, ["start:10", "start:13"]);
+  assert.deepEqual(errors.map(({ id }) => id), ["12", "14"]);
+  assert.deepEqual(errors.map(({ error }) => error instanceof ChannelAdmissionError && error.scope), ["conversation", "global"]);
+  releaseFirst?.();
+  await Promise.all([first, second, otherConversation]);
+  assert.ok(events.indexOf("end:10") < events.indexOf("start:11"));
+  assert.ok(events.indexOf("start:11") < events.indexOf("end:11"));
+
+  await adapter.deliver?.(message({ id: "12" }));
+  assert.equal(events.at(-2), "start:12", "a rejected message must remain eligible for later delivery");
 });
 
 test("file session bindings isolate channel conversations", async () => {
