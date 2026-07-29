@@ -379,6 +379,8 @@ export async function chatWithModel(modelConfig: any, input: any = {}, { stateDi
     let payload;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       const attemptId = `provider_attempt_${randomUUID()}`;
+      response = undefined;
+      payload = undefined;
       try {
         response = await fetch(`${baseUrl}/${isResponsesTransport ? "responses" : "chat/completions"}`, {
           method: "POST",
@@ -391,12 +393,20 @@ export async function chatWithModel(modelConfig: any, input: any = {}, { stateDi
           : streamRequested
             ? await readStreamingChatResponse(response, onDelta)
             : await readModelResponse(response);
-        await onProviderAttempt?.({ attemptId, providerId: parsed.provider, modelId: parsed.model, attempt: attempt + 1, status: response.status, retryable: !response.ok && isRetryableProviderStatus(response.status) });
       } catch (error) {
-        await onProviderAttempt?.({ attemptId, providerId: parsed.provider, modelId: parsed.model, attempt: attempt + 1, status: "error", retryable: true });
-        throw error;
+        const retryable = !controller.signal.aborted;
+        await onProviderAttempt?.({ attemptId, providerId: parsed.provider, modelId: parsed.model, attempt: attempt + 1, status: "error", retryable });
+        if (!retryable || attempt === maxRetries) throw error;
+        await waitForRetry(undefined, attempt, controller.signal);
+        continue;
       }
-      if (response.ok || !isRetryableProviderStatus(response.status) || attempt === maxRetries) break;
+      const emptySuccess = response.ok
+        && !(isResponsesTransport ? responseText(payload) : payload?.choices?.[0]?.message?.content)?.trim()
+        && !extractToolCalls(payload, isResponsesTransport, tools).length;
+      const retryable = emptySuccess || (!response.ok && isRetryableProviderStatus(response.status));
+      await onProviderAttempt?.({ attemptId, providerId: parsed.provider, modelId: parsed.model, attempt: attempt + 1, status: emptySuccess ? "empty" : response.status, retryable });
+      if (response.ok && !emptySuccess) break;
+      if (!retryable || attempt === maxRetries) break;
       await waitForRetry(response, attempt, controller.signal);
     }
     if (!response) throw new Error("model provider returned no response");
@@ -749,7 +759,7 @@ function isRetryableProviderStatus(status: any) {
 }
 
 async function waitForRetry(response: any, attempt: any, signal: any) {
-  const retryAfter = Number(response.headers.get("retry-after"));
+  const retryAfter = Number(response?.headers?.get?.("retry-after"));
   const delay = Number.isFinite(retryAfter) && retryAfter >= 0
     ? Math.min(retryAfter * 1000, 30_000)
     : Math.min(500 * (2 ** attempt), 8_000) + Math.floor(Math.random() * 250);

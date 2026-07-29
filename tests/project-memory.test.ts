@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -387,6 +387,112 @@ test("agent.run aggregates provider usage across tool-calling model turns", asyn
   }
 });
 
+test("agent.run can verify an exact final response before returning it", async () => {
+  const fx = await modelFixture((_request, index) => index === 1 ? {
+    id: "agent_unverified_final",
+    choices: [{ message: { role: "assistant", content: "{\"checksum\":58}" } }],
+    usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 }
+  } : {
+    id: "agent_verified_final",
+    choices: [{ message: { role: "assistant", content: "{\"checksum\":63}" } }],
+    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 }
+  });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat"] });
+  try {
+    const result = await execute(fx, "agent_final_verification", "agent.run", {
+      model: "test:test-model",
+      prompt: "Return the correctly computed checksum as JSON.",
+      verifyFinal: true
+    }, policy);
+    assert.equal(result.output.content, "{\"checksum\":63}");
+    assert.deepEqual(result.output.finalVerification, { performed: true });
+    assert.equal(result.output.usage.totalTokens, 9);
+    assert.equal(fx.requests.length, 2);
+    assert.equal(fx.requests[1].tools, undefined);
+    assert.match(fx.requests[1].messages[0].content, /Final answer verification/u);
+    assert.match(fx.requests[1].messages[1].content, /Candidate answer:\n\{"checksum":58\}/u);
+  } finally {
+    await fx.close();
+  }
+});
+
+test("agent.run permits bounded workflows beyond eight model turns", async () => {
+  const fx = await modelFixture((_request, index) => index <= 9 ? {
+    id: `agent_long_workflow_${index}`,
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: `call_long_${index}`,
+          type: "function",
+          function: { name: "workspace_x2e_readText", arguments: '{"path":"input.txt"}' }
+        }]
+      }
+    }]
+  } : {
+    id: "agent_long_workflow_final",
+    choices: [{ message: { role: "assistant", content: "Long workflow completed." } }]
+  });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "workspace.readText"] });
+  try {
+    await writeFile(join(fx.root, "input.txt"), "bounded\n");
+    const result = await execute(fx, "agent_long_workflow", "agent.run", {
+      model: "test:test-model",
+      prompt: "Complete a bounded workflow.",
+      maxTurns: 10
+    }, policy);
+    assert.equal(result.output.content, "Long workflow completed.");
+    assert.equal(fx.requests.length, 10);
+  } finally {
+    await fx.close();
+  }
+});
+
+test("agent.run forwards its model timeout", async () => {
+  const provider = createHttpServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain the request before simulating a slow provider.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    if (response.destroyed) return;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "agent_delayed",
+      choices: [{ message: { role: "assistant", content: "Too late." } }]
+    }));
+  });
+  await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  const address = provider.address();
+  if (!address || typeof address === "string") throw new Error("mock provider did not bind a TCP port");
+  const fx = await fixture({
+    defaultModel: "test:test-model",
+    providers: {
+      test: {
+        type: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        models: ["test-model"]
+      }
+    }
+  });
+  try {
+    const startedAt = Date.now();
+    await assert.rejects(
+      execute(fx, "agent_model_timeout", "agent.run", {
+        model: "test:test-model",
+        prompt: "Return eventually.",
+        timeoutMs: 1_000,
+        retries: 0
+      }),
+      /model request timed out/u
+    );
+    assert.ok(Date.now() - startedAt < 1_400);
+  } finally {
+    provider.closeAllConnections();
+    await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("agent.run performs one auditable Ollama reasoning-budget recovery", async () => {
   const fx = await modelFixture((request) => request.max_tokens < 900 ? {
     id: "agent_reasoning_exhausted",
@@ -599,7 +705,7 @@ test("agent.run permits at most one retry-safe tool correction", async () => {
         model: "test:test-model",
         prompt: "Read the fixture."
       }, policy),
-      /workspace\.readText requires path/u
+      /workspace\.readText requires (?:a non-empty )?path/u
     );
     assert.equal(fx.requests.length, 2);
     assert.ok(fx.requests[1].messages.some((message: any) => message.tool_call_id === "call_bad_read_1"));
@@ -690,6 +796,38 @@ for (const scenario of [{
     }
   });
 }
+
+test("agent.run edits its workspace and executes a bounded verification command", async () => {
+  const fx = await modelFixture((_request, index) => index === 1 ? {
+    id: "agent_workspace_turn_1",
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "call_write", type: "function", function: { name: "workspace_x2e_writeText", arguments: '{"path":"result.txt","content":"FORGE_WORKSPACE_OK\\n"}' } },
+          { id: "call_verify", type: "function", function: { name: "process_x2e_exec", arguments: JSON.stringify({ command: process.execPath, args: ["-e", "process.stdout.write(require('node:fs').readFileSync('result.txt','utf8'))"] }) } }
+        ]
+      }
+    }]
+  } : {
+    id: "agent_workspace_turn_2",
+    choices: [{ message: { role: "assistant", content: "Workspace change verified." } }]
+  });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "workspace.writeText", "process.exec"] });
+  try {
+    const result = await execute(fx, "agent_workspace_tools", "agent.run", {
+      model: "test:test-model",
+      messages: [{ role: "user", content: "Create result.txt and verify its content." }]
+    }, policy);
+    assert.equal(result.output.content, "Workspace change verified.");
+    assert.equal(await readFile(join(fx.root, "result.txt"), "utf8"), "FORGE_WORKSPACE_OK\n");
+    const nestedEvents = (await fx.auditStore.readAll()).filter((event: any) => event.actor === "agent" && event.type === "task.completed");
+    assert.deepEqual(nestedEvents.map((event: any) => event.tool).sort(), ["process.exec", "workspace.writeText"]);
+  } finally {
+    await fx.close();
+  }
+});
 
 test("agent.run preserves aggregated usage when a later tool requires approval", async () => {
   const fx = await modelFixture((_request, index) => index === 1 ? {

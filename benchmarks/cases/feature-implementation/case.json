@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "feature-implementation-001",
+  "title": "Implement a bounded JavaScript feature from tests",
+  "requires": [
+    "workspace.read",
+    "workspace.write",
+    "process.exec"
+  ],
+  "promptFile": "prompt.md",
+  "fixtureDir": "workspace",
+  "maxTurns": 12,
+  "trials": 5,
+  "timeoutMs": 300000,
+  "assertions": [
+    {
+      "type": "file_sha256",
+      "path": "tags.test.mjs",
+      "expected": "ac065adfca557af81331f3cd7bb209fe42fd61f19f7198738d85ae98425ee53c"
+    },
+    {
+      "type": "command",
+      "command": "node",
+      "args": [
+        "--test",
+        "tags.test.mjs"
+      ],
+      "exitCode": 0,
+      "timeoutMs": 30000
+    }
+  ]
+}

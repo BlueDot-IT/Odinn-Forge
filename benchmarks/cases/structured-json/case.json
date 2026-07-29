@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "structured-json-001",
+  "title": "Produce an exact structured JSON result",
+  "requires": [
+    "text.generate"
+  ],
+  "promptFile": "prompt.md",
+  "verifyFinal": true,
+  "trials": 5,
+  "timeoutMs": 120000,
+  "assertions": [
+    {
+      "type": "stdout_json_equals",
+      "expected": {
+        "status": "ok",
+        "ordered": [
+          2,
+          2,
+          7,
+          9
+        ],
+        "checksum": 63
+      }
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "cross-agent-exact-response",
+  "cases": [
+    "../cases/exact-response/case.json"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "cross-agent-smoke",
+  "cases": [
+    "../cases/exact-response/case.json",
+    "../cases/javascript-repair/case.json"
+  ]
+}

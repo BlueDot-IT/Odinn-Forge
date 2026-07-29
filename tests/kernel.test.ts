@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { createServer as createHttpServer } from "node:http";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -405,6 +405,99 @@ test("workspace.readText is confined to the workspace root", async () => {
   );
 });
 
+test("workspace.writeText atomically edits files and rejects lexical and symbolic-link escapes", async () => {
+  const { root, auditStore, registry } = await fixture();
+  const outside = await mkdtemp(join(tmpdir(), "odinn-kernel-outside-"));
+  const policy = createDefaultPolicy({ allowedCapabilities: [...createDefaultPolicy().allowedCapabilities, "workspace.writeText"] });
+
+  await assert.rejects(runTask({
+    task: { id: "run_write_default_denied", tool: "workspace.writeText", input: { path: "denied.txt", content: "no\n" }, actor: "test" },
+    auditStore,
+    registry
+  }), /capability is not allowed/);
+
+  const created = await runTask({
+    task: { id: "run_write_create", tool: "workspace.writeText", input: { path: "src/note.txt", content: "created\n" }, actor: "test" },
+    auditStore,
+    registry,
+    policy
+  });
+  assert.equal(created.output.created, true);
+  assert.equal(await readFile(join(root, "src", "note.txt"), "utf8"), "created\n");
+
+  const replaced = await runTask({
+    task: { id: "run_write_replace", tool: "workspace.writeText", input: { path: "src/note.txt", content: "replaced\n" }, actor: "test" },
+    auditStore,
+    registry,
+    policy
+  });
+  assert.equal(replaced.output.created, false);
+  assert.equal(await readFile(join(root, "src", "note.txt"), "utf8"), "replaced\n");
+
+  await assert.rejects(runTask({
+    task: { id: "run_write_escape", tool: "workspace.writeText", input: { path: "../outside.txt", content: "no\n" }, actor: "test" },
+    auditStore,
+    registry,
+    policy
+  }), /path escapes workspace root/);
+
+  await symlink(outside, join(root, "linked"));
+  await assert.rejects(runTask({
+    task: { id: "run_write_symlink_escape", tool: "workspace.writeText", input: { path: "linked/outside.txt", content: "no\n" }, actor: "test" },
+    auditStore,
+    registry,
+    policy
+  }), /symbolic[- ]link/);
+});
+
+test("process.exec uses argument arrays, workspace cwd confinement, and bounded output", async () => {
+  const { root, auditStore, registry } = await fixture();
+  const policy = createDefaultPolicy({ allowedCapabilities: [...createDefaultPolicy().allowedCapabilities, "process.exec"] });
+  const literal = "literal; shell syntax is data";
+  await assert.rejects(runTask({
+    task: { id: "run_process_default_denied", tool: "process.exec", input: { command: process.execPath }, actor: "test" },
+    auditStore,
+    registry
+  }), /capability is not allowed/);
+
+  const executed = await runTask({
+    task: {
+      id: "run_process_exec",
+      tool: "process.exec",
+      input: { command: process.execPath, args: ["-e", "process.stdout.write(process.argv[1])", literal] },
+      actor: "test"
+    },
+    auditStore,
+    registry,
+    policy
+  });
+  assert.equal(executed.output.exitCode, 0);
+  assert.equal(executed.output.stdout, literal);
+  assert.equal(executed.output.cwd, "");
+  assert.equal(executed.output.timedOut, false);
+
+  const truncated = await runTask({
+    task: {
+      id: "run_process_output_limit",
+      tool: "process.exec",
+      input: { command: process.execPath, args: ["-e", "process.stdout.write('x'.repeat(4096))"], maxOutputBytes: 1024 },
+      actor: "test"
+    },
+    auditStore,
+    registry,
+    policy
+  });
+  assert.equal(truncated.output.outputTruncated, true);
+  assert.equal(Buffer.byteLength(truncated.output.stdout), 1024);
+
+  await assert.rejects(runTask({
+    task: { id: "run_process_escape", tool: "process.exec", input: { command: process.execPath, cwd: ".." }, actor: "test" },
+    auditStore,
+    registry,
+    policy
+  }), /path escapes workspace root/);
+});
+
 test("self-improvement defaults to automatic observation without a review gate", async () => {
   const { root, auditStore } = await fixture();
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn"), auditStore });
@@ -738,11 +831,13 @@ test("agent auto-learns explicit facts and recalls them into later model context
       }
     }
   });
+  const agentPolicy = createDefaultPolicy({ allowedCapabilities: [...createDefaultPolicy().allowedCapabilities, "workspace.writeText", "process.exec"] });
   try {
     const session = await runTask({
       task: { id: "run_agent_memory_session", tool: "session.create", input: { title: "Memory test session" }, actor: "test" },
       auditStore,
-      registry
+      registry,
+      policy: agentPolicy
     });
     const learned = await runTask({
       task: {
@@ -756,7 +851,8 @@ test("agent auto-learns explicit facts and recalls them into later model context
         actor: "test"
       },
       auditStore,
-      registry
+      registry,
+      policy: agentPolicy
     });
     assert.equal(learned.output.memory.suggested, 1);
     assert.equal(learned.output.memory.learned, 0);
@@ -765,6 +861,9 @@ test("agent auto-learns explicit facts and recalls them into later model context
       "project", "person", "artifact", "correction", "procedure", "decision", "preference", "system"
     ]);
     const agentToolNames = requests[0].tools.map((tool: any) => tool.function.name);
+    assert.ok(agentToolNames.some((name: string) => name.includes("workspace") && name.includes("readText")), agentToolNames.join(", "));
+    assert.ok(agentToolNames.some((name: string) => name.includes("workspace") && name.includes("writeText")), agentToolNames.join(", "));
+    assert.ok(agentToolNames.some((name: string) => name.includes("process") && name.includes("exec")), agentToolNames.join(", "));
     assert.ok(agentToolNames.some((name: string) => name.includes("discord") && name.includes("readMessages")), agentToolNames.join(", "));
     assert.ok(agentToolNames.some((name: string) => name.includes("discord") && name.includes("sendMessage")), agentToolNames.join(", "));
     const candidates = await runTask({
@@ -794,7 +893,8 @@ test("agent auto-learns explicit facts and recalls them into later model context
         actor: "test"
       },
       auditStore,
-      registry
+      registry,
+      policy: agentPolicy
     });
     assert.equal(recalled.output.memory.recalled, 1);
     const contextMessage = requests[1].messages.find((message: any) => message.content.includes("Durable context recalled"));

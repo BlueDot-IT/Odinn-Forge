@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "tool-recovery-001",
+  "title": "Recover from an expected missing-file tool error",
+  "requires": [
+    "workspace.read",
+    "workspace.write"
+  ],
+  "promptFile": "prompt.md",
+  "fixtureDir": "workspace",
+  "trials": 5,
+  "timeoutMs": 180000,
+  "assertions": [
+    {
+      "type": "file_sha256",
+      "path": "source.txt",
+      "expected": "e1c6cbdfe41db2493d47d6440cc454b0ae6401d3751cfe3b528ed476e9dca3ae"
+    },
+    {
+      "type": "file_json_equals",
+      "path": "result.json",
+      "expected": {
+        "total": 25,
+        "largest": "north"
+      }
+    }
+  ]
+}

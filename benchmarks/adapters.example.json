@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "modelPolicy": "cloud-only",
+  "adapters": [
+    {
+      "id": "odinn-forge",
+      "metadata": {
+        "provider": "configure-me",
+        "model": "configure-me",
+        "reasoning": "configure-me",
+        "deployment": "cloud"
+      },
+      "capabilities": [
+        "text.generate",
+        "workspace.read",
+        "workspace.write",
+        "process.exec",
+        "memory.read",
+        "memory.write",
+        "web.read",
+        "browser.read",
+        "browser.write"
+      ],
+      "command": "node",
+      "args": [
+        "{repo}/apps/cli/src/cli.ts",
+        "run",
+        "--tool",
+        "agent.run",
+        "--input-file",
+        "{inputFile}",
+        "--state",
+        "{state}"
+      ],
+      "stateFixture": "benchmarks/state/odinn",
+      "output": {
+        "format": "json",
+        "path": "output.content",
+        "metrics": {
+          "totalTokens": "output.usage.total_tokens"
+        }
+      },
+      "version": {
+        "command": "node",
+        "args": [
+          "{repo}/apps/cli/src/cli.ts",
+          "--version"
+        ]
+      }
+    },
+    {
+      "id": "openclaw",
+      "metadata": {
+        "provider": "configure-me",
+        "model": "configure-me",
+        "reasoning": "configure-me",
+        "deployment": "cloud"
+      },
+      "capabilities": [
+        "text.generate",
+        "workspace.read",
+        "workspace.write",
+        "process.exec",
+        "memory.read",
+        "memory.write",
+        "web.read",
+        "browser.read",
+        "browser.write"
+      ],
+      "command": "openclaw",
+      "args": [
+        "agent",
+        "--agent",
+        "main",
+        "--local",
+        "--session-key",
+        "{trialId}",
+        "--message-file",
+        "{promptFile}",
+        "--json"
+      ],
+      "env": {
+        "OPENCLAW_STATE_DIR": "{state}",
+        "ODINN_BENCH_WORKSPACE": "{workspace}"
+      },
+      "stateFixture": "benchmarks/state/openclaw",
+      "output": {
+        "format": "json",
+        "path": "payloads.0.text",
+        "metrics": {
+          "runtimeDurationMs": "meta.durationMs",
+          "provider": "meta.agentMeta.provider",
+          "model": "meta.agentMeta.model"
+        }
+      },
+      "version": {
+        "command": "openclaw",
+        "args": [
+          "--version"
+        ]
+      }
+    },
+    {
+      "id": "hermes-agent",
+      "metadata": {
+        "provider": "configure-me",
+        "model": "configure-me",
+        "reasoning": "configure-me",
+        "deployment": "cloud"
+      },
+      "capabilities": [
+        "text.generate",
+        "workspace.read",
+        "workspace.write",
+        "process.exec",
+        "memory.read",
+        "memory.write",
+        "web.read",
+        "browser.read",
+        "browser.write"
+      ],
+      "command": "hermes",
+      "args": [
+        "--oneshot",
+        "{prompt}"
+      ],
+      "env": {
+        "HERMES_HOME": "{state}"
+      },
+      "stateFixture": "benchmarks/state/hermes",
+      "output": {
+        "format": "text"
+      },
+      "version": {
+        "command": "hermes",
+        "args": [
+          "--version"
+        ]
+      }
+    }
+  ]
+}

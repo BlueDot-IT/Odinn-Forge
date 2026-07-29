@@ -1,7 +1,6 @@
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, realpath } from "node:fs/promises";
-import { join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
@@ -23,6 +22,7 @@ import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, list
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
 import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.ts";
+import { executeWorkspaceProcess, readWorkspaceText, writeWorkspaceText } from "./workspace-tools.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
@@ -79,24 +79,19 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       capability: "workspace.readText",
       description: "Read a UTF-8 text file confined to the workspace root.",
       inputSchema: { type: "object", properties: { path: { type: "string" }, maxBytes: { type: "integer" } }, required: ["path"] },
-      execute: async ({ path, maxBytes = 65_536 }: any) => {
-        if (typeof path !== "string" || path.trim() === "") throw new Error("workspace.readText requires path");
-        const realRoot = await realpath(root);
-        const lexicalTarget = resolve(realRoot, path);
-        const lexicalRelative = relative(realRoot, lexicalTarget);
-        if (lexicalRelative === "" || lexicalRelative.startsWith("..") || lexicalRelative.includes("..\\")) throw new Error("workspace.readText path escapes workspace root");
-        const target = await realpath(lexicalTarget);
-        const rel = relative(realRoot, target);
-        if (rel === "" || rel.startsWith("..") || rel.includes("..\\") || target !== realRoot && !target.startsWith(`${realRoot}${sep}`)) {
-          throw new Error("workspace.readText path escapes workspace root");
-        }
-        const content = await readFile(target, "utf8");
-        return {
-          path: rel.replaceAll("\\", "/"),
-          truncated: Buffer.byteLength(content, "utf8") > maxBytes,
-          content: content.slice(0, maxBytes)
-        };
-      }
+      execute: async (input: any) => readWorkspaceText(root, input)
+    }],
+    ["workspace.writeText", {
+      capability: "workspace.writeText",
+      description: "Atomically create or replace a UTF-8 text file confined to the workspace root.",
+      inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" }, createDirectories: { type: "boolean" } }, required: ["path", "content"] },
+      execute: async (input: any) => writeWorkspaceText(root, input)
+    }],
+    ["process.exec", {
+      capability: "process.exec",
+      description: "Execute a bounded argument-array command in a workspace directory without an implicit shell.",
+      inputSchema: { type: "object", properties: { command: { type: "string" }, args: { type: "array", items: { type: "string" } }, cwd: { type: "string" }, timeoutMs: { type: "integer" }, maxOutputBytes: { type: "integer" } }, required: ["command"] },
+      execute: async (input: any, context: any) => executeWorkspaceProcess(root, input, context.signal)
     }],
     ["web.search", {
       capability: "web.read",
@@ -482,12 +477,13 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   if (memoryStore && canRecallMemory && memoryOptions.autoRecall && latestUserMessage?.content) {
     await onAgentProgress?.({ stage: "memory-recalled", message: "Memory recall completed.", durationMs: Date.now() - recallStartedAt, count: recalled.memories.length });
   }
-  const systemMessage = `${agent.systemPrompt}\n\n## Runtime safety contract\nUse web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.`.trim();
+  const systemMessage = `${agent.systemPrompt}\n\n## Runtime safety contract\nUse workspace tools to inspect and edit files only inside the current workspace. Use process.exec for bounded workspace commands and pass arguments separately without shell syntax. Batch independent reads or checks when possible, minimize redundant tool calls, and stop using tools once the requested result is verified. Verify changes with the relevant tests or checks before claiming completion. Before returning an exact or structured answer, recheck its arithmetic, required fields, ordering, and output-only constraints. Use web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.`.trim();
   const existingSystem = messages.find((message: any) => message.role === "system");
   if (existingSystem) existingSystem.content = `${systemMessage}\n${existingSystem.content || ""}`.trim();
   else messages.unshift({ role: "system", content: systemMessage });
   if (recalled.memories.length) messages.splice(1, 0, { role: "system", content: formatMemoryContext(recalled.memories) });
-  const maxTurns = Math.min(Math.max(Number(input.maxTurns) || 6, 1), 8);
+  const maxTurns = Math.min(Math.max(Number(input.maxTurns) || 6, 1), 16);
+  const verifyFinal = input.verifyFinal === true;
   const availableTools = modelVisibleAgentToolSchemas(registry).filter((schema: any) => {
     return policyAllows(schema.function.name);
   });
@@ -504,11 +500,16 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
       messages,
       tools: availableTools,
       stream: true,
-      ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens })
+      ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens }),
+      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+      ...(input.retries === undefined && input.maxRetries === undefined ? {} : {
+        ...(input.retries === undefined ? {} : { retries: input.retries }),
+        ...(input.maxRetries === undefined ? {} : { maxRetries: input.maxRetries })
+      })
     };
     let result: any;
     try {
-      result = await chatWithModel(modelConfig, modelRequest, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
+      result = await chatWithModel(modelConfig, modelRequest, { stateDir, signal, onDelta: verifyFinal ? undefined : onModelDelta, onProviderAttempt });
     } catch (error: any) {
       const recovery = agentBudgetRecovery(error, selectedModel, input, budgetRecoveryUsed);
       if (!recovery) throw error;
@@ -527,15 +528,28 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
       result = await chatWithModel(modelConfig, {
         ...modelRequest,
         maxTokens: recovery.toMaxTokens
-      }, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
+      }, { stateDir, signal, onDelta: verifyFinal ? undefined : onModelDelta, onProviderAttempt });
     }
     aggregateUsage = mergeUsage(aggregateUsage, result.usage);
     if (!result.toolCalls?.length) {
+      const finalResult = verifyFinal
+        ? await verifyAgentFinal(modelConfig, {
+          model: input.model || agent.manifest.model.default || undefined,
+          systemMessage,
+          messages,
+          candidate: result.content || "",
+          timeoutMs: input.timeoutMs,
+          retries: input.retries,
+          maxRetries: input.maxRetries
+        }, { stateDir, signal, onModelDelta, onProviderAttempt })
+        : result;
+      if (verifyFinal) aggregateUsage = mergeUsage(aggregateUsage, finalResult.usage);
       return {
-        ...result,
+        ...finalResult,
         ...(aggregateUsage ? { usage: aggregateUsage } : {}),
+        ...(verifyFinal ? { finalVerification: { performed: true } } : {}),
         ...(budgetRecovery ? { modelRecovery: budgetRecovery } : {}),
-        ...answerShapeMetadata(latestUserMessage?.content, result.content),
+        ...answerShapeMetadata(latestUserMessage?.content, finalResult.content),
         memory: { recalled: recalled.memories.length, suggested: learned.suggested.length, learned: 0, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 }
       };
     }
@@ -599,6 +613,29 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
     }
   }
   throw new Error(`agent reached its ${maxTurns}-turn tool limit`);
+}
+
+async function verifyAgentFinal(modelConfig: any, input: any, { stateDir, signal, onModelDelta, onProviderAttempt }: any) {
+  const originalUserMessage = [...input.messages].reverse().find((message: any) => message.role === "user")?.content ?? "";
+  return chatWithModel(modelConfig, {
+    model: input.model,
+    messages: [
+      {
+        role: "system",
+        content: `${input.systemMessage}\n\n## Final answer verification\nYou are performing the final verification pass. Recompute arithmetic and recheck every requested field, ordering rule, exact-output rule, and formatting constraint. Return only the corrected final answer. Do not describe the review. If the candidate is already correct, reproduce it exactly.`
+      },
+      {
+        role: "user",
+        content: `Original request:\n${originalUserMessage}\n\nCandidate answer:\n${input.candidate}`
+      }
+    ],
+    stream: true,
+    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+    ...(input.retries === undefined && input.maxRetries === undefined ? {} : {
+      ...(input.retries === undefined ? {} : { retries: input.retries }),
+      ...(input.maxRetries === undefined ? {} : { maxRetries: input.maxRetries })
+    })
+  }, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
 }
 
 function agentToolFailureMessage(error: any) {

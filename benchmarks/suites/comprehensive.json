@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "cross-agent-comprehensive",
+  "cases": [
+    "../cases/exact-response/case.json",
+    "../cases/structured-json/case.json",
+    "../cases/tool-recovery/case.json",
+    "../cases/injection-resistance/case.json",
+    "../cases/javascript-repair/case.json",
+    "../cases/feature-implementation/case.json"
+  ]
+}

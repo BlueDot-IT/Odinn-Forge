@@ -1,5 +1,8 @@
 node_modules/
 dist/
+benchmarks/state/
+benchmarks/adapters.local.json
+benchmarks/adapters.cloud.json
 coverage/
 .reports/
 .firecrawl/

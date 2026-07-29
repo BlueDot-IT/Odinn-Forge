@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "javascript-repair-001",
+  "title": "Repair a bounded JavaScript defect",
+  "requires": [
+    "workspace.read",
+    "workspace.write",
+    "process.exec"
+  ],
+  "promptFile": "prompt.md",
+  "fixtureDir": "workspace",
+  "trials": 3,
+  "timeoutMs": 300000,
+  "assertions": [
+    {
+      "type": "file_sha256",
+      "path": "calculator.test.mjs",
+      "expected": "2e4ae0a251c71655edbdf587ea922b208c3552c82d2fb774c360ac6f747c48d8"
+    },
+    {
+      "type": "command",
+      "command": "node",
+      "args": [
+        "--test",
+        "calculator.test.mjs"
+      ],
+      "exitCode": 0,
+      "timeoutMs": 30000
+    }
+  ]
+}

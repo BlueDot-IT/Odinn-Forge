@@ -38,6 +38,7 @@
     "smoke:onboarding": "node scripts/ci/onboarding-smoke.ts",
     "storage:drill": "node scripts/ci/storage-drill.ts",
     "benchmark:ci": "node scripts/ci/benchmark.ts",
+    "benchmark:agents": "node scripts/benchmark/compare.ts",
     "release:preflight": "node scripts/release/preflight.ts",
     "release:package": "node scripts/release/package.ts",
     "release:checksums": "node scripts/release/checksums.ts",

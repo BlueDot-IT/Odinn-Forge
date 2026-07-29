@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "cross-agent-javascript-repair",
+  "cases": [
+    "../cases/javascript-repair/case.json"
+  ]
+}

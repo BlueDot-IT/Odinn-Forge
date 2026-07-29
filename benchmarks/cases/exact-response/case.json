@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "exact-response-001",
+  "title": "Follow an exact response contract",
+  "requires": [
+    "text.generate"
+  ],
+  "promptFile": "prompt.md",
+  "trials": 3,
+  "timeoutMs": 120000,
+  "assertions": [
+    {
+      "type": "stdout_equals",
+      "expected": "BENCHMARK_OK"
+    }
+  ]
+}

@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "modelPolicy": "cloud-only",
+  "adapters": [
+    {
+      "id": "odinn-forge",
+      "metadata": {
+        "provider": "openai-oauth",
+        "model": "gpt-5.6-luna",
+        "reasoning": "model-default",
+        "deployment": "cloud"
+      },
+      "capabilities": [
+        "text.generate",
+        "workspace.read",
+        "workspace.write",
+        "process.exec"
+      ],
+      "command": "node",
+      "args": [
+        "{repo}/apps/cli/src/cli.ts",
+        "run",
+        "--tool",
+        "agent.run",
+        "--input-file",
+        "{inputFile}",
+        "--state",
+        "{state}"
+      ],
+      "env": {
+        "HOME": "{state}"
+      },
+      "stateFixture": "benchmarks/state/oauth-odinn",
+      "output": {
+        "format": "json",
+        "path": "output.content",
+        "metrics": {
+          "totalTokens": "output.usage.total_tokens",
+          "provider": "output.provider",
+          "model": "output.model"
+        }
+      },
+      "version": {
+        "command": "node",
+        "args": [
+          "{repo}/apps/cli/src/cli.ts",
+          "--version"
+        ]
+      }
+    },
+    {
+      "id": "openclaw",
+      "metadata": {
+        "provider": "openai-oauth",
+        "model": "gpt-5.6-luna",
+        "reasoning": "model-default",
+        "deployment": "cloud"
+      },
+      "capabilities": [
+        "text.generate",
+        "workspace.read",
+        "workspace.write",
+        "process.exec"
+      ],
+      "command": "/home/rev/.npm-global/bin/openclaw",
+      "args": [
+        "agent",
+        "--agent",
+        "main",
+        "--local",
+        "--session-key",
+        "{trialId}",
+        "--message-file",
+        "{promptFile}",
+        "--model",
+        "openai/gpt-5.6-luna",
+        "--timeout",
+        "300",
+        "--json"
+      ],
+      "env": {
+        "OPENCLAW_STATE_DIR": "{state}",
+        "ODINN_BENCH_WORKSPACE": "{workspace}",
+        "HOME": "{state}"
+      },
+      "stateFixture": "benchmarks/state/oauth-openclaw",
+      "output": {
+        "format": "json",
+        "path": "payloads.0.text",
+        "metrics": {
+          "runtimeDurationMs": "meta.durationMs",
+          "provider": "meta.agentMeta.provider",
+          "model": "meta.agentMeta.model"
+        }
+      },
+      "version": {
+        "command": "/home/rev/.npm-global/bin/openclaw",
+        "args": [
+          "--version"
+        ]
+      }
+    },
+    {
+      "id": "hermes-agent",
+      "metadata": {
+        "provider": "openai-oauth",
+        "model": "gpt-5.6-luna",
+        "reasoning": "model-default",
+        "deployment": "cloud"
+      },
+      "capabilities": [
+        "text.generate",
+        "workspace.read",
+        "workspace.write",
+        "process.exec"
+      ],
+      "command": "/home/rev/.local/bin/hermes",
+      "args": [
+        "--oneshot",
+        "{prompt}",
+        "--model",
+        "gpt-5.6-luna",
+        "--provider",
+        "openai-codex",
+        "--toolsets",
+        "terminal,file",
+        "--ignore-rules"
+      ],
+      "env": {
+        "HERMES_HOME": "{state}",
+        "HOME": "{state}"
+      },
+      "stateFixture": "benchmarks/state/oauth-hermes",
+      "output": {
+        "format": "text"
+      },
+      "version": {
+        "command": "/home/rev/.local/bin/hermes",
+        "args": [
+          "--version"
+        ]
+      }
+    }
+  ]
+}
