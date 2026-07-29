@@ -30,6 +30,9 @@ owner-only, and written atomically.
 - The router admits at most 8 pending messages per conversation and 100
   globally, rejecting excess work before it can invoke a model while
   preserving per-conversation serialization.
+- Each sender may start at most 30 model-backed messages per 60-second
+  admission window. Sender-window state is capped at 2,000 entries;
+  new senders are rejected while that bounded state is full.
 - Telegram uses long polling, avoiding a public inbound webhook.
 
 ## Configure Telegram

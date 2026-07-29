@@ -26,7 +26,8 @@ The script configures:
 - Linear history
 - Force-push and branch-deletion prevention
 - Conversation resolution
-- A protected `release` environment
+- A protected `release` environment requiring owner approval
+- Exact release deployment admission for the `main` branch and `v*` tags
 
 The default policy requests one approval. On a single-maintainer repository, administrators can bypass that review requirement because administrator enforcement is disabled. Once a second maintainer is active, remove routine bypasses and treat the review as mandatory.
 

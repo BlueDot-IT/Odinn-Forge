@@ -144,6 +144,41 @@ test("channel router bounds retained work while preserving per-conversation seri
   assert.equal(events.at(-2), "start:12", "a rejected message must remain eligible for later delivery");
 });
 
+test("channel router rate-limits each sender with bounded admission state", async () => {
+  const adapter = new FixtureAdapter();
+  const handled: string[] = [];
+  const errors: Array<{ error: unknown; id: string }> = [];
+  let now = 1_000;
+  const router = new ChannelRouter({
+    async handle(input) { handled.push(input.id); return input.id; }
+  }, {
+    clock: () => now,
+    maximumMessagesPerSenderWindow: 2,
+    maximumTrackedSenders: 2,
+    senderWindowMs: 1_000,
+    onError(error, input) { errors.push({ error, id: input.id }); }
+  });
+  await router.attach(adapter);
+
+  await adapter.deliver?.(message({ id: "10" }));
+  await adapter.deliver?.(message({ id: "11" }));
+  await adapter.deliver?.(message({ id: "12" }));
+  await adapter.deliver?.(message({ id: "13", sender: { id: "101" } }));
+  await adapter.deliver?.(message({ id: "14", sender: { id: "102" } }));
+
+  assert.deepEqual(handled, ["10", "11", "13"]);
+  assert.deepEqual(errors.map(({ id }) => id), ["12", "14"]);
+  assert.deepEqual(
+    errors.map(({ error }) => error instanceof ChannelAdmissionError && error.scope),
+    ["sender", "sender-state"]
+  );
+
+  now += 1_001;
+  await adapter.deliver?.(message({ id: "12" }));
+  await adapter.deliver?.(message({ id: "14", sender: { id: "102" } }));
+  assert.deepEqual(handled, ["10", "11", "13", "12", "14"]);
+});
+
 test("file session bindings isolate channel conversations", async () => {
   const directory = await mkdtemp(join(tmpdir(), "odinn-channel-bindings-"));
   const path = join(directory, "bindings.json");

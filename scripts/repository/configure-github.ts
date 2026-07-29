@@ -41,6 +41,10 @@ function isEnabled(value: any) {
   return value === true || value?.enabled === true;
 }
 
+function isDisabled(value: any) {
+  return value === false || value?.enabled === false;
+}
+
 console.log(`Configuring ${repository}`);
 
 gh("/actions/permissions/workflow", "PUT", {
@@ -95,8 +99,9 @@ if (
   || protection.required_pull_request_reviews?.require_code_owner_reviews !== true
   || !isEnabled(protection.required_linear_history)
   || !isEnabled(protection.required_conversation_resolution)
-  || isEnabled(protection.allow_force_pushes)
-  || isEnabled(protection.allow_deletions)
+  || !isDisabled(protection.enforce_admins)
+  || !isDisabled(protection.allow_force_pushes)
+  || !isDisabled(protection.allow_deletions)
 ) {
   throw new Error(
     `main branch protection verification failed${missingChecks.length > 0
@@ -153,10 +158,26 @@ gh("/environments/release", "PUT", {
   wait_timer: 0,
   reviewers: [{ type: "User", id: ownerUserId }],
   deployment_branch_policy: {
-    protected_branches: true,
-    custom_branch_policies: false
+    protected_branches: false,
+    custom_branch_policies: true
   }
 });
+
+const requiredDeploymentPolicies = [
+  { name: "main", type: "branch" },
+  { name: "v*", type: "tag" }
+];
+const existingDeploymentPolicies = JSON.parse(
+  gh("/environments/release/deployment-branch-policies")
+);
+for (const expected of requiredDeploymentPolicies) {
+  const exists = existingDeploymentPolicies.branch_policies?.some(
+    (policy: any) => policy?.name === expected.name && policy?.type === expected.type
+  );
+  if (!exists) {
+    gh("/environments/release/deployment-branch-policies", "POST", expected);
+  }
+}
 
 const releaseEnvironment = JSON.parse(gh("/environments/release"));
 const reviewerRule = Array.isArray(releaseEnvironment.protection_rules)
@@ -167,13 +188,27 @@ const ownerIsRequired = effectiveReviewers.some(
   (entry: any) => entry?.type === "User" && Number(entry?.reviewer?.id) === ownerUserId
 );
 const branchPolicy = releaseEnvironment.deployment_branch_policy;
+const deploymentPolicies = JSON.parse(
+  gh("/environments/release/deployment-branch-policies")
+);
+const effectiveDeploymentPolicies = Array.isArray(deploymentPolicies.branch_policies)
+  ? deploymentPolicies.branch_policies
+  : [];
+const hasExactDeploymentPolicies =
+  effectiveDeploymentPolicies.length === requiredDeploymentPolicies.length
+  && requiredDeploymentPolicies.every((expected) =>
+    effectiveDeploymentPolicies.some(
+      (policy: any) => policy?.name === expected.name && policy?.type === expected.type
+    )
+  );
 if (
   !ownerIsRequired
-  || branchPolicy?.protected_branches !== true
-  || branchPolicy?.custom_branch_policies !== false
+  || branchPolicy?.protected_branches !== false
+  || branchPolicy?.custom_branch_policies !== true
+  || !hasExactDeploymentPolicies
 ) {
   throw new Error(
-    "release environment policy verification failed: the required owner reviewer and protected-branch policy must be effective"
+    "release environment policy verification failed: the required owner reviewer and exact main/v* deployment policies must be effective"
   );
 }
 

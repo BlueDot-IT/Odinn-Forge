@@ -22,16 +22,20 @@ export interface ChannelRouterOptions {
   dedupeSize?: number;
   maximumPendingGlobal?: number;
   maximumPendingPerConversation?: number;
+  maximumMessagesPerSenderWindow?: number;
+  maximumTrackedSenders?: number;
+  senderWindowMs?: number;
+  clock?: () => number;
   onError?: (error: unknown, message: InboundChannelMessage) => void;
 }
 
 export class ChannelAdmissionError extends Error {
   readonly code = "CHANNEL_CAPACITY_REACHED";
-  readonly scope: "global" | "conversation";
+  readonly scope: "global" | "conversation" | "sender" | "sender-state";
   readonly limit: number;
 
-  constructor(scope: "global" | "conversation", limit: number) {
-    super(`channel ${scope} pending-message limit reached (${limit})`);
+  constructor(scope: "global" | "conversation" | "sender" | "sender-state", limit: number) {
+    super(`channel ${scope} admission limit reached (${limit})`);
     this.name = "ChannelAdmissionError";
     this.scope = scope;
     this.limit = limit;
@@ -59,10 +63,15 @@ export class ChannelRouter {
     dedupeSize: number;
     maximumPendingGlobal: number;
     maximumPendingPerConversation: number;
+    maximumMessagesPerSenderWindow: number;
+    maximumTrackedSenders: number;
+    senderWindowMs: number;
   };
+  readonly #clock: () => number;
   readonly #seen = new Set<string>();
   readonly #queues = new Map<string, Promise<void>>();
   readonly #pendingByConversation = new Map<string, number>();
+  readonly #senderWindows = new Map<string, { count: number; resetAt: number }>();
   #pendingGlobal = 0;
 
   constructor(handler: ChannelMessageHandler, options: ChannelRouterOptions = {}) {
@@ -71,8 +80,12 @@ export class ChannelRouter {
       ...options,
       dedupeSize: boundedPositiveInteger(options.dedupeSize, 2_000),
       maximumPendingGlobal: boundedPositiveInteger(options.maximumPendingGlobal, 100),
-      maximumPendingPerConversation: boundedPositiveInteger(options.maximumPendingPerConversation, 8)
+      maximumPendingPerConversation: boundedPositiveInteger(options.maximumPendingPerConversation, 8),
+      maximumMessagesPerSenderWindow: boundedPositiveInteger(options.maximumMessagesPerSenderWindow, 30),
+      maximumTrackedSenders: boundedPositiveInteger(options.maximumTrackedSenders, 2_000),
+      senderWindowMs: boundedPositiveInteger(options.senderWindowMs, 60_000)
     };
+    this.#clock = options.clock ?? Date.now;
   }
 
   attach(adapter: ChannelAdapter): Promise<void> {
@@ -92,6 +105,11 @@ export class ChannelRouter {
     }
     if (conversationPending >= this.#options.maximumPendingPerConversation) {
       this.#options.onError?.(new ChannelAdmissionError("conversation", this.#options.maximumPendingPerConversation), message);
+      return;
+    }
+    const senderAdmissionError = this.#admitSender(message);
+    if (senderAdmissionError) {
+      this.#options.onError?.(senderAdmissionError, message);
       return;
     }
     this.#remember(deliveryKey);
@@ -130,6 +148,35 @@ export class ChannelRouter {
       if (typeof oldest !== "string") break;
       this.#seen.delete(oldest);
     }
+  }
+
+  #admitSender(message: InboundChannelMessage): ChannelAdmissionError | undefined {
+    const now = this.#clock();
+    const senderKey = [message.address.channel, message.address.accountId, message.sender.id]
+      .map(encodeURIComponent)
+      .join(":");
+    const current = this.#senderWindows.get(senderKey);
+    if (current && current.resetAt > now) {
+      if (current.count >= this.#options.maximumMessagesPerSenderWindow) {
+        return new ChannelAdmissionError("sender", this.#options.maximumMessagesPerSenderWindow);
+      }
+      current.count += 1;
+      return undefined;
+    }
+    if (current) this.#senderWindows.delete(senderKey);
+    if (this.#senderWindows.size >= this.#options.maximumTrackedSenders) {
+      for (const [key, window] of this.#senderWindows) {
+        if (window.resetAt <= now) this.#senderWindows.delete(key);
+      }
+    }
+    if (this.#senderWindows.size >= this.#options.maximumTrackedSenders) {
+      return new ChannelAdmissionError("sender-state", this.#options.maximumTrackedSenders);
+    }
+    this.#senderWindows.set(senderKey, {
+      count: 1,
+      resetAt: now + this.#options.senderWindowMs
+    });
+    return undefined;
   }
 }
 

@@ -86,6 +86,8 @@ test("repository setup fails closed and verifies the effective release reviewer 
   assert.match(configure, /const releaseEnvironment = JSON\.parse\(gh\("\/environments\/release"\)\)/);
   assert.match(configure, /rule\?\.type === "required_reviewers"/);
   assert.match(configure, /Number\(entry\?\.reviewer\?\.id\) === ownerUserId/);
+  assert.match(configure, /\{ name: "main", type: "branch" \}/);
+  assert.match(configure, /\{ name: "v\*", type: "tag" \}/);
   assert.match(configure, /release environment policy verification failed/);
   assert.doesNotMatch(configure, /Release environment reviewer policy could not be applied/);
   assert.doesNotMatch(configure, /ALLOW_UNSAFE|REVIEWERLESS|without reviewers/i);
@@ -108,6 +110,8 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
   process.stdout.write('[{"id":19858700,"name":"default","target":"branch"}]');
 } else if (endpoint.endsWith("/rulesets/19858700") && method === "GET") {
   process.stdout.write(process.env.FAKE_RULESET || "{}");
+} else if (endpoint.endsWith("/environments/release/deployment-branch-policies") && method === "GET") {
+  process.stdout.write(process.env.FAKE_DEPLOYMENT_POLICIES || "{}");
 } else if (endpoint.endsWith("/environments/release") && method === "GET") {
   process.stdout.write(process.env.FAKE_RELEASE_ENVIRONMENT || "{}");
 } else {
@@ -125,8 +129,8 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
       reviewers: [{ type: "User", reviewer: { id: 8_335_428 } }]
     }],
     deployment_branch_policy: {
-      protected_branches: true,
-      custom_branch_policies: false
+      protected_branches: false,
+      custom_branch_policies: true
     },
     ...overrides
   });
@@ -160,6 +164,7 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
     },
     required_linear_history: { enabled: true },
     required_conversation_resolution: { enabled: true },
+    enforce_admins: { enabled: false },
     allow_force_pushes: { enabled: false },
     allow_deletions: { enabled: false }
   };
@@ -191,6 +196,12 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
         FAKE_BRANCH_PROTECTION: JSON.stringify(branchProtection),
         FAKE_RULESET: JSON.stringify(ruleset),
         FAKE_RELEASE_ENVIRONMENT: JSON.stringify(environment),
+        FAKE_DEPLOYMENT_POLICIES: JSON.stringify({
+          branch_policies: [
+            { id: 1, name: "main", type: "branch" },
+            { id: 2, name: "v*", type: "tag" }
+          ]
+        }),
         ...extraEnv
       }
     }
@@ -199,12 +210,23 @@ if (endpoint.endsWith("/branches/main/protection") && method === "GET") {
   assert.notEqual(run(effective(), { FAKE_RELEASE_PUT_FAIL: "1" }).status, 0);
   assert.notEqual(run(effective(), { FAKE_BRANCH_PROTECTION: "{}" }).status, 0);
   assert.notEqual(run(effective(), {
+    FAKE_BRANCH_PROTECTION: JSON.stringify({
+      ...branchProtection,
+      allow_force_pushes: undefined
+    })
+  }).status, 0);
+  assert.notEqual(run(effective(), {
     FAKE_RULESET: JSON.stringify({ ...ruleset, enforcement: "disabled" })
   }).status, 0);
   assert.notEqual(run(effective({ protection_rules: [] })).status, 0);
   assert.notEqual(run(effective({
-    deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }
+    deployment_branch_policy: { protected_branches: true, custom_branch_policies: false }
   })).status, 0);
+  assert.notEqual(run(effective(), {
+    FAKE_DEPLOYMENT_POLICIES: JSON.stringify({
+      branch_policies: [{ id: 1, name: "main", type: "branch" }]
+    })
+  }).status, 0);
   const succeeded = run(effective());
   assert.equal(succeeded.status, 0, succeeded.stderr || succeeded.stdout);
   assert.match(succeeded.stdout, /Repository policy configured/);
