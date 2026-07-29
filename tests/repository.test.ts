@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { readFile, readdir } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { chmod, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { assertReleaseCommit, expectedReleaseCommit } from "../scripts/release/commit.ts";
 
@@ -43,12 +47,103 @@ test("published GitHub releases hand npm publication to the protected workflow",
   assert.match(release, /^\s{2}release:\s*\n\s{4}types:\s*\n\s{6}- published/m);
   assert.match(release, /^\s{2}workflow_dispatch:/m);
   assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \|\| github\.event\.release\.tag_name \}\}/);
-  assert.match(release, /npm publish "dist\/package-stage\/odinn-v\$version" --access public --provenance/);
-  assert.match(release, /gh release view "\$TAG" --json isDraft/);
+  assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}contents: read/m);
+  assert.match(release, /\.tag_name == \$tag and \.draft == false/);
+  assert.doesNotMatch(release.match(/^  release-policy:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /^\s+needs:/m);
+  assert.match(release, /^  verify:\s*[\s\S]*?^    needs: release-policy/m);
+  assert.match(
+    release,
+    /^  source-package:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- verify/m
+  );
+  assert.doesNotMatch(release.match(/^  source-package:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /id-token: write/);
+  assert.match(
+    release,
+    /^  publish-release:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- source-package\s*\n[\s\S]*?^    environment: release\s*\n[\s\S]*?^      id-token: write/m
+  );
+  assert.match(release, /mapfile -t package_manifests < <\(find dist\/npm-package -type f -name package\.json -print\)/);
+  assert.match(release, /test "\$\{#package_manifests\[@\]\}" -eq 1/);
+  assert.match(release, /npm publish "\$package_dir" --access public --provenance/);
+  assert.match(release, /release_commit: \$\{\{ steps\.release\.outputs\.commit \}\}/);
+  assert.match(release, /ref: \$\{\{ needs\.release-policy\.outputs\.release_commit \}\}/);
+  const publishJob = release.match(/^  publish-release:[\s\S]*$/m)?.[0] ?? "";
+  assert.ok(
+    publishJob.indexOf("Revalidate published release and exact tag commit") < publishJob.indexOf("npm publish"),
+    "exact tag/release revalidation must precede npm publication"
+  );
+  assert.match(publishJob, /test "\$\(git rev-list -n 1 "refs\/tags\/\$TAG"\)" = "\$EXPECTED_COMMIT"/);
   assert.doesNotMatch(release, /^\s{2}workflow_call:/m);
-  assert.match(release, /test "\$is_draft" = "false"/);
   assert.match(preflight, /releaseTag !== expected/);
   assert.match(preflight, /tagCommit\.stdout\.trim\(\) !== headCommit\.stdout\.trim\(\)/);
+});
+
+test("repository setup fails closed and verifies the effective release reviewer policy", async () => {
+  const configure = await read("scripts/repository/configure-github.ts");
+
+  assert.match(configure, /reviewers: \[\{ type: "User", id: ownerUserId \}\]/);
+  assert.match(configure, /const releaseEnvironment = JSON\.parse\(gh\("\/environments\/release"\)\)/);
+  assert.match(configure, /rule\?\.type === "required_reviewers"/);
+  assert.match(configure, /Number\(entry\?\.reviewer\?\.id\) === ownerUserId/);
+  assert.match(configure, /release environment policy verification failed/);
+  assert.doesNotMatch(configure, /Release environment reviewer policy could not be applied/);
+  assert.doesNotMatch(configure, /ALLOW_UNSAFE|REVIEWERLESS|without reviewers/i);
+});
+
+test("repository setup executes fail-closed release environment verification", async () => {
+  const bin = await mkdtemp(join(tmpdir(), "odinn-fake-gh-"));
+  const fakeGh = join(bin, "gh.js");
+  await writeFile(fakeGh, `const args = process.argv.slice(2);
+const endpoint = args[1] || "";
+const methodIndex = args.indexOf("--method");
+const method = methodIndex >= 0 ? args[methodIndex + 1] : "GET";
+if (endpoint.endsWith("/environments/release") && method === "PUT" && process.env.FAKE_RELEASE_PUT_FAIL === "1") {
+  process.stderr.write("reviewer policy rejected");
+  process.exit(1);
+}
+if (endpoint.endsWith("/environments/release") && method === "GET") {
+  process.stdout.write(process.env.FAKE_RELEASE_ENVIRONMENT || "{}");
+} else {
+  process.stdout.write("{}");
+  }
+`);
+  const gh = join(bin, "gh");
+  await writeFile(gh, `#!/usr/bin/env node\nrequire(${JSON.stringify(fakeGh)});\n`, { mode: 0o755 });
+  await chmod(gh, 0o755);
+  await writeFile(join(bin, "gh.cmd"), `@node "${fakeGh}" %*\r\n`);
+  const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+  const effective = (overrides: Record<string, unknown> = {}) => ({
+    protection_rules: [{
+      type: "required_reviewers",
+      reviewers: [{ type: "User", reviewer: { id: 8_335_428 } }]
+    }],
+    deployment_branch_policy: {
+      protected_branches: true,
+      custom_branch_policies: false
+    },
+    ...overrides
+  });
+  const run = (environment: Record<string, unknown>, extraEnv: Record<string, string> = {}) => spawnSync(
+    process.execPath,
+    ["scripts/repository/configure-github.ts", "BlueDot-IT/Odinn-Forge", "8335428"],
+    {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${bin}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
+        FAKE_RELEASE_ENVIRONMENT: JSON.stringify(environment),
+        ...extraEnv
+      }
+    }
+  );
+
+  assert.notEqual(run(effective(), { FAKE_RELEASE_PUT_FAIL: "1" }).status, 0);
+  assert.notEqual(run(effective({ protection_rules: [] })).status, 0);
+  assert.notEqual(run(effective({
+    deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }
+  })).status, 0);
+  const succeeded = run(effective());
+  assert.equal(succeeded.status, 0, succeeded.stderr || succeeded.stdout);
+  assert.match(succeeded.stdout, /Repository policy configured/);
 });
 
 test("dispatched release pull requests receive dependency and title checks", async () => {

@@ -4,7 +4,13 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { digestExtensionBundle, ExtensionExecutor, ExtensionRegistry } from "../packages/kernel/src/extensions.ts";
+import {
+  buildContainerExtensionArgs,
+  digestExtensionBundle,
+  ExtensionExecutor,
+  ExtensionRegistry,
+  validateOciImageReference
+} from "../packages/kernel/src/extensions.ts";
 import { createAuditStore, createDifferentiatedRuntime } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
@@ -61,6 +67,55 @@ test("container extensions bind integrity to the complete immutable bundle", asy
   try {
     await assert.rejects(() => new ExtensionExecutor(registry, { workspaceRoot: root }).invoke("container-tool", {}, { runtime: runtime.value }), /bundle integrity check failed/);
   } finally { runtime.differentiated.ledger.close(); }
+});
+
+test("container extension argv terminates runtime options before a validated OCI image", () => {
+  assert.deepEqual(
+    buildContainerExtensionArgs("ghcr.io/bluedot-it/odinn-extension:1.2.3", "/srv/odinn/bundle", "main.ts"),
+    [
+      "run", "--rm", "-i", "--network", "none", "--read-only", "--cap-drop", "ALL",
+      "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "256m", "--cpus", "0.5",
+      "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+      "--mount", "type=bind,src=/srv/odinn/bundle,dst=/extension,readonly",
+      "--workdir", "/extension",
+      "--",
+      "ghcr.io/bluedot-it/odinn-extension:1.2.3",
+      "node",
+      "/extension/main.ts"
+    ]
+  );
+});
+
+test("container images reject option injection, controls, whitespace, and malformed OCI references", async () => {
+  assert.equal(
+    validateOciImageReference(`registry.example.com/team/tool@sha256:${"a".repeat(64)}`),
+    `registry.example.com/team/tool@sha256:${"a".repeat(64)}`
+  );
+  for (const image of [
+    "--privileged",
+    "node:24-alpine --privileged",
+    "node:24-alpine\n--privileged",
+    "node:24-alpine\u0000--privileged",
+    "UPPERCASE/repository:latest",
+    "registry.example.com:70000/team/tool:latest",
+    "registry.example.com/team//tool:latest"
+  ]) {
+    assert.throws(() => validateOciImageReference(image), /strict OCI image reference/);
+  }
+
+  const root = await mkdtemp(join(tmpdir(), "odinn-extension-image-"));
+  const registry = new ExtensionRegistry(join(root, "extensions.json"));
+  await assert.rejects(
+    () => registry.install({
+      id: "bad-image",
+      version: "1.0.0",
+      type: "tool",
+      capabilities: [],
+      sandbox: "container",
+      containerImage: "--privileged"
+    }),
+    /strict OCI image reference/
+  );
 });
 
 test("extensions require content integrity and bound non-terminated output", async () => {

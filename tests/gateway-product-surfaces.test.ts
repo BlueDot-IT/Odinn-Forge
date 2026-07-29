@@ -197,7 +197,7 @@ test("audit query paginates and filters while usage shares its summary semantics
     query.searchParams.set("q", "audit-fixture");
     query.searchParams.set("type", "task.completed");
     query.searchParams.set("tool", "text.echo");
-    query.searchParams.set("actor", "audit-fixture-user");
+    query.searchParams.set("actor", "gateway");
     query.searchParams.set("outcome", "completed");
     query.searchParams.set("pageSize", "10");
     query.searchParams.set("page", "2");
@@ -205,7 +205,7 @@ test("audit query paginates and filters while usage shares its summary semantics
 
     assert.deepEqual(audit.pagination, { page: 2, pageSize: 10, pages: 2, total: 12, from: 11, to: 12 });
     assert.equal(audit.events.length, 2);
-    assert.ok(audit.events.every((event: any) => event.type === "task.completed" && event.tool === "text.echo" && event.actor === "audit-fixture-user"));
+    assert.ok(audit.events.every((event: any) => event.type === "task.completed" && event.tool === "text.echo" && event.actor === "gateway"));
     assert.deepEqual(
       { events: audit.filteredSummary.events, runs: audit.filteredSummary.runs, errors: audit.filteredSummary.errors },
       { events: 12, runs: 12, errors: 0 }
@@ -246,10 +246,10 @@ test("tasks hide system reads, expose real detail, and enforce replay safety", a
       });
     }
 
-    const firstPage = await requestJson(`${gateway.base}/tasks?q=pagination-user&page=1&pageSize=5`);
-    const secondPage = await requestJson(`${gateway.base}/tasks?q=pagination-user&page=2&pageSize=5`);
-    assert.deepEqual(firstPage.pagination, { page: 1, pageSize: 5, pages: 3, total: 12, from: 1, to: 5 });
-    assert.deepEqual(secondPage.pagination, { page: 2, pageSize: 5, pages: 3, total: 12, from: 6, to: 10 });
+    const firstPage = await requestJson(`${gateway.base}/tasks?q=text.echo&page=1&pageSize=5`);
+    const secondPage = await requestJson(`${gateway.base}/tasks?q=text.echo&page=2&pageSize=5`);
+    assert.deepEqual(firstPage.pagination, { page: 1, pageSize: 5, pages: 3, total: 13, from: 1, to: 5 });
+    assert.deepEqual(secondPage.pagination, { page: 2, pageSize: 5, pages: 3, total: 13, from: 6, to: 10 });
     assert.equal(firstPage.tasks.length, 5);
     assert.equal(secondPage.tasks.length, 5);
     assert.equal(firstPage.tasks.some((task: any) => secondPage.tasks.some((other: any) => other.id === task.id)), false);

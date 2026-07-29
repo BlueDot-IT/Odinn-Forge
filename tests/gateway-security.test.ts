@@ -118,19 +118,48 @@ test("remote gateway binding never bootstraps the control token through a spoofe
   }
 });
 
-test("approval records survive restart and claim idempotently", async () => {
+test("approval records survive restart and consume exactly once for the bound action", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-restart-"));
   const path = join(stateDir, "approvals.json");
   const first = createApprovalStore({ path });
-  const id = first.create({ tool: "browser.click", input: { confirmed: true }, summary: "Click" });
+  const action = { tool: "browser.click", runId: "run-browser-click", accountId: "home", input: { selector: "#send", confirmed: true }, summary: "Click" };
+  const id = first.create(action);
   const restarted = createApprovalStore({ path });
   const claimed = restarted.claim(id);
   assert.equal(claimed.status, "approved");
-  assert.equal(claimed.runId, `approval:${id}`);
+  assert.equal(claimed.runId, "run-browser-click");
   const secondClaim = createApprovalStore({ path }).claim(id);
   assert.equal(secondClaim.status, "approved");
   assert.equal(secondClaim.runId, claimed.runId);
+  for (const mismatch of [
+    { tool: "browser.press", runId: action.runId, accountId: action.accountId, input: { selector: "#send" } },
+    { tool: action.tool, runId: "different-run", accountId: action.accountId, input: { selector: "#send" } },
+    { tool: action.tool, runId: action.runId, accountId: "different-account", input: { selector: "#send" } },
+    { tool: action.tool, runId: action.runId, accountId: action.accountId, input: { selector: "#other" } }
+  ]) {
+    assert.equal(createApprovalStore({ path }).consume(id, mismatch), undefined);
+  }
+  const consumed = createApprovalStore({ path }).consume(id, {
+    tool: action.tool,
+    runId: action.runId,
+    accountId: action.accountId,
+    input: { selector: "#send" }
+  });
+  assert.equal(consumed?.id, id);
+  assert.equal(createApprovalStore({ path }).consume(id, action), undefined);
   assert.deepEqual(createApprovalStore({ path }).list(), []);
+});
+
+test("approval store recovers a crash-stale lock owned by a dead process", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-stale-lock-"));
+  const path = join(stateDir, "approvals.json");
+  await writeFile(`${path}.lock`, JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned",
+    createdAt: Date.now() - 60_000
+  }), { mode: 0o600 });
+  const id = createApprovalStore({ path }).create({ tool: "browser.click", input: { selector: "#send" } });
+  assert.match(id, /^approval_/);
 });
 
 test("gateway state files and directory are owner-only", async () => {

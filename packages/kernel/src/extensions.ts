@@ -10,6 +10,14 @@ const EXTENSION_SCHEMA_VERSION = 1;
 const EXTENSION_TYPES = new Set(["tool", "skill", "mcp"]);
 const SANDBOXES = new Set(["unconfined-process", "container", "none"]);
 const MAX_EXTENSION_OUTPUT_BYTES = 1_000_000;
+const OCI_PATH_COMPONENT = String.raw`[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*`;
+const OCI_DOMAIN_LABEL = String.raw`[a-z0-9](?:[a-z0-9-]*[a-z0-9])?`;
+const OCI_REGISTRY = String.raw`(?:${OCI_DOMAIN_LABEL}(?:\.${OCI_DOMAIN_LABEL})*|localhost)(?::[0-9]{1,5})?`;
+const OCI_TAG = String.raw`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`;
+const OCI_DIGEST = String.raw`[A-Za-z][A-Za-z0-9]*(?:[+._-][A-Za-z0-9]+)*:[A-Fa-f0-9]{32,}`;
+const OCI_REFERENCE = new RegExp(
+  String.raw`^(?:(?:${OCI_REGISTRY})/)?${OCI_PATH_COMPONENT}(?:/${OCI_PATH_COMPONENT})*(?::${OCI_TAG})?(?:@${OCI_DIGEST})?$`
+);
 
 type ExtensionType = "tool" | "skill" | "mcp";
 type ExtensionSandbox = "unconfined-process" | "container" | "none";
@@ -289,12 +297,7 @@ async function runContainerExtension(extension: ExtensionManifest, entrypoint: s
   const runtime = process.env.ODINN_EXTENSION_CONTAINER_RUNTIME || "docker";
   const relativeEntrypoint = relative(bundleRoot, entrypoint).replaceAll("\\", "/");
   if (!relativeEntrypoint || relativeEntrypoint.startsWith("..")) throw new Error("extension entrypoint must remain inside its immutable bundle");
-  const args = [
-    "run", "--rm", "-i", "--network", "none", "--read-only", "--cap-drop", "ALL",
-    "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "256m", "--cpus", "0.5",
-    "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--mount", `type=bind,src=${bundleRoot},dst=/extension,readonly`,
-    "--workdir", "/extension", extension.containerImage || "node:24-alpine", "node", `/extension/${relativeEntrypoint}`
-  ];
+  const args = buildContainerExtensionArgs(extension.containerImage, bundleRoot, relativeEntrypoint);
   try {
     return await runExtensionProcess(runtime, args, request, { cwd: bundleRoot, timeoutMs, protocol });
   } catch (error) {
@@ -302,6 +305,37 @@ async function runContainerExtension(extension: ExtensionManifest, entrypoint: s
     if ((failure as NodeError).code === "ENOENT") throw new Error(`extension container runtime not found: ${runtime}; install Docker/Podman or set ODINN_EXTENSION_CONTAINER_RUNTIME`);
     throw error;
   }
+}
+
+export function validateOciImageReference(input: unknown) {
+  const image = String(input ?? "");
+  if (
+    !image
+    || image !== image.trim()
+    || image.length > 512
+    || /[\s\u0000-\u001f\u007f]/u.test(image)
+    || !OCI_REFERENCE.test(image)
+  ) {
+    throw new Error("extension containerImage must be a strict OCI image reference");
+  }
+  const name = image.split("@", 1)[0].replace(/:[^/]*$/u, "");
+  if (name.length > 255) throw new Error("extension containerImage must be a strict OCI image reference");
+  const first = name.split("/", 1)[0];
+  const port = first.includes(":") ? Number(first.slice(first.lastIndexOf(":") + 1)) : undefined;
+  if (port !== undefined && (port < 1 || port > 65_535)) {
+    throw new Error("extension containerImage must be a strict OCI image reference");
+  }
+  return image;
+}
+
+export function buildContainerExtensionArgs(containerImage: unknown, bundleRoot: string, relativeEntrypoint: string) {
+  const image = validateOciImageReference(containerImage);
+  return [
+    "run", "--rm", "-i", "--network", "none", "--read-only", "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "256m", "--cpus", "0.5",
+    "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--mount", `type=bind,src=${bundleRoot},dst=/extension,readonly`,
+    "--workdir", "/extension", "--", image, "node", `/extension/${relativeEntrypoint}`
+  ];
 }
 
 export async function digestExtensionBundle(root: string) {
@@ -349,7 +383,7 @@ function normalizeManifest(input: unknown, { source, provenance }: Required<Inst
     contentDigest: String(value.contentDigest ?? "").trim().toLowerCase(),
     bundleRoot: String(value.bundleRoot ?? "").trim(),
     bundleDigest: String(value.bundleDigest ?? "").trim().toLowerCase(),
-    containerImage: String(value.containerImage ?? "node:24-alpine").trim(),
+    containerImage: validateOciImageReference(value.containerImage ?? "node:24-alpine"),
     integrity: value.bundleDigest ? "bundle-verified" : value.contentDigest ? "content-verified" : "metadata-only",
     permissions: value.permissions && typeof value.permissions === "object" && !Array.isArray(value.permissions) ? value.permissions as JsonObject : {}
   };

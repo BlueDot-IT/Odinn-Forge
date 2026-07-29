@@ -132,19 +132,19 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       capability: "browser.act",
       description: "Click a browser control after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser)
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.type", {
       capability: "browser.act",
       description: "Fill a browser field after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser)
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.press", {
       capability: "browser.act",
       description: "Press a browser key after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser)
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
     }],
     ["browser.recovery.status", {
       capability: "browser.read",
@@ -679,7 +679,9 @@ export async function runTask({
   runLedger,
   onModelDelta,
   onProviderAttempt,
-  onAgentProgress
+  onAgentProgress,
+  trustedApprovalId,
+  trustedApprovalRunId
 }: any) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
@@ -818,6 +820,8 @@ export async function runTask({
       },
       runLedger,
       capability: capabilityClaims,
+      trustedApprovalId,
+      trustedApprovalRunId,
       runTool: (nestedTask: any) => runTask({
         task: { ...nestedTask, actor: nestedTask.actor ?? request.actor },
         auditStore,

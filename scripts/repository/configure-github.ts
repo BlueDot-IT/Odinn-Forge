@@ -78,24 +78,32 @@ gh("/branches/main/protection", "PUT", {
   allow_fork_syncing: true
 });
 
-try {
-  gh("/environments/release", "PUT", {
-    wait_timer: 0,
-    reviewers: [{ type: "User", id: ownerUserId }],
-    deployment_branch_policy: {
-      protected_branches: true,
-      custom_branch_policies: false
-    }
-  });
-} catch (error: any) {
-  console.warn(`Release environment reviewer policy could not be applied: ${error.message}`);
-  gh("/environments/release", "PUT", {
-    wait_timer: 0,
-    deployment_branch_policy: {
-      protected_branches: true,
-      custom_branch_policies: false
-    }
-  });
+gh("/environments/release", "PUT", {
+  wait_timer: 0,
+  reviewers: [{ type: "User", id: ownerUserId }],
+  deployment_branch_policy: {
+    protected_branches: true,
+    custom_branch_policies: false
+  }
+});
+
+const releaseEnvironment = JSON.parse(gh("/environments/release"));
+const reviewerRule = Array.isArray(releaseEnvironment.protection_rules)
+  ? releaseEnvironment.protection_rules.find((rule: any) => rule?.type === "required_reviewers")
+  : undefined;
+const effectiveReviewers = Array.isArray(reviewerRule?.reviewers) ? reviewerRule.reviewers : [];
+const ownerIsRequired = effectiveReviewers.some(
+  (entry: any) => entry?.type === "User" && Number(entry?.reviewer?.id) === ownerUserId
+);
+const branchPolicy = releaseEnvironment.deployment_branch_policy;
+if (
+  !ownerIsRequired
+  || branchPolicy?.protected_branches !== true
+  || branchPolicy?.custom_branch_policies !== false
+) {
+  throw new Error(
+    "release environment policy verification failed: the required owner reviewer and protected-branch policy must be effective"
+  );
 }
 
 console.log("Repository policy configured.");

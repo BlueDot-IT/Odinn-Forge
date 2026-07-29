@@ -46,7 +46,7 @@ test("Discord agent read tools use the configured bot account", async () => {
   }
 });
 
-test("Discord messages and reactions execute without per-action approval", async () => {
+test("Discord mutations require action-bound one-time approval before fetch", async () => {
   const original = process.env.ODINN_TEST_DISCORD_TOKEN;
   process.env.ODINN_TEST_DISCORD_TOKEN = "test-token";
   let requests = 0;
@@ -63,21 +63,35 @@ test("Discord messages and reactions execute without per-action approval", async
     }
   });
   try {
-    const sent = await registry.get("discord.sendMessage").execute({ channelId: "123", content: "hello" });
+    const sendInput = { channelId: "123", content: "hello" };
+    const pending = await registry.get("discord.sendMessage").execute(sendInput, { request: { id: "run-send" } });
+    assert.equal(pending.type, "approval.required");
+    assert.equal(requests, 0, "Discord must not fetch before approval is claimed");
+    approvalStore.claim(pending.approvalId);
+    const sent = await registry.get("discord.sendMessage").execute(sendInput, {
+      request: { id: "run-send" },
+      trustedApprovalId: pending.approvalId
+    });
     assert.equal(sent.id, "456");
     assert.equal(requests, 1);
-    await registry.get("discord.addReaction").execute({ channelId: "123", messageId: "456", emoji: "👍" });
-    assert.equal(requests, 2);
+    await assert.rejects(
+      registry.get("discord.sendMessage").execute(sendInput, {
+        request: { id: "run-send" },
+        trustedApprovalId: pending.approvalId
+      }),
+      /approval is missing, expired, already used, or does not match/
+    );
+    assert.equal(requests, 1, "a consumed approval must not reach Discord twice");
     assert.equal(approvalStore.list().length, 0);
-    assert.equal(toolSafetyDescriptor("discord.sendMessage", registry.get("discord.sendMessage")).requiresApproval, false);
-    assert.equal(toolSafetyDescriptor("discord.addReaction", registry.get("discord.addReaction")).requiresApproval, false);
+    assert.equal(toolSafetyDescriptor("discord.sendMessage", registry.get("discord.sendMessage")).requiresApproval, true);
+    assert.equal(toolSafetyDescriptor("discord.addReaction", registry.get("discord.addReaction")).requiresApproval, true);
   } finally {
     if (original === undefined) delete process.env.ODINN_TEST_DISCORD_TOKEN;
     else process.env.ODINN_TEST_DISCORD_TOKEN = original;
   }
 });
 
-test("Discord thread creation retains explicit approval", async () => {
+test("Discord reaction and thread approvals are claimed before fetch and bound to exact input", async () => {
   const original = process.env.ODINN_TEST_DISCORD_TOKEN;
   process.env.ODINN_TEST_DISCORD_TOKEN = "test-token";
   let requests = 0;
@@ -91,10 +105,51 @@ test("Discord thread creation retains explicit approval", async () => {
     }
   });
   try {
-    const pending = await registry.get("discord.createThread").execute({ channelId: "123", name: "Review" });
-    assert.equal(pending.type, "approval.required");
+    const reactionInput = { channelId: "123", messageId: "456", emoji: "👍" };
+    const reaction = await registry.get("discord.addReaction").execute(reactionInput, { request: { id: "run-reaction" } });
+    assert.equal(reaction.type, "approval.required");
     assert.equal(requests, 0);
-    assert.equal(approvalStore.list().length, 1);
+    approvalStore.claim(reaction.approvalId);
+    await assert.rejects(
+      registry.get("discord.addReaction").execute(reactionInput, {
+        request: { id: "different-run" },
+        trustedApprovalId: reaction.approvalId
+      }),
+      /does not match/
+    );
+    await assert.rejects(
+      registry.get("discord.addReaction").execute({ ...reactionInput, emoji: "👎" }, {
+        request: { id: "run-reaction" },
+        trustedApprovalId: reaction.approvalId
+      }),
+      /does not match/
+    );
+    assert.equal(requests, 0, "mismatched action must fail before Discord fetch");
+    await registry.get("discord.addReaction").execute(reactionInput, {
+      request: { id: "run-reaction" },
+      trustedApprovalId: reaction.approvalId
+    });
+    assert.equal(requests, 1);
+
+    const threadInput = { channelId: "123", name: "Review" };
+    const thread = await registry.get("discord.createThread").execute(threadInput, { request: { id: "run-thread" } });
+    assert.equal(thread.type, "approval.required");
+    assert.equal(requests, 1);
+    await assert.rejects(
+      registry.get("discord.createThread").execute(threadInput, {
+        request: { id: "run-thread" },
+        trustedApprovalId: thread.approvalId
+      }),
+      /approval is missing/
+    );
+    assert.equal(requests, 1, "unclaimed approval must fail before Discord fetch");
+    approvalStore.claim(thread.approvalId);
+    const created = await registry.get("discord.createThread").execute(threadInput, {
+      request: { id: "run-thread" },
+      trustedApprovalId: thread.approvalId
+    });
+    assert.equal(created.id, "thread-1");
+    assert.equal(requests, 2);
   } finally {
     if (original === undefined) delete process.env.ODINN_TEST_DISCORD_TOKEN;
     else process.env.ODINN_TEST_DISCORD_TOKEN = original;

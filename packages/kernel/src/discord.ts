@@ -21,6 +21,9 @@ export function createDiscordAgentTools({ config = {}, approvalStore, fetch = gl
   if (!plugin.enabled) return new Map();
   const execute = async (tool: string, input: Record<string, any>, context: Record<string, any> = {}) => {
     const account = resolveDiscordAccount(plugin.accounts, input.accountId);
+    const normalizedInput = { ...input };
+    delete normalizedInput.confirmed;
+    delete normalizedInput.approvalId;
     if (tool === "discord.listChannels") {
       return discordRequest(fetch, account.token, "GET", `/guilds/${snowflake(input.guildId, "guildId")}/channels`);
     }
@@ -30,16 +33,27 @@ export function createDiscordAgentTools({ config = {}, approvalStore, fetch = gl
       if (input.after) query.set("after", snowflake(input.after, "after"));
       return discordRequest(fetch, account.token, "GET", `/channels/${snowflake(input.channelId, "channelId")}/messages?${query}`);
     }
-    if (tool === "discord.createThread" && context.request?.actor !== "user-approved") {
+    if (["discord.sendMessage", "discord.addReaction", "discord.createThread"].includes(tool) && !context.trustedApprovalId) {
       const summary = discordMutationSummary(tool, input);
       const approvalId = approvalStore.create({
         type: "approval.required",
         tool,
+        runId: context.request?.id,
+        accountId: account.accountId,
         summary,
-        input: { ...input, confirmed: true }
+        input: normalizedInput
       });
       return { type: "approval.required", approvalId, tool, summary, expiresInSeconds: 300 };
     }
+    if (["discord.sendMessage", "discord.addReaction", "discord.createThread"].includes(tool) && !approvalStore.consume(context.trustedApprovalId, {
+      tool,
+      runId: context.trustedApprovalRunId ?? context.request?.id,
+      accountId: account.accountId,
+      input: normalizedInput
+    })) {
+      throw new Error("Discord action approval is missing, expired, already used, or does not match this action");
+    }
+    input = normalizedInput;
     if (tool === "discord.sendMessage") {
       const content = requiredText(input.content, "content", 2_000);
       return discordRequest(fetch, account.token, "POST", `/channels/${snowflake(input.channelId, "channelId")}/messages`, {
