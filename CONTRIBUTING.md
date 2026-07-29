@@ -72,8 +72,11 @@ Every pull request must also declare its documentation impact. Select exactly
 one outcome in the pull request template and provide concrete details:
 
 - `Documentation updated` requires at least one changed Markdown/MDX file or a
-  file under `docs/`, and the details must identify the relevant paths.
-- `Documentation not required` requires a specific rationale. This is
+  file under `docs/`, and the details must identify at least one exact changed
+  documentation path.
+- `Documentation not required` requires a specific rationale; generic
+  assertions such as `No documentation required` are rejected, and reviewers
+  enforce whether the supplied rationale is adequate. This is
   appropriate for changes such as internal refactors, focused tests, or fixes
   that do not change user, operator, contributor, API, configuration, security,
   installation, upgrade, or troubleshooting behavior.

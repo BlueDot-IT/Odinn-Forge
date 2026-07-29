@@ -81,3 +81,28 @@ test("rejects an updated declaration without a documentation path", async () => 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /no Markdown\/MDX or docs\/ path changed/);
 });
+
+test("rejects updated details that do not identify a changed documentation path", async () => {
+  const result = await runPolicy(body("updated", "Updated docs/not-actually-changed.md."), [
+    "src/config.ts",
+    "docs/configuration.md",
+  ]);
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /identify at least one changed documentation path/);
+});
+
+test("rejects a generic documentation-not-required assertion", async () => {
+  for (const details of [
+    "N/A",
+    "None",
+    "Not required",
+    "Documentation not required",
+    "No docs",
+    "No documentation is required.",
+  ]) {
+    const result = await runPolicy(body("not-required", details), ["tests/config.test.ts"]);
+    assert.equal(result.status, 1, `expected rejection for: ${details}`);
+    assert.match(result.stderr, /must provide a specific rationale/);
+  }
+});
