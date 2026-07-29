@@ -24,12 +24,21 @@ Describe changes to permissions, secrets, network access, approvals, audit,
 updates, backups, restore, or other trust boundaries. State `None` when
 applicable.
 
+## Documentation impact
+
+Select exactly one outcome and replace the details placeholder.
+
+- [ ] Documentation updated
+- [ ] Documentation not required
+
+Documentation details: _Replace this text with updated paths or the concrete
+reason documentation is not required._
+
 ## Validation
 
 - [ ] Relevant unit and integration tests
 - [ ] Compatibility and security boundary tests where behavior changed
 - [ ] Cross-platform impact considered
-- [ ] Documentation updated for user-visible behavior
 - [ ] No unrelated formatting churn
 
 Include exact commands and sanitized evidence.
