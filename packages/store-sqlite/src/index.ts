@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
+import { redactDurableValue, type DurableRedactionContext } from "@odinn/protocol";
 
 export const SQLITE_SCHEMA_VERSION = 3;
 export type SqliteStoreOptions = { targetVersion?: number };
@@ -9,23 +10,6 @@ type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
 type FeatureFlags = Record<string, boolean>;
 type Artifact = { digest: string; path: string; mediaType: string; sizeBytes: number };
-
-const SECRET_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|capability(?:[_-]?token)?|authorization|cookie|credential|password|passwd|secret|private[_-]?key)/i;
-const SECRET_ASSIGNMENT = /\b([A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|capability(?:[_-]?token)?|authorization|cookie|credential|password|passwd|secret|private[_-]?key)[A-Za-z0-9_.-]*)\s*([:=])\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/giu;
-const URL_CREDENTIAL = /(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/giu;
-const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/gu;
-const SECRET_VALUES = [
-  /\bBearer\s+[A-Za-z0-9._~+\/-]+/giu,
-  /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/giu,
-  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{20,})\b/gu,
-  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu,
-  /\bAIza[A-Za-z0-9_-]{30,}\b/gu,
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/gu,
-  /\b(?:sk|rk)-[A-Za-z0-9_-]{12,}\b/gu,
-  /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{12,}\b/gu,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu,
-  /\b(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,})\b/gu
-];
 
 function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
@@ -36,22 +20,8 @@ function stable(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function redact(value: unknown, key = "", depth = 0): unknown {
-  if (depth > 8) return "[redacted-depth]";
-  if (SECRET_KEY.test(key)) return "[redacted]";
-  if (typeof value === "string") {
-    let redacted = value
-      .replace(PRIVATE_KEY_BLOCK, "[redacted]")
-      .replace(URL_CREDENTIAL, "$1[redacted]@");
-    for (const pattern of SECRET_VALUES) redacted = redacted.replace(pattern, "[redacted]");
-    redacted = redacted.replace(SECRET_ASSIGNMENT, "$1$2[redacted]");
-    return redacted.slice(0, 100_000);
-  }
-  if (Array.isArray(value)) return value.slice(0, 1_000).map((item) => redact(item, "", depth + 1));
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).slice(0, 1_000).filter(([, item]) => item !== undefined).map(([name, item]) => [name, redact(item, name, depth + 1)]));
-  }
-  return value;
+export function redact(value: unknown, context: DurableRedactionContext = {}): unknown {
+  return redactDurableValue(value, context);
 }
 
 const SHA256_K = Uint32Array.from([
@@ -410,8 +380,8 @@ export class ArtifactStore {
     return { digest: hash, path: relativePath.replaceAll("\\", "/"), mediaType, sizeBytes: bytes.byteLength };
   }
 
-  putJson(value: unknown): Artifact {
-    return this.put(JSON.stringify(redact(value)), { mediaType: "application/json" });
+  putJson(value: unknown, context: DurableRedactionContext = {}): Artifact {
+    return this.put(JSON.stringify(redact(value, context)), { mediaType: "application/json" });
   }
 }
 
@@ -473,7 +443,7 @@ export class RunLedger {
   }
 
   beginTool({ runId, toolName, input, safety, metadata = {} }: { runId: string; toolName: string; input?: unknown; safety?: unknown; metadata?: JsonMap }) {
-    const inputArtifact = this.artifacts.putJson(input ?? {});
+    const inputArtifact = this.artifacts.putJson(input ?? {}, { toolName, input: true });
     const now = new Date().toISOString();
     const stepId = `step_${randomUUID()}`;
     this.database.transaction((db) => {

@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
-import { unzipSync, zipSync } from "fflate";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { Unzip, UnzipInflate, zipSync } from "fflate";
 import { createRunLedger, redact } from "./run-ledger.ts";
 import { ProofVerifier, proofEvidenceView } from "./proof.ts";
 import { evaluatePolicyInvariants, normalizePolicyInvariants } from "@odinn/policy";
@@ -27,17 +27,72 @@ function containsRedaction(value: unknown): boolean {
   return false;
 }
 function hash(value: string | Buffer) { return createHash("sha256").update(value).digest("hex"); }
-function capsuleArchiveEntries(path: string): Map<string, Buffer> {
-  let archive: Record<string, Uint8Array>;
+const CAPSULE_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const CAPSULE_MAX_ENTRIES = 512;
+const CAPSULE_MAX_ENTRY_BYTES = 32 * 1024 * 1024;
+const CAPSULE_MAX_EXPANDED_BYTES = 128 * 1024 * 1024;
+const CAPSULE_DECOMPRESSION_TIMEOUT_MS = 10_000;
+const CAPSULE_COMPRESSED_CHUNK_BYTES = 16 * 1024;
+function capsuleArchiveBytes(path: string): Buffer {
+  let descriptor: number | undefined;
   try {
-    archive = unzipSync(readFileSync(path));
-  } catch {
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const metadata = fstatSync(descriptor);
+    if (!metadata.isFile() || metadata.size > CAPSULE_MAX_ARCHIVE_BYTES) {
+      throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ARCHIVE_BYTES}-byte compressed-size limit`);
+    }
+    return readFileSync(descriptor);
+  } catch (error) {
+    if (error instanceof OdinnRuntimeError) throw error;
+    throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function capsuleArchiveEntries(path: string): Map<string, Buffer> {
+  const compressed = capsuleArchiveBytes(path);
+  const archive = new Map<string, Buffer>();
+  let entries = 0;
+  let expandedBytes = 0;
+  const startedAt = Date.now();
+  try {
+    const unzipper = new Unzip((file) => {
+      entries += 1;
+      if (entries > CAPSULE_MAX_ENTRIES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ENTRIES}-entry limit`);
+      const name = file.name.replaceAll("\\", "/");
+      if (archive.has(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule contains a duplicate path", { name });
+      const chunks: Buffer[] = [];
+      let entryBytes = 0;
+      file.ondata = (error, data, final) => {
+        if (error) throw error;
+        if (Date.now() - startedAt > CAPSULE_DECOMPRESSION_TIMEOUT_MS) {
+          throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule decompression exceeded the ${CAPSULE_DECOMPRESSION_TIMEOUT_MS}ms execution limit`);
+        }
+        entryBytes += data.byteLength;
+        expandedBytes += data.byteLength;
+        if (entryBytes > CAPSULE_MAX_ENTRY_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule entry exceeds the ${CAPSULE_MAX_ENTRY_BYTES}-byte expanded-size limit`);
+        if (expandedBytes > CAPSULE_MAX_EXPANDED_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_EXPANDED_BYTES}-byte expanded-size limit`);
+        if (data.byteLength) chunks.push(Buffer.from(data));
+        if (final) archive.set(name, Buffer.concat(chunks, entryBytes));
+      };
+      file.start();
+    });
+    unzipper.register(UnzipInflate);
+    // Feed a bounded amount of compressed input at a time. fflate's streaming
+    // inflater emits after each push; handing it the entire archive would let
+    // forged size metadata drive an arbitrarily large allocation before our
+    // ondata limits can reject the entry.
+    if (compressed.byteLength === 0) unzipper.push(compressed, true);
+    for (let offset = 0; offset < compressed.byteLength; offset += CAPSULE_COMPRESSED_CHUNK_BYTES) {
+      const end = Math.min(offset + CAPSULE_COMPRESSED_CHUNK_BYTES, compressed.byteLength);
+      unzipper.push(compressed.subarray(offset, end), end === compressed.byteLength);
+    }
+  } catch (error) {
+    if (error instanceof OdinnRuntimeError) throw error;
     throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
   }
-  return new Map(Object.entries(archive).map(([name, bytes]) => [
-    name.replaceAll("\\", "/"),
-    Buffer.from(bytes)
-  ]));
+  return archive;
 }
 function capsuleEntryText(entries: Map<string, Buffer>, name: string): string {
   const entry = entries.get(name);
@@ -45,6 +100,21 @@ function capsuleEntryText(entries: Map<string, Buffer>, name: string): string {
   return entry.toString("utf8");
 }
 function parse(value: string | undefined | null, fallback: any = {}): any { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } }
+function redactArtifactBytes(bytes: Buffer, context: { toolName?: string; input?: boolean }) {
+  try {
+    return Buffer.from(json(redact(JSON.parse(bytes.toString("utf8")), context)));
+  } catch {
+    return bytes;
+  }
+}
+function replaceCapsuleDigests(value: any, digests: Map<string, string>): any {
+  if (typeof value === "string") return digests.get(value) ?? value;
+  if (Array.isArray(value)) return value.map((item) => replaceCapsuleDigests(item, digests));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceCapsuleDigests(item, digests)]));
+  }
+  return value;
+}
 function odinnVersion() {
   const configured = process.env.ODINN_VERSION?.trim();
   if (configured) return configured;
@@ -86,6 +156,39 @@ function isWithin(root: string, target: string) {
   const base = resolve(root);
   const resolvedTarget = resolve(target);
   return resolvedTarget === base || resolvedTarget.startsWith(`${base}${sep}`);
+}
+
+function assertCapsuleExportPath(root: string, target: string) {
+  const base = resolve(root);
+  const destination = resolve(target);
+  if (!isWithin(base, destination)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output escapes its allowed root");
+  const physicalBase = resolve(realpathSync(base));
+  const segments = relative(base, destination).split(sep).filter(Boolean);
+  let cursor = base;
+  for (const segment of segments) {
+    cursor = join(cursor, segment);
+    if (!existsSync(cursor)) break;
+    if (lstatSync(cursor).isSymbolicLink()) {
+      throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output cannot traverse a symbolic link", { path: target });
+    }
+    const physical = resolve(realpathSync(cursor));
+    if (!isWithin(physicalBase, physical)) {
+      throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output escapes its allowed root", { path: target });
+    }
+  }
+  return destination;
+}
+
+function physicalCapsuleExportPath(root: string, target: string) {
+  const destination = assertCapsuleExportPath(root, target);
+  const physicalBase = resolve(realpathSync(root));
+  // Node does not expose a portable openat(2). Restrict output to a direct
+  // child of an already-established allowed root so a workspace-controlled
+  // intermediate directory cannot be replaced between validation and open.
+  if (dirname(destination) !== resolve(root)) {
+    throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output must be directly inside an allowed root", { path: target });
+  }
+  return { destination, physicalBase, physicalDestination: join(physicalBase, basename(destination)) };
 }
 
 function isPlainRecord(value: unknown): value is AnyRecord {
@@ -586,44 +689,88 @@ export class CapsuleManager {
     const run = this.ledger.getRun(runId); if (!run) throw new OdinnRuntimeError("CAPSULE_INVALID", "run not found", { runId });
     const destination = resolve(output);
     const allowedRoots = [this.root, this.ledger.workspaceRoot].map((root) => resolve(root));
-    if (!allowedRoots.some((root) => destination === root || destination.startsWith(`${root}${sep}`))) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output must remain inside the workspace or .odinn/capsules directory", { output });
-    if (existsSync(destination) && lstatSync(destination).isSymbolicLink()) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output cannot be a symbolic link", { output });
+    const allowedRoot = allowedRoots.find((root) => isWithin(root, destination));
+    if (!allowedRoot) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output must remain inside the workspace or .odinn/capsules directory", { output });
+    assertCapsuleExportPath(allowedRoot, destination);
     const staging = join(this.root, `.staging-${randomUUID()}`); mkdirSync(join(staging, "artifacts"), { recursive: true }); mkdirSync(join(staging, "snapshots"), { recursive: true }); mkdirSync(join(staging, "verification"), { recursive: true });
     try {
       const storedContract = this.ledger.database.db.prepare("SELECT contract_json FROM verification_contracts WHERE run_id = ? ORDER BY created_at DESC LIMIT 1").get(runId);
       const storedPolicy = this.ledger.database.db.prepare("SELECT policy_json FROM policies WHERE run_id = ? ORDER BY created_at DESC LIMIT 1").get(runId);
       const effectiveContract = contract ?? parse(storedContract?.contract_json, null);
       const effectivePolicy = policy ?? parse(storedPolicy?.policy_json, null);
-      const manifest = { formatVersion: 1, odinnVersion: odinnVersion(), runId, createdAt: now(), sourcePlatform: `${process.platform}-${process.arch}`, model: { provider: run.providerId, modelId: run.modelId }, replayMode, redactions: ["api keys", "tokens", "cookies", "authorization headers"], requiredSecrets: [], checksumsFile: "checksums.sha256" };
+      const manifest = { formatVersion: 1, odinnVersion: odinnVersion(), runId, createdAt: now(), sourcePlatform: `${process.platform}-${process.arch}`, model: { provider: run.providerId, modelId: run.modelId }, replayMode, redactions: ["api keys", "tokens", "cookies", "authorization headers", "tool-declared sensitive input"], requiredSecrets: [], checksumsFile: "checksums.sha256" };
       writeFileSync(join(staging, "manifest.json"), `${json(manifest)}\n`);
-      writeFileSync(join(staging, "run.json"), `${json(redact(run))}\n`);
-      writeFileSync(join(staging, "events.jsonl"), `${(run.events ?? []).map((event: AnyRecord) => json(redact(event))).join("\n")}\n`);
       writeFileSync(join(staging, "environment.json"), `${json({ platform: process.platform, arch: process.arch, node: process.version })}\n`);
       writeFileSync(join(staging, "README.txt"), "This Odinn Forge capsule is content-addressed, redacted, and safe to inspect before replay.\n");
       if (effectiveContract) writeFileSync(join(staging, "contract.json"), `${json(redact(effectiveContract))}\n`);
       if (effectivePolicy) writeFileSync(join(staging, "policy.json"), `${json(redact(effectivePolicy))}\n`);
       const referenced = this.referencedArtifactRows(runId);
+      const artifactContexts = this.artifactRedactionContexts(runId);
+      const capsuleDigests = new Map<string, string>();
       for (const artifact of referenced) {
         const source = resolve(this.ledger.artifacts.root, artifact.path);
         if (!source.startsWith(`${resolve(this.ledger.artifacts.root)}${sep}`) || !existsSync(source)) continue;
-        const target = join(staging, "artifacts", artifact.digest);
-        copyFileSync(source, target);
+        const context = artifactContexts.get(artifact.digest) ?? {};
+        const bytes = redactArtifactBytes(readFileSync(source), context);
+        const safeDigest = hash(bytes);
+        capsuleDigests.set(artifact.digest, safeDigest);
+        writeFileSync(join(staging, "artifacts", safeDigest), bytes);
       }
-      const verification = this.ledger.database.db.prepare("SELECT * FROM assertion_results WHERE run_id = ? ORDER BY completed_at").all(runId).map((row: AnyRecord) => redact({ ...row, evidenceArtifactIds: parse(row.evidence_artifact_ids_json, []), result: parse(row.result_json) }));
+      const capsuleRun = replaceCapsuleDigests(redact(run), capsuleDigests);
+      writeFileSync(join(staging, "run.json"), `${json(capsuleRun)}\n`);
+      writeFileSync(join(staging, "events.jsonl"), `${(capsuleRun.events ?? []).map((event: AnyRecord) => json(event)).join("\n")}\n`);
+      const verification = this.ledger.database.db.prepare("SELECT * FROM assertion_results WHERE run_id = ? ORDER BY completed_at").all(runId).map((row: AnyRecord) => replaceCapsuleDigests(redact({ ...row, evidenceArtifactIds: parse(row.evidence_artifact_ids_json, []), result: parse(row.result_json) }), capsuleDigests));
       writeFileSync(join(staging, "verification", "results.json"), `${json(verification)}\n`);
-      const snapshots = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE run_id = ? ORDER BY created_at").all(runId).map((row: AnyRecord) => redact({ ...row, manifest: parse(row.manifest_json, {}) }));
+      const snapshots = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE run_id = ? ORDER BY created_at").all(runId).map((row: AnyRecord) => replaceCapsuleDigests(redact({ ...row, manifest: parse(row.manifest_json, {}) }), capsuleDigests));
       writeFileSync(join(staging, "snapshots", "index.json"), `${json(snapshots)}\n`);
       const files: string[] = []; for (const entryName of readdirSync(staging, { recursive: true })) { const name = String(entryName); if (name === "checksums.sha256") continue; const file = join(staging, name); if (lstatSync(file).isFile()) files.push(name.replaceAll("\\", "/")); }
       writeFileSync(join(staging, "checksums.sha256"), `${files.sort().map((name) => `${hash(readFileSync(join(staging, name)))}  ${name}`).join("\n")}\n`);
-      mkdirSync(dirname(destination), { recursive: true });
       const archiveEntries: Record<string, Uint8Array> = {};
+      let expandedBytes = 0;
       for (const entryName of readdirSync(staging, { recursive: true })) {
         const name = String(entryName).replaceAll("\\", "/");
         const file = join(staging, String(entryName));
-        if (lstatSync(file).isFile()) archiveEntries[name] = readFileSync(file);
+        if (!lstatSync(file).isFile()) continue;
+        if (Object.keys(archiveEntries).length >= CAPSULE_MAX_ENTRIES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ENTRIES}-entry limit`);
+        const bytes = readFileSync(file);
+        if (bytes.byteLength > CAPSULE_MAX_ENTRY_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule entry exceeds the ${CAPSULE_MAX_ENTRY_BYTES}-byte expanded-size limit`, { name });
+        expandedBytes += bytes.byteLength;
+        if (expandedBytes > CAPSULE_MAX_EXPANDED_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_EXPANDED_BYTES}-byte expanded-size limit`);
+        archiveEntries[name] = bytes;
       }
-      writeFileSync(destination, zipSync(archiveEntries, { level: 9 }), { flag: "wx", mode: 0o600 });
-      const digest = hash(readFileSync(destination)); this.ledger.database.db.prepare("INSERT OR REPLACE INTO capsules(id, run_id, path, manifest_json, digest, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`capsule_${randomUUID()}`, runId, destination, json(manifest), digest, now()); this.ledger.appendEvent({ runId, type: "artifact-created", payload: { kind: "capsule", path: destination, digest } }); return { path: destination, digest, manifest };
+      const compressed = Buffer.from(zipSync(archiveEntries, { level: 9 }));
+      if (compressed.byteLength > CAPSULE_MAX_ARCHIVE_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ARCHIVE_BYTES}-byte compressed-size limit`);
+      const { physicalBase, physicalDestination } = physicalCapsuleExportPath(allowedRoot, destination);
+      let descriptor: number | undefined;
+      let created = false;
+      let createdIdentity: { dev: number; ino: number } | undefined;
+      try {
+        descriptor = openSync(physicalDestination, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600);
+        created = true;
+        writeFileSync(descriptor, compressed);
+        fsyncSync(descriptor);
+        createdIdentity = fstatSync(descriptor);
+        const currentIdentity = lstatSync(physicalDestination);
+        const written = resolve(realpathSync(physicalDestination));
+        const lexical = resolve(realpathSync(destination));
+        if (!isWithin(physicalBase, written) || lexical !== written || !currentIdentity.isFile() || currentIdentity.dev !== createdIdentity.dev || currentIdentity.ino !== createdIdentity.ino) {
+          throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output parent changed during export", { output });
+        }
+        closeSync(descriptor);
+        descriptor = undefined;
+      } catch (error) {
+        if (descriptor !== undefined) {
+          try { closeSync(descriptor); } catch {}
+        }
+        if (created) {
+          try {
+            const currentIdentity = lstatSync(physicalDestination);
+            if (!createdIdentity || currentIdentity.dev === createdIdentity.dev && currentIdentity.ino === createdIdentity.ino) rmSync(physicalDestination, { force: true });
+          } catch {}
+        }
+        throw error;
+      }
+      const digest = hash(compressed); this.ledger.database.db.prepare("INSERT OR REPLACE INTO capsules(id, run_id, path, manifest_json, digest, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`capsule_${randomUUID()}`, runId, destination, json(manifest), digest, now()); this.ledger.appendEvent({ runId, type: "artifact-created", payload: { kind: "capsule", path: destination, digest } }); return { path: destination, digest, manifest };
     } finally { await rm(staging, { recursive: true, force: true }); }
   }
   referencedArtifactRows(runId: string) {
@@ -634,12 +781,31 @@ export class CapsuleManager {
     for (const row of this.ledger.database.db.prepare("SELECT se.artifact_digest FROM snapshot_entries se JOIN snapshots s ON s.id = se.snapshot_id WHERE s.run_id = ? AND se.artifact_digest IS NOT NULL").all(runId)) digests.add(row.artifact_digest);
     return [...digests].map((digest) => this.ledger.database.db.prepare("SELECT digest, path FROM artifacts WHERE digest = ?").get(digest)).filter(Boolean);
   }
+  artifactRedactionContexts(runId: string) {
+    const contexts = new Map<string, { toolName?: string; input?: boolean }>();
+    const steps = this.ledger.database.db.prepare("SELECT input_digest, output_digest, metadata_json FROM run_steps WHERE run_id = ?").all(runId);
+    const addContext = (digest: unknown, context: { toolName?: string; input?: boolean }) => {
+      if (typeof digest !== "string") return;
+      const prior = contexts.get(digest);
+      contexts.set(digest, {
+        toolName: context.toolName ?? prior?.toolName,
+        input: context.input === true || prior?.input === true
+      });
+    };
+    for (const step of steps) {
+      const metadata = parse(step.metadata_json, {});
+      const toolName = typeof metadata.toolName === "string" ? metadata.toolName : undefined;
+      addContext(step.input_digest, { toolName, input: true });
+      addContext(step.output_digest, { toolName });
+    }
+    return contexts;
+  }
   async verify(path: string) {
     requireExperimental(this.featureFlags, "capsules", this.ledger);
     const archive = resolve(path);
     if (!existsSync(archive)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule not found");
     const recorded = this.ledger.database.db.prepare("SELECT digest FROM capsules WHERE path = ? ORDER BY created_at DESC LIMIT 1").get(archive);
-    if (recorded && recorded.digest !== hash(readFileSync(archive))) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule archive digest changed", { path: archive });
+    if (recorded && recorded.digest !== hash(capsuleArchiveBytes(archive))) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule archive digest changed", { path: archive });
     const entries = capsuleArchiveEntries(archive);
     const normalizedNames = [...entries.keys()];
     const seenNames = new Set<string>();

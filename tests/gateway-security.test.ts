@@ -150,6 +150,68 @@ test("approval records survive restart and consume exactly once for the bound ac
   assert.deepEqual(createApprovalStore({ path }).list(), []);
 });
 
+test("approval persistence redacts browser values without weakening action binding", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-redaction-"));
+  const path = join(stateDir, "approvals.json");
+  const sentinel = "SENTINEL_APPROVAL_BROWSER_VALUE_4f91";
+  const action = {
+    tool: "browser.type",
+    runId: "run-browser-type",
+    input: { selector: "#password", value: sentinel, sensitive: true }
+  };
+  const id = createApprovalStore({ path }).create(action);
+  const persisted = await readFile(path, "utf8");
+  assert.doesNotMatch(persisted, new RegExp(sentinel));
+  assert.doesNotMatch(persisted, /bindingDigest/u);
+  assert.doesNotMatch(persisted, /ciphertext|sealedAction/u);
+
+  const restarted = createApprovalStore({ path });
+  const claimed = restarted.claim(id);
+  assert.equal(claimed?.input?.value, "[redacted]");
+  assert.equal(claimed?.input?.selector, "#password");
+  assert.doesNotMatch(await readFile(path, "utf8"), new RegExp(sentinel));
+  assert.equal(restarted.consume(id, {
+    ...action,
+    input: { ...action.input, value: "wrong-value" }
+  }), undefined);
+  assert.equal(restarted.consume(id, claimed!)?.input?.value, sentinel);
+  assert.doesNotMatch(await readFile(path, "utf8"), new RegExp(sentinel));
+});
+
+test("approval take restores exact volatile input once without persisting the payload", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-take-"));
+  const path = join(stateDir, "approvals.json");
+  const action = { tool: "browser.type", runId: "run-take", input: { selector: "#secretary", value: "exact value" } };
+  const id = createApprovalStore({ path }).create(action);
+  const taken = createApprovalStore({ path }).take(id);
+  assert.deepEqual(taken?.input, action.input);
+  assert.equal(createApprovalStore({ path }).take(id), undefined);
+  assert.doesNotMatch(await readFile(path, "utf8"), /exact value|ciphertext|sealedAction/u);
+});
+
+test("approval records fail closed after process-volatile input is unavailable", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-legacy-"));
+  const path = join(stateDir, "approvals.json");
+  const legacySecret = "LEGACY_BROWSER_VALUE_MUST_BE_SCRUBBED";
+  await writeFile(path, `${JSON.stringify({
+    schemaVersion: 1,
+    approvals: [{
+      id: "approval_without_volatile_input",
+      tool: "browser.type",
+      runId: "legacy",
+      input: { selector: "#password", value: legacySecret },
+      bindingTag: "unrecoverable",
+      status: "pending",
+      expiresAt: Date.now() + 60_000
+    }]
+  })}\n`, { mode: 0o600 });
+  const store = createApprovalStore({ path });
+  const claimed = store.claim("approval_without_volatile_input");
+  assert.equal(claimed?.input?.value, "[redacted]");
+  assert.doesNotMatch(await readFile(path, "utf8"), new RegExp(legacySecret));
+  assert.equal(store.consume("approval_without_volatile_input", claimed!), undefined);
+});
+
 test("approval store recovers a crash-stale lock owned by a dead process", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-stale-lock-"));
   const path = join(stateDir, "approvals.json");

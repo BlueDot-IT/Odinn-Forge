@@ -349,6 +349,59 @@ test("gateway stops browser state changes for explicit approval", async () => {
   }
 });
 
+test("gateway approval POST restores and executes the exact volatile browser input", async (t: any) => {
+  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
+  try { await access(chromiumPath); } catch { t.skip(`Chromium not available at ${chromiumPath}`); return; }
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-sealed-approval-"));
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
+    policy: { security: { browser: { allowPrivateNetwork: true } } }
+  }, null, 2)}\n`, { mode: 0o600 });
+  const sentinel = "SENTINEL_EXACT_APPROVED_VALUE_91f3";
+  const fixture = createHttpServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(`<!doctype html><title>before</title><input id="secretary"><script>
+      const field = document.querySelector("#secretary");
+      field.addEventListener("input", () => { document.title = field.value; });
+    </script>`);
+  });
+  await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+  const fixtureAddress = fixture.address();
+  if (!fixtureAddress || typeof fixtureAddress === "string") throw new Error("browser fixture did not bind a TCP port");
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const opened = await postJson(`${base}/run`, { tool: "browser.open", input: { url: `http://127.0.0.1:${fixtureAddress.port}/` } });
+    const requested = await postJson(`${base}/run`, {
+      id: "sealed-browser-type",
+      tool: "browser.type",
+      input: {
+        tabId: opened.output.id,
+        snapshotId: opened.output.snapshotId,
+        expectedUrl: opened.output.url,
+        selector: "#secretary",
+        value: sentinel
+      }
+    });
+    assert.equal(requested.output.type, "approval.required");
+    assert.doesNotMatch(await readFile(join(stateDir, "approvals.json"), "utf8"), new RegExp(sentinel));
+
+    const approvedResponse = await fetch(`${base}/approvals/${requested.output.approvalId}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    const approved = await approvedResponse.json();
+    assert.equal(approvedResponse.status, 200);
+    assert.equal(approved.output.type, "browser.action.completed");
+    assert.equal(approved.output.title, sentinel);
+    assert.deepEqual(JSON.parse(await readFile(join(stateDir, "approvals.json"), "utf8")).approvals, []);
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+    await new Promise((resolve: any) => fixture.close(() => resolve()));
+  }
+});
+
 test("gateway reuses one browser worker across sequential browser tasks", async (t: any) => {
   const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
   try {

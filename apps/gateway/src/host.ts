@@ -39,10 +39,19 @@ export async function verifyPassword(password: any, record: any) {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-export async function createMultiUserHost({ stateDir = ".odinn-host", users, publicOrigin, tls, loginLimits = {}, tenantLimits = {} }: any = {}) {
+export async function createMultiUserHost({
+  stateDir = ".odinn-host",
+  users,
+  publicOrigin,
+  tls,
+  loginLimits = {},
+  sessionLimits = {},
+  tenantLimits = {}
+}: any = {}) {
   const root = resolve(stateDir);
   await ensureSecureStateDirectory(root);
   const usersPath = join(root, "users.json");
+  const sessions: Map<string, any> = new Map();
   let usersById: Map<string, any> = new Map();
   const loadUsers = async () => {
     const records: any = users ?? JSON.parse(await readFile(usersPath, "utf8"));
@@ -56,10 +65,38 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
     assertNonOverlappingWorkspaces(active);
     if (new Set(active.map((user: any) => user.id)).size !== active.length) throw new Error("duplicate host user id");
     usersById = new Map(active.map((user: any) => [user.id, user]));
+    for (const [id, session] of sessions) {
+      if (!usersById.has(session.userId)) sessions.delete(id);
+    }
     return usersById;
   };
   await loadUsers();
-  const sessions: Map<string, any> = new Map();
+  const maximumSessionsGlobal = boundedInteger(sessionLimits.maximumGlobal, 500, 1, 10_000);
+  const maximumSessionsPerUser = Math.min(
+    maximumSessionsGlobal,
+    boundedInteger(sessionLimits.maximumPerUser, 5, 1, 100)
+  );
+  const sessionDurationMs = boundedInteger(sessionLimits.durationMs, 8 * 60 * 60 * 1000, 1_000, 30 * 24 * 60 * 60 * 1000);
+  const sessionSweepMs = boundedInteger(sessionLimits.sweepIntervalMs, Math.min(sessionDurationMs, 60_000), 100, 60_000);
+  const sweepSessions = (now = Date.now()) => {
+    for (const [id, session] of sessions) {
+      if (!Number.isFinite(session?.expiresAt) || session.expiresAt <= now) sessions.delete(id);
+    }
+  };
+  const revokeUserSessions = (userId: string) => {
+    for (const [id, session] of sessions) {
+      if (session.userId === userId) sessions.delete(id);
+    }
+  };
+  const replaceOldestUserSessionAtCapacity = (userId: string) => {
+    const owned = Array.from(sessions.entries())
+      .filter(([, session]) => session.userId === userId)
+      .sort((left, right) => left[1].issuedAt - right[1].issuedAt);
+    while (owned.length >= maximumSessionsPerUser) {
+      const oldest = owned.shift();
+      if (oldest) sessions.delete(oldest[0]);
+    }
+  };
   const tenants: Map<string, any> = new Map();
   const tenantIdleMs = Math.max(30_000, Number(tenantLimits.idleMs ?? 15 * 60 * 1000));
   const maximumTenantStorageBytes = Math.max(1_000_000, Number(tenantLimits.maximumStorageBytes ?? 2 * 1024 * 1024 * 1024));
@@ -166,6 +203,8 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
     if (sweepLoginAttempts()) void persistLoginAttempts().catch(() => undefined);
   }, Math.min(loginWindowMs, 60_000));
   loginAttemptSweepTimer.unref();
+  const sessionSweepTimer = setInterval(sweepSessions, sessionSweepMs);
+  sessionSweepTimer.unref();
 
   const handler = async (request: any, response: any) => {
     try {
@@ -216,11 +255,17 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
         }
         const pairAttemptCleared = loginAttempts.delete(attemptKey);
         if (pairAttemptCleared || swept) await persistLoginAttempts();
+        sweepSessions(now);
+        replaceOldestUserSessionAtCapacity(user.id);
+        if (sessions.size >= maximumSessionsGlobal) {
+          response.setHeader("retry-after", String(Math.max(1, Math.ceil(sessionSweepMs / 1_000))));
+          return send(response, 503, { error: "host session capacity reached" });
+        }
         const id = randomBytes(32).toString("base64url");
-        const expiresAt = Date.now() + 8 * 60 * 60 * 1000;
-        sessions.set(id, { userId: user.id, expiresAt });
+        const expiresAt = now + sessionDurationMs;
+        sessions.set(id, { userId: user.id, issuedAt: now, expiresAt });
         const signature = createHmac("sha256", sessionKey).update(id).digest("base64url");
-        response.setHeader("set-cookie", `odinn_host_session=${id}.${signature}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${tls ? "; Secure" : ""}`);
+        response.setHeader("set-cookie", `odinn_host_session=${id}.${signature}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.ceil(sessionDurationMs / 1_000)}${tls ? "; Secure" : ""}`);
         return send(response, 200, { ok: true, userId: user.id });
       }
       const session = authenticate(request, sessions, sessionKey);
@@ -233,7 +278,7 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
       }
       const user = usersById.get(session.userId);
       if (!user) {
-        sessions.delete(session.id);
+        revokeUserSessions(session.userId);
         const current = tenants.get(session.userId);
         if (current) await closeTenant(session.userId, current, tenants);
         return send(response, 403, { error: "user disabled" });
@@ -251,6 +296,7 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
   server.close = (callback: any) => {
     clearInterval(evictionTimer);
     clearInterval(loginAttemptSweepTimer);
+    clearInterval(sessionSweepTimer);
     void Promise.allSettled([...tenants.values()].map(({ gateway }: any) => new Promise((done: any) => gateway.close(() => done())))).then(() => close(callback));
     return server;
   };
@@ -463,6 +509,16 @@ if (isMain) {
   const cert = process.env.ODINN_TLS_CERT; const key = process.env.ODINN_TLS_KEY;
   if (remote && (!cert || !key || !process.env.ODINN_PUBLIC_ORIGIN)) throw new Error("remote hosting requires ODINN_TLS_CERT, ODINN_TLS_KEY, and ODINN_PUBLIC_ORIGIN");
   const tls = cert && key ? { cert: await readFile(cert), key: await readFile(key) } : undefined;
-  const server = await createMultiUserHost({ stateDir, publicOrigin: process.env.ODINN_PUBLIC_ORIGIN, tls });
+  const server = await createMultiUserHost({
+    stateDir,
+    publicOrigin: process.env.ODINN_PUBLIC_ORIGIN,
+    tls,
+    sessionLimits: {
+      maximumPerUser: process.env.ODINN_HOST_SESSION_MAX_PER_USER,
+      maximumGlobal: process.env.ODINN_HOST_SESSION_MAX_GLOBAL,
+      durationMs: process.env.ODINN_HOST_SESSION_DURATION_MS,
+      sweepIntervalMs: process.env.ODINN_HOST_SESSION_SWEEP_MS
+    }
+  });
   server.listen(port, host, () => console.log(`Odinn Forge multi-user host listening on ${tls ? "https" : "http"}://${host}:${port}`));
 }

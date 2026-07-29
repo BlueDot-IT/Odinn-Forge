@@ -17,7 +17,30 @@ export interface ChannelAdapter {
 }
 export interface ChannelMessageHandler { handle(message: InboundChannelMessage): Promise<string | undefined> }
 export interface ChannelAccessPolicy { allows(message: InboundChannelMessage): boolean }
-export interface ChannelRouterOptions { access?: ChannelAccessPolicy; dedupeSize?: number; onError?: (error: unknown, message: InboundChannelMessage) => void }
+export interface ChannelRouterOptions {
+  access?: ChannelAccessPolicy;
+  dedupeSize?: number;
+  maximumPendingGlobal?: number;
+  maximumPendingPerConversation?: number;
+  maximumMessagesPerSenderWindow?: number;
+  maximumTrackedSenders?: number;
+  senderWindowMs?: number;
+  clock?: () => number;
+  onError?: (error: unknown, message: InboundChannelMessage) => void;
+}
+
+export class ChannelAdmissionError extends Error {
+  readonly code = "CHANNEL_CAPACITY_REACHED";
+  readonly scope: "global" | "conversation" | "sender" | "sender-state";
+  readonly limit: number;
+
+  constructor(scope: "global" | "conversation" | "sender" | "sender-state", limit: number) {
+    super(`channel ${scope} admission limit reached (${limit})`);
+    this.name = "ChannelAdmissionError";
+    this.scope = scope;
+    this.limit = limit;
+  }
+}
 
 export function channelConversationKey(address: ChannelAddress): string {
   return [address.channel, address.accountId, address.conversationKind, address.conversationId, address.threadId ?? ""].map(encodeURIComponent).join(":");
@@ -36,13 +59,33 @@ export function createAllowlistPolicy(entries: string[]): ChannelAccessPolicy {
 
 export class ChannelRouter {
   readonly #handler: ChannelMessageHandler;
-  readonly #options: ChannelRouterOptions & { dedupeSize: number };
+  readonly #options: ChannelRouterOptions & {
+    dedupeSize: number;
+    maximumPendingGlobal: number;
+    maximumPendingPerConversation: number;
+    maximumMessagesPerSenderWindow: number;
+    maximumTrackedSenders: number;
+    senderWindowMs: number;
+  };
+  readonly #clock: () => number;
   readonly #seen = new Set<string>();
   readonly #queues = new Map<string, Promise<void>>();
+  readonly #pendingByConversation = new Map<string, number>();
+  readonly #senderWindows = new Map<string, { count: number; resetAt: number }>();
+  #pendingGlobal = 0;
 
   constructor(handler: ChannelMessageHandler, options: ChannelRouterOptions = {}) {
     this.#handler = handler;
-    this.#options = { ...options, dedupeSize: Math.max(1, options.dedupeSize ?? 2_000) };
+    this.#options = {
+      ...options,
+      dedupeSize: boundedPositiveInteger(options.dedupeSize, 2_000),
+      maximumPendingGlobal: boundedPositiveInteger(options.maximumPendingGlobal, 100),
+      maximumPendingPerConversation: boundedPositiveInteger(options.maximumPendingPerConversation, 8),
+      maximumMessagesPerSenderWindow: boundedPositiveInteger(options.maximumMessagesPerSenderWindow, 30),
+      maximumTrackedSenders: boundedPositiveInteger(options.maximumTrackedSenders, 2_000),
+      senderWindowMs: boundedPositiveInteger(options.senderWindowMs, 60_000)
+    };
+    this.#clock = options.clock ?? Date.now;
   }
 
   attach(adapter: ChannelAdapter): Promise<void> {
@@ -54,11 +97,27 @@ export class ChannelRouter {
     if (this.#options.access && !this.#options.access.allows(message)) return;
     const deliveryKey = `${message.address.channel}:${message.address.accountId}:${message.id}`;
     if (this.#seen.has(deliveryKey)) return;
-    this.#remember(deliveryKey);
-    await this.#acknowledge(adapter, message, "processing");
     const conversationKey = channelConversationKey(message.address);
+    const conversationPending = this.#pendingByConversation.get(conversationKey) ?? 0;
+    if (this.#pendingGlobal >= this.#options.maximumPendingGlobal) {
+      this.#options.onError?.(new ChannelAdmissionError("global", this.#options.maximumPendingGlobal), message);
+      return;
+    }
+    if (conversationPending >= this.#options.maximumPendingPerConversation) {
+      this.#options.onError?.(new ChannelAdmissionError("conversation", this.#options.maximumPendingPerConversation), message);
+      return;
+    }
+    const senderAdmissionError = this.#admitSender(message);
+    if (senderAdmissionError) {
+      this.#options.onError?.(senderAdmissionError, message);
+      return;
+    }
+    this.#remember(deliveryKey);
+    this.#pendingGlobal += 1;
+    this.#pendingByConversation.set(conversationKey, conversationPending + 1);
     const previous = this.#queues.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
+      await this.#acknowledge(adapter, message, "processing");
       try {
         const reply = await this.#handler.handle(message);
         if (reply?.trim()) await adapter.send({ address: message.address, text: reply, replyToId: message.id });
@@ -68,6 +127,10 @@ export class ChannelRouter {
         throw error;
       }
     }).catch((error) => this.#options.onError?.(error, message)).finally(() => {
+      this.#pendingGlobal -= 1;
+      const remaining = (this.#pendingByConversation.get(conversationKey) ?? 1) - 1;
+      if (remaining > 0) this.#pendingByConversation.set(conversationKey, remaining);
+      else this.#pendingByConversation.delete(conversationKey);
       if (this.#queues.get(conversationKey) === current) this.#queues.delete(conversationKey);
     });
     this.#queues.set(conversationKey, current);
@@ -86,6 +149,39 @@ export class ChannelRouter {
       this.#seen.delete(oldest);
     }
   }
+
+  #admitSender(message: InboundChannelMessage): ChannelAdmissionError | undefined {
+    const now = this.#clock();
+    const senderKey = [message.address.channel, message.address.accountId, message.sender.id]
+      .map(encodeURIComponent)
+      .join(":");
+    const current = this.#senderWindows.get(senderKey);
+    if (current && current.resetAt > now) {
+      if (current.count >= this.#options.maximumMessagesPerSenderWindow) {
+        return new ChannelAdmissionError("sender", this.#options.maximumMessagesPerSenderWindow);
+      }
+      current.count += 1;
+      return undefined;
+    }
+    if (current) this.#senderWindows.delete(senderKey);
+    if (this.#senderWindows.size >= this.#options.maximumTrackedSenders) {
+      for (const [key, window] of this.#senderWindows) {
+        if (window.resetAt <= now) this.#senderWindows.delete(key);
+      }
+    }
+    if (this.#senderWindows.size >= this.#options.maximumTrackedSenders) {
+      return new ChannelAdmissionError("sender-state", this.#options.maximumTrackedSenders);
+    }
+    this.#senderWindows.set(senderKey, {
+      count: 1,
+      resetAt: now + this.#options.senderWindowMs
+    });
+    return undefined;
+  }
+}
+
+function boundedPositiveInteger(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
 }
 
 export interface SessionBindingStore {

@@ -178,37 +178,107 @@ export async function dnsLookupAll(hostnameValue: any) {
   }
 }
 
+function normalizedAddress(value: unknown) {
+  let address = String(value || "").trim().toLowerCase();
+  if (address.startsWith("[") && address.endsWith("]")) address = address.slice(1, -1);
+  address = address.replace(/%[^%]+$/, "");
+  if (isIP(address)) return address;
+  try {
+    const hostname = new URL(`http://${address}/`).hostname.toLowerCase();
+    const normalized = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+    return isIP(normalized) ? normalized : address;
+  } catch {
+    return address;
+  }
+}
+
+function ipv4Number(address: string) {
+  const parts = address.split(".").map(Number);
+  return parts.length === 4
+    ? (((parts[0]! * 0x1000000) + (parts[1]! << 16) + (parts[2]! << 8) + parts[3]!) >>> 0)
+    : null;
+}
+
+function inIpv4Cidr(address: number, base: number, bits: number) {
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return (address & mask) === (base & mask);
+}
+
+const NON_PUBLIC_IPV4_CIDRS = [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+  ["192.31.196.0", 24], ["192.52.193.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16],
+  ["192.175.48.0", 24], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24],
+  ["224.0.0.0", 4], ["240.0.0.0", 4]
+] as const;
+
+function ipv6Bytes(address: string): number[] | null {
+  const halves = address.split("::");
+  if (halves.length > 2) return null;
+  const parseHalf = (half: string) => {
+    if (!half) return [] as number[];
+    const words: number[] = [];
+    for (const part of half.split(":")) {
+      if (part.includes(".")) {
+        const normalized = normalizedAddress(part);
+        if (isIP(normalized) !== 4) return null;
+        const bytes = normalized.split(".").map(Number);
+        words.push((bytes[0]! << 8) | bytes[1]!, (bytes[2]! << 8) | bytes[3]!);
+      } else {
+        if (!/^[a-f0-9]{1,4}$/.test(part)) return null;
+        words.push(Number.parseInt(part, 16));
+      }
+    }
+    return words;
+  };
+  const left = parseHalf(halves[0]!);
+  const right = parseHalf(halves[1] ?? "");
+  if (!left || !right) return null;
+  const missing = 8 - left.length - right.length;
+  if ((halves.length === 1 && missing !== 0) || (halves.length === 2 && missing < 1)) return null;
+  const words = [...left, ...Array(missing).fill(0), ...right];
+  if (words.length !== 8) return null;
+  return words.flatMap((word) => [word >>> 8, word & 0xff]);
+}
+
+function ipv6Prefix(bytes: number[], prefix: number[], bits: number) {
+  const fullBytes = Math.floor(bits / 8);
+  const remainder = bits % 8;
+  for (let index = 0; index < fullBytes; index += 1) if (bytes[index] !== prefix[index]) return false;
+  if (!remainder) return true;
+  const mask = 0xff << (8 - remainder);
+  return (bytes[fullBytes]! & mask) === (prefix[fullBytes]! & mask);
+}
+
 export function isPrivateAddress(value: any) {
-  const address = String(value || "").toLowerCase().replace(/^::ffff:/, "");
+  const address = normalizedAddress(value);
   if (address === "localhost" || address.endsWith(".localhost") || address.endsWith(".local") || address === "metadata.google.internal") return true;
   if (isIP(address) === 4) {
-    const [a, b, c] = address.split(".").map(Number);
-    return a === 0
-      || a === 10
-      || a === 100 && b >= 64 && b <= 127
-      || a === 127
-      || a === 169 && b === 254
-      || a === 172 && b >= 16 && b <= 31
-      || a === 192 && b === 0 && (c === 0 || c === 2)
-      || a === 192 && b === 88 && c === 99
-      || a === 192 && b === 168
-      || a === 198 && (b === 18 || b === 19 || b === 51 && c === 100)
-      || a === 203 && b === 0 && c === 113
-      || a >= 224;
+    const numeric = ipv4Number(address)!;
+    return NON_PUBLIC_IPV4_CIDRS.some(([base, bits]) => inIpv4Cidr(numeric, ipv4Number(base)!, bits));
   }
   if (isIP(address) === 6) {
-    return address === "::"
-      || address === "::1"
-      || address.startsWith("fc")
-      || address.startsWith("fd")
-      || address.startsWith("fe8")
-      || address.startsWith("fe9")
-      || address.startsWith("fea")
-      || address.startsWith("feb")
-      || address.startsWith("ff")
-      || address.startsWith("100:")
-      || address.startsWith("2001:2:")
-      || address.startsWith("2001:db8:");
+    const bytes = ipv6Bytes(address);
+    if (!bytes) return true;
+    const embeddedIpv4 = (offset: number) => {
+      const numeric = ((bytes[offset]! << 24) | (bytes[offset + 1]! << 16) | (bytes[offset + 2]! << 8) | bytes[offset + 3]!) >>> 0;
+      return NON_PUBLIC_IPV4_CIDRS.some(([base, bits]) => inIpv4Cidr(numeric, ipv4Number(base)!, bits));
+    };
+    const prefix = (literal: string, bits: number) => ipv6Prefix(bytes, ipv6Bytes(literal)!, bits);
+    // IPv4-compatible, mapped, NAT64, and 6to4 forms can otherwise disguise
+    // an internal IPv4 destination. Treat the translation-only prefixes as
+    // non-public, and inspect the embedded address where that is meaningful.
+    if (prefix("::", 96)) return true;
+    if (prefix("::ffff:0:0", 96)) return embeddedIpv4(12);
+    if (prefix("64:ff9b::", 96)) return embeddedIpv4(12);
+    if (prefix("64:ff9b:1::", 48) || prefix("100::", 64) || prefix("2001::", 23)) return true;
+    if (prefix("2002::", 16)) return true;
+    // Public unicast is currently allocated from 2000::/3. Explicitly reject
+    // special-use blocks within it and every non-global address outside it.
+    if (!prefix("2000::", 3)) return true;
+    return prefix("2001:db8::", 32)
+      || prefix("3fff::", 20)
+      || prefix("5f00::", 16);
   }
   return false;
 }

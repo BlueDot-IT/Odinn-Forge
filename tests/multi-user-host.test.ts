@@ -98,6 +98,124 @@ test("multi-user host rate limits repeated authentication failures", async () =>
   } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
 });
 
+test("multi-user host bounds sessions per user and globally", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-session-limit-"));
+  const aliceRoot = await mkdtemp(join(tmpdir(), "odinn-session-alice-"));
+  const bobRoot = await mkdtemp(join(tmpdir(), "odinn-session-bob-"));
+  const charlieRoot = await mkdtemp(join(tmpdir(), "odinn-session-charlie-"));
+  const alice = await hashPassword("alice-password-long");
+  const bob = await hashPassword("bob-password-longer");
+  const charlie = await hashPassword("charlie-password-long");
+  const publicOrigin = "https://odinn.test";
+  const server = await createMultiUserHost({
+    stateDir: root,
+    publicOrigin,
+    sessionLimits: { maximumPerUser: 2, maximumGlobal: 3 },
+    users: { schemaVersion: 1, users: [
+      { id: "alice", workspaceRoot: aliceRoot, salt: alice.salt, passwordHash: alice.hash },
+      { id: "bob", workspaceRoot: bobRoot, salt: bob.salt, passwordHash: bob.hash },
+      { id: "charlie", workspaceRoot: charlieRoot, salt: charlie.salt, passwordHash: charlie.hash }
+    ] }
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const login = (userId: string, password: string) => fetch(`${base}/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: publicOrigin },
+    body: JSON.stringify({ userId, password })
+  });
+  try {
+    const aliceOne = await login("alice", "alice-password-long");
+    const aliceOneCookie = aliceOne.headers.get("set-cookie")!.split(";")[0];
+    const aliceTwo = await login("alice", "alice-password-long");
+    const aliceTwoCookie = aliceTwo.headers.get("set-cookie")!.split(";")[0];
+    const aliceThree = await login("alice", "alice-password-long");
+    const aliceThreeCookie = aliceThree.headers.get("set-cookie")!.split(";")[0];
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceOneCookie } })).status, 401, "oldest user session must be revoked at capacity");
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceTwoCookie } })).status, 200);
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceThreeCookie } })).status, 200);
+
+    assert.equal((await login("bob", "bob-password-longer")).status, 200);
+    const capacity = await login("charlie", "charlie-password-long");
+    assert.equal(capacity.status, 503);
+    assert.match((await capacity.json()).error, /session capacity/);
+    assert.ok(Number(capacity.headers.get("retry-after")) >= 1);
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+  }
+});
+
+test("multi-user host sweeps expired sessions and reclaims global capacity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-session-expiry-"));
+  const aliceRoot = await mkdtemp(join(tmpdir(), "odinn-session-expiry-alice-"));
+  const bobRoot = await mkdtemp(join(tmpdir(), "odinn-session-expiry-bob-"));
+  const alice = await hashPassword("alice-password-long");
+  const bob = await hashPassword("bob-password-longer");
+  const publicOrigin = "https://odinn.test";
+  const server = await createMultiUserHost({
+    stateDir: root,
+    publicOrigin,
+    sessionLimits: { maximumPerUser: 1, maximumGlobal: 1, durationMs: 1_000, sweepIntervalMs: 100 },
+    users: { schemaVersion: 1, users: [
+      { id: "alice", workspaceRoot: aliceRoot, salt: alice.salt, passwordHash: alice.hash },
+      { id: "bob", workspaceRoot: bobRoot, salt: bob.salt, passwordHash: bob.hash }
+    ] }
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const login = (userId: string, password: string) => fetch(`${base}/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: publicOrigin },
+    body: JSON.stringify({ userId, password })
+  });
+  try {
+    const aliceLogin = await login("alice", "alice-password-long");
+    const aliceCookie = aliceLogin.headers.get("set-cookie")!.split(";")[0];
+    assert.equal((await login("bob", "bob-password-longer")).status, 503);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1_100));
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceCookie } })).status, 401);
+    assert.equal((await login("bob", "bob-password-longer")).status, 200, "expiry sweep must reclaim global capacity");
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+  }
+});
+
+test("multi-user host preserves a configured global session ceiling below the per-user limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-session-hard-global-"));
+  const aliceRoot = await mkdtemp(join(tmpdir(), "odinn-session-hard-global-alice-"));
+  const bobRoot = await mkdtemp(join(tmpdir(), "odinn-session-hard-global-bob-"));
+  const alice = await hashPassword("alice-password-long");
+  const bob = await hashPassword("bob-password-longer");
+  const publicOrigin = "https://odinn.test";
+  const server = await createMultiUserHost({
+    stateDir: root,
+    publicOrigin,
+    sessionLimits: { maximumPerUser: 5, maximumGlobal: 1 },
+    users: { schemaVersion: 1, users: [
+      { id: "alice", workspaceRoot: aliceRoot, salt: alice.salt, passwordHash: alice.hash },
+      { id: "bob", workspaceRoot: bobRoot, salt: bob.salt, passwordHash: bob.hash }
+    ] }
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const login = (userId: string, password: string) => fetch(`${base}/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: publicOrigin },
+    body: JSON.stringify({ userId, password })
+  });
+  try {
+    const aliceOne = await login("alice", "alice-password-long");
+    const aliceOneCookie = aliceOne.headers.get("set-cookie")!.split(";")[0];
+    assert.equal((await login("bob", "bob-password-longer")).status, 503, "the configured global limit must remain the hard ceiling");
+
+    const aliceTwo = await login("alice", "alice-password-long");
+    assert.equal(aliceTwo.status, 200, "the effective per-user limit should clamp to permit replacement");
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceOneCookie } })).status, 401);
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+  }
+});
+
 test("multi-user host canonicalizes accepted login IDs before throttling", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-host-normalized-limit-"));
   const workspace = await mkdtemp(join(tmpdir(), "odinn-normalized-limit-user-"));
@@ -280,19 +398,24 @@ test("multi-user host rejects overlapping tenant workspaces", async () => {
 
 test("multi-user host reloads disabled users without restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-host-reload-"));
-  const workspace = await mkdtemp(join(tmpdir(), "odinn-reload-workspace-"));
-  const password = await hashPassword("correct-password-long");
-  const record = { id: "alice", workspaceRoot: workspace, salt: password.salt, passwordHash: password.hash, disabled: false };
-  await writeFile(join(root, "users.json"), JSON.stringify({ schemaVersion: 1, users: [record] }));
+  const aliceWorkspace = await mkdtemp(join(tmpdir(), "odinn-reload-alice-workspace-"));
+  const bobWorkspace = await mkdtemp(join(tmpdir(), "odinn-reload-bob-workspace-"));
+  const alicePassword = await hashPassword("correct-password-long");
+  const bobPassword = await hashPassword("another-correct-password");
+  const alice = { id: "alice", workspaceRoot: aliceWorkspace, salt: alicePassword.salt, passwordHash: alicePassword.hash, disabled: false };
+  const bob = { id: "bob", workspaceRoot: bobWorkspace, salt: bobPassword.salt, passwordHash: bobPassword.hash, disabled: false };
+  await writeFile(join(root, "users.json"), JSON.stringify({ schemaVersion: 1, users: [alice, bob] }));
   const publicOrigin = "https://odinn.test";
-  const server = await createMultiUserHost({ stateDir: root, publicOrigin });
+  const server = await createMultiUserHost({ stateDir: root, publicOrigin, sessionLimits: { maximumGlobal: 1 } });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const login = await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "alice", password: "correct-password-long" }) });
     const cookie = login.headers.get("set-cookie").split(";")[0];
     assert.equal((await fetch(`${base}/status`, { headers: { cookie } })).status, 200);
-    await writeFile(join(root, "users.json"), JSON.stringify({ schemaVersion: 1, users: [{ ...record, disabled: true }] }));
-    assert.equal((await fetch(`${base}/status`, { headers: { cookie } })).status, 403);
+    await writeFile(join(root, "users.json"), JSON.stringify({ schemaVersion: 1, users: [{ ...alice, disabled: true }, bob] }));
+    const bobLogin = await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "bob", password: "another-correct-password" }) });
+    assert.equal(bobLogin.status, 200, "disabling a user must promptly reclaim that user's session capacity");
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie } })).status, 401);
   } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
 });

@@ -172,6 +172,20 @@ test("redaction preserves ordinary identifiers and non-secret prose", () => {
   for (const value of publicValues) assert.equal(redact(value), value);
 });
 
+test("redaction does not treat secret-like substrings or sensitive siblings as credentials", () => {
+  assert.deepEqual(redact({
+    secretary: "Alice",
+    cookiePolicy: "strict",
+    authorizationStatus: "allowed",
+    marked: { sensitive: true, label: "keep this label", value: "hide this value" }
+  }), {
+    secretary: "Alice",
+    cookiePolicy: "strict",
+    authorizationStatus: "allowed",
+    marked: { sensitive: true, label: "keep this label", value: "[redacted]" }
+  });
+});
+
 test("property: request input cannot broaden an explicit policy denial", () => {
   fc.assert(
     fc.property(identifierArbitrary, identifierArbitrary, jsonRecordArbitrary, (toolName, capability, generatedInput) => {

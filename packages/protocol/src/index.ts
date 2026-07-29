@@ -4,6 +4,105 @@ export const AUDIT_SCHEMA_VERSION = 1;
 
 export type JsonObject = { [key: string]: unknown };
 
+export type DurableRedactionContext = {
+  toolName?: string;
+  input?: boolean;
+};
+
+const REDACTED = "[redacted]";
+const SECRET_KEYS = new Set([
+  "apikey",
+  "accesstoken",
+  "refreshtoken",
+  "idtoken",
+  "capability",
+  "capabilitytoken",
+  "authorization",
+  "cookie",
+  "credential",
+  "credentials",
+  "password",
+  "passwordhash",
+  "passwd",
+  "secret",
+  "clientsecret",
+  "botsecret",
+  "bottoken",
+  "privatekey"
+]);
+const SECRET_ASSIGNMENT = /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|capability(?:[_-]?token)?|authorization|cookie|credentials?|password(?:[_-]?hash)?|passwd|secret|client[_-]?secret|bot[_-]?(?:secret|token)|private[_-]?key)\s*([:=])\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/giu;
+const URL_CREDENTIAL = /(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/giu;
+const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/gu;
+const SECRET_VALUES = [
+  /\bBearer\s+[A-Za-z0-9._~+\/-]+/giu,
+  /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/giu,
+  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{20,})\b/gu,
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu,
+  /\bAIza[A-Za-z0-9_-]{30,}\b/gu,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/gu,
+  /\b(?:sk|rk)-[A-Za-z0-9_-]{12,}\b/gu,
+  /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{12,}\b/gu,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu,
+  /\b(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,})\b/gu
+];
+
+/**
+ * The single persistence-boundary sanitizer used by audit, approval, ledger,
+ * and portable-export stores. Tool semantics are deliberately applied here,
+ * after authorization/idempotency digests have been computed from the real
+ * request, so redaction cannot weaken action binding.
+ */
+export function redactDurableValue(value: unknown, context: DurableRedactionContext = {}): unknown {
+  return redactDurableNode(value, {
+    toolName: context.toolName,
+    input: context.input === true,
+    depth: 0,
+    key: ""
+  });
+}
+
+function redactDurableNode(value: unknown, state: DurableRedactionContext & { depth: number; key: string }): unknown {
+  if (state.depth > 8) return "[redacted-depth]";
+  if (isSecretKey(state.key)) return REDACTED;
+  if (typeof value === "string") {
+    let redacted = value
+      .replace(PRIVATE_KEY_BLOCK, REDACTED)
+      .replace(URL_CREDENTIAL, `$1${REDACTED}@`);
+    for (const pattern of SECRET_VALUES) redacted = redacted.replace(pattern, REDACTED);
+    return redacted.replace(SECRET_ASSIGNMENT, `$1$2${REDACTED}`).slice(0, 100_000);
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 1_000).map((item) => redactDurableNode(item, { ...state, key: "", depth: state.depth + 1 }));
+  }
+  if (!value || typeof value !== "object") return value;
+
+  const record = value as JsonObject;
+  const toolName = typeof record.toolName === "string"
+    ? record.toolName
+    : typeof record.tool === "string"
+      ? record.tool
+      : state.toolName;
+  const markedSensitive = record.sensitive === true;
+  return Object.fromEntries(Object.entries(record)
+    .slice(0, 1_000)
+    .filter(([, item]) => item !== undefined)
+    .map(([key, item]) => {
+      const isInput = state.input || key === "input";
+      const browserTypeValue = toolName === "browser.type" && isInput && key === "value";
+      if (browserTypeValue || (markedSensitive && key === "value")) return [key, REDACTED];
+      return [key, redactDurableNode(item, {
+        toolName,
+        input: isInput,
+        depth: state.depth + 1,
+        key
+      })];
+    }));
+}
+
+function isSecretKey(key: string): boolean {
+  return SECRET_KEYS.has(key.replaceAll("_", "").replaceAll("-", "").toLowerCase());
+}
+
 export interface TaskRequest {
   id: string;
   tool: string;

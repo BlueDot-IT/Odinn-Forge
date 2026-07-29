@@ -37,6 +37,14 @@ const requiredChecks = [
   "Conventional title"
 ];
 
+function isEnabled(value: any) {
+  return value === true || value?.enabled === true;
+}
+
+function isDisabled(value: any) {
+  return value === false || value?.enabled === false;
+}
+
 console.log(`Configuring ${repository}`);
 
 gh("/actions/permissions/workflow", "PUT", {
@@ -61,12 +69,12 @@ gh("/branches/main/protection", "PUT", {
     strict: true,
     contexts: requiredChecks
   },
-  enforce_admins: false,
+  enforce_admins: true,
   required_pull_request_reviews: {
     dismiss_stale_reviews: true,
     require_code_owner_reviews: true,
     required_approving_review_count: 1,
-    require_last_push_approval: false
+    require_last_push_approval: true
   },
   restrictions: null,
   required_linear_history: true,
@@ -78,14 +86,100 @@ gh("/branches/main/protection", "PUT", {
   allow_fork_syncing: true
 });
 
+const protection = JSON.parse(gh("/branches/main/protection"));
+const effectiveChecks = Array.isArray(protection.required_status_checks?.contexts)
+  ? protection.required_status_checks.contexts
+  : [];
+const missingChecks = requiredChecks.filter((check) => !effectiveChecks.includes(check));
+if (
+  protection.required_status_checks?.strict !== true
+  || missingChecks.length > 0
+  || protection.required_pull_request_reviews?.required_approving_review_count !== 1
+  || protection.required_pull_request_reviews?.dismiss_stale_reviews !== true
+  || protection.required_pull_request_reviews?.require_code_owner_reviews !== true
+  || protection.required_pull_request_reviews?.require_last_push_approval !== true
+  || !isEnabled(protection.required_linear_history)
+  || !isEnabled(protection.required_conversation_resolution)
+  || !isEnabled(protection.enforce_admins)
+  || !isDisabled(protection.allow_force_pushes)
+  || !isDisabled(protection.allow_deletions)
+) {
+  throw new Error(
+    `main branch protection verification failed${missingChecks.length > 0
+      ? `: missing required checks ${missingChecks.join(", ")}`
+      : ""}`
+  );
+}
+
+const rulesets = JSON.parse(gh("/rulesets"));
+const defaultRuleset = Array.isArray(rulesets)
+  ? rulesets.find((ruleset: any) => ruleset?.name === "default" && ruleset?.target === "branch")
+  : undefined;
+if (!defaultRuleset?.id) {
+  throw new Error("default branch ruleset verification failed: the expected ruleset does not exist");
+}
+gh(`/rulesets/${defaultRuleset.id}`, "PUT", {
+  name: "default",
+  target: "branch",
+  enforcement: "active",
+  bypass_actors: [],
+  conditions: {
+    ref_name: {
+      include: ["~DEFAULT_BRANCH"],
+      exclude: []
+    }
+  },
+  rules: [
+    { type: "deletion" },
+    { type: "non_fast_forward" },
+    { type: "required_linear_history" }
+  ]
+});
+
+const effectiveRuleset = JSON.parse(gh(`/rulesets/${defaultRuleset.id}`));
+const effectiveRuleTypes = new Set(
+  Array.isArray(effectiveRuleset.rules)
+    ? effectiveRuleset.rules.map((rule: any) => rule?.type)
+    : []
+);
+if (
+  effectiveRuleset.enforcement !== "active"
+  || !Array.isArray(effectiveRuleset.bypass_actors)
+  || effectiveRuleset.bypass_actors.length !== 0
+  || !effectiveRuleset.conditions?.ref_name?.include?.includes("~DEFAULT_BRANCH")
+  || !effectiveRuleTypes.has("deletion")
+  || !effectiveRuleTypes.has("non_fast_forward")
+  || !effectiveRuleTypes.has("required_linear_history")
+) {
+  throw new Error(
+    "default branch ruleset verification failed: active deletion, non-fast-forward, and linear-history controls must be effective"
+  );
+}
+
 gh("/environments/release", "PUT", {
   wait_timer: 0,
   reviewers: [{ type: "User", id: ownerUserId }],
   deployment_branch_policy: {
-    protected_branches: true,
-    custom_branch_policies: false
+    protected_branches: false,
+    custom_branch_policies: true
   }
 });
+
+const requiredDeploymentPolicies = [
+  { name: "main", type: "branch" },
+  { name: "v*", type: "tag" }
+];
+const existingDeploymentPolicies = JSON.parse(
+  gh("/environments/release/deployment-branch-policies")
+);
+for (const expected of requiredDeploymentPolicies) {
+  const exists = existingDeploymentPolicies.branch_policies?.some(
+    (policy: any) => policy?.name === expected.name && policy?.type === expected.type
+  );
+  if (!exists) {
+    gh("/environments/release/deployment-branch-policies", "POST", expected);
+  }
+}
 
 const releaseEnvironment = JSON.parse(gh("/environments/release"));
 const reviewerRule = Array.isArray(releaseEnvironment.protection_rules)
@@ -96,13 +190,27 @@ const ownerIsRequired = effectiveReviewers.some(
   (entry: any) => entry?.type === "User" && Number(entry?.reviewer?.id) === ownerUserId
 );
 const branchPolicy = releaseEnvironment.deployment_branch_policy;
+const deploymentPolicies = JSON.parse(
+  gh("/environments/release/deployment-branch-policies")
+);
+const effectiveDeploymentPolicies = Array.isArray(deploymentPolicies.branch_policies)
+  ? deploymentPolicies.branch_policies
+  : [];
+const hasExactDeploymentPolicies =
+  effectiveDeploymentPolicies.length === requiredDeploymentPolicies.length
+  && requiredDeploymentPolicies.every((expected) =>
+    effectiveDeploymentPolicies.some(
+      (policy: any) => policy?.name === expected.name && policy?.type === expected.type
+    )
+  );
 if (
   !ownerIsRequired
-  || branchPolicy?.protected_branches !== true
-  || branchPolicy?.custom_branch_policies !== false
+  || branchPolicy?.protected_branches !== false
+  || branchPolicy?.custom_branch_policies !== true
+  || !hasExactDeploymentPolicies
 ) {
   throw new Error(
-    "release environment policy verification failed: the required owner reviewer and protected-branch policy must be effective"
+    "release environment policy verification failed: the required owner reviewer and exact main/v* deployment policies must be effective"
   );
 }
 
