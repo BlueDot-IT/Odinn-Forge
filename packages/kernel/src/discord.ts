@@ -1,5 +1,5 @@
 import type { ApprovalStore } from "./approvals.ts";
-import { DiscordRestClient } from "@odinn/channel-discord";
+import type { DiscordRestClient } from "@odinn/channel-discord";
 
 type DiscordToolOptions = {
   config?: Record<string, any>;
@@ -45,7 +45,11 @@ export function createDiscordAgentTools({ config = {}, approvalStore, fetch = gl
   const clients = new Map<string, DiscordRestClient>();
   const execute = async (tool: string, input: Record<string, any>, context: Record<string, any> = {}) => {
     const account = resolveDiscordAccount(plugin.accounts, input.accountId);
-    const client = clients.get(account.accountId) ?? new DiscordRestClient({ token: account.token, fetch });
+    const existingClient = clients.get(account.accountId);
+    const client = existingClient ?? new (await import("@odinn/channel-discord")).DiscordRestClient({
+      token: account.token,
+      fetch
+    });
     clients.set(account.accountId, client);
     const normalizedInput = { ...input };
     delete normalizedInput.confirmed;

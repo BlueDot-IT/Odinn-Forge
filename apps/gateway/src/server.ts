@@ -15,11 +15,6 @@ import {
   GatewayChannelHandler,
   createAllowlistPolicy
 } from "@odinn/channels";
-import { telegramChannelPlugin } from "@odinn/channel-telegram";
-import { discordChannelPlugin } from "@odinn/channel-discord";
-import { slackChannelPlugin } from "@odinn/channel-slack";
-import { teamsChannelPlugin } from "@odinn/channel-teams";
-import { whatsappChannelPlugin } from "@odinn/channel-whatsapp";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
@@ -531,7 +526,7 @@ export async function createGatewayServer({
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
   const skillStore = new SkillPackageStore(state);
   const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
-  const channelSupervisor = createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes });
+  const channelSupervisor = await createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry });
   await supervisor.start();
   const cronTimer = setInterval(() => runDueCronJobs(cronStore, isolatedTaskExecutor).catch(() => undefined), 30_000);
@@ -1946,16 +1941,23 @@ async function summarizeProviders(config: any, state: any) {
   }));
 }
 
-function createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes }: any) {
-  const plugins = new ChannelPluginRegistry([
-    telegramChannelPlugin,
-    discordChannelPlugin,
-    slackChannelPlugin,
-    teamsChannelPlugin,
-    whatsappChannelPlugin
-  ]);
+async function loadChannelPlugin(type: string) {
+  switch (type) {
+    case "telegram": return (await import("@odinn/channel-telegram")).telegramChannelPlugin;
+    case "discord": return (await import("@odinn/channel-discord")).discordChannelPlugin;
+    case "slack": return (await import("@odinn/channel-slack")).slackChannelPlugin;
+    case "teams": return (await import("@odinn/channel-teams")).teamsChannelPlugin;
+    case "whatsapp": return (await import("@odinn/channel-whatsapp")).whatsappChannelPlugin;
+    default: throw new Error(`unsupported channel plugin: ${type}`);
+  }
+}
+
+async function createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes }: any) {
+  const configuredEntries = Object.entries(config.channels ?? {});
+  const configuredTypes = [...new Set(configuredEntries.map(([, value]: any) => String(value?.type ?? "telegram")))];
+  const plugins = new ChannelPluginRegistry(await Promise.all(configuredTypes.map(loadChannelPlugin)));
   const dedupe = new FileChannelDedupeStore(join(state, "channel-dedupe.json"));
-  const configured = Object.entries(config.channels ?? {}).map(([name, value]: any) => {
+  const configured = configuredEntries.map(([name, value]: any) => {
     const type = String(value?.type ?? "telegram");
     const plugin = plugins.get(type);
     const accountConfig = plugin.normalizeAccountConfig(name, value);
