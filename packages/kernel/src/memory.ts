@@ -174,14 +174,26 @@ export async function decideMemoryCandidate(store: MemoryRecordStore, input: Mem
 
 export async function searchMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const limit = normalizeLimit(input.limit, 20);
-  return { memories: rankMemoryRecords(activeMemoryRecords(await store.readAll()), input).slice(0, limit) };
+  const ranked = rankMemoryRecords(activeMemoryRecords(await store.readAll()), input);
+  const memories = ranked.memories.slice(0, limit);
+  return {
+    memories,
+    selection: memorySelectionAudit(memories, ranked)
+  };
 }
 
 export async function recallMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const query = cleanRequired(input.query, "memory.recall requires query");
   const limit = normalizeLimit(input.limit, 8);
-  const memories = rankMemoryRecords(activeMemoryRecords(await store.readAll()), { ...input, query }).slice(0, limit);
-  return { query, memories, source: "odinn-memory", generatedAt: new Date().toISOString() };
+  const ranked = rankMemoryRecords(activeMemoryRecords(await store.readAll()), { ...input, query });
+  const memories = ranked.memories.slice(0, limit);
+  return {
+    query,
+    memories,
+    selection: memorySelectionAudit(memories, ranked),
+    source: "odinn-memory",
+    generatedAt: new Date().toISOString()
+  };
 }
 
 export async function browseMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
@@ -327,6 +339,10 @@ const MEMORY_STOPWORDS = new Set([
   "a", "an", "and", "are", "as", "at", "be", "but", "by", "do", "for", "from", "how", "i", "if", "in", "is", "it", "me", "my", "of", "on", "or", "our", "that", "the", "this", "to", "use", "we", "what", "when", "where", "which", "who", "with", "you", "your"
 ]);
 
+const DEFAULT_MEMORY_RELEVANCE_FLOOR = 0.2;
+const CONTRARY_EVIDENCE_QUERY = /\b(?:contrary|contradiction|conflict|disagree|disprove|exception|exclusion|negative evidence|what (?:was|is) not|no decision)\b/i;
+const BOILERPLATE_NEGATIVE_MEMORY = /\b(?:there (?:was|is)\s+)?no\s+(?:decision|change|action|update|finding|evidence|requirement|plan|policy)\s+(?:was\s+)?(?:made\s+)?(?:about|on|regarding|for)\b/i;
+
 function memoryTokens(value: any) {
   return Array.from(new Set(String(value || "")
     .toLowerCase()
@@ -346,6 +362,11 @@ function rankMemoryRecords(records: any, input: any = {}) {
   const requestedScopeId = cleanString(input.scopeId, "");
   const requestedProjectId = cleanString(input.projectId, "");
   const requestedSessionId = cleanString(input.sessionId, "");
+  const relevanceFloor = normalizeRelevanceFloor(input.relevanceFloor);
+  const includeContrary = input.includeContrary === true || CONTRARY_EVIDENCE_QUERY.test(query);
+  const scope = retrievalScopeAudit(input);
+  let suppressedNegative = 0;
+  let belowRelevanceFloor = 0;
   const scored = records
     .filter((record: any) => !kind || record.kind === kind)
     .filter((record: any) => !subject || String(record.subject ?? "").toLowerCase().includes(subject))
@@ -360,6 +381,13 @@ function rankMemoryRecords(records: any, input: any = {}) {
       if (scopeType === "session") return Boolean(requestedSessionId) && scopeId === requestedSessionId;
       return false;
     })
+    .filter((record: any) => {
+      // An unqueried memory.search is an operator inventory, not automatic
+      // context selection, so it must preserve the complete active record set.
+      if (!query || includeContrary || !isBoilerplateNegativeMemory(record)) return true;
+      suppressedNegative += 1;
+      return false;
+    })
     .map((record: any) => {
       const normalizedQuery = query.toLowerCase();
       const text = String(record.text || "").toLowerCase();
@@ -368,35 +396,134 @@ function rankMemoryRecords(records: any, input: any = {}) {
       const tags = (record.tags || []).map((tag: any) => String(tag).toLowerCase());
       const terms = new Set(memoryTokens(`${record.namespace} ${recordSubject} ${summary} ${text} ${tags.join(" ")}`));
       const matches = queryTokens.filter((token: any) => terms.has(token));
-      let score = queryTokens.length ? matches.length / queryTokens.length : 0;
+      const lexical = queryTokens.length ? matches.length / queryTokens.length : 0;
       const phraseMatched = Boolean(query && (
         text.includes(normalizedQuery)
         || summary.includes(normalizedQuery)
         || recordSubject.includes(normalizedQuery)
         || record.namespace.includes(normalizedQuery)
       ));
-      score += query && text.includes(normalizedQuery) ? 2 : 0;
-      score += query && summary.includes(normalizedQuery) ? 1 : 0;
-      score += query && recordSubject.includes(normalizedQuery) ? 3 : 0;
-      score += query && record.namespace.includes(normalizedQuery) ? 2 : 0;
-      score += matches.filter((token: any) => recordSubject.includes(token)).length * 1.5;
-      score += matches.filter((token: any) => tags.includes(token)).length;
-      score += record.tier === "l0" ? 0.35 : record.tier === "l1" ? 0.2 : 0.05;
-      score += Math.min(Math.max(Number(record.confidence) || 0, 0), 1) * 0.25;
-      score += recencyScore(record.at);
-      return { ...record, score: Number(score.toFixed(4)), matchTerms: matches, matchedQuery: !query || matches.length > 0 || phraseMatched };
+      const phrase = (query && text.includes(normalizedQuery) ? 2 : 0)
+        + (query && summary.includes(normalizedQuery) ? 1 : 0)
+        + (query && recordSubject.includes(normalizedQuery) ? 3 : 0)
+        + (query && record.namespace.includes(normalizedQuery) ? 2 : 0);
+      const subjectMatch = matches.filter((token: any) => recordSubject.includes(token)).length * 1.5;
+      const tagMatch = matches.filter((token: any) => tags.includes(token)).length;
+      const tier = record.tier === "l0" ? 0.35 : record.tier === "l1" ? 0.2 : 0.05;
+      const confidence = Math.min(Math.max(Number(record.confidence) || 0, 0), 1) * 0.3;
+      const authority = memoryAuthorityScore(record);
+      const correction = record.kind === "correction" || record.supersedes ? 0.6 : 0;
+      const recency = recencyScore(record.at);
+      const score = lexical + phrase + subjectMatch + tagMatch + tier + confidence + authority + correction + recency;
+      const relevant = !query || lexical >= relevanceFloor || phraseMatched;
+      if (!relevant) belowRelevanceFloor += 1;
+      return {
+        ...record,
+        score: Number(score.toFixed(4)),
+        matchTerms: matches,
+        matchedQuery: relevant,
+        retrieval: {
+          relevance: Number(lexical.toFixed(4)),
+          relevanceFloor,
+          weights: {
+            phrase: Number(phrase.toFixed(4)),
+            subject: Number(subjectMatch.toFixed(4)),
+            tags: Number(tagMatch.toFixed(4)),
+            tier: Number(tier.toFixed(4)),
+            correction: Number(correction.toFixed(4)),
+            recency: Number(recency.toFixed(4)),
+            confidence: Number(confidence.toFixed(4)),
+            sourceAuthority: Number(authority.toFixed(4))
+          }
+        }
+      };
     })
     .filter((record: any) => record.matchedQuery)
     .map(({ matchedQuery: _matchedQuery, ...record }: any) => record)
     .sort((left: any, right: any) => right.score - left.score || right.at.localeCompare(left.at));
-  return scored;
+  return {
+    memories: scored,
+    scope,
+    relevanceFloor,
+    includeContrary,
+    excluded: { suppressedNegative, belowRelevanceFloor }
+  };
 }
 
 function recencyScore(value: any) {
   const at = Date.parse(value || "");
   if (!Number.isFinite(at)) return 0;
   const ageDays = Math.max(0, (Date.now() - at) / 86_400_000);
-  return Math.max(0, 0.15 - ageDays * 0.002);
+  return Math.max(0, 0.2 - ageDays * 0.002);
+}
+
+function normalizeRelevanceFloor(value: any) {
+  const floor = Number(value ?? DEFAULT_MEMORY_RELEVANCE_FLOOR);
+  if (!Number.isFinite(floor)) return DEFAULT_MEMORY_RELEVANCE_FLOOR;
+  return Math.max(0, Math.min(floor, 1));
+}
+
+function isBoilerplateNegativeMemory(record: any) {
+  return BOILERPLATE_NEGATIVE_MEMORY.test(`${record.summary || ""} ${record.text || ""}`);
+}
+
+function memoryAuthorityScore(record: any) {
+  const authority = cleanString(record.authority, "").toLowerCase();
+  const source = cleanString(record.source, "").toLowerCase();
+  let score = 0;
+  if (/(?:user-correction|user-curated|user-reviewed|user-requested)/.test(authority)) score += 0.4;
+  else if (/(?:user-stated|verified|authoritative)/.test(authority)) score += 0.3;
+  else if (/(?:agent-derived|automatic-suggestion)/.test(authority)) score -= 0.1;
+  if (/(?:memory-cherry-pick|user|manual|reviewed)/.test(source)) score += 0.15;
+  else if (/(?:agent\.auto|session\.compaction)/.test(source)) score -= 0.05;
+  return Math.max(-0.15, Math.min(score, 0.55));
+}
+
+function retrievalScopeAudit(input: any = {}) {
+  const scopeType = cleanString(input.scopeType, "");
+  if (scopeType) return { mode: "explicit", scopeType, scopeId: cleanString(input.scopeId, "") || undefined };
+  const sessionId = cleanString(input.sessionId, "");
+  const projectId = cleanString(input.projectId, "");
+  if (sessionId) {
+    // Global records remain eligible because user preferences and system procedures
+    // legitimately cross projects; the relevance floor is the contamination guard.
+    return { mode: "session-default", sessionId, projectId: projectId || undefined, includesGlobal: true };
+  }
+  if (projectId) return { mode: "project-default", projectId, includesGlobal: true };
+  return { mode: "global-unscoped", includesGlobal: true };
+}
+
+function memorySelectionAudit(memories: any[], ranked: any) {
+  return {
+    scope: ranked.scope,
+    relevanceFloor: ranked.relevanceFloor,
+    includeContrary: ranked.includeContrary,
+    excluded: ranked.excluded,
+    records: memories.map((memory: any) => ({
+      id: memory.id,
+      title: cleanString(memory.title, memory.summary || memory.subject || memory.id).slice(0, 160),
+      score: memory.score,
+      // Keep core provenance flat so bounded-depth audit redaction retains it in
+      // nested automatic memory.recall task records.
+      source: memory.source,
+      authority: memory.authority,
+      confidence: memory.confidence,
+      scopeType: memory.scopeType ?? "global",
+      scopeId: memory.scopeId,
+      namespace: memory.namespace,
+      provenance: {
+        source: memory.source,
+        authority: memory.authority,
+        confidence: memory.confidence,
+        scopeType: memory.scopeType ?? "global",
+        scopeId: memory.scopeId,
+        namespace: memory.namespace,
+        at: memory.at,
+        origin: memory.origin
+      },
+      retrieval: memory.retrieval
+    }))
+  };
 }
 
 function extractMemoryStatements(messages: any = []) {

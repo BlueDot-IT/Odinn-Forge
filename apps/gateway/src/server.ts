@@ -1228,7 +1228,8 @@ export async function createGatewayServer({
             registry,
             signal: controller.signal,
             runLedger: runtime.ledger,
-            onModelDelta: (delta: string) => sendEvent("delta", { delta })
+            onModelDelta: (delta: string) => sendEvent("delta", { delta }),
+            onAgentProgress: (progress: any) => sendEvent("progress", progress)
           });
           quotaGate.recordUsage(body.tool, result.output?.usage);
           sendEvent("result", result);
@@ -4450,7 +4451,7 @@ function renderConsoleHtml(version = "development") {
       return data;
     }
 
-    async function streamApi(path, options, onDelta) {
+    async function streamApi(path, options, onDelta, onProgress = () => {}) {
       const response = await fetch(path, options);
       if (!response.ok || !response.body) throw new Error(response.statusText || "stream request failed");
       const reader = response.body.getReader();
@@ -4469,6 +4470,7 @@ function renderConsoleHtml(version = "development") {
           const raw = /^data:\\s*(.+)$/mu.exec(block)?.[1] || "{}";
           const value = JSON.parse(raw);
           if (event === "delta") onDelta(value.delta || "");
+          if (event === "progress") onProgress(value);
           if (event === "result") result = value;
           if (event === "error") throw new Error(value.error || "stream failed");
         }
@@ -4938,6 +4940,7 @@ function renderConsoleHtml(version = "development") {
         "task.blocked": "Stopped safely",
         "task.approval_required": "Waiting for approval",
         "task.cancelled": "Cancelled",
+        "agent.progress": "Agent progress",
         "provider.attempt": "Connected to model",
         "memory.curate": "Memory updated"
       };
@@ -5366,11 +5369,18 @@ function renderConsoleHtml(version = "development") {
       }
       const result = options.tool === "job.healthcheck"
         ? await api("/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(toolRequest) })
-        : await streamApi("/run/stream", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(toolRequest) }, (delta) => {
-            streamed += delta;
-            state.messages[state.messages.length - 1].content = streamed;
-            renderChatMessages(state.messages);
-          });
+        : await streamApi(
+            "/run/stream",
+            { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(toolRequest) },
+            (delta) => {
+              streamed += delta;
+              state.messages[state.messages.length - 1].content = streamed;
+              renderChatMessages(state.messages);
+            },
+            (progress) => {
+              $("chat-status").textContent = progress.message || "Working…";
+            }
+          );
       const reply = options.tool === "job.healthcheck"
         ? "System check passed. Ódinn is working normally."
         : result.output.content;
