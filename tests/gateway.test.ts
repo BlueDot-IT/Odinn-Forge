@@ -4,6 +4,7 @@ process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
@@ -13,6 +14,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
+import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/teams/src/index.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
@@ -191,6 +193,171 @@ test("gateway exposes only provider-authenticated channel webhook routes before 
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
     for (const [key, value] of Object.entries(environment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("gateway bounds and authenticates Microsoft Teams webhook activities end to end", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-teams-"));
+  const previousEnvironment = {
+    ODINN_TEST_TEAMS_APP_ID: process.env.ODINN_TEST_TEAMS_APP_ID,
+    ODINN_TEST_TEAMS_APP_PASSWORD: process.env.ODINN_TEST_TEAMS_APP_PASSWORD,
+    ODINN_TEST_TEAMS_PROVIDER_KEY: process.env.ODINN_TEST_TEAMS_PROVIDER_KEY
+  };
+  process.env.ODINN_TEST_TEAMS_APP_ID = "teams-test-app";
+  process.env.ODINN_TEST_TEAMS_APP_PASSWORD = "teams-test-password";
+  process.env.ODINN_TEST_TEAMS_PROVIDER_KEY = "teams-provider-key";
+  const outbound: any[] = [];
+  const authenticated: any[] = [];
+  let providerCalls = 0;
+  const provider = createHttpServer(async (request, response) => {
+    if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+      response.writeHead(404).end();
+      return;
+    }
+    providerCalls += 1;
+    for await (const _chunk of request) {
+      // Consume the complete bounded provider request.
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "teams-provider-response",
+      object: "chat.completion",
+      model: "teams-test-model",
+      choices: [{
+        index: 0,
+        finish_reason: "stop",
+        message: { role: "assistant", content: "ODINN_TEAMS_WEBHOOK_OK" }
+      }]
+    }));
+  });
+  await new Promise((resolve: any) => provider.listen(0, "127.0.0.1", resolve));
+  const providerPort = (provider.address() as any).port;
+  const signedToken = createHmac("sha256", "teams-test-signing-key").update("activity-1").digest("hex");
+  const connector = {
+    conversations: {
+      async sendToConversation(_conversationId: string, activity: any) {
+        outbound.push(activity);
+        return { id: `teams-out-${outbound.length}` };
+      },
+      async replyToActivity(_conversationId: string, _replyToId: string, activity: any) {
+        outbound.push(activity);
+        return { id: `teams-out-${outbound.length}` };
+      },
+      async updateActivity(_conversationId: string, _messageId: string, activity: any) {
+        outbound.push(activity);
+        return { id: activity.id };
+      },
+      async deleteActivity() {}
+    }
+  };
+  const botFrameworkAuthentication: any = {
+    async authenticateRequest(activity: any, authorization: string) {
+      assert.equal(authorization, `Bearer ${signedToken}`);
+      authenticated.push(activity);
+      return {
+        audience: "teams-test-audience",
+        callerId: "teams-test-caller",
+        claimsIdentity: { claims: [], isAuthenticated: true },
+        connectorFactory: { async create() { return connector; } }
+      };
+    },
+    createConnectorFactory() {
+      return { async create() { return connector; } };
+    },
+    async createUserTokenClient() { return {}; }
+  };
+  const testTeamsPlugin = {
+    ...teamsChannelPlugin,
+    createAdapter({ accountId, config, credential, credentials, onError }: any) {
+      return new TeamsChannelAdapter({
+        accountId,
+        appPassword: credential,
+        appId: credentials.appId,
+        tenantId: credentials.tenantId,
+        requireMention: config.requireMention,
+        botFrameworkAuthentication,
+        onError
+      });
+    }
+  };
+  await writeFile(join(stateDir, "config.json"), JSON.stringify({
+    version: 1,
+    defaultModel: "ci:teams-test-model",
+    providers: {
+      ci: {
+        type: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${providerPort}/v1`,
+        apiKeyEnv: "ODINN_TEST_TEAMS_PROVIDER_KEY",
+        models: ["teams-test-model"]
+      }
+    },
+    channels: {
+      work: {
+        type: "teams",
+        enabled: true,
+        tokenEnv: "ODINN_TEST_TEAMS_APP_PASSWORD",
+        appIdEnv: "ODINN_TEST_TEAMS_APP_ID",
+        allowlist: ["teams:aad-user-1"],
+        requireMention: false
+      }
+    }
+  }));
+  const server = await createGatewayServer({
+    stateDir,
+    workspaceRoot: root,
+    requestMaxBytes: 2_048,
+    async channelPluginLoader(type: string) {
+      assert.equal(type, "teams");
+      return testTeamsPlugin;
+    }
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await new Promise((resolveWait) => setImmediate(resolveWait));
+    const activity = {
+      type: "message",
+      id: "activity-1",
+      timestamp: "2026-07-29T12:00:00.000Z",
+      serviceUrl: "https://smba.trafficmanager.net/amer/",
+      channelId: "msteams",
+      text: "hello Odinn",
+      from: { id: "teams-user-1", aadObjectId: "aad-user-1", name: "Jason" },
+      recipient: { id: "teams-test-app", name: "Odinn" },
+      conversation: { id: "teams-conversation-1" },
+      channelData: { tenant: { id: "teams-tenant-1" } }
+    };
+    const accepted = await fetch(`${base}/channels/webhook/teams/work`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${signedToken}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(activity)
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal(authenticated.length, 1);
+    assert.equal(authenticated[0].id, "activity-1");
+    assert.equal(providerCalls, 1);
+    assert.ok(
+      outbound.some((message) => message.text === "ODINN_TEAMS_WEBHOOK_OK"),
+      `expected Teams reply in outbound activities: ${JSON.stringify(outbound)}`
+    );
+
+    const oversized = await fetch(`${base}/channels/webhook/teams/work`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(2_049)
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal(authenticated.length, 1);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => provider.close((error: any) => error ? reject(error) : resolve()));
+    for (const [key, value] of Object.entries(previousEnvironment)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }

@@ -24,6 +24,7 @@ export interface TeamsAdapterOptions {
   tenantId?: string;
   accountId?: string;
   requireMention?: boolean;
+  botFrameworkAuthentication?: ConstructorParameters<typeof CloudAdapter>[0];
   onError?: (error: unknown) => void;
 }
 
@@ -61,12 +62,12 @@ export class TeamsChannelAdapter implements ChannelAdapter {
     this.id = `teams:${this.accountId}`;
     this.#onError = options.onError;
     this.#requireMention = options.requireMention !== false;
-    const authentication = new ConfigurationBotFrameworkAuthentication({
-      MicrosoftAppType: options.tenantId ? "SingleTenant" : "MultiTenant",
-      MicrosoftAppId: options.appId,
-      MicrosoftAppPassword: options.appPassword,
-      MicrosoftAppTenantId: options.tenantId ?? ""
-    } as any);
+    const authentication = options.botFrameworkAuthentication ?? new ConfigurationBotFrameworkAuthentication({
+        MicrosoftAppType: options.tenantId ? "SingleTenant" : "MultiTenant",
+        MicrosoftAppId: options.appId,
+        MicrosoftAppPassword: options.appPassword,
+        MicrosoftAppTenantId: options.tenantId ?? ""
+      } as any);
     this.#adapter = new CloudAdapter(authentication);
     this.#adapter.onTurnError = async (_turnContext, error) => {
       this.#onError?.(error);
@@ -99,7 +100,27 @@ export class TeamsChannelAdapter implements ChannelAdapter {
     if (!this.#running || !this.#context) throw new Error("Microsoft Teams channel is not running");
     const rawRequest = request.rawRequest as any;
     const rawResponse = request.rawResponse as any;
-    await this.#adapter.process(rawRequest, rawResponse, async (turnContext) => {
+    if (!rawRequest || !rawResponse) throw new Error("Microsoft Teams webhook requires an HTTP request and response");
+    let body: unknown = {};
+    if ((request.method ?? rawRequest.method) === "POST") {
+      if (!Buffer.isBuffer(request.body)) throw new Error("Microsoft Teams webhook requires a bounded request body");
+      try {
+        body = JSON.parse(request.body.toString("utf8"));
+      } catch {
+        rawResponse.writeHead(400, {
+          "content-type": "text/plain; charset=utf-8",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff"
+        });
+        rawResponse.end("invalid Microsoft Teams webhook JSON");
+        return;
+      }
+    }
+    await this.#adapter.process({
+      method: request.method ?? rawRequest.method,
+      headers: rawRequest.headers,
+      body
+    } as any, botFrameworkResponse(rawResponse), async (turnContext) => {
       const normalized = normalizeTeamsActivity(turnContext.activity, this.accountId, {
         requireMention: this.#requireMention
       });
@@ -310,8 +331,36 @@ export const teamsChannelPlugin: ChannelPlugin<TeamsChannelAccountConfig> = {
   webhookPath(accountId) {
     return `/channels/webhook/teams/${encodeURIComponent(accountId)}`;
   },
-  webhookRequestMode: "raw-stream"
+  webhookRequestMode: "buffer"
 };
+
+function botFrameworkResponse(response: any) {
+  return {
+    socket: response.socket,
+    status(code: number) {
+      response.statusCode = code;
+      return this;
+    },
+    header(name: string, value: unknown) {
+      response.setHeader(name, String(value));
+      return this;
+    },
+    send(body: unknown) {
+      if (body === undefined || body === null) return this;
+      if (Buffer.isBuffer(body) || typeof body === "string") {
+        response.write(body);
+      } else {
+        if (!response.hasHeader("content-type")) response.setHeader("content-type", "application/json; charset=utf-8");
+        response.write(JSON.stringify(body));
+      }
+      return this;
+    },
+    end() {
+      if (!response.writableEnded) response.end();
+      return this;
+    }
+  };
+}
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;

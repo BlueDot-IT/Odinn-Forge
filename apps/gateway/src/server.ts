@@ -494,7 +494,8 @@ export async function createGatewayServer({
   workspaceRoot = process.cwd(),
   requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
   quotas = {},
-  hosted = false
+  hosted = false,
+  channelPluginLoader = loadChannelPlugin
 }: any = {}) {
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
@@ -526,7 +527,13 @@ export async function createGatewayServer({
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
   const skillStore = new SkillPackageStore(state);
   const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
-  const channelSupervisor = await createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes });
+  const channelSupervisor = await createChannelSupervisor({
+    config,
+    state,
+    gatewayToken,
+    requestMaxBytes,
+    loadPlugin: channelPluginLoader
+  });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry });
   await supervisor.start();
   const cronTimer = setInterval(() => runDueCronJobs(cronStore, isolatedTaskExecutor).catch(() => undefined), 30_000);
@@ -1952,10 +1959,10 @@ async function loadChannelPlugin(type: string) {
   }
 }
 
-async function createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes }: any) {
+async function createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes, loadPlugin }: any) {
   const configuredEntries = Object.entries(config.channels ?? {});
   const configuredTypes = [...new Set(configuredEntries.map(([, value]: any) => String(value?.type ?? "telegram")))];
-  const plugins = new ChannelPluginRegistry(await Promise.all(configuredTypes.map(loadChannelPlugin)));
+  const plugins = new ChannelPluginRegistry(await Promise.all(configuredTypes.map(loadPlugin)));
   const dedupe = new FileChannelDedupeStore(join(state, "channel-dedupe.json"));
   const configured = configuredEntries.map(([name, value]: any) => {
     const type = String(value?.type ?? "telegram");
