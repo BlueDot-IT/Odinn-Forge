@@ -1,0 +1,131 @@
+name: Codex Security daily scan
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: codex-security-daily
+  cancel-in-progress: true
+
+jobs:
+  codex-security:
+    name: Codex Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "26"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+
+      - name: Install Codex Security
+        env:
+          CODEX_SECURITY_PACKAGE: ${{ vars.CODEX_SECURITY_PACKAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -z "$CODEX_SECURITY_PACKAGE"; then
+            echo "Set the CODEX_SECURITY_PACKAGE repository or organization variable." >&2
+            exit 1
+          fi
+          npm install \
+            --prefix "$RUNNER_TEMP/codex-security" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            "$CODEX_SECURITY_PACKAGE"
+
+      - name: Verify Codex Security
+        env:
+          CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$CODEX_SECURITY_BIN"
+          "$CODEX_SECURITY_BIN" --version
+
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Restore ChatGPT OAuth sign-in
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          CODEX_AUTH_JSON: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
+          CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -z "$CODEX_AUTH_JSON"; then
+            echo "Set the ODINN_OPENAI_OAUTH_JSON repository or organization secret." >&2
+            exit 1
+          fi
+          install -d -m 700 "$CODEX_HOME"
+          printf '%s' "$CODEX_AUTH_JSON" > "$CODEX_HOME/auth.json"
+          chmod 600 "$CODEX_HOME/auth.json"
+          "$CODEX_SECURITY_BIN" login status
+
+      - name: Scan repository
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
+          SCAN_DIR: ${{ runner.temp }}/codex-security-results
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CODEX_SECURITY_BIN" scan . \
+            --mode standard \
+            --output-dir "$SCAN_DIR" \
+            --max-cost 5 \
+            --json > "$RUNNER_TEMP/codex-security.json"
+
+      - name: Export SARIF
+        id: export-sarif
+        if: always()
+        env:
+          CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
+          SCAN_DIR: ${{ runner.temp }}/codex-security-results
+          SARIF_FILE: ${{ runner.temp }}/codex-security.sarif
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f "$SCAN_DIR/scan-manifest.json"; then
+            "$CODEX_SECURITY_BIN" export "$SCAN_DIR" \
+              --export-format sarif \
+              --source-root "$GITHUB_WORKSPACE" \
+              --output "$SARIF_FILE"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload SARIF
+        if: always() && steps.export-sarif.outputs.available == 'true'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4
+        with:
+          sarif_file: ${{ runner.temp }}/codex-security.sarif
+          category: codex-security-daily
+
+      - name: Preserve scan results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: codex-security-results-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/codex-security-results
+            ${{ runner.temp }}/codex-security.json
+          if-no-files-found: warn
+          retention-days: 7
