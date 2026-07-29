@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
-import { unzipSync, zipSync } from "fflate";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { Unzip, UnzipInflate, zipSync } from "fflate";
 import { createRunLedger, redact } from "./run-ledger.ts";
 import { ProofVerifier, proofEvidenceView } from "./proof.ts";
 import { evaluatePolicyInvariants, normalizePolicyInvariants } from "@odinn/policy";
@@ -31,45 +31,68 @@ const CAPSULE_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 const CAPSULE_MAX_ENTRIES = 512;
 const CAPSULE_MAX_ENTRY_BYTES = 32 * 1024 * 1024;
 const CAPSULE_MAX_EXPANDED_BYTES = 128 * 1024 * 1024;
-function capsuleArchiveEntries(path: string): Map<string, Buffer> {
-  let compressed: Buffer;
+const CAPSULE_DECOMPRESSION_TIMEOUT_MS = 10_000;
+const CAPSULE_COMPRESSED_CHUNK_BYTES = 16 * 1024;
+function capsuleArchiveBytes(path: string): Buffer {
+  let descriptor: number | undefined;
   try {
-    const metadata = statSync(path);
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const metadata = fstatSync(descriptor);
     if (!metadata.isFile() || metadata.size > CAPSULE_MAX_ARCHIVE_BYTES) {
       throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ARCHIVE_BYTES}-byte compressed-size limit`);
     }
-    compressed = readFileSync(path);
+    return readFileSync(descriptor);
   } catch (error) {
     if (error instanceof OdinnRuntimeError) throw error;
     throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
+}
 
-  let archive: Record<string, Uint8Array>;
+function capsuleArchiveEntries(path: string): Map<string, Buffer> {
+  const compressed = capsuleArchiveBytes(path);
+  const archive = new Map<string, Buffer>();
+  let entries = 0;
+  let expandedBytes = 0;
+  const startedAt = Date.now();
   try {
-    let entries = 0;
-    let expandedBytes = 0;
-    // fflate invokes the filter from ZIP central-directory metadata before it
-    // allocates or inflates each entry. A metadata-only pass therefore admits
-    // the complete archive before any material expansion takes place.
-    unzipSync(compressed, {
-      filter: ({ originalSize }) => {
-        entries += 1;
-        expandedBytes += originalSize;
-        if (entries > CAPSULE_MAX_ENTRIES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ENTRIES}-entry limit`);
-        if (originalSize > CAPSULE_MAX_ENTRY_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule entry exceeds the ${CAPSULE_MAX_ENTRY_BYTES}-byte expanded-size limit`);
+    const unzipper = new Unzip((file) => {
+      entries += 1;
+      if (entries > CAPSULE_MAX_ENTRIES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ENTRIES}-entry limit`);
+      const name = file.name.replaceAll("\\", "/");
+      if (archive.has(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule contains a duplicate path", { name });
+      const chunks: Buffer[] = [];
+      let entryBytes = 0;
+      file.ondata = (error, data, final) => {
+        if (error) throw error;
+        if (Date.now() - startedAt > CAPSULE_DECOMPRESSION_TIMEOUT_MS) {
+          throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule decompression exceeded the ${CAPSULE_DECOMPRESSION_TIMEOUT_MS}ms execution limit`);
+        }
+        entryBytes += data.byteLength;
+        expandedBytes += data.byteLength;
+        if (entryBytes > CAPSULE_MAX_ENTRY_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule entry exceeds the ${CAPSULE_MAX_ENTRY_BYTES}-byte expanded-size limit`);
         if (expandedBytes > CAPSULE_MAX_EXPANDED_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_EXPANDED_BYTES}-byte expanded-size limit`);
-        return false;
-      }
+        if (data.byteLength) chunks.push(Buffer.from(data));
+        if (final) archive.set(name, Buffer.concat(chunks, entryBytes));
+      };
+      file.start();
     });
-    archive = unzipSync(compressed);
+    unzipper.register(UnzipInflate);
+    // Feed a bounded amount of compressed input at a time. fflate's streaming
+    // inflater emits after each push; handing it the entire archive would let
+    // forged size metadata drive an arbitrarily large allocation before our
+    // ondata limits can reject the entry.
+    if (compressed.byteLength === 0) unzipper.push(compressed, true);
+    for (let offset = 0; offset < compressed.byteLength; offset += CAPSULE_COMPRESSED_CHUNK_BYTES) {
+      const end = Math.min(offset + CAPSULE_COMPRESSED_CHUNK_BYTES, compressed.byteLength);
+      unzipper.push(compressed.subarray(offset, end), end === compressed.byteLength);
+    }
   } catch (error) {
     if (error instanceof OdinnRuntimeError) throw error;
     throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
   }
-  return new Map(Object.entries(archive).map(([name, bytes]) => [
-    name.replaceAll("\\", "/"),
-    Buffer.from(bytes)
-  ]));
+  return archive;
 }
 function capsuleEntryText(entries: Map<string, Buffer>, name: string): string {
   const entry = entries.get(name);
@@ -154,6 +177,18 @@ function assertCapsuleExportPath(root: string, target: string) {
     }
   }
   return destination;
+}
+
+function physicalCapsuleExportPath(root: string, target: string) {
+  const destination = assertCapsuleExportPath(root, target);
+  const physicalBase = resolve(realpathSync(root));
+  // Node does not expose a portable openat(2). Restrict output to a direct
+  // child of an already-established allowed root so a workspace-controlled
+  // intermediate directory cannot be replaced between validation and open.
+  if (dirname(destination) !== resolve(root)) {
+    throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output must be directly inside an allowed root", { path: target });
+  }
+  return { destination, physicalBase, physicalDestination: join(physicalBase, basename(destination)) };
 }
 
 function isPlainRecord(value: unknown): value is AnyRecord {
@@ -690,16 +725,52 @@ export class CapsuleManager {
       writeFileSync(join(staging, "snapshots", "index.json"), `${json(snapshots)}\n`);
       const files: string[] = []; for (const entryName of readdirSync(staging, { recursive: true })) { const name = String(entryName); if (name === "checksums.sha256") continue; const file = join(staging, name); if (lstatSync(file).isFile()) files.push(name.replaceAll("\\", "/")); }
       writeFileSync(join(staging, "checksums.sha256"), `${files.sort().map((name) => `${hash(readFileSync(join(staging, name)))}  ${name}`).join("\n")}\n`);
-      mkdirSync(dirname(destination), { recursive: true });
-      assertCapsuleExportPath(allowedRoot, destination);
       const archiveEntries: Record<string, Uint8Array> = {};
+      let expandedBytes = 0;
       for (const entryName of readdirSync(staging, { recursive: true })) {
         const name = String(entryName).replaceAll("\\", "/");
         const file = join(staging, String(entryName));
-        if (lstatSync(file).isFile()) archiveEntries[name] = readFileSync(file);
+        if (!lstatSync(file).isFile()) continue;
+        if (Object.keys(archiveEntries).length >= CAPSULE_MAX_ENTRIES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ENTRIES}-entry limit`);
+        const bytes = readFileSync(file);
+        if (bytes.byteLength > CAPSULE_MAX_ENTRY_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule entry exceeds the ${CAPSULE_MAX_ENTRY_BYTES}-byte expanded-size limit`, { name });
+        expandedBytes += bytes.byteLength;
+        if (expandedBytes > CAPSULE_MAX_EXPANDED_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_EXPANDED_BYTES}-byte expanded-size limit`);
+        archiveEntries[name] = bytes;
       }
-      writeFileSync(destination, zipSync(archiveEntries, { level: 9 }), { flag: "wx", mode: 0o600 });
-      const digest = hash(readFileSync(destination)); this.ledger.database.db.prepare("INSERT OR REPLACE INTO capsules(id, run_id, path, manifest_json, digest, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`capsule_${randomUUID()}`, runId, destination, json(manifest), digest, now()); this.ledger.appendEvent({ runId, type: "artifact-created", payload: { kind: "capsule", path: destination, digest } }); return { path: destination, digest, manifest };
+      const compressed = Buffer.from(zipSync(archiveEntries, { level: 9 }));
+      if (compressed.byteLength > CAPSULE_MAX_ARCHIVE_BYTES) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule archive exceeds the ${CAPSULE_MAX_ARCHIVE_BYTES}-byte compressed-size limit`);
+      const { physicalBase, physicalDestination } = physicalCapsuleExportPath(allowedRoot, destination);
+      let descriptor: number | undefined;
+      let created = false;
+      let createdIdentity: { dev: number; ino: number } | undefined;
+      try {
+        descriptor = openSync(physicalDestination, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600);
+        created = true;
+        writeFileSync(descriptor, compressed);
+        fsyncSync(descriptor);
+        createdIdentity = fstatSync(descriptor);
+        const currentIdentity = lstatSync(physicalDestination);
+        const written = resolve(realpathSync(physicalDestination));
+        const lexical = resolve(realpathSync(destination));
+        if (!isWithin(physicalBase, written) || lexical !== written || !currentIdentity.isFile() || currentIdentity.dev !== createdIdentity.dev || currentIdentity.ino !== createdIdentity.ino) {
+          throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output parent changed during export", { output });
+        }
+        closeSync(descriptor);
+        descriptor = undefined;
+      } catch (error) {
+        if (descriptor !== undefined) {
+          try { closeSync(descriptor); } catch {}
+        }
+        if (created) {
+          try {
+            const currentIdentity = lstatSync(physicalDestination);
+            if (!createdIdentity || currentIdentity.dev === createdIdentity.dev && currentIdentity.ino === createdIdentity.ino) rmSync(physicalDestination, { force: true });
+          } catch {}
+        }
+        throw error;
+      }
+      const digest = hash(compressed); this.ledger.database.db.prepare("INSERT OR REPLACE INTO capsules(id, run_id, path, manifest_json, digest, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`capsule_${randomUUID()}`, runId, destination, json(manifest), digest, now()); this.ledger.appendEvent({ runId, type: "artifact-created", payload: { kind: "capsule", path: destination, digest } }); return { path: destination, digest, manifest };
     } finally { await rm(staging, { recursive: true, force: true }); }
   }
   referencedArtifactRows(runId: string) {
@@ -734,7 +805,7 @@ export class CapsuleManager {
     const archive = resolve(path);
     if (!existsSync(archive)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule not found");
     const recorded = this.ledger.database.db.prepare("SELECT digest FROM capsules WHERE path = ? ORDER BY created_at DESC LIMIT 1").get(archive);
-    if (recorded && recorded.digest !== hash(readFileSync(archive))) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule archive digest changed", { path: archive });
+    if (recorded && recorded.digest !== hash(capsuleArchiveBytes(archive))) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule archive digest changed", { path: archive });
     const entries = capsuleArchiveEntries(archive);
     const normalizedNames = [...entries.keys()];
     const seenNames = new Set<string>();

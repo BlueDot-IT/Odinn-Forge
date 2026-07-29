@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, open, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,16 @@ import { createDifferentiatedRuntime, ProofVerifier } from "../packages/kernel/s
 import { isPrivateAddress } from "../packages/kernel/src/web.ts";
 
 const { zipSync } = createRequire(new URL("../packages/kernel/package.json", import.meta.url))("fflate");
+
+function forgeZipExpandedSize(archive: Uint8Array, claimedSize: number) {
+  const forged = Buffer.from(archive);
+  for (let offset = 0; offset <= forged.length - 30; offset += 1) {
+    const signature = forged.readUInt32LE(offset);
+    if (signature === 0x04034b50) forged.writeUInt32LE(claimedSize, offset + 22);
+    if (signature === 0x02014b50) forged.writeUInt32LE(claimedSize, offset + 24);
+  }
+  return forged;
+}
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "odinn-security-capsules-"));
@@ -33,6 +43,12 @@ test("capsule export rejects paths beneath a parent symlink", async () => {
       runtime.capsules.export("symlink-export", { output: join(workspace, "linked-parent", "escaped.odinn") }),
       (error: any) => error.code === "CAPSULE_INVALID" && /symbolic link/.test(error.message)
     );
+    const nestedParent = join(workspace, "new-parent");
+    await assert.rejects(
+      runtime.capsules.export("symlink-export", { output: join(nestedParent, "nested.odinn") }),
+      (error: any) => error.code === "CAPSULE_INVALID" && /directly inside/.test(error.message)
+    );
+    await assert.rejects(access(nestedParent), /ENOENT/);
   } finally {
     runtime.ledger.close();
     await rm(root, { recursive: true, force: true });
@@ -65,6 +81,51 @@ test("capsule verification enforces compressed, entry, and expansion limits", as
     await assert.rejects(
       runtime.capsules.verify(expansionBomb),
       (error: any) => error.code === "CAPSULE_INVALID" && /expanded-size limit/.test(error.message)
+    );
+
+    const forgedExpansionBomb = join(workspace, "forged-expansion-bomb.odinn");
+    const forgedArchive = forgeZipExpandedSize(
+      zipSync({ "forged.txt": new Uint8Array(32 * 1024 * 1024 + 1) }, { level: 9 }),
+      1
+    );
+    await writeFile(forgedExpansionBomb, forgedArchive);
+    await assert.rejects(
+      runtime.capsules.verify(forgedExpansionBomb),
+      (error: any) => error.code === "CAPSULE_INVALID" && /expanded-size limit/.test(error.message)
+    );
+  } finally {
+    runtime.ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("capsule export enforces verifier limits and valid exports round-trip", async () => {
+  const { root, workspace, runtime } = await fixture();
+  try {
+    runtime.ledger.ensureRun({ runId: "oversized-export", objective: "reject oversized export" });
+    const artifact = runtime.ledger.artifacts.put(Buffer.alloc(32 * 1024 * 1024 + 1), { mediaType: "application/octet-stream" });
+    runtime.ledger.database.db.prepare(
+      "INSERT INTO artifacts(digest, path, media_type, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)"
+    ).run(artifact.digest, artifact.path, artifact.mediaType, artifact.sizeBytes, new Date().toISOString());
+    runtime.ledger.appendEvent({ runId: "oversized-export", type: "tool-request", payload: { inputDigest: artifact.digest } });
+    const rejectedOutput = join(workspace, "oversized-export.odinn");
+    await assert.rejects(
+      runtime.capsules.export("oversized-export", { output: rejectedOutput }),
+      (error: any) => error.code === "CAPSULE_INVALID" && /expanded-size limit/.test(error.message)
+    );
+    await assert.rejects(access(rejectedOutput), /ENOENT/);
+
+    runtime.ledger.ensureRun({ runId: "round-trip-export", objective: "round trip" });
+    const validOutput = join(workspace, "round-trip.odinn");
+    await runtime.capsules.export("round-trip-export", { output: validOutput });
+    const verification = await runtime.capsules.verify(validOutput);
+    assert.equal(verification.valid, true);
+    const replaced = await open(validOutput, "w");
+    await replaced.truncate(64 * 1024 * 1024 + 1);
+    await replaced.close();
+    await assert.rejects(
+      runtime.capsules.verify(validOutput),
+      (error: any) => error.code === "CAPSULE_INVALID" && /compressed-size limit/.test(error.message)
     );
   } finally {
     runtime.ledger.close();
@@ -111,6 +172,33 @@ test("proof regex execution is terminated within a bounded time", async () => {
     assert.equal(result.status, "failed");
     assert.ok(Date.now() - started < 2_000, "catastrophic matcher must not block the verifier");
     assert.match(result.assertions[0].message, /regular expression exceeded 250ms execution limit/);
+  } finally {
+    runtime.ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("benign proof regex workers tolerate concurrent startup load", async () => {
+  const { root, workspace, runtime } = await fixture();
+  try {
+    await writeFile(join(workspace, "evidence.txt"), "NOTICE");
+    const verifications = Array.from({ length: 12 }, async (_, index) => {
+      const runId = `regex-concurrent-${index}`;
+      runtime.ledger.ensureRun({ runId, objective: "concurrent benign matcher" });
+      return await new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: workspace }).verify({
+        schemaVersion: 1,
+        id: `regex-concurrent-contract-${index}`,
+        runId,
+        assertions: [{
+          id: "benign-regex",
+          type: "file",
+          path: "evidence.txt",
+          expect: { exists: true, content: { matches: "^notice$", flags: "i" } }
+        }]
+      });
+    });
+    const results = await Promise.all(verifications);
+    assert.ok(results.every((result) => result.status === "passed"));
   } finally {
     runtime.ledger.close();
     await rm(root, { recursive: true, force: true });

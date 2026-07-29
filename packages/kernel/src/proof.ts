@@ -23,6 +23,7 @@ const MATCHER_KEYS = new Set(["equals", "contains", "matches", "flags"]);
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const DEFAULT_MAX_FILE_BYTES = 1_000_000;
+const REGEX_WORKER_STARTUP_TIMEOUT_MS = 2_000;
 const REGEX_EXECUTION_TIMEOUT_MS = 250;
 
 type NodeError = Error & { code?: string };
@@ -293,18 +294,27 @@ async function matchesText(actual: string, matcher: Matcher) {
       { eval: true, workerData: { actual, pattern: matcher.matches, flags: matcher.flags ?? "" } }
     );
     let settled = false;
+    let executionDeadline: NodeJS.Timeout | undefined;
     const finish = (error?: Error, matched?: boolean) => {
       if (settled) return;
       settled = true;
-      clearTimeout(deadline);
+      clearTimeout(startupDeadline);
+      if (executionDeadline) clearTimeout(executionDeadline);
       void worker.terminate();
       if (error) rejectMatch(error);
       else resolveMatch(matched === true);
     };
-    const deadline = setTimeout(
-      () => finish(new Error(`proof regular expression exceeded ${REGEX_EXECUTION_TIMEOUT_MS}ms execution limit`)),
-      REGEX_EXECUTION_TIMEOUT_MS
+    const startupDeadline = setTimeout(
+      () => finish(new Error(`proof regular expression worker exceeded ${REGEX_WORKER_STARTUP_TIMEOUT_MS}ms startup limit`)),
+      REGEX_WORKER_STARTUP_TIMEOUT_MS
     );
+    worker.once("online", () => {
+      clearTimeout(startupDeadline);
+      executionDeadline = setTimeout(
+        () => finish(new Error(`proof regular expression exceeded ${REGEX_EXECUTION_TIMEOUT_MS}ms execution limit`)),
+        REGEX_EXECUTION_TIMEOUT_MS
+      );
+    });
     worker.once("message", (message: { match?: boolean; error?: string }) => {
       if (message.error) finish(new Error(`proof regular expression failed: ${message.error}`));
       else finish(undefined, message.match);
