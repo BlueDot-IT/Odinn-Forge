@@ -1,5 +1,6 @@
+import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { withStateMutationLock } from "./state-mutation.ts";
 
@@ -30,8 +31,34 @@ type SkillRecord = SkillManifest & {
 
 type RegistryState = { schemaVersion: 1; packages: SkillRecord[] };
 
+type DisclosureIndexEntry = SkillDisclosureMetadata & { integrity: string };
+type DisclosureIndex = {
+  schemaVersion: 1;
+  entries: DisclosureIndexEntry[];
+  integrity: string;
+};
+
+export type EnabledSkillContent = {
+  id: string;
+  version: string;
+  name: string;
+  description: string;
+  requestedTools: string[];
+  requestedCapabilities: string[];
+  integrity: string;
+  content: string;
+};
+
+export type SkillDisclosureMetadata = Omit<EnabledSkillContent, "integrity" | "content">;
+
 const SKILL_ID = /^[a-z0-9][a-z0-9-]{1,63}$/u;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
+const DISCLOSURE_INDEX_MAX_BYTES = 256 * 1024;
+const DISCLOSURE_INDEX_MAX_ENTRIES = 1_024;
+const DISCLOSURE_DESCRIPTION_MAX_BYTES = 2_048;
+const DISCLOSURE_LIST_MAX_ENTRIES = 64;
+const DISCLOSURE_LIST_ITEM_MAX_BYTES = 128;
+const MANAGED_PACKAGE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 
 export function validateSkillPackage(input: any) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("skill package manifest must be an object");
@@ -77,12 +104,16 @@ export class SkillPackageStore {
   readonly stateDir: string;
   readonly root: string;
   readonly registryPath: string;
+  readonly disclosureIndexPath: string;
+  readonly disclosureDirtyPath: string;
   private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(stateDir: string) {
     this.stateDir = resolve(stateDir);
     this.root = join(this.stateDir, "skills");
     this.registryPath = join(this.root, "registry.json");
+    this.disclosureIndexPath = join(this.root, "disclosure-index.json");
+    this.disclosureDirtyPath = join(this.root, ".disclosure-index-dirty");
   }
 
   async list() {
@@ -100,7 +131,7 @@ export class SkillPackageStore {
         }
         packages.push({ ...record, verification });
       }
-      if (changed) await this.write(state);
+      if (changed) await this.writeStateAndDisclosure(state);
       return packages;
     }));
     this.writeChain = pending.catch(() => undefined);
@@ -154,7 +185,7 @@ export class SkillPackageStore {
         record.status = "quarantined";
         record.trusted = false;
         record.updatedAt = new Date().toISOString();
-        await this.write(state);
+        await this.writeStateAndDisclosure(state);
         throw new Error("skill package failed integrity verification and was quarantined");
       }
       record.status = action === "enable" ? "enabled" : action === "disable" ? "disabled" : "quarantined";
@@ -170,21 +201,171 @@ export class SkillPackageStore {
     return this.verifyRecord(record);
   }
 
+  async listDisclosureMetadata(maxEntries: number): Promise<SkillDisclosureMetadata[]> {
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error("skill disclosure entry limit must be a positive safe integer");
+    const pending = this.writeChain.then(() => withStateMutationLock(this.root, async () => {
+      const index = await this.readDisclosureIndex();
+      const entries: SkillDisclosureMetadata[] = [];
+      for (const record of index.entries) {
+        entries.push({
+          id: record.id,
+          version: record.version,
+          name: record.name,
+          description: record.description,
+          requestedTools: [...record.requestedTools],
+          requestedCapabilities: [...record.requestedCapabilities]
+        });
+        if (entries.length > maxEntries) break;
+      }
+      return entries;
+    }));
+    this.writeChain = pending.catch(() => undefined);
+    return pending;
+  }
+
+  async migrateDisclosureIndex() {
+    const pending = this.writeChain.then(() => withStateMutationLock(this.root, async () => {
+      const state = await this.read();
+      const serialized = this.serializeDisclosureIndex(state);
+      await this.writeDisclosureIndex(serialized);
+      return { migrated: true, entries: JSON.parse(serialized).entries.length as number };
+    }));
+    this.writeChain = pending.catch(() => undefined);
+    return pending;
+  }
+
+  async recoverDisclosureIndex() {
+    const pending = this.writeChain.then(() => withStateMutationLock(this.root, async () => {
+      const state = await this.read();
+      const changedAt = new Date().toISOString();
+      const actions: Array<{
+        id: string;
+        action: "disable" | "quarantine";
+        reason: "incompatible-metadata" | "invalid-integrity" | "entry-limit" | "byte-limit";
+      }> = [];
+      const candidates: Array<{ record: SkillRecord; entry: DisclosureIndexEntry }> = [];
+      for (const record of state.packages) {
+        if (record.status !== "enabled" || !record.trusted) continue;
+        let validated: ReturnType<typeof validateSkillPackage>;
+        try {
+          validated = validateSkillPackage(record);
+          if (validated.integrity !== record.integrity) throw new Error("integrity mismatch");
+        } catch {
+          reduceDisclosureLifecycle(record, "quarantined", changedAt);
+          actions.push({ id: record.id, action: "quarantine", reason: "invalid-integrity" });
+          continue;
+        }
+        try {
+          candidates.push({
+            record,
+            entry: { ...disclosureMetadata(validated.manifest), integrity: record.integrity }
+          });
+        } catch (error) {
+          if (!(error instanceof DisclosureMetadataLimitError)) throw error;
+          reduceDisclosureLifecycle(record, "disabled", changedAt);
+          actions.push({ id: record.id, action: "disable", reason: "incompatible-metadata" });
+        }
+      }
+      candidates.sort((left, right) => left.entry.id < right.entry.id ? -1 : left.entry.id > right.entry.id ? 1 : 0);
+      const countBounded = candidates.slice(0, DISCLOSURE_INDEX_MAX_ENTRIES);
+      for (const candidate of candidates.slice(DISCLOSURE_INDEX_MAX_ENTRIES)) {
+        reduceDisclosureLifecycle(candidate.record, "disabled", changedAt);
+        actions.push({ id: candidate.entry.id, action: "disable", reason: "entry-limit" });
+      }
+      const retainedCount = largestDisclosurePrefixWithinByteLimit(countBounded.map((candidate) => candidate.entry));
+      for (const candidate of countBounded.slice(retainedCount)) {
+        reduceDisclosureLifecycle(candidate.record, "disabled", changedAt);
+        actions.push({ id: candidate.entry.id, action: "disable", reason: "byte-limit" });
+      }
+      await this.writeStateAndDisclosure(state);
+      actions.sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+      return {
+        recovered: true,
+        retainedEnabled: countBounded.slice(0, retainedCount).map((candidate) => candidate.entry.id),
+        actions
+      };
+    }));
+    this.writeChain = pending.catch(() => undefined);
+    return pending;
+  }
+
+  async readEnabledContent(id: string, maxContentBytes: number): Promise<EnabledSkillContent> {
+    if (!SKILL_ID.test(id)) throw new Error("skill id must be exact and contain only 2-64 lowercase letters, digits, or hyphens");
+    if (!Number.isSafeInteger(maxContentBytes) || maxContentBytes < 1) throw new Error("skill content byte limit must be a positive safe integer");
+    const pending = this.writeChain.then(() => withStateMutationLock(this.root, async () => {
+      const state = await this.read();
+      const record = state.packages.find((entry) => entry.id === id);
+      if (!record) throw new Error("skill package not found");
+      if (record.status !== "enabled" || !record.trusted) throw new Error(`skill package is not enabled and trusted: ${id}`);
+      const verification = await this.verifyRecordForHydration(record, maxContentBytes);
+      if (!verification.valid || verification.content === undefined || !verification.canonical) {
+        if (verification.limitFailure) throw new Error(verification.limitFailure);
+        record.status = "quarantined";
+        record.trusted = false;
+        record.updatedAt = new Date().toISOString();
+        await this.writeStateAndDisclosure(state);
+        throw new Error(`skill package failed integrity verification and was quarantined: ${verification.failures.join("; ")}`);
+      }
+      const canonical = disclosureMetadata(verification.canonical);
+      return {
+        ...canonical,
+        integrity: record.integrity,
+        content: verification.content
+      };
+    }));
+    this.writeChain = pending.catch(() => undefined);
+    return pending;
+  }
+
   private async verifyRecord(record: SkillRecord) {
     const failures: string[] = [];
-    const expectedPath = this.safePackagePath(record.id, record.version);
-    if (resolve(record.packagePath) !== expectedPath) failures.push("package path escaped managed storage");
     try {
-      const content = await readFile(join(expectedPath, "SKILL.md"), "utf8");
+      const expectedPath = this.safePackagePath(record.id, record.version);
+      if (resolve(record.packagePath) !== expectedPath) failures.push("package path escaped managed storage");
+      await assertManagedPackageDirectory(this.root, record.id, expectedPath);
+      const content = await readUtf8Bounded(
+        join(expectedPath, "SKILL.md"),
+        MANAGED_PACKAGE_FILE_MAX_BYTES,
+        "SKILL.md"
+      );
       if (digest(content) !== record.fileIntegrity?.["SKILL.md"]) failures.push("SKILL.md digest mismatch");
       const validated = validateSkillPackage(record);
       if (validated.integrity !== record.integrity) failures.push("manifest digest mismatch");
-      const metadata = JSON.parse(await readFile(join(expectedPath, "skill.json"), "utf8"));
+      const metadata = JSON.parse(await readUtf8Bounded(
+        join(expectedPath, "skill.json"),
+        MANAGED_PACKAGE_FILE_MAX_BYTES,
+        "skill.json"
+      ));
       if (stableJson(metadata) !== stableJson(skillMetadata(validated))) failures.push("skill.json metadata mismatch");
     } catch (error: any) {
       failures.push(error?.code === "ENOENT" ? "managed package file is missing" : error.message);
     }
     return { valid: failures.length === 0, failures, checkedAt: new Date().toISOString() };
+  }
+
+  private async verifyRecordForHydration(record: SkillRecord, maxContentBytes: number) {
+    const failures: string[] = [];
+    let content: string | undefined;
+    let limitFailure: string | undefined;
+    let canonical: SkillManifest | undefined;
+    try {
+      const expectedPath = this.safePackagePath(record.id, record.version);
+      if (resolve(record.packagePath) !== expectedPath) failures.push("package path escaped managed storage");
+      await assertManagedPackageDirectory(this.root, record.id, expectedPath);
+      content = await readUtf8Bounded(join(expectedPath, "SKILL.md"), maxContentBytes, "SKILL.md");
+      if (digest(content) !== record.fileIntegrity?.["SKILL.md"]) failures.push("SKILL.md digest mismatch");
+      const validated = validateSkillPackage(record);
+      if (validated.integrity !== record.integrity) failures.push("manifest digest mismatch");
+      canonical = validated.manifest;
+      disclosureMetadata(canonical);
+      const metadataText = await readUtf8Bounded(join(expectedPath, "skill.json"), 1024 * 1024, "skill.json");
+      const metadata = JSON.parse(metadataText);
+      if (stableJson(metadata) !== stableJson(skillMetadata(validated))) failures.push("skill.json metadata mismatch");
+    } catch (error: any) {
+      if (error instanceof ManagedFileLimitError || error instanceof DisclosureMetadataLimitError) limitFailure = error.message;
+      failures.push(error?.code === "ENOENT" ? "managed package file is missing" : error.message);
+    }
+    return { valid: failures.length === 0, failures, content, canonical, limitFailure };
   }
 
   private async read(): Promise<RegistryState> {
@@ -207,11 +388,94 @@ export class SkillPackageStore {
     await chmod(this.registryPath, 0o600);
   }
 
+  private async readDisclosureIndex(): Promise<DisclosureIndex> {
+    try {
+      await lstat(this.disclosureDirtyPath);
+      throw new Error("skill disclosure index is dirty; run explicit disclosure index migration");
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    let serialized: string;
+    try {
+      serialized = await readUtf8Bounded(
+        this.disclosureIndexPath,
+        DISCLOSURE_INDEX_MAX_BYTES,
+        "skill disclosure index"
+      );
+    } catch (error: any) {
+      if (error?.code === "ENOENT") {
+        throw new Error("skill disclosure index is missing; run explicit disclosure index migration");
+      }
+      throw error;
+    }
+    const value = JSON.parse(serialized);
+    if (value?.schemaVersion !== 1 || !Array.isArray(value.entries)) throw new Error("invalid skill disclosure index schema");
+    if (value.entries.length > DISCLOSURE_INDEX_MAX_ENTRIES) throw new Error("skill disclosure index entry limit exceeded");
+    const entries = value.entries.map((entry: any) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("invalid skill disclosure index entry");
+      const metadata = disclosureMetadata(entry);
+      if (!/^[a-f0-9]{64}$/u.test(entry.integrity)) throw new Error("invalid skill disclosure package integrity");
+      return { ...metadata, integrity: entry.integrity };
+    });
+    const expectedIntegrity = digest(stableJson({ schemaVersion: 1, entries }));
+    if (value.integrity !== expectedIntegrity) throw new Error("skill disclosure index integrity mismatch");
+    return { schemaVersion: 1, entries, integrity: expectedIntegrity };
+  }
+
+  private serializeDisclosureIndex(state: RegistryState) {
+    const entries = state.packages
+      .filter((record) => record.status === "enabled" && record.trusted)
+      .map((record) => {
+        const validated = validateSkillPackage(record);
+        if (validated.integrity !== record.integrity) throw new Error(`cannot index skill with invalid manifest integrity: ${record.id}`);
+        return { ...disclosureMetadata(validated.manifest), integrity: record.integrity };
+      })
+      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+    if (entries.length > DISCLOSURE_INDEX_MAX_ENTRIES) {
+      throw new Error(`skill disclosure index exceeds ${DISCLOSURE_INDEX_MAX_ENTRIES} entries`);
+    }
+    const serialized = renderDisclosureIndex(entries);
+    if (Buffer.byteLength(serialized, "utf8") > DISCLOSURE_INDEX_MAX_BYTES) {
+      throw new Error(`skill disclosure index exceeds ${DISCLOSURE_INDEX_MAX_BYTES} UTF-8 bytes`);
+    }
+    return serialized;
+  }
+
+  private async writeDisclosureIndex(serialized: string) {
+    await mkdir(this.root, { recursive: true, mode: 0o700 });
+    await writeFile(this.disclosureDirtyPath, "dirty\n", { mode: 0o600 });
+    const temporary = `${this.disclosureIndexPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, serialized, { mode: 0o600 });
+      await rename(temporary, this.disclosureIndexPath);
+      await chmod(this.disclosureIndexPath, 0o600);
+      await rm(this.disclosureDirtyPath);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+  }
+
+  private async writeStateAndDisclosure(state: RegistryState) {
+    const serialized = this.serializeDisclosureIndex(state);
+    await mkdir(this.root, { recursive: true, mode: 0o700 });
+    await writeFile(this.disclosureDirtyPath, "dirty\n", { mode: 0o600 });
+    await this.write(state);
+    const temporary = `${this.disclosureIndexPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, serialized, { mode: 0o600 });
+      await rename(temporary, this.disclosureIndexPath);
+      await chmod(this.disclosureIndexPath, 0o600);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    await rm(this.disclosureDirtyPath);
+  }
+
   private async mutate<T>(operation: (state: RegistryState) => Promise<T>) {
     const pending = this.writeChain.then(() => withStateMutationLock(this.root, async () => {
       const state = await this.read();
       const result = await operation(state);
-      await this.write(state);
+      await this.writeStateAndDisclosure(state);
       return result;
     }));
     this.writeChain = pending.catch(() => undefined);
@@ -240,6 +504,131 @@ function stringList(value: any) {
 
 function digest(value: string) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function readUtf8Bounded(path: string, maxBytes: number, label: string) {
+  const before = await lstat(path);
+  if (before.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
+  if (!before.isFile()) throw new Error(`${label} must be a regular file`);
+  if (before.size > maxBytes) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error(`${label} changed during secure open`);
+    }
+    if (opened.size > maxBytes) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const remaining = maxBytes + 1 - total;
+      if (remaining <= 0) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remaining));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      chunks.push(chunk.subarray(0, bytesRead));
+      total += bytesRead;
+      if (total > maxBytes) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total));
+  } finally {
+    await handle.close();
+  }
+}
+
+class ManagedFileLimitError extends Error {}
+
+class DisclosureMetadataLimitError extends Error {}
+
+function disclosureMetadata(manifest: Pick<
+  SkillManifest,
+  "id" | "version" | "name" | "description" | "requestedTools" | "requestedCapabilities"
+>): SkillDisclosureMetadata {
+  if (!SKILL_ID.test(manifest.id)) throw new DisclosureMetadataLimitError("skill disclosure id is invalid");
+  if (!SEMVER.test(manifest.version)) throw new DisclosureMetadataLimitError("skill disclosure version is invalid");
+  if (typeof manifest.name !== "string" || manifest.name.length < 2 || Buffer.byteLength(manifest.name, "utf8") > 120) {
+    throw new DisclosureMetadataLimitError("skill disclosure name exceeds 120 UTF-8 bytes");
+  }
+  if (
+    typeof manifest.description !== "string"
+    || Buffer.byteLength(manifest.description, "utf8") < 12
+    || Buffer.byteLength(manifest.description, "utf8") > DISCLOSURE_DESCRIPTION_MAX_BYTES
+  ) {
+    throw new DisclosureMetadataLimitError(
+      `skill disclosure description must be 12-${DISCLOSURE_DESCRIPTION_MAX_BYTES} UTF-8 bytes`
+    );
+  }
+  return {
+    id: manifest.id,
+    version: manifest.version,
+    name: manifest.name,
+    description: manifest.description,
+    requestedTools: disclosureList(manifest.requestedTools, "requested tools"),
+    requestedCapabilities: disclosureList(manifest.requestedCapabilities, "requested capabilities")
+  };
+}
+
+function disclosureList(value: unknown, label: string) {
+  if (!Array.isArray(value) || value.length > DISCLOSURE_LIST_MAX_ENTRIES) {
+    throw new DisclosureMetadataLimitError(`${label} exceed ${DISCLOSURE_LIST_MAX_ENTRIES} entries`);
+  }
+  return value.map((entry) => {
+    if (
+      typeof entry !== "string"
+      || entry.length === 0
+      || Buffer.byteLength(entry, "utf8") > DISCLOSURE_LIST_ITEM_MAX_BYTES
+    ) {
+      throw new DisclosureMetadataLimitError(`${label} entries must be 1-${DISCLOSURE_LIST_ITEM_MAX_BYTES} UTF-8 bytes`);
+    }
+    return entry;
+  });
+}
+
+function renderDisclosureIndex(entries: DisclosureIndexEntry[]) {
+  const index: DisclosureIndex = {
+    schemaVersion: 1,
+    entries,
+    integrity: digest(stableJson({ schemaVersion: 1, entries }))
+  };
+  return `${JSON.stringify(index, null, 2)}\n`;
+}
+
+function largestDisclosurePrefixWithinByteLimit(entries: DisclosureIndexEntry[]) {
+  let low = 0;
+  let high = entries.length;
+  while (low < high) {
+    const candidate = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(renderDisclosureIndex(entries.slice(0, candidate)), "utf8") <= DISCLOSURE_INDEX_MAX_BYTES) {
+      low = candidate;
+    } else {
+      high = candidate - 1;
+    }
+  }
+  return low;
+}
+
+function reduceDisclosureLifecycle(
+  record: SkillRecord,
+  status: "disabled" | "quarantined",
+  changedAt: string
+) {
+  record.status = status;
+  record.trusted = false;
+  record.updatedAt = changedAt;
+}
+
+async function assertManagedPackageDirectory(root: string, id: string, expectedPath: string) {
+  const packagesRoot = resolve(join(root, "packages"));
+  const idRoot = resolve(packagesRoot, id);
+  for (const [path, label] of [
+    [packagesRoot, "managed package root"],
+    [idRoot, "managed skill directory"],
+    [expectedPath, "managed skill version directory"]
+  ] as const) {
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`${label} must be a real directory`);
+    if (await realpath(path) !== path) throw new Error(`${label} escaped through a symbolic link`);
+  }
 }
 
 function stableJson(value: any): string {
