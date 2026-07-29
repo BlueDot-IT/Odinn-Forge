@@ -131,6 +131,7 @@ test("channel router bounds retained work while preserving per-conversation seri
     address: { ...message().address, conversationId: "202" }
   }));
   await Promise.all([rejectedConversation, rejectedGlobal]);
+  await new Promise((resolveWait) => setImmediate(resolveWait));
 
   assert.deepEqual(events, ["start:10", "start:13"]);
   assert.deepEqual(errors.map(({ id }) => id), ["12", "14"]);

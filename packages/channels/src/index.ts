@@ -115,9 +115,9 @@ export class ChannelRouter {
     this.#remember(deliveryKey);
     this.#pendingGlobal += 1;
     this.#pendingByConversation.set(conversationKey, conversationPending + 1);
-    await this.#acknowledge(adapter, message, "processing");
     const previous = this.#queues.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
+      await this.#acknowledge(adapter, message, "processing");
       try {
         const reply = await this.#handler.handle(message);
         if (reply?.trim()) await adapter.send({ address: message.address, text: reply, replyToId: message.id });
