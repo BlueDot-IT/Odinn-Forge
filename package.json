@@ -30,6 +30,8 @@
     "test:backup": "node --test --test-reporter=spec --test-name-pattern=backup tests/state-lifecycle.test.ts",
     "test:restore": "node --test --test-reporter=spec --test-name-pattern=restore tests/state-lifecycle.test.ts",
     "test:uninstall": "node --test --test-reporter=spec --test-name-pattern=uninstall tests/application-lifecycle.test.ts",
+    "fuzz:security": "node scripts/ci/security-fuzz.ts",
+    "fuzz:replay": "node scripts/ci/security-fuzz.ts",
     "test:compiled-release": "pnpm build && pnpm release:package && pnpm release:checksums && node scripts/release/verify.ts && node --test --test-reporter=spec tests/v1/compiled-release.test.ts",
     "build": "node scripts/ci/run.ts build",
     "build:production": "node scripts/build-production.ts",
