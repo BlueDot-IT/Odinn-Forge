@@ -1,6 +1,6 @@
 import { createServer as createProviderServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -103,11 +103,27 @@ export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions =
   } catch (error: any) {
     throw new Error(`${error.message}${error.cause ? ` (${error.cause.message})` : ""}; child=${childOutput}${childError}`);
   } finally {
-    child.kill();
-    await new Promise((resolve: any) => child.once("close", resolve));
+    await terminateChild(child);
     await close(provider);
     await rm(stateDir, { recursive: true, force: true });
   }
+}
+
+async function terminateChild(child: any) {
+  if (child.exitCode !== null) return;
+  const closed = new Promise((resolve: any) => child.once("close", resolve));
+  if (process.platform === "win32" && child.pid) {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+      encoding: "utf8",
+      windowsHide: true
+    });
+  } else {
+    child.kill();
+  }
+  await Promise.race([
+    closed,
+    new Promise((resolve: any) => setTimeout(resolve, 5_000))
+  ]);
 }
 
 async function listen(server: any) {
