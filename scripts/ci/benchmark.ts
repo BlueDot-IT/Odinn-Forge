@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { runInferenceProtocolSmoke } from "./inference-smoke.ts";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -65,6 +65,15 @@ async function writeReport(report: Record<string, unknown>): Promise<void> {
   console.log(`benchmark report: ${relative(root, output)}`);
 }
 
+function commandVersion(command: string, args: string[], fallback: string): string {
+  const result = spawnSync(command, args, { cwd: root, encoding: "utf8", env: process.env, shell: process.platform === "win32" });
+  return result.status === 0 ? result.stdout.trim() : fallback;
+}
+
+export function isMainModule(moduleUrl: string, argv1 = process.argv[1]): boolean {
+  return Boolean(argv1) && moduleUrl === pathToFileURL(argv1).href;
+}
+
 export async function main(): Promise<void> {
   const maxP95Ms = parseP95Threshold(process.env.ODINN_BENCHMARK_P95_MAX_MS);
   const packageRoot = await preparePackagedRelease();
@@ -100,6 +109,12 @@ export async function main(): Promise<void> {
     node: process.version,
     platform: process.platform,
     architecture: process.arch,
+    provenance: {
+      command: "pnpm benchmark:ci",
+      commit: process.env.GITHUB_SHA ?? commandVersion("git", ["rev-parse", "HEAD"], "unknown"),
+      packageVersion: JSON.parse(await readFile(join(root, "package.json"), "utf8")).version,
+      pnpm: commandVersion("pnpm", ["--version"], "unknown")
+    },
     ...(samples.length === 0 ? {} : {
       p50Ms: Number(percentile(samples, 0.5).toFixed(2)),
       p95Ms: Number(percentile(samples, 0.95).toFixed(2)),
@@ -117,6 +132,6 @@ export async function main(): Promise<void> {
   console.log(JSON.stringify(report, null, 2));
 }
 
-if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file:").href) {
+if (isMainModule(import.meta.url)) {
   await main();
 }

@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { parseP95Threshold, percentile } from "../scripts/ci/benchmark.ts";
 
@@ -30,6 +34,30 @@ test("CI benchmark targets the staged packaged release and retains a JSON report
   assert.match(benchmark, /dist.*package-stage/u);
   assert.match(benchmark, /benchmark\.json/u);
   assert.match(benchmark, /gatewayCommand/u);
+  assert.match(benchmark, /pathToFileURL/u);
+  assert.match(benchmark, /provenance/u);
   assert.match(smoke, /gatewayCommand/u);
   assert.doesNotMatch(benchmark, /apps\/gateway\/src\/server\.ts/u);
+});
+
+test("benchmark subprocess writes a report when invoked directly", { timeout: 180_000 }, async () => {
+  const workspace = resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const script = fileURLToPath(new URL("../scripts/ci/benchmark.ts", import.meta.url));
+  const temp = await mkdtemp(join(tmpdir(), "odinn-benchmark-entrypoint-"));
+  const reportPath = join(temp, "benchmark.json");
+  try {
+    const result = spawnSync(process.execPath, [script], {
+      cwd: workspace,
+      encoding: "utf8",
+      env: { ...process.env, ODINN_BENCHMARK_JSON: reportPath },
+      timeout: 165_000
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const report = JSON.parse(await readFile(reportPath, "utf8"));
+    assert.equal(report.sampleTarget, 20);
+    assert.equal(report.samples.length, 20);
+    assert.equal(report.provenance.command, "pnpm benchmark:ci");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
 });
