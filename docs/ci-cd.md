@@ -173,7 +173,8 @@ observational assurance microbenchmarks described below.
 The gate uses 20 samples by default. `ODINN_BENCHMARK_SAMPLES` accepts a
 positive integer for bounded diagnostic or cross-platform entrypoint checks;
 record any override with the raw report and do not use a reduced sample count
-as release evidence.
+as release evidence. The subprocess regression also exercises Corepack-only
+Windows hosts and verifies packaged gateway process-tree cleanup.
 
 ### Controlled-host benchmark reproduction
 
