@@ -1,5 +1,11 @@
 # UAT findings proof log
 
+> **Historical supporting log.** These commands and results support the
+> July 21, 2026 `v0.4.0` acceptance snapshot. They describe the named branch and
+> controlled hosts used then; they are not current-`main`, current-release, or
+> current-platform evidence. See the [acceptance record](../v0.4.0-uat.md) for
+> scope and the current documentation it points to.
+
 Branch: `fix/uat-findings`
 
 Date: 2026-07-21

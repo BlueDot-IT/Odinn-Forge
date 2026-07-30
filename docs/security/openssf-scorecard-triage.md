@@ -1,29 +1,53 @@
 # OpenSSF Scorecard triage
 
-This record covers the five open Scorecard code-scanning alerts observed on
-July 22, 2026. The scan evaluated `main` at
-[`31c3034`](https://github.com/jason-allen-oneal/Odinn/commit/31c3034f287932cc157d622d39df5632c2b127bd).
-It is a point-in-time triage record, not a claim that every Scorecard check
-scores 10.
+> **Historical snapshot (July 22, 2026).** This record preserves the five
+> Scorecard dispositions reviewed before the repository moved to
+> `BlueDot-IT/Odinn-Forge`. It is not a current score, alert count, rescan
+> tracker, or repository-policy attestation. Current evidence observed on
+> July 30, 2026 is separated below.
 
-## Production alert snapshot
+The reviewed scan evaluated `main` at
+[`31c3034`](https://github.com/BlueDot-IT/Odinn-Forge/commit/31c3034f287932cc157d622d39df5632c2b127bd).
+The original workflow run and API record use the repository's former
+`jason-allen-oneal/Odinn` identity.
 
-At the time of this review, the GitHub APIs reported no open CodeQL, Dependabot,
-or secret-scanning alerts. The corresponding
-[Security workflow](https://github.com/jason-allen-oneal/Odinn/actions/runs/29892689978)
-also completed successfully. Recheck all three alert classes at the release
-commit; this snapshot does not close the stable-release security gate.
+## Historical production alert snapshot
 
-## Scorecard dispositions
+At the time of the July 22 review, the GitHub APIs reported no open CodeQL,
+Dependabot, or secret-scanning alerts, and the corresponding
+[pre-migration security workflow](https://github.com/jason-allen-oneal/Odinn/actions/runs/29892689978)
+completed successfully. Those counts are a point-in-time record only. Current
+alert APIs are permission-gated and change independently, so this document does
+not restate them as current facts.
 
-| Finding | Current disposition | Exit evidence |
+The current repository's
+[security workflow on `a93e5f6`](https://github.com/BlueDot-IT/Odinn-Forge/actions/runs/30565879712)
+reported successful job conclusions for CodeQL, dependency audit, secret scan,
+and OpenSSF Scorecard on July 30. Those workflow conclusions are repository
+evidence; they are not an aggregate Scorecard API score.
+
+## Dispositions and later evidence
+
+| Finding | July 22 snapshot | Evidence observed July 30, 2026 |
 | --- | --- | --- |
-| Security Policy | Open pending the next default-branch scan. The policy now links directly to private reporting and defines response and coordinated-disclosure targets. | A later Scorecard scan recognizes the updated [`SECURITY.md`](../../SECURITY.md). |
-| Fuzzing | Open pending the next default-branch scan. Generated-input property tests must be merged into the normal test path, and this record does not pre-empt the scanner's result. | A later Scorecard scan recognizes the merged property-test evidence. |
-| Code Review | Remediated. [`CODEOWNERS`](../../.github/CODEOWNERS) names Jason and Kite; `main` requires one approving code-owner review after the last push, administrator enforcement is enabled, and the default ruleset has no bypass actors. | Reconfirm the effective policy after repository-administration changes and in later Scorecard runs. |
-| Maintained | Age-bound; not evidence of maintainer inactivity. The repository was created on July 12, 2026, so the check cannot clear its 90-day age guard before October 10, 2026. | Re-run on or after October 10, 2026, with continued maintenance activity. |
-| CII Best Practices | Deferred during prerelease; unresolved. No OpenSSF Best Practices badge is claimed, and this disposition does not treat the gap as fixed. | Reconsider badge enrollment after prerelease stabilization. |
+| Security Policy | Open pending a later default-branch scan after the policy gained private-reporting and disclosure-timeline guidance. | [`SECURITY.md`](../../SECURITY.md) is present in the current repository. The legacy API record dated July 26 scored this check 10, but no current-repository aggregate score is claimed. |
+| Fuzzing | Open pending scanner recognition of generated-input testing in the normal test path. | [PR #50](https://github.com/BlueDot-IT/Odinn-Forge/pull/50) merged bounded continuous security fuzzing, including the [workflow](../../.github/workflows/continuous-fuzz.yml) and [scope/evidence contract](continuous-fuzzing.md). This is implementation evidence, not a claim that the public Scorecard API has rescanned it. |
+| Code Review | Recorded as remediated based on the repository settings observed during the original review. | The current [`CODEOWNERS`](../../.github/CODEOWNERS) file identifies owners. The earlier branch-protection statement is not carried forward as current policy; verify live GitHub rulesets before making an enforcement claim. |
+| Maintained | Age-bound rather than evidence of maintainer inactivity. | The [current public repository metadata](https://api.github.com/repos/BlueDot-IT/Odinn-Forge) records the migrated repository as created July 26, 2026, so the age-sensitive check remains time-dependent. |
+| CII Best Practices | Deferred during prerelease; no badge was claimed in this snapshot. | The current [OpenSSF Best Practices project](https://www.bestpractices.dev/projects/13830) reports Passing, and the current [README](../../README.md) displays that badge. |
 
-The live [Scorecard result](https://api.scorecard.dev/projects/github.com/BlueDot-IT/Odinn-Forge)
-and GitHub's [security overview](https://github.com/BlueDot-IT/Odinn-Forge/security)
-remain the authoritative current status.
+## Current Scorecard source boundary
+
+As observed July 30, 2026, the public Scorecard API endpoint for
+`github.com/BlueDot-IT/Odinn-Forge` returns `404 Not Found`. The
+[legacy API record](https://api.scorecard.dev/projects/github.com/jason-allen-oneal/Odinn)
+is dated July 26 and names the former repository identity at commit `5ec2a9b`.
+It is useful historical evidence but is not authoritative for current `main`.
+Do not claim a current aggregate score or successful API rescan until the
+BlueDot repository endpoint publishes a result.
+
+For current operational evidence, use the repository's
+[security workflow](https://github.com/BlueDot-IT/Odinn-Forge/actions/workflows/security.yml),
+[security overview](https://github.com/BlueDot-IT/Odinn-Forge/security), and
+individual source or workflow links above. Each source answers a narrower
+question; none should be generalized beyond its timestamp and scope.
