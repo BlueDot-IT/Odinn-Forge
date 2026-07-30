@@ -13,9 +13,10 @@ and raw output that produced it.
 
 ### Enforced synthetic OpenAI-compatible protocol latency gate
 
-`pnpm benchmark:ci` starts with `scripts/ci/benchmark.ts`. The script runs 20
-OpenAI-compatible protocol smoke samples and reports p50, p95, and maximum
-elapsed time. It fails when p95 exceeds the configured limit, which defaults to
+`pnpm benchmark:ci` starts with `scripts/ci/benchmark.ts`. The script builds and
+stages the production package, then runs 20 cold OpenAI-compatible protocol
+smoke samples through the packaged gateway. It reports p50, p95, and maximum
+elapsed time and fails when p95 exceeds the configured limit, which defaults to
 2,000 milliseconds through `ODINN_BENCHMARK_P95_MAX_MS`.
 
 The command runs in CI, merge-queue, nightly, and release verification. This is
@@ -102,16 +103,18 @@ hosts is environment evidence, not a product regression by itself.
 
 ## Raw artifacts and CI retention
 
-Benchmark scripts emit JSON to standard output. Console output is transient
-unless a workflow or operator captures it. Other workflow artifacts, such as
-release candidates or security reports, must not be cited as benchmark raw
-data unless they actually contain the complete output being discussed.
+The packaged gateway gate writes its raw JSON report to
+`dist/benchmark/benchmark.json`. CI, merge-queue, nightly, and release
+workflows upload that file as the `benchmark-report` artifact. Link the exact
+workflow run and retained artifact when citing its values; a green check alone
+does not preserve the measured distribution.
 
-Until a run exposes a retained raw artifact, cite the exact check and commit
-only as evidence that the configured gate passed. Do not reconstruct precise
-historical values from a green status. When retained benchmark artifacts are
-available, link the exact workflow run and artifact rather than copying a
-number without provenance.
+The observational assurance and memory-index scripts emit JSON to standard
+output. Their console output remains transient unless a workflow or operator
+captures it. Other workflow artifacts, such as release candidates or security
+reports, must not be cited as benchmark raw data unless they actually contain
+the complete output being discussed. Do not reconstruct precise historical
+values from a green status.
 
 Local outputs are transient unless the operator deliberately captures them.
 Store them outside personal state, review them for secrets, and record their
