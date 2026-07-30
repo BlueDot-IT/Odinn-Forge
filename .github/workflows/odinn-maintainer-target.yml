@@ -61,9 +61,10 @@ concurrency:
 jobs:
   plan:
     name: "Plan ${{ inputs.target_kind }} #${{ inputs.target_number }}"
-    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: odinn-maintainer-oauth-${{ github.repository }}
     permissions:
       contents: read
       checks: read
@@ -94,7 +95,7 @@ jobs:
   apply:
     name: "Apply ${{ inputs.target_kind }} #${{ inputs.target_number }}"
     needs: plan
-    if: always() && needs.plan.result == 'success'
+    if: needs.plan.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -106,7 +107,6 @@ jobs:
     steps:
       - id: download
         name: Download bounded plan
-        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: odinn-maintainer-plan-${{ github.run_id }}-${{ inputs.target_kind }}-${{ inputs.target_number }}
@@ -143,7 +143,7 @@ jobs:
             echo "- Stale plan blocked: ${STALE:-false}"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Report an unrecoverable queue item
-        if: steps.download.outcome != 'success'
+        if: failure() && steps.download.outcome == 'failure'
         shell: bash
         run: |
           echo "::error::No valid plan artifact was produced for this target; a later event or scheduled sweep will retry it."
