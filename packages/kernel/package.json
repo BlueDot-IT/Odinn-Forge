@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./provider-capabilities": "./src/provider-capabilities.ts",
     "./session-lanes": "./src/session-lanes.ts",
     "./skill-disclosure": "./src/skill-disclosure.ts"
   },
