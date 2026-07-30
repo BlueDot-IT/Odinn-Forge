@@ -42,6 +42,10 @@ test("CI records assurance hot-path latency without weakening the cold-start gat
   assert.match(pkg.scripts["benchmark:ci"], /benchmark:assurance/);
   assert.equal(pkg.scripts["benchmark:assurance"], "node scripts/ci/assurance-benchmark.ts");
   assert.match(coldBenchmark, /ODINN_BENCHMARK_P95_MAX_MS/);
+  assert.match(coldBenchmark, /parseP95Threshold/);
+  assert.match(coldBenchmark, /release:package/);
+  assert.match(coldBenchmark, /package-stage/);
+  assert.match(coldBenchmark, /benchmark\.json/);
   assert.match(assuranceBenchmark, /benchmarkToolDispatch\(0\)/);
   assert.match(assuranceBenchmark, /benchmarkToolDispatch\(10\)/);
   assert.match(assuranceBenchmark, /\[100, 1_000, 10_000\]/);

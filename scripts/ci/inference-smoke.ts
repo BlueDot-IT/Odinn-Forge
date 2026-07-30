@@ -1,13 +1,22 @@
 import { createServer as createProviderServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
+const sourceRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
-export async function runInferenceProtocolSmoke() {
+export type InferenceSmokeOptions = {
+  root?: string;
+  gatewayCommand?: string;
+  gatewayArgs?: string[];
+};
+
+export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions = {}) {
+  const root = options.root ?? sourceRoot;
+  const gatewayCommand = options.gatewayCommand ?? process.execPath;
+  const gatewayArgs = options.gatewayArgs ?? [join(root, "apps", "gateway", "src", "server.ts")];
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-packaged-gateway-") );
   const provider = createProviderServer(async (request: any, response: any) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
@@ -53,7 +62,8 @@ export async function runInferenceProtocolSmoke() {
     }
   }, null, 2)}\n`);
 
-  const child = spawn(process.execPath, ["apps/gateway/src/server.ts"], {
+  const child = spawn(gatewayCommand, gatewayArgs, {
+    shell: process.platform === "win32" && gatewayCommand.toLowerCase().endsWith(".cmd"),
     cwd: root,
     env: { ...process.env, INIT_CWD: root, ODINN_PORT: "0", ODINN_STATE_DIR: stateDir, ODINN_CI_PROVIDER_KEY: "ci-provider-key" },
     stdio: ["ignore", "pipe", "pipe"]
@@ -93,11 +103,27 @@ export async function runInferenceProtocolSmoke() {
   } catch (error: any) {
     throw new Error(`${error.message}${error.cause ? ` (${error.cause.message})` : ""}; child=${childOutput}${childError}`);
   } finally {
-    child.kill();
-    await new Promise((resolve: any) => child.once("close", resolve));
+    await terminateChild(child);
     await close(provider);
     await rm(stateDir, { recursive: true, force: true });
   }
+}
+
+async function terminateChild(child: any) {
+  if (child.exitCode !== null) return;
+  const closed = new Promise((resolve: any) => child.once("close", resolve));
+  if (process.platform === "win32" && child.pid) {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+      encoding: "utf8",
+      windowsHide: true
+    });
+  } else {
+    child.kill();
+  }
+  await Promise.race([
+    closed,
+    new Promise((resolve: any) => setTimeout(resolve, 5_000))
+  ]);
 }
 
 async function listen(server: any) {

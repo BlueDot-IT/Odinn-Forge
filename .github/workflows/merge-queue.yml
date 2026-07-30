@@ -38,6 +38,14 @@ jobs:
       - run: pnpm test:integration
       - run: pnpm smoke:inference
       - run: pnpm benchmark:ci
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: benchmark-report-${{ github.run_id }}
+          path: dist/benchmark/benchmark.json
+          if-no-files-found: warn
+          retention-days: 14
       - run: pnpm build
       - run: pnpm release:package
       - run: pnpm release:checksums
