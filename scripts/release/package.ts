@@ -241,7 +241,7 @@ const manifest = {
   lockfileSha256: createHash("sha256").update(lockfile).digest("hex"),
   toolchain: {
     node: process.version,
-    pnpm: commandOutput(process.platform === "win32" ? "pnpm.cmd" : "pnpm", ["--version"])
+    pnpm: commandOutput("corepack", ["pnpm", "--version"])
   },
   artifacts: [zipName, tarName],
   sbom: "odinn.spdx.json",
