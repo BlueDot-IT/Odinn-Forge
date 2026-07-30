@@ -47,7 +47,7 @@ jobs:
       count: ${{ steps.targets.outputs.count }}
     steps:
       - id: targets
-        uses: BlueDot-IT/odinn-maintainer/.github/actions/targets@f9b37ebf6e225572790b454f37af13e0ea767568 # v0.5.0
+        uses: BlueDot-IT/odinn-maintainer/.github/actions/targets@2473070555445ba62025f4684ecf35c91ec182b9 # control-plane-hardening
         with:
           github-read-token: ${{ github.token }}
           include-issues: "true"
@@ -90,7 +90,7 @@ jobs:
       actions: write
       contents: write
       pull-requests: write
-    uses: BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml@59376dfaaaee551203897d7cbd4ec2b98ee33f73 # remediation-v1
+    uses: BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml@0c5f7b0dea200979ea96107b6856ed3dc5e7bcc0 # credential-isolation
     with:
       target_ref: main
     secrets:

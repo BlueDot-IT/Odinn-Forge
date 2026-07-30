@@ -326,8 +326,9 @@ test("security scanning is license-independent and optional maintenance is expli
   );
   assert.match(
     maintainerTarget,
-    /always\(\) && needs\.plan\.result == 'success'/u,
+    /if: needs\.plan\.result == 'success'/u,
   );
+  assert.doesNotMatch(maintainerTarget, /continue-on-error:\s*true/u);
 });
 
 test("maintainer reconciliation serializes the exact target across every triggering run", async () => {
@@ -349,6 +350,10 @@ test("maintainer reconciliation serializes the exact target across every trigger
   assert.match(target, /cancel-in-progress: false/u);
   assert.doesNotMatch(target, /group:[^\n]*(?:github\.run_id|github\.event)/u);
   assert.match(target, /^  plan:$/m);
+  assert.match(
+    target,
+    /plan:[\s\S]*?concurrency:\s*\n\s+group: odinn-maintainer-oauth-\$\{\{ github\.repository \}\}/u,
+  );
   assert.match(target, /^  apply:\n    name:[\s\S]*?    needs: plan$/m);
   assert.match(ciDocs, /bursts coalesce to the newest pending\s+event/u);
   assert.match(ciDocs, /re-fetches the complete live target state/u);
@@ -357,7 +362,7 @@ test("maintainer reconciliation serializes the exact target across every trigger
 test("daily Codex remediation is isolated, pinned, and draft-only", async () => {
   const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
   const ciDocs = await read("docs/ci-cd.md");
-  const remediationSha = "59376dfaaaee551203897d7cbd4ec2b98ee33f73";
+  const remediationSha = "0c5f7b0dea200979ea96107b6856ed3dc5e7bcc0";
 
   assert.deepEqual(
     [...dispatcher.matchAll(/^\s+- cron: "([^"]+)"$/gmu)].map((match) => match[1]),
@@ -388,15 +393,19 @@ test("daily Codex remediation is isolated, pinned, and draft-only", async () => 
   assert.match(ciDocs, /scan and patch steps receive OAuth without a repository write credential/u);
 });
 
-test("maintainer actions pin the published v0.5.0 release commit", async () => {
+test("maintainer actions pin exact reviewed commits", async () => {
   const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
   const target = await read(".github/workflows/odinn-maintainer-target.yml");
   const releaseSha = "f9b37ebf6e225572790b454f37af13e0ea767568";
-  const pins = [...dispatcher.matchAll(/BlueDot-IT\/odinn-maintainer\/\.github\/actions\/[^@\s]+@([a-f0-9]{40}) # v0\.5\.0/gu)]
-    .concat([...target.matchAll(/BlueDot-IT\/odinn-maintainer\/\.github\/actions\/[^@\s]+@([a-f0-9]{40}) # v0\.5\.0/gu)]);
+  const targetSha = "2473070555445ba62025f4684ecf35c91ec182b9";
+  const stablePins = [...target.matchAll(/BlueDot-IT\/odinn-maintainer\/\.github\/actions\/[^@\s]+@([a-f0-9]{40}) # v0\.5\.0/gu)];
 
-  assert.equal(pins.length, 3);
-  assert.deepEqual(pins.map((match) => match[1]), [releaseSha, releaseSha, releaseSha]);
+  assert.equal(stablePins.length, 2);
+  assert.deepEqual(stablePins.map((match) => match[1]), [releaseSha, releaseSha]);
+  assert.match(
+    dispatcher,
+    new RegExp(`uses: BlueDot-IT/odinn-maintainer/\\.github/actions/targets@${targetSha}`),
+  );
 });
 
 test("user documentation and reporting surfaces ship in the release tree", async () => {

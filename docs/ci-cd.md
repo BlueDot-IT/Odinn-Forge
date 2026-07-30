@@ -64,6 +64,11 @@ target lock uses `cancel-in-progress: false`, so a newer event does not cancel a
 plan or deterministic apply already in progress. GitHub retains at most one
 pending run for a concurrency group, so bursts coalesce to the newest pending
 event; that run re-fetches the complete live target state before planning.
+Planning jobs also share a repository-wide OAuth concurrency group. This
+prevents simultaneous refresh consumers from racing the rotating credential.
+As with other GitHub concurrency groups, bursts coalesce to the newest pending
+plan while the active plan completes. Plan or artifact-download failures remain
+visible workflow failures; they are not converted into successful runs.
 
 ### Codex Security remediation
 
