@@ -158,13 +158,33 @@ pnpm benchmark:ci
 node scripts/ci/audit.ts high
 ```
 
-`benchmark:ci` measures twenty cold packaged-gateway protocol runs and fails
-when p95 exceeds the 2-second budget. The local Forgejo integration runner
-executes inside nested Docker and uses a documented 4-second cold-start
-allowance; all other workflows retain the 2-second default. Set
-`ODINN_BENCHMARK_P95_MAX_MS` only when diagnosing a slower host; do not use it
-to hide a release regression. It then runs the observational assurance
-microbenchmarks described below.
+`benchmark:ci` first builds and stages the production package, then measures
+twenty cold packaged-gateway protocol runs from `dist/package-stage/`; it does
+not benchmark `apps/gateway/src/server.ts`. The raw report is retained at
+`dist/benchmark/benchmark.json` and uploaded by CI. The benchmark fails when
+p95 exceeds the 2-second budget. Invalid `ODINN_BENCHMARK_P95_MAX_MS` values
+(non-finite, zero, or negative) fail before sampling rather than becoming a
+silent `NaN` comparison. The local Forgejo integration runner executes inside
+nested Docker and uses a documented 4-second cold-start allowance; all other
+workflows retain the 2-second default. Set the threshold only when diagnosing a
+slower host; do not use it to hide a release regression. It then runs the
+observational assurance microbenchmarks described below.
+
+### Controlled-host benchmark reproduction
+
+Reproduce benchmark numbers only on a controlled host: use Node.js 24 or newer,
+the pinned pnpm version, a clean checkout at an exact commit, and
+`pnpm install --frozen-lockfile`. Keep the host idle of other CPU/memory-heavy
+work, use the loopback-only synthetic OpenAI-compatible provider supplied by the
+benchmark, and record OS, architecture, Node, pnpm, commit, threshold, and the
+raw JSON report. Do not compare a workstation result directly with a nested
+Docker or hosted-runner result; compare reports from equivalent host classes.
+
+```bash
+pnpm install --frozen-lockfile
+pnpm benchmark:ci
+cat dist/benchmark/benchmark.json
+```
 
 `benchmark:assurance` measures the synchronous paths added by the core advanced
 services: ordinary tool dispatch with zero, one, three, and ten Gatewatch

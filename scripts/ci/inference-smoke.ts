@@ -5,9 +5,18 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
+const sourceRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
-export async function runInferenceProtocolSmoke() {
+export type InferenceSmokeOptions = {
+  root?: string;
+  gatewayCommand?: string;
+  gatewayArgs?: string[];
+};
+
+export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions = {}) {
+  const root = options.root ?? sourceRoot;
+  const gatewayCommand = options.gatewayCommand ?? process.execPath;
+  const gatewayArgs = options.gatewayArgs ?? [join(root, "apps", "gateway", "src", "server.ts")];
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-packaged-gateway-") );
   const provider = createProviderServer(async (request: any, response: any) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
@@ -53,7 +62,8 @@ export async function runInferenceProtocolSmoke() {
     }
   }, null, 2)}\n`);
 
-  const child = spawn(process.execPath, ["apps/gateway/src/server.ts"], {
+  const child = spawn(gatewayCommand, gatewayArgs, {
+    shell: process.platform === "win32" && gatewayCommand.toLowerCase().endsWith(".cmd"),
     cwd: root,
     env: { ...process.env, INIT_CWD: root, ODINN_PORT: "0", ODINN_STATE_DIR: stateDir, ODINN_CI_PROVIDER_KEY: "ci-provider-key" },
     stdio: ["ignore", "pipe", "pipe"]
