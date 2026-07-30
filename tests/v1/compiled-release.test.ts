@@ -77,12 +77,18 @@ test("production package runs without pnpm or a source checkout", async () => {
     ], workspace);
     assert.match(tool, /ODINN_COMPILED_TEST_OK/);
     const lifecycleHelp = run(cli, ["help", "--all"], workspace);
-    for (const command of ["odinn update check", "odinn rollback", "odinn backup", "odinn restore", "odinn uninstall", "odinn state status"]) {
+    for (const command of ["odinn doctor", "odinn sessions", "odinn update check", "odinn rollback", "odinn backup", "odinn restore", "odinn uninstall", "odinn state status"]) {
       assert.match(lifecycleHelp, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     }
+    assert.equal(lifecycleHelp.match(/^  odinn audit \[--state \.odinn\]$/gmu)?.length, 1);
+    assert.doesNotMatch(lifecycleHelp, /--plan-file <plan\.json>.*--plan-file <plan\.json>/u);
     const stateStatus = JSON.parse(run(cli, ["state", "status", "--state", state], workspace));
     assert.equal(stateStatus.ok, true);
     assert.equal(stateStatus.pendingMigration, false);
+    const sessions = JSON.parse(run(cli, ["sessions", "--limit", "5", "--state", state], workspace));
+    assert.deepEqual(sessions, { sessions: [] });
+    const createdSession = JSON.parse(run(cli, ["sessions", "create", "--title", "Compiled alias session", "--state", state], workspace));
+    assert.equal(createdSession.type, "session.created");
 
     const marker = join(state, "lifecycle-marker.txt");
     const backup = join(temporary, "backup");

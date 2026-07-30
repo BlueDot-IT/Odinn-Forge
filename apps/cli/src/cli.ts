@@ -241,8 +241,10 @@ async function main() {
       await memory(args);
       break;
     case "session":
-    case "sessions":
       await session(args);
+      break;
+    case "sessions":
+      await session(args.length === 0 || args[0].startsWith("-") ? ["list", ...args] : args);
       break;
     case "goal":
     case "goals":
@@ -379,10 +381,10 @@ function usage() {
   odinn state migrate --dry-run [--state .odinn]
   odinn backup [--output <directory>] [--state .odinn]
   odinn restore --input <directory> --confirm [--state .odinn]
-  odinn update check [--manifest <path-or-url>] [--state .odinn]
-  odinn update [--artifact <archive>] [--checksums <file>] [--manifest <path-or-url>] [--state .odinn]
-  odinn rollback [--state .odinn]
-  odinn uninstall [--remove-state --confirm|--force] [--state .odinn]
+  odinn update check [--manifest <path-or-url>] [--prefix <directory>] [--state .odinn]
+  odinn update [--artifact <archive>] [--checksums <file>] [--manifest <path-or-url>] [--prefix <directory>] [--state .odinn]
+  odinn rollback [--prefix <directory>] [--state .odinn]
+  odinn uninstall [--remove-state --confirm|--force] [--prefix <directory>] [--state .odinn]
   odinn extension install --manifest <manifest.json> [--state .odinn]
   odinn extension list [--state .odinn]
   odinn extension enable --id <id> --grant <capability[,capability]> [--trust] [--allow-unsafe-sandbox] [--confirm-impact] [--state .odinn]
@@ -395,6 +397,8 @@ function usage() {
   odinn config channel list [--state .odinn]
   odinn config channel enable|disable|remove <name> [--state .odinn]
   odinn status [--state .odinn]
+  odinn doctor [--state .odinn]
+  odinn sessions [--limit 20] [--state .odinn]
   odinn audit [--state .odinn]
   odinn audit verify [--allow-unsigned] [--state .odinn]
   odinn audit rotate-key [--state .odinn]
@@ -420,14 +424,13 @@ function usage() {
   odinn capsule export <run-id> --output <run.odinn> [--state .odinn]
   odinn capsule inspect|verify <run.odinn> [--state .odinn]
   odinn capsule replay <run.odinn> [--mode verification-only|tool-mocked|full] [--workspace <directory>] [--approve-external] [--state .odinn]
-  odinn counterfactual run --source-run <run-id> --from <step-id> --plan-file <plan.json> [--plan-file <plan.json>] [--execute] [--state .odinn]
+  odinn counterfactual run --source-run <run-id> --from <step-id> --plan-file <plan.json> [--execute] [--state .odinn]
   odinn counterfactual compare <group-id> [--state .odinn]
   odinn counterfactual select <group-id> --run <run-id> [--apply] [--state .odinn]
   odinn routing observe --run <run-id> --provider <id> --model <id> --task-class <class> --verified true|false [--partial true|false] [--duration-ms <ms>] [--cost-usd <amount>] [--tool-calls <count>] [--tool-errors <count>] [--retries <count>] [--policy-violations <count>] [--rolled-back] [--state .odinn]
   odinn routing stats [--task-class <class>] [--state .odinn]
   odinn routing choose --task-class <class> [--state .odinn]
   odinn plan --file <plan.json> [--state .odinn]
-  odinn audit [--state .odinn]
   odinn runs [--limit 20] [--state .odinn]
   odinn show --run <run-id> [--state .odinn]
   odinn memory remember --text <text> [--kind project] [--subject general] [--namespace path] [--tier l0|l1|l2] [--tags a,b] [--state .odinn]
