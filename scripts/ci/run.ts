@@ -33,6 +33,15 @@ function boundedEnvironment() {
   };
 }
 
+function runPnpm(args: string[]) {
+  return spawnSync("corepack", ["pnpm", ...args], {
+    cwd: root,
+    encoding: "utf8",
+    env: boundedEnvironment(),
+    shell: process.platform === "win32"
+  });
+}
+
 async function walk(directory: any): Promise<string[]> {
   const output: string[] = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -86,12 +95,7 @@ async function lintRepository() {
   }
   if (errors.length) fail(errors);
   else console.log("repository lint passed");
-  const eslint = spawnSync("pnpm", ["exec", "eslint", "."], {
-    cwd: root,
-    encoding: "utf8",
-    env: boundedEnvironment(),
-    shell: process.platform === "win32"
-  });
+  const eslint = runPnpm(["exec", "eslint", "."]);
   if (eslint.stdout) process.stdout.write(eslint.stdout);
   if (eslint.stderr) process.stderr.write(eslint.stderr);
   if (eslint.status !== 0) process.exit(eslint.status ?? 1);
@@ -117,11 +121,14 @@ async function workspaceFilters() {
 
 async function runWorkspaceScript(script: any) {
   const filters = await workspaceFilters();
-  const result = spawnSync(
-    "pnpm",
-    ["--recursive", `--workspace-concurrency=${workspaceConcurrency}`, "--if-present", ...filters.flatMap((filter) => ["--filter", filter]), "run", script],
-    { cwd: root, encoding: "utf8", env: boundedEnvironment(), shell: process.platform === "win32" }
-  );
+  const result = runPnpm([
+    "--recursive",
+    `--workspace-concurrency=${workspaceConcurrency}`,
+    "--if-present",
+    ...filters.flatMap((filter) => ["--filter", filter]),
+    "run",
+    script
+  ]);
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   if (result.status !== 0) process.exit(result.status ?? 1);
@@ -132,12 +139,7 @@ async function typecheck() {
   if (rootPackage.engines?.node !== ">=24.0.0") fail(["package.json: engines.node must remain >=24.0.0"]);
   if (await workspacePackageCount()) await runWorkspaceScript("typecheck");
   for (const config of ["tsconfig.tools.json"]) {
-    const tools = spawnSync("pnpm", ["exec", "tsc", "-p", config], {
-      cwd: root,
-      encoding: "utf8",
-      env: boundedEnvironment(),
-      shell: process.platform === "win32"
-    });
+    const tools = runPnpm(["exec", "tsc", "-p", config]);
     if (tools.stdout) process.stdout.write(tools.stdout);
     if (tools.stderr) process.stderr.write(tools.stderr);
     if (tools.status !== 0) process.exit(tools.status ?? 1);
