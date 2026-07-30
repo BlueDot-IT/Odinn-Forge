@@ -1,7 +1,13 @@
 # Ódinn Forge Stabilization Plan
 
-This plan increases confidence in the existing runtime without adding another
-major experimental subsystem.
+> **Historical plan — v1.0.0 stabilization.** This document records the
+> stabilization work that culminated in the `v1.0.0` release on July 25, 2026.
+> It is preserved as release-history evidence, not as the current roadmap or a
+> continuing feature freeze. Use the [v1 compatibility policy](v1-compatibility.md)
+> and [surface matrix](surface-matrix.md) for current interface classifications.
+
+This plan increased confidence in the existing runtime without adding another
+major experimental subsystem during that stabilization phase.
 
 ## Objective
 
