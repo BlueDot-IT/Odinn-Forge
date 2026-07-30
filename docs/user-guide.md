@@ -46,17 +46,21 @@ also exposes build-provenance attestations for the workflow-built assets.
 
 ### Linux and macOS
 
-Replace `<tag>` with the exact release tag shown on the Releases page:
+Replace `vX.Y.Z` with the exact release tag shown on the Releases page. Release
+tags and archives use the same `vX.Y.Z` identity, so tag `v1.2.3` is packaged
+as `odinn-v1.2.3.tar.gz` and extracts to `odinn-v1.2.3`:
 
 ```bash
-tag=<tag>
-curl -fLO "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$tag/odinn-$tag.tar.gz"
+tag="vX.Y.Z"
+archive="odinn-$tag.tar.gz"
+curl -fLO "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$tag/$archive"
 curl -fLO "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$tag/SHA256SUMS.txt"
-grep "  odinn-$tag.tar.gz$" SHA256SUMS.txt | sha256sum -c -
-tar -xzf "odinn-$tag.tar.gz"
+grep "  $archive$" SHA256SUMS.txt | sha256sum -c -
+tar -xzf "$archive"
 cd "odinn-$tag"
 ./install/install.sh --prefix "$HOME/.local/share/odinn"
 export PATH="$HOME/.local/share/odinn/bin:$PATH"
+odinn --version
 odinn onboard
 ```
 
@@ -79,10 +83,10 @@ On macOS, use `shasum -a 256 -c` instead of `sha256sum -c` when GNU coreutils is
 
 ### Windows PowerShell
 
-Replace `<tag>` with the published tag:
+Replace `vX.Y.Z` with the exact published tag:
 
 ```powershell
-$Tag = "<tag>"
+$Tag = "vX.Y.Z"
 $Archive = "odinn-$Tag.zip"
 Invoke-WebRequest "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$Tag/$Archive" -OutFile $Archive
 Invoke-WebRequest "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$Tag/SHA256SUMS.txt" -OutFile SHA256SUMS.txt
@@ -93,6 +97,7 @@ Expand-Archive $Archive -DestinationPath . -Force
 Set-Location "odinn-$Tag"
 ./install/install.ps1 -Prefix "$HOME/.local/share/odinn"
 $env:Path = "$HOME/.local/share/odinn/bin;$env:Path"
+odinn.cmd --version
 odinn.cmd onboard
 odinn.cmd start
 ```
@@ -117,14 +122,30 @@ installs into an immutable version directory, checks migration compatibility,
 switches atomically, and runs a health check. A failed switch restores the
 previous application and any pre-update state snapshot.
 
+After reviewing the check, install the latest verified release with:
+
+```bash
+odinn update
+```
+
+If the release was installed under a non-default prefix, pass the same
+`--prefix <directory>` to `odinn update check`, `odinn update`,
+`odinn rollback`, and `odinn uninstall`.
+
 Use these commands for local state:
 
 ```bash
 odinn backup
-odinn backup --output <directory>
-odinn restore --input <directory> --confirm
+odinn backup --output ./odinn-backup
+odinn restore --input ./odinn-backup --confirm
 odinn state migrate --dry-run
 ```
+
+The bare backup command appends `.backups` to the configured state-directory
+path and creates a timestamped `manual-...` directory beneath that sibling
+backup root. It reports the exact destination. `--output` must name the new
+backup directory. Restore changes the active state, so review the selected
+backup before supplying the required `--confirm` flag.
 
 Normal backups include configuration, projects, sessions, goals, memory, jobs,
 cron definitions, audit records and verification keys, approval and browser
@@ -153,10 +174,14 @@ Uninstall preserves state by default:
 ```bash
 odinn uninstall
 odinn uninstall --remove-state --confirm
+odinn uninstall --remove-state --force
 ```
 
-Use `--force` only for deliberate non-interactive state removal. Odinn rejects
-ambiguous paths and unexpected files in a custom installation prefix.
+The first command removes the application but retains state. Use the confirmed
+form for interactive state removal; use the `--remove-state --force`
+combination only for deliberate non-interactive state removal. `--force`
+without `--remove-state` does not remove state. Odinn rejects ambiguous paths
+and unexpected files in a custom installation prefix.
 
 ## Privacy and external services
 

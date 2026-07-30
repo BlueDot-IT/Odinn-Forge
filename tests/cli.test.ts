@@ -16,6 +16,8 @@ test("CLI advanced help exposes documented safety controls", () => {
   });
   assert.equal(help.status, 0, help.stderr || help.stdout);
   for (const expected of [
+    "doctor [--state .odinn]",
+    "sessions [--limit 20] [--state .odinn]",
     "config self-improvement set",
     "--interval-ms <ms>",
     "--max-changes <count>",
@@ -30,6 +32,40 @@ test("CLI advanced help exposes documented safety controls", () => {
   ]) {
     assert.match(help.stdout, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
+  assert.equal(help.stdout.match(/^  odinn audit \[--state \.odinn\]$/gmu)?.length, 1);
+  assert.doesNotMatch(help.stdout, /--plan-file <plan\.json>.*--plan-file <plan\.json>/u);
+});
+
+test("CLI plural sessions alias forwards list options and explicit subcommands", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-sessions-alias-"));
+  const sessions = spawnSync("node", [
+    "apps/cli/src/cli.ts",
+    "sessions",
+    "--limit",
+    "5",
+    "--state",
+    state
+  ], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  assert.equal(sessions.status, 0, sessions.stderr || sessions.stdout);
+  assert.deepEqual(JSON.parse(sessions.stdout), { sessions: [] });
+
+  const created = spawnSync("node", [
+    "apps/cli/src/cli.ts",
+    "sessions",
+    "create",
+    "--title",
+    "Plural alias session",
+    "--state",
+    state
+  ], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  assert.equal(created.status, 0, created.stderr || created.stdout);
+  assert.equal(JSON.parse(created.stdout).type, "session.created");
 });
 
 test("CLI redacts credential-like values from top-level failures", async () => {
