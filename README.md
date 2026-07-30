@@ -272,6 +272,8 @@ odinn doctor          # Create a safe diagnostic summary
 
 ## Documentation
 
+- [Documentation hub](docs/README.md) — the complete navigation index for
+  guides, references, architecture notes, policies, and project records
 - [Latest release](https://github.com/BlueDot-IT/Odinn-Forge/releases/latest) —
   download the current supported release
 - [v1 compatibility policy](docs/v1-compatibility.md) — the stable product
@@ -285,6 +287,9 @@ odinn doctor          # Create a safe diagnostic summary
   experimental, provider-dependent, or unsupported
 - [Interface reference](docs/interface-reference.md) — CLI and authenticated
   loopback gateway inputs and outputs
+- [Benchmark evidence and limitations](docs/benchmarks.md) — enforced gates,
+  observational and synthetic measurements, reproduction, and publication
+  caveats
 - [Report a bug or request a feature](https://github.com/BlueDot-IT/Odinn-Forge/issues/new/choose)
 - [Contributing guide](CONTRIBUTING.md) — development setup, pull requests,
   validation, and releases
