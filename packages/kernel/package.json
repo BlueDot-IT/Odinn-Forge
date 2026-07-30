@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./agent-run-graphs": "./src/agent-run-graphs.ts",
     "./async-telemetry": "./src/async-telemetry.ts",
     "./automation-primitives": "./src/automation-primitives.ts",
     "./provider-capabilities": "./src/provider-capabilities.ts",
