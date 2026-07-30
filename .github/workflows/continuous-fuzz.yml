@@ -1,0 +1,79 @@
+name: Continuous security fuzzing
+
+on:
+  schedule:
+    - cron: "29 6 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Total generated cases across all scenarios.
+        required: false
+        default: "20000"
+      max_seconds:
+        description: Total wall-clock budget.
+        required: false
+        default: "240"
+      scenario:
+        description: Optional single scenario for deterministic replay.
+        required: false
+      seed:
+        description: Optional signed 32-bit replay seed.
+        required: false
+      path:
+        description: Optional fast-check replay path.
+        required: false
+  pull_request:
+    paths:
+      - ".github/workflows/continuous-fuzz.yml"
+      - "scripts/ci/security-fuzz.ts"
+      - "tests/fuzz-harness.test.ts"
+      - "docs/security/continuous-fuzzing.md"
+      - "package.json"
+      - "pnpm-lock.yaml"
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10.14.0"
+
+jobs:
+  fuzz:
+    name: Security fuzz (${{ matrix.os }})
+    concurrency:
+      group: continuous-security-fuzz-${{ github.ref }}-${{ matrix.os }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run bounded fuzz campaign
+        env:
+          ODINN_FUZZ_RUNS: ${{ inputs.runs || (github.event_name == 'pull_request' && '2000') || '20000' }}
+          ODINN_FUZZ_MAX_SECONDS: ${{ inputs.max_seconds || (github.event_name == 'pull_request' && '90') || '240' }}
+          ODINN_FUZZ_SCENARIO: ${{ inputs.scenario }}
+          ODINN_FUZZ_SEED: ${{ inputs.seed }}
+          ODINN_FUZZ_PATH: ${{ inputs.path }}
+        run: pnpm fuzz:security
+      - name: Preserve campaign and replay evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: continuous-security-fuzz-${{ matrix.os }}-${{ github.run_id }}
+          path: artifacts/fuzz/
+          if-no-files-found: error
+          retention-days: 30
