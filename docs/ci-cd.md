@@ -177,8 +177,12 @@ the pinned pnpm version, a clean checkout at an exact commit, and
 `pnpm install --frozen-lockfile`. Keep the host idle of other CPU/memory-heavy
 work, use the loopback-only synthetic OpenAI-compatible provider supplied by the
 benchmark, and record OS, architecture, Node, pnpm, commit, threshold, and the
-raw JSON report. Do not compare a workstation result directly with a nested
-Docker or hosted-runner result; compare reports from equivalent host classes.
+raw JSON report. Aster's controlled comparison in hosted run `30565879814`
+measured the old source-entrypoint benchmark at p95 `15,415.13 ms` on Windows
+versus `1,226.16 ms` on Linux, a `12.572x` dispersion. That result is harness
+and platform-sensitive evidence, not a portable product-regression baseline.
+Do not compare a workstation result directly with a nested Docker or
+hosted-runner result; compare reports from equivalent host classes.
 
 ```bash
 pnpm install --frozen-lockfile
