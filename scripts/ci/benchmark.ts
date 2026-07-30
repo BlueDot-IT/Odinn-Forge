@@ -7,13 +7,22 @@ import { runInferenceProtocolSmoke } from "./inference-smoke.ts";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const DEFAULT_P95_MAX_MS = 2_000;
-const SAMPLE_COUNT = 20;
+const DEFAULT_SAMPLE_COUNT = 20;
 
 export function parseP95Threshold(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === "") return DEFAULT_P95_MAX_MS;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new Error(`ODINN_BENCHMARK_P95_MAX_MS must be a finite number greater than zero; received ${JSON.stringify(raw)}`);
+  }
+  return parsed;
+}
+
+export function parseSampleCount(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SAMPLE_COUNT;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`ODINN_BENCHMARK_SAMPLES must be a positive safe integer; received ${JSON.stringify(raw)}`);
   }
   return parsed;
 }
@@ -42,8 +51,8 @@ function run(command: string, args: string[]): void {
 }
 
 async function preparePackagedRelease(): Promise<string> {
-  run("pnpm", ["build"]);
-  run("pnpm", ["release:package"]);
+  run("corepack", ["pnpm", "build"]);
+  run("corepack", ["pnpm", "release:package"]);
   const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
   const packageRoot = join(root, "dist", "package-stage", `odinn-v${pkg.version}`);
   const gatewayLauncher = join(
@@ -76,6 +85,7 @@ export function isMainModule(moduleUrl: string, argv1 = process.argv[1]): boolea
 
 export async function main(): Promise<void> {
   const maxP95Ms = parseP95Threshold(process.env.ODINN_BENCHMARK_P95_MAX_MS);
+  const sampleCount = parseSampleCount(process.env.ODINN_BENCHMARK_SAMPLES);
   const packageRoot = await preparePackagedRelease();
   const gatewayCommand = join(
     packageRoot,
@@ -86,7 +96,7 @@ export async function main(): Promise<void> {
   const startedAt = new Date().toISOString();
   let failure: string | undefined;
 
-  for (let index = 0; index < SAMPLE_COUNT; index += 1) {
+  for (let index = 0; index < sampleCount; index += 1) {
     const started = performance.now();
     try {
       await runInferenceProtocolSmoke({ root: packageRoot, gatewayCommand, gatewayArgs: [] });
@@ -102,7 +112,7 @@ export async function main(): Promise<void> {
     benchmark: "packaged-gateway-inference-smoke",
     startedAt,
     completedAt: new Date().toISOString(),
-    sampleTarget: SAMPLE_COUNT,
+    sampleTarget: sampleCount,
     samples,
     p95MaxMs: maxP95Ms,
     packageRoot: relative(root, packageRoot),
@@ -113,7 +123,7 @@ export async function main(): Promise<void> {
       command: "pnpm benchmark:ci",
       commit: process.env.GITHUB_SHA ?? commandVersion("git", ["rev-parse", "HEAD"], "unknown"),
       packageVersion: JSON.parse(await readFile(join(root, "package.json"), "utf8")).version,
-      pnpm: commandVersion("pnpm", ["--version"], "unknown")
+      pnpm: commandVersion("corepack", ["pnpm", "--version"], "unknown")
     },
     ...(samples.length === 0 ? {} : {
       p50Ms: Number(percentile(samples, 0.5).toFixed(2)),

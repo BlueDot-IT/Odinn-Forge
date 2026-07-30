@@ -170,6 +170,11 @@ workflows retain the 2-second default. Set the threshold only when diagnosing a
 slower host; do not use it to hide a release regression. It then runs the
 observational assurance microbenchmarks described below.
 
+The gate uses 20 samples by default. `ODINN_BENCHMARK_SAMPLES` accepts a
+positive integer for bounded diagnostic or cross-platform entrypoint checks;
+record any override with the raw report and do not use a reduced sample count
+as release evidence.
+
 ### Controlled-host benchmark reproduction
 
 Reproduce benchmark numbers only on a controlled host: use Node.js 24 or newer,

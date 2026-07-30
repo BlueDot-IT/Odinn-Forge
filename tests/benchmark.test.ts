@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { parseP95Threshold, percentile } from "../scripts/ci/benchmark.ts";
+import { parseP95Threshold, parseSampleCount, percentile } from "../scripts/ci/benchmark.ts";
 
 const read = (path: string) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
@@ -15,6 +15,15 @@ test("benchmark p95 threshold defaults and rejects invalid values", () => {
   assert.equal(parseP95Threshold("1250.5"), 1_250.5);
   for (const value of ["NaN", "Infinity", "-1", "0", "not-a-number"]) {
     assert.throws(() => parseP95Threshold(value), /finite number greater than zero/u);
+  }
+});
+
+test("benchmark sample count defaults and rejects invalid values", () => {
+  assert.equal(parseSampleCount(undefined), 20);
+  assert.equal(parseSampleCount(""), 20);
+  assert.equal(parseSampleCount("1"), 1);
+  for (const value of ["NaN", "Infinity", "-1", "0", "1.5", "not-a-number"]) {
+    assert.throws(() => parseSampleCount(value), /positive safe integer/u);
   }
 });
 
@@ -49,13 +58,18 @@ test("benchmark subprocess writes a report when invoked directly", { timeout: 18
     const result = spawnSync(process.execPath, [script], {
       cwd: workspace,
       encoding: "utf8",
-      env: { ...process.env, ODINN_BENCHMARK_JSON: reportPath },
+      env: {
+        ...process.env,
+        ODINN_BENCHMARK_JSON: reportPath,
+        ODINN_BENCHMARK_P95_MAX_MS: "60000",
+        ODINN_BENCHMARK_SAMPLES: "1"
+      },
       timeout: 165_000
     });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     const report = JSON.parse(await readFile(reportPath, "utf8"));
-    assert.equal(report.sampleTarget, 20);
-    assert.equal(report.samples.length, 20);
+    assert.equal(report.sampleTarget, 1);
+    assert.equal(report.samples.length, 1);
     assert.equal(report.provenance.command, "pnpm benchmark:ci");
   } finally {
     await rm(temp, { recursive: true, force: true });
