@@ -164,6 +164,8 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         stateDir,
         defaultAgentId: config.defaultAgentId,
         memoryStore: recordStore,
+        auditStore: context.auditStore,
+        runId: context.request.id,
         registry: context.registry,
         runTool: context.runTool,
         runLedger: context.runLedger,
@@ -448,7 +450,7 @@ function modelVisibleAgentToolSchemas(registry: any) {
   });
 }
 
-async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt, onAgentProgress }: any = {}) {
+async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, auditStore, runId, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt, onAgentProgress }: any = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const agent = await loadAgent(stateDir, cleanString(input.agentId, defaultAgentId || DEFAULT_AGENT_ID));
   const memoryOptions = normalizeMemoryOptions(input.memory);
@@ -541,15 +543,17 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
     }
     messages.push({ role: "assistant", content: result.content || "", tool_calls: result.toolCalls });
     for (const [callIndex, call] of result.toolCalls.entries()) {
-      let args;
-      try { args = JSON.parse(call.arguments || "{}"); } catch { args = {}; }
       let nested;
       try {
+        const args = parseAgentToolArguments(call.arguments, registry?.get?.(call.name)?.inputSchema);
         nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
       } catch (error: any) {
         throwIfAborted(signal);
+        const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError;
+        const argumentCorrection = failure.code === "TOOL_ARGUMENTS_MALFORMED" || failure.code === "TOOL_ARGUMENTS_SCHEMA_INVALID";
+        if (argumentCorrection) await recordAgentToolRejection(auditStore, runId ?? input?.sessionId, call, failure);
         const safety = toolSafetyDescriptor(call.name, registry?.get?.(call.name));
-        if (!safety.retrySafe || toolRepairUsed) throw error;
+        if ((!argumentCorrection && !safety.retrySafe) || toolRepairUsed) throw error;
         toolRepairUsed = true;
         messages.push({
           role: "tool",
@@ -602,9 +606,189 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
 }
 
 function agentToolFailureMessage(error: any) {
+  if (error?.code === "TOOL_ARGUMENTS_MALFORMED") return "The tool arguments were malformed JSON. Return one valid JSON object and retry once.";
+  if (error?.code === "TOOL_ARGUMENTS_SCHEMA_INVALID") return "The tool arguments did not match the declared schema. Return one valid JSON object matching the schema and retry once.";
   if (error?.code === "ENOENT") return "The requested file or resource was not found. Inspect the workspace and try a valid path.";
   if (error?.code === "EACCES" || error?.code === "EPERM") return "The requested operation was not permitted.";
   return "The tool could not complete the requested operation. Inspect the input and try a valid alternative.";
+}
+
+const MAX_AGENT_TOOL_ARGUMENT_BYTES = 1_048_576;
+const FORBIDDEN_AGENT_ARGUMENT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const SUPPORTED_AGENT_SCHEMA_KEYS = new Set([
+  "type", "properties", "required", "additionalProperties", "items", "enum",
+  "minLength", "maxLength", "minItems", "maxItems", "minimum", "maximum",
+  "exclusiveMinimum", "exclusiveMaximum", "title", "description"
+]);
+const SUPPORTED_AGENT_SCHEMA_TYPES = new Set(["object", "array", "string", "boolean", "number", "integer", "null"]);
+
+function agentToolArgumentError(code: string, message: string): NodeError {
+  const error = new Error(message) as NodeError;
+  error.code = code;
+  return error;
+}
+
+function parseAgentToolArguments(raw: any, schema: any): any {
+  const text = typeof raw === "string" && raw.trim() ? raw : "{}";
+  if (Buffer.byteLength(text, "utf8") > MAX_AGENT_TOOL_ARGUMENT_BYTES) {
+    throw agentToolArgumentError("TOOL_ARGUMENTS_MALFORMED", "Tool arguments exceed the maximum permitted size.");
+  }
+  let value;
+  try {
+    rejectDuplicateJsonKeys(text);
+    value = JSON.parse(text);
+  } catch {
+    throw agentToolArgumentError("TOOL_ARGUMENTS_MALFORMED", "Tool arguments are not valid JSON.");
+  }
+  try {
+    validateAgentToolSchema(value, schema);
+  } catch {
+    throw agentToolArgumentError("TOOL_ARGUMENTS_SCHEMA_INVALID", "Tool arguments do not match the declared schema.");
+  }
+  return value;
+}
+
+function validateAgentToolSchema(value: any, schema: any, path = "arguments"): void {
+  if (!schema) return;
+  validateAgentToolSchemaDefinition(schema, path);
+  if (schema.type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) throw new Error(`${path} must be an object`);
+    const properties = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+    for (const key of Object.keys(value)) {
+      if (FORBIDDEN_AGENT_ARGUMENT_KEYS.has(key)) throw new Error(`${path}.${key} is forbidden`);
+      if (schema.additionalProperties === false && !Object.prototype.hasOwnProperty.call(properties, key)) throw new Error(`${path}.${key} is not allowed`);
+      if (Object.prototype.hasOwnProperty.call(properties, key)) validateAgentToolSchema(value[key], properties[key], `${path}.${key}`);
+    }
+    for (const required of Array.isArray(schema.required) ? schema.required : []) {
+      if (!Object.prototype.hasOwnProperty.call(value, required)) throw new Error(`${path}.${required} is required`);
+    }
+    return;
+  }
+  if (schema.type === "array") {
+    if (!Array.isArray(value)) throw new Error(`${path} must be an array`);
+    if (schema.minItems !== undefined && value.length < schema.minItems) throw new Error(`${path} has too few items`);
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) throw new Error(`${path} has too many items`);
+    if (schema.items) for (const [index, entry] of value.entries()) validateAgentToolSchema(entry, schema.items, `${path}[${index}]`);
+    return;
+  }
+  if (schema.type === "string") {
+    if (typeof value !== "string") throw new Error(`${path} must be a string`);
+    const length = Array.from(value).length;
+    if (schema.minLength !== undefined && length < schema.minLength) throw new Error(`${path} is too short`);
+    if (schema.maxLength !== undefined && length > schema.maxLength) throw new Error(`${path} is too long`);
+  }
+  if (schema.type === "boolean" && typeof value !== "boolean") throw new Error(`${path} must be a boolean`);
+  if (schema.type === "number" && (typeof value !== "number" || !Number.isFinite(value))) throw new Error(`${path} must be a number`);
+  if (schema.type === "integer" && (typeof value !== "number" || !Number.isInteger(value))) throw new Error(`${path} must be an integer`);
+  if (schema.type === "number" || schema.type === "integer") {
+    if (schema.minimum !== undefined && value < schema.minimum) throw new Error(`${path} is below the minimum`);
+    if (schema.maximum !== undefined && value > schema.maximum) throw new Error(`${path} is above the maximum`);
+    if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) throw new Error(`${path} is at or below the exclusive minimum`);
+    if (schema.exclusiveMaximum !== undefined && value >= schema.exclusiveMaximum) throw new Error(`${path} is at or above the exclusive maximum`);
+  }
+  if (schema.type === "null" && value !== null) throw new Error(`${path} must be null`);
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate: any) => Object.is(candidate, value))) throw new Error(`${path} is not an allowed value`);
+}
+
+function validateAgentToolSchemaDefinition(schema: any, path: string): void {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema) || Object.getPrototypeOf(schema) !== Object.prototype) throw new Error(`${path} has an invalid schema`);
+  for (const key of Object.keys(schema)) if (!SUPPORTED_AGENT_SCHEMA_KEYS.has(key)) throw new Error(`${path} uses an unsupported schema keyword`);
+  if (schema.type !== undefined && (typeof schema.type !== "string" || !SUPPORTED_AGENT_SCHEMA_TYPES.has(schema.type))) throw new Error(`${path} has an unsupported schema type`);
+  if (schema.properties !== undefined) {
+    if (!schema.properties || typeof schema.properties !== "object" || Array.isArray(schema.properties) || Object.getPrototypeOf(schema.properties) !== Object.prototype) throw new Error(`${path}.properties is invalid`);
+    for (const [key, child] of Object.entries(schema.properties)) {
+      if (FORBIDDEN_AGENT_ARGUMENT_KEYS.has(key)) throw new Error(`${path}.properties contains a forbidden key`);
+      validateAgentToolSchemaDefinition(child, `${path}.${key}`);
+    }
+  }
+  if (schema.required !== undefined) {
+    if (!Array.isArray(schema.required) || schema.required.some((key: any) => typeof key !== "string") || new Set(schema.required).size !== schema.required.length) throw new Error(`${path}.required is invalid`);
+  }
+  if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== "boolean") throw new Error(`${path}.additionalProperties is unsupported`);
+  if (schema.items !== undefined) validateAgentToolSchemaDefinition(schema.items, `${path}.items`);
+  if (schema.enum !== undefined && !Array.isArray(schema.enum)) throw new Error(`${path}.enum is invalid`);
+  for (const key of ["minLength", "maxLength", "minItems", "maxItems"]) {
+    if (schema[key] !== undefined && (!Number.isSafeInteger(schema[key]) || schema[key] < 0)) throw new Error(`${path}.${key} is invalid`);
+  }
+  if (schema.minLength !== undefined && schema.maxLength !== undefined && schema.minLength > schema.maxLength) throw new Error(`${path} has inconsistent length bounds`);
+  if (schema.minItems !== undefined && schema.maxItems !== undefined && schema.minItems > schema.maxItems) throw new Error(`${path} has inconsistent item bounds`);
+  for (const key of ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]) {
+    if (schema[key] !== undefined && (typeof schema[key] !== "number" || !Number.isFinite(schema[key]))) throw new Error(`${path}.${key} is invalid`);
+  }
+  if (schema.minimum !== undefined && schema.maximum !== undefined && schema.minimum > schema.maximum) throw new Error(`${path} has inconsistent numeric bounds`);
+  if (schema.exclusiveMinimum !== undefined && schema.exclusiveMaximum !== undefined && schema.exclusiveMinimum >= schema.exclusiveMaximum) throw new Error(`${path} has inconsistent exclusive bounds`);
+}
+
+function rejectDuplicateJsonKeys(text: string): void {
+  let index = 0;
+  const whitespace = () => { while (/\s/u.test(text[index] ?? "")) index += 1; };
+  const string = (): string => {
+    const start = index;
+    index += 1;
+    while (index < text.length) {
+      if (text[index] === "\\") index += 2;
+      else if (text[index++] === '"') return JSON.parse(text.slice(start, index));
+    }
+    throw new Error("unterminated string");
+  };
+  const value = (depth: number): void => {
+    if (depth > 64) throw new Error("JSON nesting too deep");
+    whitespace();
+    const token = text[index];
+    if (token === '"') { string(); return; }
+    if (token === "{") {
+      index += 1;
+      const keys = new Set<string>();
+      whitespace();
+      if (text[index] === "}") { index += 1; return; }
+      while (true) {
+        whitespace();
+        if (text[index] !== '"') throw new Error("object key expected");
+        const key = string();
+        if (keys.has(key)) throw new Error("duplicate object key");
+        keys.add(key);
+        whitespace();
+        if (text[index++] !== ":") throw new Error("object colon expected");
+        value(depth + 1);
+        whitespace();
+        if (text[index] === "}") { index += 1; return; }
+        if (text[index++] !== ",") throw new Error("object separator expected");
+      }
+    }
+    if (token === "[") {
+      index += 1;
+      whitespace();
+      if (text[index] === "]") { index += 1; return; }
+      while (true) {
+        value(depth + 1);
+        whitespace();
+        if (text[index] === "]") { index += 1; return; }
+        if (text[index++] !== ",") throw new Error("array separator expected");
+      }
+    }
+    const literal = text.slice(index).match(/^(?:true|false|null)\b/u);
+    if (literal) { index += literal[0].length; return; }
+    const number = text.slice(index).match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/u);
+    if (number) { index += number[0].length; return; }
+    throw new Error("JSON value expected");
+  };
+  value(0);
+  whitespace();
+  if (index !== text.length) throw new Error("trailing JSON data");
+}
+
+async function recordAgentToolRejection(auditStore: any, runId: any, call: any, error: NodeError): Promise<void> {
+  if (!auditStore?.append) return;
+  await auditStore.append({
+    at: new Date().toISOString(),
+    runId: cleanString(runId, cleanString(call?.id, "agent-tool-call")),
+    type: "tool.call.rejected",
+    actor: "agent",
+    tool: cleanString(call?.name, "unknown"),
+    decision: "deny",
+    message: error.message,
+    data: { callId: cleanString(call?.id, "unknown"), code: error.code ?? "TOOL_ARGUMENTS_INVALID" }
+  });
 }
 
 function agentBudgetRecovery(error: any, selectedModel: any, input: any, alreadyUsed: boolean) {

@@ -565,8 +565,8 @@ test("agent.run exposes registry-derived readText schema and permits one safe co
     assert.deepEqual(JSON.parse(failedToolResult.content), {
       ok: false,
       error: {
-        code: "TOOL_ERROR",
-        message: "The tool could not complete the requested operation. Inspect the input and try a valid alternative."
+        code: "TOOL_ARGUMENTS_SCHEMA_INVALID",
+        message: "The tool arguments did not match the declared schema. Return one valid JSON object matching the schema and retry once."
       }
     });
     const correctedToolResult = fx.requests[2].messages.find((message: any) => message.role === "tool" && message.tool_call_id === "call_corrected_read");
@@ -599,7 +599,7 @@ test("agent.run permits at most one retry-safe tool correction", async () => {
         model: "test:test-model",
         prompt: "Read the fixture."
       }, policy),
-      /workspace\.readText requires path/u
+      /Tool arguments do not match the declared schema/u
     );
     assert.equal(fx.requests.length, 2);
     assert.ok(fx.requests[1].messages.some((message: any) => message.tool_call_id === "call_bad_read_1"));
@@ -654,11 +654,11 @@ test("agent.run cancels sibling calls after a retry-safe read failure", async ()
 });
 
 for (const scenario of [{
-  label: "browser work",
+  label: "schema-invalid browser work",
   tool: "browser_x2e_open",
   arguments: "{}",
   capability: "browser.read",
-  error: /browser\.open requires url/u
+  error: /Tool arguments do not match the declared schema/u
 }]) {
   test(`agent.run does not expose failed ${scenario.label} to the model for retry`, async () => {
     const fx = await modelFixture(() => ({
@@ -684,7 +684,7 @@ for (const scenario of [{
         }, policy),
         scenario.error
       );
-      assert.equal(fx.requests.length, 1);
+      assert.equal(fx.requests.length, 2);
     } finally {
       await fx.close();
     }
