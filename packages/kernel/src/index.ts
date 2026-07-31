@@ -615,6 +615,12 @@ function agentToolFailureMessage(error: any) {
 
 const MAX_AGENT_TOOL_ARGUMENT_BYTES = 1_048_576;
 const FORBIDDEN_AGENT_ARGUMENT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const SUPPORTED_AGENT_SCHEMA_KEYS = new Set([
+  "type", "properties", "required", "additionalProperties", "items", "enum",
+  "minLength", "maxLength", "minItems", "maxItems", "minimum", "maximum",
+  "exclusiveMinimum", "exclusiveMaximum", "title", "description"
+]);
+const SUPPORTED_AGENT_SCHEMA_TYPES = new Set(["object", "array", "string", "boolean", "number", "integer", "null"]);
 
 function agentToolArgumentError(code: string, message: string): NodeError {
   const error = new Error(message) as NodeError;
@@ -644,6 +650,7 @@ function parseAgentToolArguments(raw: any, schema: any): any {
 
 function validateAgentToolSchema(value: any, schema: any, path = "arguments"): void {
   if (!schema) return;
+  validateAgentToolSchemaDefinition(schema, path);
   if (schema.type === "object") {
     if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) throw new Error(`${path} must be an object`);
     const properties = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
@@ -659,15 +666,57 @@ function validateAgentToolSchema(value: any, schema: any, path = "arguments"): v
   }
   if (schema.type === "array") {
     if (!Array.isArray(value)) throw new Error(`${path} must be an array`);
+    if (schema.minItems !== undefined && value.length < schema.minItems) throw new Error(`${path} has too few items`);
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) throw new Error(`${path} has too many items`);
     if (schema.items) for (const [index, entry] of value.entries()) validateAgentToolSchema(entry, schema.items, `${path}[${index}]`);
     return;
   }
-  if (schema.type === "string" && typeof value !== "string") throw new Error(`${path} must be a string`);
+  if (schema.type === "string") {
+    if (typeof value !== "string") throw new Error(`${path} must be a string`);
+    const length = Array.from(value).length;
+    if (schema.minLength !== undefined && length < schema.minLength) throw new Error(`${path} is too short`);
+    if (schema.maxLength !== undefined && length > schema.maxLength) throw new Error(`${path} is too long`);
+  }
   if (schema.type === "boolean" && typeof value !== "boolean") throw new Error(`${path} must be a boolean`);
   if (schema.type === "number" && (typeof value !== "number" || !Number.isFinite(value))) throw new Error(`${path} must be a number`);
   if (schema.type === "integer" && (typeof value !== "number" || !Number.isInteger(value))) throw new Error(`${path} must be an integer`);
+  if (schema.type === "number" || schema.type === "integer") {
+    if (schema.minimum !== undefined && value < schema.minimum) throw new Error(`${path} is below the minimum`);
+    if (schema.maximum !== undefined && value > schema.maximum) throw new Error(`${path} is above the maximum`);
+    if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) throw new Error(`${path} is at or below the exclusive minimum`);
+    if (schema.exclusiveMaximum !== undefined && value >= schema.exclusiveMaximum) throw new Error(`${path} is at or above the exclusive maximum`);
+  }
   if (schema.type === "null" && value !== null) throw new Error(`${path} must be null`);
   if (Array.isArray(schema.enum) && !schema.enum.some((candidate: any) => Object.is(candidate, value))) throw new Error(`${path} is not an allowed value`);
+}
+
+function validateAgentToolSchemaDefinition(schema: any, path: string): void {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema) || Object.getPrototypeOf(schema) !== Object.prototype) throw new Error(`${path} has an invalid schema`);
+  for (const key of Object.keys(schema)) if (!SUPPORTED_AGENT_SCHEMA_KEYS.has(key)) throw new Error(`${path} uses an unsupported schema keyword`);
+  if (schema.type !== undefined && (typeof schema.type !== "string" || !SUPPORTED_AGENT_SCHEMA_TYPES.has(schema.type))) throw new Error(`${path} has an unsupported schema type`);
+  if (schema.properties !== undefined) {
+    if (!schema.properties || typeof schema.properties !== "object" || Array.isArray(schema.properties) || Object.getPrototypeOf(schema.properties) !== Object.prototype) throw new Error(`${path}.properties is invalid`);
+    for (const [key, child] of Object.entries(schema.properties)) {
+      if (FORBIDDEN_AGENT_ARGUMENT_KEYS.has(key)) throw new Error(`${path}.properties contains a forbidden key`);
+      validateAgentToolSchemaDefinition(child, `${path}.${key}`);
+    }
+  }
+  if (schema.required !== undefined) {
+    if (!Array.isArray(schema.required) || schema.required.some((key: any) => typeof key !== "string") || new Set(schema.required).size !== schema.required.length) throw new Error(`${path}.required is invalid`);
+  }
+  if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== "boolean") throw new Error(`${path}.additionalProperties is unsupported`);
+  if (schema.items !== undefined) validateAgentToolSchemaDefinition(schema.items, `${path}.items`);
+  if (schema.enum !== undefined && !Array.isArray(schema.enum)) throw new Error(`${path}.enum is invalid`);
+  for (const key of ["minLength", "maxLength", "minItems", "maxItems"]) {
+    if (schema[key] !== undefined && (!Number.isSafeInteger(schema[key]) || schema[key] < 0)) throw new Error(`${path}.${key} is invalid`);
+  }
+  if (schema.minLength !== undefined && schema.maxLength !== undefined && schema.minLength > schema.maxLength) throw new Error(`${path} has inconsistent length bounds`);
+  if (schema.minItems !== undefined && schema.maxItems !== undefined && schema.minItems > schema.maxItems) throw new Error(`${path} has inconsistent item bounds`);
+  for (const key of ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]) {
+    if (schema[key] !== undefined && (typeof schema[key] !== "number" || !Number.isFinite(schema[key]))) throw new Error(`${path}.${key} is invalid`);
+  }
+  if (schema.minimum !== undefined && schema.maximum !== undefined && schema.minimum > schema.maximum) throw new Error(`${path} has inconsistent numeric bounds`);
+  if (schema.exclusiveMinimum !== undefined && schema.exclusiveMaximum !== undefined && schema.exclusiveMinimum >= schema.exclusiveMaximum) throw new Error(`${path} has inconsistent exclusive bounds`);
 }
 
 function rejectDuplicateJsonKeys(text: string): void {

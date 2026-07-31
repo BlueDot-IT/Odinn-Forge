@@ -144,3 +144,36 @@ test("only one correction cycle is allowed for malformed arguments", async () =>
     await fx.close();
   }
 });
+
+test("supported schema constraints fail closed and valid boundaries dispatch once", async () => {
+  const cases = [
+    { schema: { type: "string", minLength: 2 }, invalid: "x", valid: "xy" },
+    { schema: { type: "string", maxLength: 2 }, invalid: "xyz", valid: "xy" },
+    { schema: { type: "array", items: { type: "integer" }, minItems: 2, maxItems: 3 }, invalid: [1], valid: [1, 2, 3] },
+    { schema: { type: "number", minimum: 2, maximum: 4 }, invalid: 1, valid: 2 },
+    { schema: { type: "number", exclusiveMinimum: 2, exclusiveMaximum: 4 }, invalid: 2, valid: 3 },
+    { schema: { type: "string", pattern: "^x$" }, invalid: "x", valid: undefined }
+  ];
+  for (const [index, entry] of cases.entries()) {
+    for (const [label, value, expectedDispatches] of [["invalid", entry.invalid, 0], ["valid", entry.valid, entry.valid === undefined ? 0 : 1]] as const) {
+      let dispatches = 0;
+      const fx = await fixture((_request, requestIndex) => requestIndex === 1 ? {
+        id: `constraint-${index}-${label}`,
+        choices: [{ message: { role: "assistant", content: "", tool_calls: [{ id: `constraint-${index}-${label}`, type: "function", function: { name: "test.constraint", arguments: JSON.stringify(value) } }] } }]
+      } : { id: `constraint-done-${index}-${label}`, choices: [{ message: { role: "assistant", content: "done" } }] });
+      fx.registry.set("test.constraint", {
+        capability: "browser.read",
+        description: "Constraint test tool.",
+        inputSchema: entry.schema,
+        execute: async (input: any) => { dispatches += 1; return { input }; }
+      });
+      try {
+        const result = await runAgent(fx, `constraint-${index}-${label}`, "");
+        assert.equal(result.output.content, "done");
+        assert.equal(dispatches, expectedDispatches, `${index}/${label}`);
+      } finally {
+        await fx.close();
+      }
+    }
+  }
+});
