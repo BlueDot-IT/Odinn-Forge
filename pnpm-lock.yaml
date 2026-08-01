@@ -123,7 +123,11 @@ importers:
         specifier: workspace:*
         version: link:../../packages/store-file
 
-  packages/channels: {}
+  packages/channels:
+    dependencies:
+      '@odinn/store-file':
+        specifier: workspace:*
+        version: link:../store-file
 
   packages/kernel:
     dependencies:

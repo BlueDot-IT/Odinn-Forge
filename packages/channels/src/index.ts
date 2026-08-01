@@ -1,6 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
+import { mutateSecureJsonState, readSecureJsonState } from "@odinn/store-file";
 
 export * from "./plugin.ts";
 
@@ -231,22 +230,38 @@ interface ChannelDedupeFileState {
   entries: Record<string, { state: "claimed" | "committed"; expiresAt: number }>;
 }
 
+function parseDedupeState(value: unknown): ChannelDedupeFileState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("unsupported channel dedupe state");
+  const state = value as Partial<ChannelDedupeFileState>;
+  if (state.schemaVersion !== 1 || !state.entries || typeof state.entries !== "object" || Array.isArray(state.entries)) {
+    throw new Error("unsupported channel dedupe state");
+  }
+  for (const [key, entry] of Object.entries(state.entries)) {
+    if (!key || !entry || !["claimed", "committed"].includes(entry.state) || !Number.isFinite(entry.expiresAt)) {
+      throw new Error(`invalid channel dedupe entry: ${key}`);
+    }
+  }
+  return { schemaVersion: 1, entries: state.entries as ChannelDedupeFileState["entries"] };
+}
+
 export class FileChannelDedupeStore implements ChannelDedupeStore {
   readonly #path: string;
   readonly #claimTtlMs: number;
   readonly #commitTtlMs: number;
   readonly #maximum: number;
-  #queue: Promise<unknown> = Promise.resolve();
+  readonly #lockTimeoutMs: number;
 
   constructor(path: string, {
     claimTtlMs = 2 * 60_000,
     commitTtlMs = 5 * 60_000,
-    maximum = 10_000
-  }: { claimTtlMs?: number; commitTtlMs?: number; maximum?: number } = {}) {
+    maximum = 10_000,
+    lockTimeoutMs = 30_000
+  }: { claimTtlMs?: number; commitTtlMs?: number; maximum?: number; lockTimeoutMs?: number } = {}) {
     this.#path = resolve(path);
     this.#claimTtlMs = Math.max(1_000, claimTtlMs);
     this.#commitTtlMs = Math.max(1_000, commitTtlMs);
     this.#maximum = Math.max(1, maximum);
+    this.#lockTimeoutMs = Math.max(1, lockTimeoutMs);
   }
 
   claim(key: string): Promise<boolean> {
@@ -272,36 +287,17 @@ export class FileChannelDedupeStore implements ChannelDedupeStore {
   }
 
   #mutate<Result>(operation: (state: ChannelDedupeFileState) => Result): Promise<Result> {
-    const pending = this.#queue.then(async () => {
-      const state = await this.#read();
-      this.#prune(state);
-      const result = operation(state);
-      await this.#write(state);
-      return result;
-    });
-    this.#queue = pending.catch(() => undefined);
-    return pending;
-  }
-
-  async #read(): Promise<ChannelDedupeFileState> {
-    try {
-      const value = JSON.parse(await readFile(this.#path, "utf8")) as ChannelDedupeFileState;
-      if (value.schemaVersion !== 1 || !value.entries || typeof value.entries !== "object") {
-        throw new Error("unsupported channel dedupe state");
+    return mutateSecureJsonState(this.#path, {
+      initial: (): ChannelDedupeFileState => ({ schemaVersion: 1, entries: {} }),
+      parse: parseDedupeState,
+      lockTimeoutMs: this.#lockTimeoutMs,
+      mutate: (state) => {
+        this.#prune(state);
+        const result = operation(state);
+        this.#prune(state);
+        return result;
       }
-      return value;
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { schemaVersion: 1, entries: {} };
-      throw error;
-    }
-  }
-
-  async #write(state: ChannelDedupeFileState): Promise<void> {
-    await mkdir(dirname(this.#path), { recursive: true });
-    const temporary = `${this.#path}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
-    await rename(temporary, this.#path);
-    await chmod(this.#path, 0o600);
+    });
   }
 
   #prune(state: ChannelDedupeFileState): void {
@@ -617,42 +613,47 @@ export interface SessionBindingStore {
 }
 interface BindingState { schemaVersion: 1; bindings: Record<string, string> }
 
+function parseBindingState(value: unknown): BindingState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("unsupported channel binding state");
+  const state = value as Partial<BindingState>;
+  if (state.schemaVersion !== 1 || !state.bindings || typeof state.bindings !== "object" || Array.isArray(state.bindings)) {
+    throw new Error("unsupported channel binding state");
+  }
+  for (const [key, sessionId] of Object.entries(state.bindings)) {
+    if (!key || typeof sessionId !== "string" || !sessionId.trim()) throw new Error(`invalid channel binding entry: ${key}`);
+  }
+  return { schemaVersion: 1, bindings: state.bindings as BindingState["bindings"] };
+}
+
 export class FileSessionBindingStore implements SessionBindingStore {
   readonly #path: string;
-  #writeQueue: Promise<void> = Promise.resolve();
+  readonly #lockTimeoutMs: number;
 
-  constructor(path: string) {
+  constructor(path: string, { lockTimeoutMs = 30_000 }: { lockTimeoutMs?: number } = {}) {
     this.#path = resolve(path);
+    this.#lockTimeoutMs = Math.max(1, lockTimeoutMs);
   }
 
   async get(address: ChannelAddress): Promise<string | undefined> {
-    return (await this.#read()).bindings[channelConversationKey(address)];
+    const state = await readSecureJsonState(this.#path, {
+      initial: (): BindingState => ({ schemaVersion: 1, bindings: {} }),
+      parse: parseBindingState,
+      lockTimeoutMs: this.#lockTimeoutMs
+    });
+    return state.bindings[channelConversationKey(address)];
   }
 
   async set(address: ChannelAddress, sessionId: string): Promise<void> {
     const cleanSessionId = sessionId.trim();
     if (!cleanSessionId) throw new Error("channel session binding requires a session identifier");
-    this.#writeQueue = this.#writeQueue.then(async () => {
-      const state = await this.#read();
-      state.bindings[channelConversationKey(address)] = cleanSessionId;
-      await mkdir(dirname(this.#path), { recursive: true });
-      const temporary = `${this.#path}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-      await rename(temporary, this.#path);
-      await chmod(this.#path, 0o600);
+    await mutateSecureJsonState(this.#path, {
+      initial: (): BindingState => ({ schemaVersion: 1, bindings: {} }),
+      parse: parseBindingState,
+      lockTimeoutMs: this.#lockTimeoutMs,
+      mutate: (state) => {
+        state.bindings[channelConversationKey(address)] = cleanSessionId;
+      }
     });
-    await this.#writeQueue;
-  }
-
-  async #read(): Promise<BindingState> {
-    try {
-      const value = JSON.parse(await readFile(this.#path, "utf8")) as BindingState;
-      if (value.schemaVersion !== 1 || !value.bindings || typeof value.bindings !== "object") throw new Error("unsupported channel binding state");
-      return value;
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { schemaVersion: 1, bindings: {} };
-      throw error;
-    }
   }
 }
 

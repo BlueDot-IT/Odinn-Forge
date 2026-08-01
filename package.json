@@ -21,7 +21,7 @@
     "lint": "node scripts/ci/run.ts lint",
     "typecheck": "node scripts/ci/run.ts typecheck",
     "test": "node --test --test-concurrency=1 --test-reporter=spec tests/*.test.ts",
-    "test:platform": "node --test --test-reporter=spec tests/platform.test.ts tests/resource-limits.test.ts",
+    "test:platform": "node --test --test-concurrency=1 --test-reporter=spec tests/platform.test.ts tests/resource-limits.test.ts tests/channels.test.ts",
     "test:integration": "node --test --test-reporter=spec tests/integration.test.ts",
     "test:migrations": "node --test --test-reporter=spec tests/state-migrations.test.ts",
     "test:lifecycle": "node --test --test-reporter=spec tests/application-lifecycle.test.ts tests/state-lifecycle.test.ts",

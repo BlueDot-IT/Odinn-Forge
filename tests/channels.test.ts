@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { execFile as execFileCallback, spawn } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
+import { isOwnerOnlyPath } from "../packages/store-file/src/index.ts";
 import {
   ChannelAdmissionError, ChannelRetryableError, ChannelRouter, ChannelRunUncertainError, FileChannelDedupeStore, FileSessionBindingStore,
   GatewayChannelHandler, channelConversationKey, channelExecutionKey, createAllowlistPolicy, splitChannelText,
@@ -16,6 +19,8 @@ import {
   DiscordChannelAdapter, createDiscordAccessPolicy, discordChannelPlugin,
   normalizeDiscordInteraction, normalizeDiscordMessage
 } from "../adapters/channels/discord/src/index.ts";
+
+const execFile = promisify(execFileCallback);
 
 function message(overrides: Partial<InboundChannelMessage> = {}): InboundChannelMessage {
   return {
@@ -427,6 +432,261 @@ test("file channel dedupe survives restarts and permits released claims", async 
   assert.equal(await second.claim("discord:home:11"), true);
   const persisted = JSON.parse(await readFile(path, "utf8"));
   assert.equal(persisted.schemaVersion, 1);
+
+  const expiredPath = join(directory, "expired.json");
+  await writeFile(expiredPath, `${JSON.stringify({ schemaVersion: 1, entries: {
+    expired: { state: "committed", expiresAt: Date.now() - 1 }
+  } })}\n`, { mode: 0o600 });
+  assert.equal(await new FileChannelDedupeStore(expiredPath).claim("fresh"), true);
+
+  const corruptPath = join(directory, "corrupt.json");
+  await writeFile(corruptPath, `${JSON.stringify({ schemaVersion: 1, entries: { broken: { state: "unknown", expiresAt: Date.now() } } })}\n`, { mode: 0o600 });
+  await assert.rejects(() => new FileChannelDedupeStore(corruptPath).claim("fresh"), /invalid channel dedupe entry/u);
+});
+
+test("channel persistence serializes binding updates and competing claims across processes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-processes-"));
+  const bindingsPath = join(directory, "bindings.json");
+  const dedupePath = join(directory, "dedupe.json");
+  const moduleUrl = new URL("../packages/channels/src/index.ts", import.meta.url).href;
+  const run = async (body: string) => execFile(process.execPath, ["--input-type=module", "-e", body], { cwd: process.cwd() });
+  const bindingWorkers = ["one", "two"].map((id) => run(`
+    import { FileSessionBindingStore } from ${JSON.stringify(moduleUrl)};
+    const store = new FileSessionBindingStore(${JSON.stringify(bindingsPath)});
+    await store.set({ channel: "telegram", accountId: "personal", conversationId: ${JSON.stringify(id)}, conversationKind: "direct" }, ${JSON.stringify(`sess-${id}`)});
+  `));
+  await Promise.all(bindingWorkers);
+  const bindings = new FileSessionBindingStore(bindingsPath);
+  assert.equal(await bindings.get({ channel: "telegram", accountId: "personal", conversationId: "one", conversationKind: "direct" }), "sess-one");
+  assert.equal(await bindings.get({ channel: "telegram", accountId: "personal", conversationId: "two", conversationKind: "direct" }), "sess-two");
+
+  const claimWorkers = ["one", "two"].map(() => run(`
+    import { FileChannelDedupeStore } from ${JSON.stringify(moduleUrl)};
+    const store = new FileChannelDedupeStore(${JSON.stringify(dedupePath)});
+    console.log(await store.claim("same-message"));
+  `));
+  const claims = await Promise.all(claimWorkers);
+  assert.equal(claims.filter(({ stdout }) => stdout.trim() === "true").length, 1);
+  assert.equal(claims.filter(({ stdout }) => stdout.trim() === "false").length, 1);
+});
+
+test("child processes preserve concurrent dedupe commit, release, and unrelated updates", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-dedupe-lifecycle-"));
+  const path = join(directory, "dedupe.json");
+  const moduleUrl = new URL("../packages/channels/src/index.ts", import.meta.url).href;
+  const run = async (body: string) => execFile(process.execPath, ["--input-type=module", "-e", body], { cwd: process.cwd() });
+  const worker = (unrelated: string, release = false) => run(`
+    import { FileChannelDedupeStore } from ${JSON.stringify(moduleUrl)};
+    const store = new FileChannelDedupeStore(${JSON.stringify(path)});
+    if (await store.claim("committed")) await store.commit("committed");
+    if (${JSON.stringify(release)} && await store.claim("released")) await store.release("released");
+    await store.claim(${JSON.stringify(unrelated)});
+  `);
+  await Promise.all([worker("unrelated-a", true), worker("unrelated-b")]);
+
+  const store = new FileChannelDedupeStore(path);
+  assert.equal(await store.claim("committed"), false);
+  assert.equal(await store.claim("released"), true);
+  assert.equal(await store.claim("unrelated-a"), false);
+  assert.equal(await store.claim("unrelated-b"), false);
+});
+
+test("binding persistence recovers after a failed write and rejects corrupt or insecure state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-recovery-"));
+  const blocker = join(directory, "blocked");
+  await writeFile(blocker, "not-a-directory");
+  const blockedPath = join(blocker, "bindings.json");
+  const blocked = new FileSessionBindingStore(blockedPath);
+  const address = message().address;
+  await assert.rejects(() => blocked.set(address, "sess-failed"), /not a directory|state parent|ENOTDIR|EEXIST/u);
+  await rm(blocker);
+  await mkdir(blocker, { mode: 0o700 });
+  await blocked.set(address, "sess-recovered");
+  assert.equal(await blocked.get(address), "sess-recovered");
+
+  const corruptPath = join(directory, "corrupt.json");
+  await writeFile(corruptPath, `${JSON.stringify({ schemaVersion: 99, bindings: {} })}\n`, { mode: 0o600 });
+  await assert.rejects(() => new FileSessionBindingStore(corruptPath).set(address, "sess-corrupt"), /unsupported channel binding state/u);
+
+  if (process.platform !== "win32") {
+    const insecurePath = join(directory, "insecure.json");
+    await writeFile(insecurePath, `${JSON.stringify({ schemaVersion: 1, bindings: {} })}\n`, { mode: 0o600 });
+    await chmod(insecurePath, 0o644);
+    await assert.rejects(() => new FileSessionBindingStore(insecurePath).set(address, "sess-insecure"), /not owner-only/u);
+
+    const insecureParent = join(directory, "insecure-parent");
+    await mkdir(insecureParent, { mode: 0o755 });
+    await assert.rejects(
+      () => new FileSessionBindingStore(join(insecureParent, "bindings.json")).set(address, "sess-parent"),
+      /state parent is not owner-only/u
+    );
+    assert.equal((await stat(insecureParent)).mode & 0o777, 0o755);
+  }
+});
+
+test("channel persistence recovers after cyclic mutation failure without leaving temporary state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-temp-cleanup-"));
+  const path = join(directory, "bindings.json");
+  const module = await import("../packages/store-file/src/index.ts");
+  await assert.rejects(
+    () => module.mutateSecureJsonState(path, {
+      initial: () => ({ schemaVersion: 1, bindings: {} }),
+      parse: (value) => value as { schemaVersion: 1; bindings: Record<string, string> },
+      mutate: (state) => { (state as typeof state & { cycle: unknown }).cycle = state; }
+    }),
+    /circular/u
+  );
+  assert.deepEqual((await readdir(directory)).filter((name) => name.includes(".tmp")), []);
+  const store = new FileSessionBindingStore(path);
+  await store.set(message().address, "sess-recovered");
+  assert.equal(await store.get(message().address), "sess-recovered");
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
+    schemaVersion: 1,
+    bindings: { "telegram:personal:direct:200:": "sess-recovered" }
+  });
+});
+
+test("channel persistence validates mutated state before publication and cleans up invalid output", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-invalid-mutation-"));
+  const path = join(directory, "bindings.json");
+  const module = await import("../packages/store-file/src/index.ts");
+  const initial = { schemaVersion: 1, bindings: { existing: "sess-old" } };
+  await writeFile(path, `${JSON.stringify(initial)}\n`, { mode: 0o600 });
+
+  await assert.rejects(
+    () => module.mutateSecureJsonState(path, {
+      initial: () => initial,
+      parse: (value) => {
+        const state = value as typeof initial;
+        if (Object.values(state.bindings).some((binding) => typeof binding !== "string")) {
+          throw new Error("invalid mutated binding state");
+        }
+        return state;
+      },
+      mutate: (state) => { (state.bindings as Record<string, unknown>).invalid = 42; }
+    }),
+    /invalid mutated binding state/u
+  );
+
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), initial);
+  assert.deepEqual((await readdir(directory)).filter((name) => name.includes(".tmp")), []);
+});
+
+test("interrupted channel replacement crosses the durable boundary with a complete state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-replacement-"));
+  const path = join(directory, "bindings.json");
+  const address = message().address;
+  const store = new FileSessionBindingStore(path);
+  await store.set(address, "sess-old");
+  const oldState = JSON.parse(await readFile(path, "utf8"));
+  const key = channelConversationKey(address);
+  const newState = { schemaVersion: 1, bindings: { [key]: "sess-new" } };
+  const module = await import("../packages/store-file/src/index.ts");
+  const fault = new Error("forced post-replace failure");
+  await assert.rejects(
+    () => module.mutateSecureJsonState(path, {
+      initial: () => oldState,
+      parse: (value) => value as typeof oldState,
+      mutate: (state) => { state.bindings[key] = "sess-new"; },
+      __testOnlyAfterReplace: () => { throw fault; }
+    }),
+    (error) => error === fault
+  );
+
+  const recovered = JSON.parse(await readFile(path, "utf8"));
+  assert.ok(
+    JSON.stringify(recovered) === JSON.stringify(oldState) || JSON.stringify(recovered) === JSON.stringify(newState),
+    `replacement left an incomplete state: ${JSON.stringify(recovered)}`
+  );
+  assert.deepEqual((await readdir(directory)).filter((name) => name.includes(".tmp") || name.includes(".bak")), []);
+  await store.set(address, "sess-final");
+  assert.equal(await store.get(address), "sess-final");
+});
+
+test("POSIX channel state requires ownership by the effective uid", { skip: process.platform === "win32" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-owner-"));
+  const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+  const getuid = process.getuid!;
+  Object.defineProperty(process, "getuid", { configurable: true, value: () => getuid() + 1 });
+  try {
+    await assert.rejects(
+      () => new FileSessionBindingStore(join(directory, "bindings.json")).set(message().address, "sess-owner"),
+      /state parent is not owner-only/u
+    );
+  } finally {
+    if (descriptor) Object.defineProperty(process, "getuid", descriptor);
+  }
+});
+
+test("channel dedupe prunes expired entries and enforces its maximum", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-expiry-"));
+  const path = join(directory, "dedupe.json");
+  await writeFile(path, `${JSON.stringify({
+    schemaVersion: 1,
+    entries: {
+      expired: { state: "committed", expiresAt: Date.now() - 1 },
+      oldest: { state: "committed", expiresAt: Date.now() + 10_000 }
+    }
+  })}\n`, { mode: 0o600 });
+  const store = new FileChannelDedupeStore(path, { maximum: 2 });
+  assert.equal(await store.claim("fresh"), true);
+  assert.equal(await store.claim("newest"), true);
+  const persisted = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(persisted.entries.expired, undefined);
+  assert.equal(Object.keys(persisted.entries).length, 2);
+  assert.equal(persisted.entries.newest.state, "claimed");
+});
+
+test("Windows channel persistence applies owner-only replacement semantics", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-windows-"));
+  const path = join(directory, "bindings.json");
+  const store = new FileSessionBindingStore(path);
+  await store.set(message().address, "sess-one");
+  await store.set(message().address, "sess-two");
+  assert.equal(await store.get(message().address), "sess-two");
+  assert.equal(await isOwnerOnlyPath(path), true);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).schemaVersion, 1);
+});
+
+test("a killed lock owner leaves an explicit stale token until operator-verified removal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-lock-"));
+  const path = join(directory, "bindings.json");
+  const lockPath = `${path}.lock`;
+  const moduleUrl = new URL("../packages/store-file/src/index.ts", import.meta.url).href;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { mutateSecureJsonState } from ${JSON.stringify(moduleUrl)};
+    await mutateSecureJsonState(${JSON.stringify(path)}, {
+      initial: () => ({ schemaVersion: 1, bindings: {} }),
+      parse: value => value,
+      mutate: async () => {
+        console.log("LOCKED");
+        await new Promise(() => {});
+      }
+    });
+  `], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  await new Promise<void>((resolve, reject) => {
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      if (output.includes("LOCKED")) resolve();
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`lock owner exited before acquisition: ${code}`)));
+  });
+  const foreignToken = JSON.parse(await readFile(lockPath, "utf8")).token;
+  child.kill("SIGKILL");
+  await new Promise<void>((resolve) => child.once("close", () => resolve()));
+
+  const store = new FileSessionBindingStore(path, { lockTimeoutMs: 25 });
+  await assert.rejects(() => store.set(message().address, "sess-blocked"), /timed out acquiring store lock/u);
+  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).token, foreignToken);
+
+  // Simulate the documented operator check: the owning process is known dead before stale evidence is removed.
+  assert.equal(child.killed, true);
+  await rm(lockPath);
+  await store.set(message().address, "sess-recovered");
+  assert.equal(await store.get(message().address), "sess-recovered");
 });
 
 test("file session bindings isolate channel conversations", async () => {
