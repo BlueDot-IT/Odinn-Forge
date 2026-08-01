@@ -443,7 +443,7 @@ test("memory status reports concrete policy denials without failing its health e
   }
 });
 
-test("concurrent console read surfaces do not contend on the shared run ledger", async () => {
+test("concurrent console read surfaces remain HTTP 200 under shared-state contention", async () => {
   const gateway = await gatewayFixture("odinn-concurrent-read-surfaces");
   try {
     const paths = [
@@ -454,7 +454,9 @@ test("concurrent console read surfaces do not contend on the shared run ledger",
       "/memory?limit=100",
       "/memory/browse?limit=100"
     ];
-    for (let round = 0; round < 3; round += 1) {
+    // Windows exercises the ACL-sensitive contention path with extra rounds.
+    const rounds = process.platform === "win32" ? 8 : 3;
+    for (let round = 0; round < rounds; round += 1) {
       const responses = await Promise.all(paths.map((path) => fetch(`${gateway.base}${path}`)));
       assert.deepEqual(responses.map((response) => response.status), paths.map(() => 200));
       await Promise.all(responses.map((response) => response.json()));

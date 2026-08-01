@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, rm, stat, lstat } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, link, rm, stat, lstat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { normalizeAuditEvent, redactDurableValue, type AuditEvent, type JsonObject } from "@odinn/protocol";
@@ -17,6 +17,9 @@ type NodeError = Error & { code?: string };
 const errorCode = (error: unknown) => (error as NodeError | undefined)?.code;
 const execFile = promisify(execFileCallback);
 const securingWindowsPaths = new Map<string, Promise<void>>();
+const securedWindowsPaths = new Map<string, { dev: number; ino: number; ctimeMs: number }>();
+type LockMetadata = { token?: unknown; [key: string]: unknown };
+type InterprocessLockHooks = { afterOwnerRead?: () => void | Promise<void> };
 
 function windowsPowerShell() {
   const systemRoot = process.env.SystemRoot;
@@ -34,9 +37,21 @@ async function runWindowsPowerShell(script: string, environment: Record<string, 
 
 async function secureWindowsPath(path: string, directory: boolean) {
   const key = `${directory ? "d" : "f"}:${resolve(path).toLowerCase()}`;
+  const before = await lstat(path);
+  if (before.isSymbolicLink() || (directory ? !before.isDirectory() : !before.isFile())) throw new Error(`Windows state path identity is invalid: ${path}`);
+  const evidence = securedWindowsPaths.get(key);
+  if (evidence && evidence.dev === before.dev && evidence.ino === before.ino && evidence.ctimeMs === before.ctimeMs) return;
   const pending = securingWindowsPaths.get(key);
-  if (pending) return pending;
+  if (pending) {
+    await pending;
+    return secureWindowsPath(path, directory);
+  }
   const operation = applyWindowsAcl(path, directory)
+    .then(async () => {
+      const secured = await lstat(path);
+      if (secured.isSymbolicLink() || secured.dev !== before.dev || secured.ino !== before.ino) throw new Error(`Windows state path changed during ACL hardening: ${path}`);
+      securedWindowsPaths.set(key, { dev: secured.dev, ino: secured.ino, ctimeMs: secured.ctimeMs });
+    })
     .finally(() => { securingWindowsPaths.delete(key); });
   securingWindowsPaths.set(key, operation);
   return operation;
@@ -58,13 +73,18 @@ async function applyWindowsAcl(path: string, directory: boolean) {
     "$allowedOwners=@($current.Value,$system.Value,$admins.Value)",
     "$owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
     "if($allowedOwners -notcontains $owner){$acl.SetOwner($current)}",
-    "if($directory){[System.IO.Directory]::SetAccessControl($path,$acl)}else{[System.IO.File]::SetAccessControl($path,$acl)}"
+    "if($directory){[System.IO.Directory]::SetAccessControl($path,$acl)}else{[System.IO.File]::SetAccessControl($path,$acl)}",
+    "$verified=if($directory){[System.IO.Directory]::GetAccessControl($path)}else{[System.IO.File]::GetAccessControl($path)}",
+    "$verifiedOwner=$verified.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+    "$foreign=0",
+    "$verifiedRules=$verified.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])",
+    "foreach($rule in $verifiedRules){if($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $allowedOwners -notcontains $rule.IdentityReference.Value){$foreign+=1}}",
+    "if(-not $verified.AreAccessRulesProtected -or $allowedOwners -notcontains $verifiedOwner -or $foreign -ne 0){throw 'owner-only ACL verification failed'}"
   ].join("; ");
   await runWindowsPowerShell(script, {
     ODINN_ACL_PATH: path,
     ODINN_ACL_DIRECTORY: directory ? "1" : "0"
   });
-  if (!await windowsOwnerOnly(path)) throw new Error(`failed to establish an owner-only Windows ACL: ${path}`);
 }
 
 async function windowsOwnerOnly(path: string) {
@@ -91,7 +111,8 @@ async function withInterprocessLock<T>(
   lockPath: string,
   operation: () => Promise<T>,
   timeoutMs = 30_000,
-  parentAlreadyValidated = false
+  parentAlreadyValidated = false,
+  hooks: InterprocessLockHooks = {}
 ): Promise<T> {
   if (!parentAlreadyValidated) await ensureSecureStateDirectory(dirname(lockPath));
   const token = randomUUID();
@@ -102,15 +123,26 @@ async function withInterprocessLock<T>(
       const handle = await open(lockPath, "wx", 0o600);
       try {
         await handle.writeFile(`${JSON.stringify({ token, pid: process.pid, createdAt: new Date().toISOString() })}\n`);
+        await handle.sync();
       } finally {
         await handle.close();
+      }
+      try {
+        // Windows lock files are created atomically inside the already-validated,
+        // protected parent and inherit its owner-only ACL. Re-spawning PowerShell
+        // for every transient owner would serialize unrelated readers.
+        if (process.platform !== "win32" && !await isOwnerOnlyPath(lockPath)) throw new Error(`store lock is not owner-only: ${lockPath}`);
+      } catch (error) {
+        await removeOwnedLock(lockPath, token);
+        throw error;
       }
       break;
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
       try {
         const lockInfo = await lstat(lockPath);
-        invalidLock = !lockInfo.isFile() || lockInfo.isSymbolicLink() || !await isOwnerOnlyPath(lockPath);
+        invalidLock = !lockInfo.isFile() || lockInfo.isSymbolicLink()
+          || (process.platform !== "win32" && !await isOwnerOnlyPath(lockPath));
       } catch (lockError) {
         if (errorCode(lockError) !== "ENOENT") throw lockError;
         continue;
@@ -122,15 +154,47 @@ async function withInterprocessLock<T>(
     }
   }
   try { return await operation(); }
-  finally { await removeOwnedLock(lockPath, token); }
+  finally { await removeOwnedLock(lockPath, token, hooks.afterOwnerRead); }
 }
 
-async function removeOwnedLock(lockPath: string, token: string) {
+async function removeOwnedLock(lockPath: string, token: string, afterOwnerRead?: () => void | Promise<void>) {
+  let handle;
+  let quarantined: string | undefined;
   try {
-    const owner = JSON.parse(await readFile(lockPath, "utf8"));
-    if (owner?.token === token) await rm(lockPath);
+    const lockInfo = await lstat(lockPath);
+    if (!lockInfo.isFile() || lockInfo.isSymbolicLink()) return;
+    handle = await open(lockPath, "r");
+    const handleInfo = await handle.stat();
+    if (!handleInfo.isFile()) return;
+    const owner = JSON.parse(await handle.readFile("utf8")) as LockMetadata;
+    if (owner?.token !== token) return;
+    await afterOwnerRead?.();
+    quarantined = `${lockPath}.release-${process.pid}-${randomUUID()}`;
+    // Rename is the only pathname mutation: it atomically quarantines whichever
+    // inode occupies the lock name. Never unlink the shared lock pathname.
+    await rename(lockPath, quarantined);
+    const moved = await lstat(quarantined);
+    if (!moved.isFile() || moved.isSymbolicLink() || moved.dev !== handleInfo.dev || moved.ino !== handleInfo.ino) {
+      // A replacement won the pre-rename race. Restore it without overwriting a
+      // newer owner; retain the quarantine and fail closed if the name is busy.
+      try {
+        await link(quarantined, lockPath);
+        await rm(quarantined);
+        quarantined = undefined;
+        return;
+      } catch (restoreError) {
+        if (errorCode(restoreError) === "EEXIST") {
+          throw new Error(`store lock changed during release and was quarantined: ${quarantined}`);
+        }
+        throw restoreError;
+      }
+    }
+    await rm(quarantined);
+    quarantined = undefined;
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
+  } finally {
+    await handle?.close();
   }
 }
 
@@ -141,8 +205,8 @@ export async function ensureSecureStateDirectory(path: string) {
   return path;
 }
 
-async function secureStoreFile(path: string) {
-  await ensureSecureStateDirectory(dirname(path));
+async function secureStoreFile(path: string, parentAlreadyValidated = false) {
+  if (!parentAlreadyValidated) await ensureSecureStateDirectory(dirname(path));
   try {
     if (process.platform === "win32") await secureWindowsPath(path, false);
     else await chmod(path, 0o600);
@@ -151,9 +215,10 @@ async function secureStoreFile(path: string) {
   }
 }
 
-async function replaceStoreFile(temporary: string, target: string) {
+async function replaceStoreFile(temporary: string, target: string, afterReplace?: () => void | Promise<void>) {
   if (process.platform !== "win32") {
     await rename(temporary, target);
+    await afterReplace?.();
     const parent = await open(dirname(target), "r");
     try {
       await parent.sync();
@@ -175,7 +240,8 @@ async function replaceStoreFile(temporary: string, target: string) {
   if (!hadExisting) {
     await rename(temporary, target);
     try {
-      await secureStoreFile(target);
+      await afterReplace?.();
+      await secureStoreFile(target, true);
     } catch (error) {
       await rm(target, { force: true }).catch(() => undefined);
       throw error;
@@ -191,14 +257,18 @@ async function replaceStoreFile(temporary: string, target: string) {
   });
   try {
     try {
-      await secureStoreFile(target);
+      await afterReplace?.();
+      await secureStoreFile(target, true);
     } catch (error) {
+      const displaced = `${target}.failed-${process.pid}-${randomUUID()}.bak`;
       try {
-        await runWindowsPowerShell("[System.IO.File]::Replace($env:ODINN_REPLACE_BACKUP,$env:ODINN_REPLACE_TARGET,$null,$true)", {
+        await runWindowsPowerShell("[System.IO.File]::Replace($env:ODINN_REPLACE_BACKUP,$env:ODINN_REPLACE_TARGET,$env:ODINN_REPLACE_DISPLACED,$true)", {
           ODINN_REPLACE_BACKUP: backup,
-          ODINN_REPLACE_TARGET: target
+          ODINN_REPLACE_TARGET: target,
+          ODINN_REPLACE_DISPLACED: displaced
         });
-        await secureStoreFile(target);
+        await secureStoreFile(target, true);
+        await rm(displaced, { force: true });
       } catch (rollbackError) {
         throw new AggregateError([error, rollbackError], `failed to secure and restore store file: ${target}`);
       }
@@ -216,6 +286,8 @@ export interface SecureJsonStateOptions<TState> {
   lockTimeoutMs?: number;
   /** @internal Test-only fault injection at the post-replace, pre-hardening boundary. */
   __testOnlyAfterReplace?: () => void | Promise<void>;
+  /** @internal Test-only fault injection after lock ownership is read, before release. */
+  __testOnlyAfterLockRead?: () => void | Promise<void>;
 }
 
 async function assertSecureStateParent(path: string): Promise<void> {
@@ -233,17 +305,17 @@ async function assertSecureStateParent(path: string): Promise<void> {
     info = await lstat(parent);
   }
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`state parent must be a real directory: ${parent}`);
-  if (!await isOwnerOnlyPath(parent)) throw new Error(`state parent is not owner-only: ${parent}`);
+  if (process.platform !== "win32" && !await isOwnerOnlyPath(parent)) throw new Error(`state parent is not owner-only: ${parent}`);
 }
 
-async function assertSecureStateFile(path: string): Promise<void> {
+async function assertSecureStateFile(path: string, alreadySecured = false): Promise<void> {
   let info = await lstat(path);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error(`state path must be a regular file: ${path}`);
-  if (process.platform === "win32") {
-    await secureStoreFile(path);
+  if (process.platform === "win32" && !alreadySecured) {
+    await secureStoreFile(path, true);
     info = await lstat(path);
   }
-  if (!await isOwnerOnlyPath(path)) throw new Error(`state file is not owner-only: ${path}`);
+  if (process.platform !== "win32" && !await isOwnerOnlyPath(path)) throw new Error(`state file is not owner-only: ${path}`);
 }
 
 async function readSecureJsonStateUnlocked<TState>(path: string, options: SecureJsonStateOptions<TState>): Promise<TState> {
@@ -287,15 +359,13 @@ export async function mutateSecureJsonState<TState, TResult>(
       } finally {
         await handle.close();
       }
-      await replaceStoreFile(temporary, resolved);
-      await secureStoreFile(resolved);
-      await assertSecureStateFile(resolved);
-      await options.__testOnlyAfterReplace?.();
+      await replaceStoreFile(temporary, resolved, options.__testOnlyAfterReplace);
+      await assertSecureStateFile(resolved, process.platform === "win32");
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }
     return result;
-  }, options.lockTimeoutMs ?? 30_000, true);
+  }, options.lockTimeoutMs ?? 30_000, true, { afterOwnerRead: options.__testOnlyAfterLockRead });
 }
 
 export async function isOwnerOnlyPath(path: string) {

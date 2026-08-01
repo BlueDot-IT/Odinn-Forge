@@ -137,20 +137,22 @@ test("audit journals rotate keys and verify signed records across retired keys",
   assert.equal(rotation.retiredKeyIds.length, 1);
 });
 
-test("independent audit store instances serialize one signed chain", async () => {
+test("independent audit store instances repeatedly serialize 40-writer signed chains", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-audit-concurrent-"));
   const path = join(root, "audit.jsonl");
   const left = new FileAuditStore(path);
   const right = new FileAuditStore(path);
-  await Promise.all(Array.from({ length: 40 }, (_, index) => (index % 2 ? left : right).append({
-    runId: `run-concurrent-${index}`,
-    type: "task.completed",
-    data: { index }
-  })));
-  const verification = await left.verifyIntegrity({ allowUnsigned: false });
-  assert.equal(verification.events, 40);
-  assert.equal(verification.valid, true);
-  assert.deepEqual(verification.failures, []);
+  for (let round = 0; round < 5; round += 1) {
+    await Promise.all(Array.from({ length: 40 }, (_, index) => (index % 2 ? left : right).append({
+      runId: `run-concurrent-${round}-${index}`,
+      type: "task.completed",
+      data: { round, index }
+    })));
+    const verification = await left.verifyIntegrity({ allowUnsigned: false });
+    assert.equal(verification.events, (round + 1) * 40);
+    assert.equal(verification.valid, true);
+    assert.deepEqual(verification.failures, []);
+  }
 });
 
 test("independent job stores serialize asynchronous mutations without losing state", async () => {
