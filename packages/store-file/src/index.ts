@@ -151,9 +151,10 @@ async function secureStoreFile(path: string) {
   }
 }
 
-async function replaceStoreFile(temporary: string, target: string) {
+async function replaceStoreFile(temporary: string, target: string, afterReplace?: () => void | Promise<void>) {
   if (process.platform !== "win32") {
     await rename(temporary, target);
+    await afterReplace?.();
     return;
   }
 
@@ -184,20 +185,24 @@ async function replaceStoreFile(temporary: string, target: string) {
     ODINN_REPLACE_BACKUP: backup
   });
   try {
-    await secureStoreFile(target);
-  } catch (error) {
     try {
-      await runWindowsPowerShell("[System.IO.File]::Replace($env:ODINN_REPLACE_BACKUP,$env:ODINN_REPLACE_TARGET,$null,$true)", {
-        ODINN_REPLACE_BACKUP: backup,
-        ODINN_REPLACE_TARGET: target
-      });
+      await afterReplace?.();
       await secureStoreFile(target);
-    } catch (rollbackError) {
-      throw new AggregateError([error, rollbackError], `failed to secure and restore store file: ${target}`);
+    } catch (error) {
+      try {
+        await runWindowsPowerShell("[System.IO.File]::Replace($env:ODINN_REPLACE_BACKUP,$env:ODINN_REPLACE_TARGET,$null,$true)", {
+          ODINN_REPLACE_BACKUP: backup,
+          ODINN_REPLACE_TARGET: target
+        });
+        await secureStoreFile(target);
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], `failed to secure and restore store file: ${target}`);
+      }
+      throw error;
     }
-    throw error;
+  } finally {
+    await rm(backup, { force: true }).catch(() => undefined);
   }
-  await rm(backup, { force: true }).catch(() => undefined);
 }
 
 export interface SecureJsonStateOptions<TState> {
@@ -205,6 +210,8 @@ export interface SecureJsonStateOptions<TState> {
   parse: (value: unknown) => TState;
   serialize?: (state: TState) => string;
   lockTimeoutMs?: number;
+  /** @internal Test-only fault injection at the post-replace, pre-hardening boundary. */
+  __testOnlyAfterReplace?: () => void | Promise<void>;
 }
 
 async function assertSecureStateParent(path: string): Promise<void> {
@@ -260,7 +267,7 @@ export async function mutateSecureJsonState<TState, TResult>(
     const temporary = `${resolved}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, `${(options.serialize ?? JSON.stringify)(state)}\n`, { mode: 0o600 });
-      await replaceStoreFile(temporary, resolved);
+      await replaceStoreFile(temporary, resolved, options.__testOnlyAfterReplace);
       await secureStoreFile(resolved);
       await assertSecureStateFile(resolved);
     } finally {

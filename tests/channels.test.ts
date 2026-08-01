@@ -547,7 +547,7 @@ test("channel persistence recovers after serialization failure without leaving t
   });
 });
 
-test("interrupted channel replacement leaves a complete old or new state and recovers", { skip: process.platform === "win32" }, async () => {
+test("interrupted channel replacement leaves a complete old or new state and recovers", async () => {
   const directory = await mkdtemp(join(tmpdir(), "odinn-channel-replacement-"));
   const path = join(directory, "bindings.json");
   const address = message().address;
@@ -557,30 +557,24 @@ test("interrupted channel replacement leaves a complete old or new state and rec
   const key = channelConversationKey(address);
   const newState = { schemaVersion: 1, bindings: { [key]: "sess-new" } };
   const module = await import("../packages/store-file/src/index.ts");
-  const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
-  const getuid = process.getuid!;
-  try {
-    await assert.rejects(
-      () => module.mutateSecureJsonState(path, {
-        initial: () => oldState,
-        parse: (value) => value as typeof oldState,
-        serialize: (state) => {
-          Object.defineProperty(process, "getuid", { configurable: true, value: () => getuid() + 1 });
-          return JSON.stringify(state);
-        },
-        mutate: (state) => { state.bindings[key] = "sess-new"; }
-      }),
-      /state file is not owner-only/u
-    );
-  } finally {
-    if (descriptor) Object.defineProperty(process, "getuid", descriptor);
-  }
+  const fault = new Error("forced post-replace failure");
+  await assert.rejects(
+    () => module.mutateSecureJsonState(path, {
+      initial: () => oldState,
+      parse: (value) => value as typeof oldState,
+      mutate: (state) => { state.bindings[key] = "sess-new"; },
+      __testOnlyAfterReplace: () => { throw fault; }
+    }),
+    (error) => error === fault
+  );
 
   const recovered = JSON.parse(await readFile(path, "utf8"));
   assert.ok(
     JSON.stringify(recovered) === JSON.stringify(oldState) || JSON.stringify(recovered) === JSON.stringify(newState),
     `replacement left an incomplete state: ${JSON.stringify(recovered)}`
   );
+  if (process.platform === "win32") assert.deepEqual(recovered, oldState);
+  assert.deepEqual((await readdir(directory)).filter((name) => name.includes(".tmp") || name.includes(".bak")), []);
   await store.set(address, "sess-final");
   assert.equal(await store.get(address), "sess-final");
 });
