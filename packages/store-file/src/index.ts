@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, rm, stat, lstat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { normalizeAuditEvent, redactDurableValue, type AuditEvent, type JsonObject } from "@odinn/protocol";
@@ -87,10 +87,16 @@ async function windowsOwnerOnly(path: string) {
   }
 }
 
-async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>, timeoutMs = 30_000): Promise<T> {
-  await ensureSecureStateDirectory(dirname(lockPath));
+async function withInterprocessLock<T>(
+  lockPath: string,
+  operation: () => Promise<T>,
+  timeoutMs = 30_000,
+  parentAlreadyValidated = false
+): Promise<T> {
+  if (!parentAlreadyValidated) await ensureSecureStateDirectory(dirname(lockPath));
   const token = randomUUID();
   const deadline = Date.now() + timeoutMs;
+  let invalidLock = false;
   while (true) {
     try {
       const handle = await open(lockPath, "wx", 0o600);
@@ -102,8 +108,15 @@ async function withInterprocessLock<T>(lockPath: string, operation: () => Promis
       break;
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
+      try {
+        const lockInfo = await lstat(lockPath);
+        invalidLock = !lockInfo.isFile() || lockInfo.isSymbolicLink() || !await isOwnerOnlyPath(lockPath);
+      } catch (lockError) {
+        if (errorCode(lockError) !== "ENOENT") throw lockError;
+        continue;
+      }
       if (Date.now() >= deadline) {
-        throw new Error(`timed out acquiring store lock: ${lockPath}; verify that no Odinn process is using the store before manually removing this lock`);
+        throw new Error(`timed out acquiring store lock: ${lockPath}${invalidLock ? "; lock metadata is invalid or insecure" : ""}; verify that no Odinn process is using the store before manually removing this lock`);
       }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -187,10 +200,82 @@ async function replaceStoreFile(temporary: string, target: string) {
   await rm(backup, { force: true }).catch(() => undefined);
 }
 
+export interface SecureJsonStateOptions<TState> {
+  initial: () => TState;
+  parse: (value: unknown) => TState;
+  serialize?: (state: TState) => string;
+  lockTimeoutMs?: number;
+}
+
+async function assertSecureStateParent(path: string): Promise<void> {
+  const parent = dirname(resolve(path));
+  let info;
+  try {
+    info = await lstat(parent);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+    await ensureSecureStateDirectory(parent);
+    info = await lstat(parent);
+  }
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`state parent must be a real directory: ${parent}`);
+  if (!await isOwnerOnlyPath(parent)) throw new Error(`state parent is not owner-only: ${parent}`);
+}
+
+async function assertSecureStateFile(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error(`state path must be a regular file: ${path}`);
+  if (!await isOwnerOnlyPath(path)) throw new Error(`state file is not owner-only: ${path}`);
+}
+
+async function readSecureJsonStateUnlocked<TState>(path: string, options: SecureJsonStateOptions<TState>): Promise<TState> {
+  try {
+    await assertSecureStateFile(path);
+    return options.parse(JSON.parse(await readFile(path, "utf8")));
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return options.initial();
+    throw error;
+  }
+}
+
+export async function readSecureJsonState<TState>(path: string, options: SecureJsonStateOptions<TState>): Promise<TState> {
+  const resolved = resolve(path);
+  await assertSecureStateParent(resolved);
+  return withInterprocessLock(
+    `${resolved}.lock`,
+    () => readSecureJsonStateUnlocked(resolved, options),
+    options.lockTimeoutMs ?? 30_000,
+    true
+  );
+}
+
+export async function mutateSecureJsonState<TState, TResult>(
+  path: string,
+  options: SecureJsonStateOptions<TState> & { mutate: (state: TState) => TResult | Promise<TResult> }
+): Promise<TResult> {
+  const resolved = resolve(path);
+  await assertSecureStateParent(resolved);
+  return withInterprocessLock(`${resolved}.lock`, async () => {
+    const state = await readSecureJsonStateUnlocked(resolved, options);
+    const result = await options.mutate(state);
+    const temporary = `${resolved}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, `${(options.serialize ?? JSON.stringify)(state)}\n`, { mode: 0o600 });
+      await replaceStoreFile(temporary, resolved);
+      await secureStoreFile(resolved);
+      await assertSecureStateFile(resolved);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+    return result;
+  }, options.lockTimeoutMs ?? 30_000, true);
+}
+
 export async function isOwnerOnlyPath(path: string) {
   if (process.platform === "win32") return windowsOwnerOnly(path);
   try {
-    return ((await stat(path)).mode & 0o077) === 0;
+    const info = await stat(path);
+    const getuid = process.getuid;
+    return (info.mode & 0o077) === 0 && (typeof getuid !== "function" || info.uid === getuid());
   } catch {
     return false;
   }

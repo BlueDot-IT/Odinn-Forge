@@ -32,6 +32,25 @@ Channel execution audit records use explicit states: `accepted`, `running`,
 `delivery-failed` when the terminal adapter delivery cannot be completed.
 `uncertain` is fail-closed: the router never silently re-executes that run.
 
+### Channel state persistence and recovery
+
+Binding and deduplication files retain schema version `1` and use the shared
+secure JSON mutation primitive from `@odinn/store-file`. Each complete
+read/validate/mutate/replace operation is guarded by a token-owned lock at
+`<state-file>.lock`. Lock acquisition is bounded and fail-closed; a stale lock
+is not reclaimed automatically because an operator must first verify that no
+Odinn process still owns it.
+
+State files and their immediate parent are validated as owner-only regular
+paths. Corrupt schemas, invalid entries, symbolic-link state files or parents,
+and insecure permissions are rejected before mutation. Writes use a temporary
+file followed by atomic POSIX replacement or the existing Windows
+`File.Replace` rollback path, so an interrupted write leaves the prior valid
+state or the complete replacement. A failed mutation returns its original
+error and does not poison later operations; retrying is safe after the cause
+is corrected. If a lock remains after a process crash, preserve the lock as
+evidence and remove it only after confirming that no Odinn process is active.
+
 ## Security defaults
 
 - An empty allowlist denies every inbound sender unless an explicit open
