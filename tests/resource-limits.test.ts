@@ -74,34 +74,54 @@ test("workspace.readText rejects invalid and over-cap maxBytes values", async ()
   }
 });
 
-test("workspace.readText rejects directories, FIFOs, and replaced paths", { skip: process.platform === "win32" }, async () => {
+test("workspace.readText rejects directories", async () => {
   const fixture = await workspaceFixture();
   try {
     await mkdir(join(fixture.root, "directory"));
     await assert.rejects(readWorkspace(fixture, "directory-read", { path: "directory" }), /regular file/u);
-
-    const fifo = join(fixture.root, "pipe");
-    await execFileAsync("mkfifo", [fifo]);
-    await assert.rejects(readWorkspace(fixture, "fifo-read", { path: "pipe" }), /regular file/u);
-
-    const outside = await mkdtemp(join(tmpdir(), "odinn-outside-") );
-    await writeFile(join(outside, "secret.txt"), "outside\n", "utf8");
-    await rm(join(fixture.root, "replacement"), { recursive: true, force: true });
-    await symlink(outside, join(fixture.root, "replacement"));
-    await assert.rejects(readWorkspace(fixture, "replacement-read", { path: "replacement/secret.txt" }), /path escapes workspace root/u);
-    await rm(outside, { recursive: true, force: true });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
 
-test("bounded UTF-8 reader rejects non-UTF-8 content and static symlinks", { skip: process.platform === "win32" }, async () => {
+test("workspace.readText rejects FIFOs", { skip: process.platform === "win32" }, async () => {
+  const fixture = await workspaceFixture();
+  try {
+    const fifo = join(fixture.root, "pipe");
+    await execFileAsync("mkfifo", [fifo]);
+    await assert.rejects(readWorkspace(fixture, "fifo-read", { path: "pipe" }), /regular file/u);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("workspace.readText rejects symlinked paths", { skip: process.platform === "win32" }, async () => {
+  const fixture = await workspaceFixture();
+  const outside = await mkdtemp(join(tmpdir(), "odinn-outside-"));
+  try {
+    await writeFile(join(outside, "secret.txt"), "outside\n", "utf8");
+    await symlink(outside, join(fixture.root, "replacement"));
+    await assert.rejects(readWorkspace(fixture, "replacement-read", { path: "replacement/secret.txt" }), /path escapes workspace root/u);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("bounded UTF-8 reader rejects non-UTF-8 content", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-reader-"));
   try {
     const invalid = join(root, "invalid.txt");
     await writeFile(invalid, Buffer.from([0xc3, 0x28]));
     await assert.rejects(readUtf8Prefix(invalid, 32, "invalid.txt"), /not valid UTF-8/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
+test("bounded UTF-8 reader rejects static symlinks", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-reader-"));
+  try {
     const original = join(root, "original.txt");
     const replacement = join(root, "replacement.txt");
     await writeFile(original, "safe\n", "utf8");
