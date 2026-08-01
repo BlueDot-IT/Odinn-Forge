@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, rm, stat, lstat } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, link, rm, stat, lstat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { normalizeAuditEvent, redactDurableValue, type AuditEvent, type JsonObject } from "@odinn/protocol";
@@ -17,7 +17,7 @@ type NodeError = Error & { code?: string };
 const errorCode = (error: unknown) => (error as NodeError | undefined)?.code;
 const execFile = promisify(execFileCallback);
 const securingWindowsPaths = new Map<string, Promise<void>>();
-const securedWindowsPaths = new Set<string>();
+const securedWindowsPaths = new Map<string, { dev: number; ino: number; ctimeMs: number }>();
 type LockMetadata = { token?: unknown; [key: string]: unknown };
 type InterprocessLockHooks = { afterOwnerRead?: () => void | Promise<void> };
 
@@ -37,18 +37,24 @@ async function runWindowsPowerShell(script: string, environment: Record<string, 
 
 async function secureWindowsPath(path: string, directory: boolean) {
   const key = `${directory ? "d" : "f"}:${resolve(path).toLowerCase()}`;
-  if (securedWindowsPaths.has(key)) return;
+  const before = await lstat(path);
+  if (before.isSymbolicLink() || (directory ? !before.isDirectory() : !before.isFile())) throw new Error(`Windows state path identity is invalid: ${path}`);
+  const evidence = securedWindowsPaths.get(key);
+  if (evidence && evidence.dev === before.dev && evidence.ino === before.ino && evidence.ctimeMs === before.ctimeMs) return;
   const pending = securingWindowsPaths.get(key);
-  if (pending) return pending;
+  if (pending) {
+    await pending;
+    return secureWindowsPath(path, directory);
+  }
   const operation = applyWindowsAcl(path, directory)
-    .then(() => { securedWindowsPaths.add(key); })
+    .then(async () => {
+      const secured = await lstat(path);
+      if (secured.isSymbolicLink() || secured.dev !== before.dev || secured.ino !== before.ino) throw new Error(`Windows state path changed during ACL hardening: ${path}`);
+      securedWindowsPaths.set(key, { dev: secured.dev, ino: secured.ino, ctimeMs: secured.ctimeMs });
+    })
     .finally(() => { securingWindowsPaths.delete(key); });
   securingWindowsPaths.set(key, operation);
   return operation;
-}
-
-function invalidateSecuredWindowsPath(path: string, directory: boolean) {
-  securedWindowsPaths.delete(`${directory ? "d" : "f"}:${resolve(path).toLowerCase()}`);
 }
 
 async function applyWindowsAcl(path: string, directory: boolean) {
@@ -153,6 +159,7 @@ async function withInterprocessLock<T>(
 
 async function removeOwnedLock(lockPath: string, token: string, afterOwnerRead?: () => void | Promise<void>) {
   let handle;
+  let quarantined: string | undefined;
   try {
     const lockInfo = await lstat(lockPath);
     if (!lockInfo.isFile() || lockInfo.isSymbolicLink()) return;
@@ -162,10 +169,28 @@ async function removeOwnedLock(lockPath: string, token: string, afterOwnerRead?:
     const owner = JSON.parse(await handle.readFile("utf8")) as LockMetadata;
     if (owner?.token !== token) return;
     await afterOwnerRead?.();
-    const current = await lstat(lockPath);
-    if (!current.isFile() || current.isSymbolicLink()) return;
-    if (current.dev !== handleInfo.dev || current.ino !== handleInfo.ino) return;
-    await rm(lockPath);
+    quarantined = `${lockPath}.release-${process.pid}-${randomUUID()}`;
+    // Rename is the only pathname mutation: it atomically quarantines whichever
+    // inode occupies the lock name. Never unlink the shared lock pathname.
+    await rename(lockPath, quarantined);
+    const moved = await lstat(quarantined);
+    if (!moved.isFile() || moved.isSymbolicLink() || moved.dev !== handleInfo.dev || moved.ino !== handleInfo.ino) {
+      // A replacement won the pre-rename race. Restore it without overwriting a
+      // newer owner; retain the quarantine and fail closed if the name is busy.
+      try {
+        await link(quarantined, lockPath);
+        await rm(quarantined);
+        quarantined = undefined;
+        return;
+      } catch (restoreError) {
+        if (errorCode(restoreError) === "EEXIST") {
+          throw new Error(`store lock changed during release and was quarantined: ${quarantined}`);
+        }
+        throw restoreError;
+      }
+    }
+    await rm(quarantined);
+    quarantined = undefined;
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
   } finally {
@@ -214,7 +239,6 @@ async function replaceStoreFile(temporary: string, target: string, afterReplace?
 
   if (!hadExisting) {
     await rename(temporary, target);
-    invalidateSecuredWindowsPath(target, false);
     try {
       await afterReplace?.();
       await secureStoreFile(target, true);
@@ -231,7 +255,6 @@ async function replaceStoreFile(temporary: string, target: string, afterReplace?
     ODINN_REPLACE_TARGET: target,
     ODINN_REPLACE_BACKUP: backup
   });
-  invalidateSecuredWindowsPath(target, false);
   try {
     try {
       await afterReplace?.();
@@ -244,7 +267,6 @@ async function replaceStoreFile(temporary: string, target: string, afterReplace?
           ODINN_REPLACE_TARGET: target,
           ODINN_REPLACE_DISPLACED: displaced
         });
-        invalidateSecuredWindowsPath(target, false);
         await secureStoreFile(target, true);
         await rm(displaced, { force: true });
       } catch (rollbackError) {

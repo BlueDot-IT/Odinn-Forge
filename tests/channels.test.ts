@@ -655,7 +655,25 @@ test("Windows channel persistence applies owner-only replacement semantics", { s
   assert.equal(JSON.parse(await readFile(path, "utf8")).schemaVersion, 1);
 });
 
-test("POSIX lock release does not remove a replacement owner after the token read", { skip: process.platform === "win32" }, async () => {
+test("Windows state trust boundaries repair ACL changes made after prior validation", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-windows-acl-recheck-"));
+  const path = join(directory, "bindings.json");
+  const store = new FileSessionBindingStore(path);
+  await store.set(message().address, "sess-one");
+  const validState = await readFile(path);
+  await execFile("icacls.exe", [path, "/grant", "*S-1-1-0:(F)"]);
+  assert.equal(await isOwnerOnlyPath(path), false);
+  assert.equal(await store.get(message().address), "sess-one");
+  assert.equal(await isOwnerOnlyPath(path), true);
+  await rm(path);
+  await writeFile(path, validState);
+  await execFile("icacls.exe", [path, "/grant", "*S-1-1-0:(F)"]);
+  assert.equal(await isOwnerOnlyPath(path), false);
+  assert.equal(await store.get(message().address), "sess-one");
+  assert.equal(await isOwnerOnlyPath(path), true);
+});
+
+test("lock release atomically quarantines and restores a replacement owner", async () => {
   const directory = await mkdtemp(join(tmpdir(), "odinn-channel-lock-release-race-"));
   const path = join(directory, "bindings.json");
   const lockPath = `${path}.lock`;
@@ -675,6 +693,7 @@ test("POSIX lock release does not remove a replacement owner after the token rea
 
   assert.equal(replaced, true);
   assert.equal(JSON.parse(await readFile(lockPath, "utf8")).token, "replacement-owner");
+  assert.deepEqual((await readdir(directory)).filter((entry) => entry.includes(".release-")), []);
   await rm(lockPath);
   const store = new FileSessionBindingStore(path);
   await store.set(message().address, "sess-recovered");
