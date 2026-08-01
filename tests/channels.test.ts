@@ -524,7 +524,7 @@ test("binding persistence recovers after a failed write and rejects corrupt or i
   }
 });
 
-test("channel persistence recovers after serialization failure without leaving temporary state", async () => {
+test("channel persistence recovers after cyclic mutation failure without leaving temporary state", async () => {
   const directory = await mkdtemp(join(tmpdir(), "odinn-channel-temp-cleanup-"));
   const path = join(directory, "bindings.json");
   const module = await import("../packages/store-file/src/index.ts");
@@ -532,10 +532,9 @@ test("channel persistence recovers after serialization failure without leaving t
     () => module.mutateSecureJsonState(path, {
       initial: () => ({ schemaVersion: 1, bindings: {} }),
       parse: (value) => value as { schemaVersion: 1; bindings: Record<string, string> },
-      serialize: () => { throw new Error("forced serialization failure"); },
-      mutate: (state) => { state.bindings.test = "failed"; }
+      mutate: (state) => { (state as typeof state & { cycle: unknown }).cycle = state; }
     }),
-    /forced serialization failure/u
+    /circular/u
   );
   assert.deepEqual((await readdir(directory)).filter((name) => name.includes(".tmp")), []);
   const store = new FileSessionBindingStore(path);
@@ -547,7 +546,33 @@ test("channel persistence recovers after serialization failure without leaving t
   });
 });
 
-test("interrupted channel replacement leaves a complete old or new state and recovers", async () => {
+test("channel persistence validates mutated state before publication and cleans up invalid output", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-invalid-mutation-"));
+  const path = join(directory, "bindings.json");
+  const module = await import("../packages/store-file/src/index.ts");
+  const initial = { schemaVersion: 1, bindings: { existing: "sess-old" } };
+  await writeFile(path, `${JSON.stringify(initial)}\n`, { mode: 0o600 });
+
+  await assert.rejects(
+    () => module.mutateSecureJsonState(path, {
+      initial: () => initial,
+      parse: (value) => {
+        const state = value as typeof initial;
+        if (Object.values(state.bindings).some((binding) => typeof binding !== "string")) {
+          throw new Error("invalid mutated binding state");
+        }
+        return state;
+      },
+      mutate: (state) => { (state.bindings as Record<string, unknown>).invalid = 42; }
+    }),
+    /invalid mutated binding state/u
+  );
+
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), initial);
+  assert.deepEqual((await readdir(directory)).filter((name) => name.includes(".tmp")), []);
+});
+
+test("interrupted channel replacement crosses the durable boundary with a complete state", async () => {
   const directory = await mkdtemp(join(tmpdir(), "odinn-channel-replacement-"));
   const path = join(directory, "bindings.json");
   const address = message().address;

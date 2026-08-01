@@ -154,6 +154,12 @@ async function secureStoreFile(path: string) {
 async function replaceStoreFile(temporary: string, target: string, afterReplace?: () => void | Promise<void>) {
   if (process.platform !== "win32") {
     await rename(temporary, target);
+    const parent = await open(dirname(target), "r");
+    try {
+      await parent.sync();
+    } finally {
+      await parent.close();
+    }
     await afterReplace?.();
     return;
   }
@@ -264,9 +270,17 @@ export async function mutateSecureJsonState<TState, TResult>(
   return withInterprocessLock(`${resolved}.lock`, async () => {
     const state = await readSecureJsonStateUnlocked(resolved, options);
     const result = await options.mutate(state);
+    const serialized = (options.serialize ?? JSON.stringify)(state);
+    options.parse(JSON.parse(serialized));
     const temporary = `${resolved}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await writeFile(temporary, `${(options.serialize ?? JSON.stringify)(state)}\n`, { mode: 0o600 });
+      const handle = await open(temporary, "wx", 0o600);
+      try {
+        await handle.writeFile(`${serialized}\n`);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
       await replaceStoreFile(temporary, resolved, options.__testOnlyAfterReplace);
       await secureStoreFile(resolved);
       await assertSecureStateFile(resolved);
