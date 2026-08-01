@@ -17,6 +17,8 @@ type NodeError = Error & { code?: string };
 const errorCode = (error: unknown) => (error as NodeError | undefined)?.code;
 const execFile = promisify(execFileCallback);
 const securingWindowsPaths = new Map<string, Promise<void>>();
+type LockMetadata = { token?: unknown; [key: string]: unknown };
+type InterprocessLockHooks = { afterOwnerRead?: () => void | Promise<void> };
 
 function windowsPowerShell() {
   const systemRoot = process.env.SystemRoot;
@@ -91,7 +93,8 @@ async function withInterprocessLock<T>(
   lockPath: string,
   operation: () => Promise<T>,
   timeoutMs = 30_000,
-  parentAlreadyValidated = false
+  parentAlreadyValidated = false,
+  hooks: InterprocessLockHooks = {}
 ): Promise<T> {
   if (!parentAlreadyValidated) await ensureSecureStateDirectory(dirname(lockPath));
   const token = randomUUID();
@@ -102,15 +105,24 @@ async function withInterprocessLock<T>(
       const handle = await open(lockPath, "wx", 0o600);
       try {
         await handle.writeFile(`${JSON.stringify({ token, pid: process.pid, createdAt: new Date().toISOString() })}\n`);
+        await handle.sync();
       } finally {
         await handle.close();
+      }
+      try {
+        if (process.platform === "win32") await secureWindowsPath(lockPath, false);
+        if (!await isOwnerOnlyPath(lockPath)) throw new Error(`store lock is not owner-only: ${lockPath}`);
+      } catch (error) {
+        await removeOwnedLock(lockPath, token);
+        throw error;
       }
       break;
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
       try {
         const lockInfo = await lstat(lockPath);
-        invalidLock = !lockInfo.isFile() || lockInfo.isSymbolicLink() || !await isOwnerOnlyPath(lockPath);
+        invalidLock = !lockInfo.isFile() || lockInfo.isSymbolicLink()
+          || (process.platform !== "win32" && !await isOwnerOnlyPath(lockPath));
       } catch (lockError) {
         if (errorCode(lockError) !== "ENOENT") throw lockError;
         continue;
@@ -122,15 +134,28 @@ async function withInterprocessLock<T>(
     }
   }
   try { return await operation(); }
-  finally { await removeOwnedLock(lockPath, token); }
+  finally { await removeOwnedLock(lockPath, token, hooks.afterOwnerRead); }
 }
 
-async function removeOwnedLock(lockPath: string, token: string) {
+async function removeOwnedLock(lockPath: string, token: string, afterOwnerRead?: () => void | Promise<void>) {
+  let handle;
   try {
-    const owner = JSON.parse(await readFile(lockPath, "utf8"));
-    if (owner?.token === token) await rm(lockPath);
+    const lockInfo = await lstat(lockPath);
+    if (!lockInfo.isFile() || lockInfo.isSymbolicLink()) return;
+    handle = await open(lockPath, "r");
+    const handleInfo = await handle.stat();
+    if (!handleInfo.isFile()) return;
+    const owner = JSON.parse(await handle.readFile("utf8")) as LockMetadata;
+    if (owner?.token !== token) return;
+    await afterOwnerRead?.();
+    const current = await lstat(lockPath);
+    if (!current.isFile() || current.isSymbolicLink()) return;
+    if (current.dev !== handleInfo.dev || current.ino !== handleInfo.ino) return;
+    await rm(lockPath);
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
+  } finally {
+    await handle?.close();
   }
 }
 
@@ -151,9 +176,10 @@ async function secureStoreFile(path: string) {
   }
 }
 
-async function replaceStoreFile(temporary: string, target: string) {
+async function replaceStoreFile(temporary: string, target: string, afterReplace?: () => void | Promise<void>) {
   if (process.platform !== "win32") {
     await rename(temporary, target);
+    await afterReplace?.();
     const parent = await open(dirname(target), "r");
     try {
       await parent.sync();
@@ -175,6 +201,7 @@ async function replaceStoreFile(temporary: string, target: string) {
   if (!hadExisting) {
     await rename(temporary, target);
     try {
+      await afterReplace?.();
       await secureStoreFile(target);
     } catch (error) {
       await rm(target, { force: true }).catch(() => undefined);
@@ -191,6 +218,7 @@ async function replaceStoreFile(temporary: string, target: string) {
   });
   try {
     try {
+      await afterReplace?.();
       await secureStoreFile(target);
     } catch (error) {
       try {
@@ -216,6 +244,8 @@ export interface SecureJsonStateOptions<TState> {
   lockTimeoutMs?: number;
   /** @internal Test-only fault injection at the post-replace, pre-hardening boundary. */
   __testOnlyAfterReplace?: () => void | Promise<void>;
+  /** @internal Test-only fault injection after lock ownership is read, before release. */
+  __testOnlyAfterLockRead?: () => void | Promise<void>;
 }
 
 async function assertSecureStateParent(path: string): Promise<void> {
@@ -287,15 +317,14 @@ export async function mutateSecureJsonState<TState, TResult>(
       } finally {
         await handle.close();
       }
-      await replaceStoreFile(temporary, resolved);
+      await replaceStoreFile(temporary, resolved, options.__testOnlyAfterReplace);
       await secureStoreFile(resolved);
       await assertSecureStateFile(resolved);
-      await options.__testOnlyAfterReplace?.();
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }
     return result;
-  }, options.lockTimeoutMs ?? 30_000, true);
+  }, options.lockTimeoutMs ?? 30_000, true, { afterOwnerRead: options.__testOnlyAfterLockRead });
 }
 
 export async function isOwnerOnlyPath(path: string) {

@@ -48,8 +48,14 @@ file followed by atomic POSIX replacement or the existing Windows
 `File.Replace` rollback path, so an interrupted write leaves the prior valid
 state or the complete replacement. A failed mutation returns its original
 error and does not poison later operations; retrying is safe after the cause
-is corrected. If a lock remains after a process crash, preserve the lock as
-evidence and remove it only after confirming that no Odinn process is active.
+is corrected.
+
+A successful lock owner releases only after its open handle confirms the
+original token and file identity. The handle's device and inode are compared
+with a fresh `lstat` of the lock path immediately before unlinking, so a path
+replaced by another owner is left untouched. Waiters never reclaim or delete a
+lock. An active lock remains fail-closed evidence after a process crash: verify
+that no Odinn process is using the store before manually removing the lock.
 
 ## Security defaults
 

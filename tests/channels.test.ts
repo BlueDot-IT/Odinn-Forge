@@ -583,15 +583,21 @@ test("interrupted channel replacement crosses the durable boundary with a comple
   const newState = { schemaVersion: 1, bindings: { [key]: "sess-new" } };
   const module = await import("../packages/store-file/src/index.ts");
   const fault = new Error("forced post-replace failure");
+  let observedPostReplace = false;
   await assert.rejects(
     () => module.mutateSecureJsonState(path, {
       initial: () => oldState,
       parse: (value) => value as typeof oldState,
       mutate: (state) => { state.bindings[key] = "sess-new"; },
-      __testOnlyAfterReplace: () => { throw fault; }
+      __testOnlyAfterReplace: async () => {
+        observedPostReplace = true;
+        assert.deepEqual(JSON.parse(await readFile(path, "utf8")), newState);
+        throw fault;
+      }
     }),
     (error) => error === fault
   );
+  assert.equal(observedPostReplace, true);
 
   const recovered = JSON.parse(await readFile(path, "utf8"));
   assert.ok(
@@ -642,10 +648,37 @@ test("Windows channel persistence applies owner-only replacement semantics", { s
   const path = join(directory, "bindings.json");
   const store = new FileSessionBindingStore(path);
   await store.set(message().address, "sess-one");
+  await assert.rejects(() => readFile(`${path}.lock`, "utf8"), { code: "ENOENT" });
   await store.set(message().address, "sess-two");
   assert.equal(await store.get(message().address), "sess-two");
   assert.equal(await isOwnerOnlyPath(path), true);
   assert.equal(JSON.parse(await readFile(path, "utf8")).schemaVersion, 1);
+});
+
+test("POSIX lock release does not remove a replacement owner after the token read", { skip: process.platform === "win32" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-lock-release-race-"));
+  const path = join(directory, "bindings.json");
+  const lockPath = `${path}.lock`;
+  const module = await import("../packages/store-file/src/index.ts");
+  let replaced = false;
+
+  await module.mutateSecureJsonState(path, {
+    initial: () => ({ schemaVersion: 1, bindings: {} }),
+    parse: (value) => value as { schemaVersion: 1; bindings: Record<string, string> },
+    mutate: (state) => { state.bindings.initial = "sess-initial"; },
+    __testOnlyAfterLockRead: async () => {
+      await rm(lockPath);
+      await writeFile(lockPath, `${JSON.stringify({ token: "replacement-owner", pid: 42, createdAt: new Date().toISOString() })}\n`, { flag: "wx", mode: 0o600 });
+      replaced = true;
+    }
+  });
+
+  assert.equal(replaced, true);
+  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).token, "replacement-owner");
+  await rm(lockPath);
+  const store = new FileSessionBindingStore(path);
+  await store.set(message().address, "sess-recovered");
+  assert.equal(await store.get(message().address), "sess-recovered");
 });
 
 test("a killed lock owner leaves an explicit stale token until operator-verified removal", async () => {
