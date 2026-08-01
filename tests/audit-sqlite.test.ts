@@ -135,3 +135,13 @@ test("retained signed segment inventory detects deleted rotation history", async
   const root = await mkdtemp(join(tmpdir(), "odinn-audit-retained-inventory-")); t.after(() => rm(root, { recursive: true, force: true })); const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close()); await store.append(event("one")); store.rotateSegment(); await store.append(event("two")); await store.exportArchive(join(root, "archive.jsonl"), 2); await store.applyRetention(2);
   store.db.exec("DELETE FROM audit_segments WHERE id=1; UPDATE audit_segments SET first_sequence=1,anchor_signature=NULL WHERE id=2;"); const verification = await store.verifyIntegrity({ allowUnsigned: false }); assert.equal(verification.valid, false); assert.ok(verification.failures.some((failure) => failure.reason === "retained audit segment inventory mismatch"));
 });
+
+test("rotation after export cannot authorize destructive retention with stale inventory", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-rotate-after-export-")); t.after(() => rm(root, { recursive: true, force: true })); const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close()); await store.append(event("one")); await store.append(event("two")); await store.exportArchive(join(root, "before-rotation.jsonl"), 2); store.rotateSegment();
+  await assert.rejects(store.applyRetention(2), /segment inventory does not match/u); assert.equal((await store.readAll()).length, 2); await store.exportArchive(join(root, "after-rotation.jsonl"), 2); assert.equal(await store.applyRetention(2), 2); assert.equal((await store.verifyIntegrity({ allowUnsigned: false })).valid, true);
+});
+
+test("authenticated segment ledger blocks pre-export rotation-history laundering", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-segment-launder-")); t.after(() => rm(root, { recursive: true, force: true })); const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close()); await store.append(event("one")); store.rotateSegment(); await store.append(event("two")); store.db.exec("DELETE FROM audit_segments WHERE id=1; UPDATE audit_segments SET first_sequence=1,anchor_signature=NULL WHERE id=2;");
+  const verification = await store.verifyIntegrity({ allowUnsigned: false }); assert.equal(verification.valid, false); assert.ok(verification.failures.some((failure) => failure.reason === "audit segment ledger integrity mismatch")); await assert.rejects(store.exportArchive(join(root, "forged.jsonl"), 2), /integrity verification required/u);
+});
