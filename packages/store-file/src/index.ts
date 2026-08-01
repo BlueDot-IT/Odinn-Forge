@@ -230,6 +230,10 @@ async function assertSecureStateParent(path: string): Promise<void> {
     await ensureSecureStateDirectory(parent);
     info = await lstat(parent);
   }
+  if (process.platform === "win32" && info.isDirectory() && !info.isSymbolicLink()) {
+    await ensureSecureStateDirectory(parent);
+    info = await lstat(parent);
+  }
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`state parent must be a real directory: ${parent}`);
   if (!await isOwnerOnlyPath(parent)) throw new Error(`state parent is not owner-only: ${parent}`);
 }
