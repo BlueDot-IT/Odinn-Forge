@@ -31,6 +31,7 @@ async function readWorkspace(fixture: Awaited<ReturnType<typeof workspaceFixture
 
 async function closeWorkspaceFixture(fixture: Awaited<ReturnType<typeof workspaceFixture>>) {
   fixture.registry.close();
+  fixture.auditStore.close();
   await rm(fixture.root, { recursive: true, force: true });
 }
 
