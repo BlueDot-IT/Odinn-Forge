@@ -12,6 +12,7 @@ import {
   stateLifecycleStatus
 } from "../packages/kernel/src/index.ts";
 import { migrateLegacyRecordsToSqlite, SqliteRecordStore } from "../packages/store-sqlite/src/authoritative.ts";
+import { SqliteAuditStore } from "../packages/store-sqlite/src/audit.ts";
 
 async function preparedState() {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-state-lifecycle-"));
@@ -49,6 +50,10 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     await writeFile(join(fixture.state, "browser-profile", "Cookies"), "do-not-copy\n");
     await writeFile(join(fixture.state, "gateway.token"), "do-not-copy\n");
     await writeFile(join(fixture.state, "capability-signing.key"), "do-not-copy\n");
+    await mkdir(join(fixture.state, "db"), { recursive: true });
+    for (const sidecar of ["custom-audit.sqlite-wal", "custom-audit.sqlite-shm", "custom-audit.sqlite.notify"]) {
+      await writeFile(join(fixture.state, "db", sidecar), "ephemeral\n");
+    }
 
     const created = await createStateBackup(fixture.state, backup, {
       applicationVersion: "1.0.0",
@@ -60,6 +65,7 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     for (const forbidden of ["oauth/openai.json", "credentials/custom-oauth.json", "browser-profile/Cookies", "gateway.token", "capability-signing.key"]) {
       assert.equal(created.manifest.files.some((file) => file.path === forbidden), false);
     }
+    assert.equal(created.manifest.files.some((file) => /^db\/custom-audit\.sqlite(?:-(?:wal|shm)|\.notify)$/u.test(file.path)), false);
     assert.ok(created.manifest.excluded.includes("credentials/custom-oauth.json"));
     assert.doesNotMatch(JSON.stringify(created), /do-not-copy/u);
     const inspected = await inspectStateBackup(backup);
@@ -90,6 +96,14 @@ test("backup tampering and future schemas fail before restore", async () => {
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
   }
+});
+
+test("backup refuses a corrupt authoritative SQLite audit journal", async () => {
+  const fixture = await preparedState(); const backup = join(fixture.temporary, "corrupt-audit-backup"); const auditPath = join(fixture.state, "db", "audit.sqlite");
+  try {
+    const store = new SqliteAuditStore(auditPath, { keyringPath: join(fixture.state, "audit.jsonl.keys.json") }); await store.append({ at: new Date().toISOString(), runId: "corrupt-audit", type: "task.started", actor: "test" }); store.db.prepare("UPDATE audit_events SET event_json=? WHERE sequence=1").run(JSON.stringify({ at: new Date().toISOString(), runId: "tampered", type: "task.started", actor: "test" })); store.close();
+    await assert.rejects(createStateBackup(fixture.state, backup), /(?:active state is unhealthy|staged audit snapshot is inconsistent)/u);
+  } finally { await rm(fixture.temporary, { recursive: true, force: true }); }
 });
 
 test("restore verifies into staging, backs up current state, and activates atomically", async () => {

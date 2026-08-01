@@ -3023,14 +3023,14 @@ async function branchCommand(command: any, args: any) {
 }
 
 async function capsuleCommand(args: any) {
-  const [subcommand, ...rest] = args; const { state, runtime } = runtimeFor(rest); try {
+  const [subcommand, ...rest] = args; const { state, runtime } = runtimeFor(rest); let replayAuditStore: any; const replayRegistries = new Map<string, any>(); try {
     const path = rest.find((value: any) => !value.startsWith("--"));
     if (subcommand === "export") await printJson(await runtime.capsules.export(path, { output: option(rest, "--output") }));
     else if (subcommand === "inspect" || subcommand === "verify") await printJson(await runtime.capsules.verify(path));
     else if (subcommand === "replay") {
       const mode = option(rest, "--mode", "verification-only");
       const config = await readConfig(state);
-      const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+      replayAuditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
       await printJson(await runtime.capsules.replay(path, {
         mode,
         workspace: option(rest, "--workspace", ""),
@@ -3041,29 +3041,30 @@ async function capsuleCommand(args: any) {
             const issued = runtime.capabilities.issue({ runId: taskId, stepId: `replay-step-${stepIndex}`, toolName: tool, scopes: [tool], resourceConstraints: input.resource ?? {} });
             input = { ...input, capabilityToken: issued.token };
           }
+          let registry = replayRegistries.get(workspaceRoot);
+          if (!registry) { registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore: replayAuditStore }); replayRegistries.set(workspaceRoot, registry); }
           return runTask({
             task: { id: taskId, tool, input, actor: "capsule-replay" },
-            auditStore,
+            auditStore: replayAuditStore,
             policy: createDefaultPolicy(config.policy),
-            registry: createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore }),
+            registry,
             runLedger: runtime.ledger
           });
         } : undefined
       }));
     }
     else throw new Error("capsule requires export, inspect, verify, or replay");
-  } finally { runtime.ledger.close(); }
+  } finally { for (const registry of replayRegistries.values()) registry.close(); replayAuditStore?.close(); runtime.ledger.close(); }
 }
 
 async function counterfactualCommand(args: any) {
-  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
+  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); let executionAuditStore: any; const executionRegistries = new Map<string, any>(); try {
     if (subcommand === "run") {
       const files = []; for (let i = 0; i < rest.length; i += 1) if (rest[i] === "--plan-file") files.push(rest[i + 1]);
       const created = await runtime.counterfactual.create({ sourceRunId: option(rest, "--source-run"), sourceStepId: option(rest, "--from"), plans: await Promise.all(files.map(async (file: any) => parseStructuredDocument(await readFile(resolveInvocationPath(file), "utf8"), file))), workspaceRoot: invocationRoot() });
       if (!hasFlag(rest, "--execute")) { await printJson(created); return; }
       const config = await readConfig(stateDir(rest));
-      const auditStore = createAuditStore(join(stateDir(rest), config.auditLog ?? "audit.jsonl"));
-      const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: stateDir(rest), config, auditStore });
+      executionAuditStore = createAuditStore(join(stateDir(rest), config.auditLog ?? "audit.jsonl"));
       const result = await runtime.counterfactual.execute(created.groupId, {
         proof: {
           run: async (runId: any, contract: any, { workspaceRoot = invocationRoot() }: any = {}) => {
@@ -3081,7 +3082,11 @@ async function counterfactualCommand(args: any) {
         capabilities: runtime.capabilities,
         policy: createDefaultPolicy(config.policy),
         workspaceRoot: invocationRoot(),
-        executor: async (task: any, context: any) => runTask({ task, auditStore, policy: context.policy, registry: createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore }), runLedger: runtime.ledger })
+        executor: async (task: any, context: any) => {
+          let registry = executionRegistries.get(context.workspaceRoot);
+          if (!registry) { registry = createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore: executionAuditStore }); executionRegistries.set(context.workspaceRoot, registry); }
+          return runTask({ task, auditStore: executionAuditStore, policy: context.policy, registry, runLedger: runtime.ledger });
+        }
       });
       await printJson({ ...created, execution: result });
       return;
@@ -3089,7 +3094,7 @@ async function counterfactualCommand(args: any) {
     if (subcommand === "compare") { await printJson(runtime.counterfactual.compare(rest[0])); return; }
     if (subcommand === "select") { await printJson(await runtime.counterfactual.select(rest[0], option(rest, "--run"), { apply: hasFlag(rest, "--apply") })); return; }
     throw new Error("counterfactual requires run, compare, or select");
-  } finally { runtime.ledger.close(); }
+  } finally { for (const registry of executionRegistries.values()) registry.close(); executionAuditStore?.close(); runtime.ledger.close(); }
 }
 
 async function routingCommand(args: any) {

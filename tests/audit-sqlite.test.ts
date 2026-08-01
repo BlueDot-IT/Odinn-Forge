@@ -39,7 +39,7 @@ test("subscriber cursor is monotonic and cross-instance notifications wake bound
   const writer = new SqliteAuditStore(path, { keyringPath: keys }); const reader = new SqliteAuditStore(path, { keyringPath: keys }); t.after(() => { writer.close(); reader.close(); });
   const woke = new Promise<number>((resolve) => { const stop = reader.subscribe((sequence) => { stop(); resolve(sequence); }); });
   await writer.append(event("wake")); assert.equal(await woke, 1);
-  await reader.ackCursor("client", 1); await reader.ackCursor("client", 0); assert.equal(await reader.getCursor("client"), 1);
+  await reader.ackCursor("client", 1); await reader.ackCursor("client", 0); assert.equal(await reader.getCursor("client"), 1); await assert.rejects(reader.ackCursor("client", 2), /outside the durable audit range/u);
 });
 
 test("integrity verification detects modification, deletion, insertion, reorder, key and head errors", async (t) => {
@@ -99,18 +99,24 @@ test("rotation, archive and retention require a verified immutable artifact", as
   const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close());
   await store.append(event("one")); store.rotateSegment(); await store.rotateKey(); await store.append(event("two"));
   await assert.rejects(store.applyRetention(1), /verified archive/u);
-  const archive = store.exportArchive(join(root, "archive.jsonl"), 1); assert.equal(archive.events, 1); assert.equal(await store.applyRetention(1), 1); assert.equal((await store.verifyIntegrity({ allowUnsigned: false })).valid, true);
+  const archive = await store.exportArchive(join(root, "archive.jsonl"), 1); assert.equal(archive.events, 1); assert.equal(await store.applyRetention(1), 1); assert.equal((await store.verifyIntegrity({ allowUnsigned: false })).valid, true);
 });
 
 test("retention refuses to launder a tampered online chain into a newly signed archive", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-audit-retention-tamper-")); t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, "audit.sqlite"); const store = new SqliteAuditStore(path, { keyringPath: join(root, "keys.json") }); t.after(() => store.close()); await store.append(event("one"));
-  store.db.prepare("UPDATE audit_events SET event_json=? WHERE sequence=1").run(JSON.stringify(event("tampered"))); store.exportArchive(join(root, "archive.jsonl"), 1);
-  await assert.rejects(store.applyRetention(1), /integrity verification required/u);
+  store.db.prepare("UPDATE audit_events SET event_json=? WHERE sequence=1").run(JSON.stringify(event("tampered"))); await assert.rejects(store.exportArchive(join(root, "archive.jsonl"), 1), /integrity verification required/u);
 });
 
 test("successive retention archives remain cumulative and independently verifiable", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-audit-cumulative-")); t.after(() => rm(root, { recursive: true, force: true })); const path = join(root, "audit.sqlite"); const store = new SqliteAuditStore(path, { keyringPath: join(root, "keys.json") }); t.after(() => store.close());
-  await store.append(event("one")); const firstPath = join(root, "first.jsonl"); store.exportArchive(firstPath, 1); await store.applyRetention(1); await store.append(event("two")); const secondPath = join(root, "second.jsonl"); const second = store.exportArchive(secondPath, 2); assert.equal(second.events, 2); await store.applyRetention(2);
+  await store.append(event("one")); const firstPath = join(root, "first.jsonl"); await store.exportArchive(firstPath, 1); await store.applyRetention(1); await store.append(event("two")); const secondPath = join(root, "second.jsonl"); const second = await store.exportArchive(secondPath, 2); assert.equal(second.events, 2); await store.applyRetention(2);
   await rm(firstPath); await rm(`${firstPath}.manifest.json`); assert.equal((await store.verifyIntegrity({ allowUnsigned: false })).valid, true); assert.equal((await readFile(secondPath, "utf8")).trim().split("\n").length, 2);
+});
+
+test("retained segment boundaries remain bound to archived event signatures", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-retained-segments-")); t.after(() => rm(root, { recursive: true, force: true })); const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close());
+  await store.append(event("one")); store.rotateSegment(); await store.append(event("two")); await store.exportArchive(join(root, "archive.jsonl"), 2); await store.applyRetention(2);
+  store.db.exec("UPDATE audit_segments SET final_signature='forged' WHERE id=1; UPDATE audit_segments SET anchor_signature='forged' WHERE id=2;");
+  const verification = await store.verifyIntegrity({ allowUnsigned: false }); assert.equal(verification.valid, false); assert.ok(verification.failures.some((failure) => failure.reason === "audit segment final signature mismatch"));
 });

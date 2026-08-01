@@ -558,7 +558,7 @@ test("non-cooperative timeout releases global capacity but retains physical lane
   assert.equal((await scheduler.get("stuck"))?.status, "needs-review");
   assert.equal((await scheduler.get("same-lane"))?.status, "queued");
   assert.deepEqual(started, ["stuck", "other-lane"]);
-  assert.equal(scheduler.status().lockedLanes, 1);
+  await waitFor(() => scheduler.status().lockedLanes === 1 ? true : undefined);
   releaseStuck();
   await waitFor(async () => (await scheduler.get("same-lane"))?.status === "completed" ? true : undefined);
   assert.deepEqual(started, ["stuck", "other-lane", "same-lane"]);

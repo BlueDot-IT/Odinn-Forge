@@ -1133,6 +1133,16 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/events") {
         return streamAuditEvents(request, response, auditStore, url);
       }
+      if (request.method === "POST" && url.pathname === "/events/ack") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const subscriber = String(body.subscriber ?? "").trim();
+        const sequence = Number(body.sequence);
+        if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(subscriber)) throw new GatewayError(400, "audit subscriber id is invalid");
+        if (!Number.isSafeInteger(sequence) || sequence < 0) throw new GatewayError(400, "audit subscriber sequence is invalid");
+        try { await auditStore.ackCursor(subscriber, sequence); }
+        catch (error: any) { throw new GatewayError(409, error?.message || "audit subscriber cursor could not be acknowledged"); }
+        return json(response, 200, { ok: true, subscriber, sequence: await auditStore.getCursor(subscriber) });
+      }
       if (request.method === "GET" && url.pathname === "/approvals") {
         return json(response, 200, approvalStore.list());
       }
@@ -1619,7 +1629,6 @@ async function streamAuditEvents(request: any, response: any, auditStore: any, u
           if (closed) return;
           cursor = item.sequence;
         }
-        if (page.length && subscriber && auditStore.ackCursor) await auditStore.ackCursor(subscriber, cursor);
         if (page.length === 500) pending = true;
       } while (pending && !closed);
     } catch (error: any) {

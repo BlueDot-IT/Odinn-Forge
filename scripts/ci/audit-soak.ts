@@ -21,7 +21,7 @@ try {
   unsubscribe();
   let cursor = 0; let delivered = 0; for (;;) { const page = await reader.readPage({ afterSequence: cursor, limit: 137 }); if (!page.length) break; assert.equal(page[0]!.sequence, cursor + 1); cursor = page.at(-1)!.sequence; delivered += page.length; await reader.ackCursor("soak", cursor); }
   assert.equal(delivered, events); assert.equal(await reader.getCursor("soak"), events); await reader.rotateKey(); reader.rotateSegment();
-  const archive = reader.exportArchive(join(root, "archive.jsonl"), Math.floor(events / 2)); await reader.applyRetention(archive.throughSequence);
+  const archive = await reader.exportArchive(join(root, "archive.jsonl"), Math.floor(events / 2)); await reader.applyRetention(archive.throughSequence);
   assert.equal((await reader.verifyIntegrity({ allowUnsigned: false })).valid, true); reader.close();
   const restarted = new SqliteAuditStore(path, { keyringPath: keys }); assert.equal(await restarted.getCursor("soak"), events); assert.equal((await restarted.verifyIntegrity({ allowUnsigned: false })).valid, true); restarted.close();
   process.stdout.write(`${JSON.stringify({ ok: true, events, delivered, wakeups, restart: true, rotation: true, archive: true, retention: true })}\n`);
