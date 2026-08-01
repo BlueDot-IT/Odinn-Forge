@@ -558,7 +558,7 @@ test("agent.run exposes registry-derived readText schema and permits one safe co
     }, policy);
     assert.equal(result.output.content, "GO: fixture is ready.");
     const readSchema = fx.requests[0].tools.find((schema: any) => schema.function.name === "workspace_x2e_readText");
-    assert.equal(readSchema.function.description, "Read a UTF-8 text file confined to the workspace root.");
+    assert.equal(readSchema.function.description, "Read a UTF-8 text file confined to the workspace root. maxBytes is a positive byte limit capped at 8388608; content is valid UTF-8 and at most maxBytes bytes; bytesRead reports the bounded probe of up to maxBytes + 1 bytes; truncated is byte-based.");
     assert.deepEqual(readSchema.function.parameters.required, ["path"]);
     assert.equal(readSchema.function.parameters.properties.maxBytes.type, "integer");
     const failedToolResult = fx.requests[1].messages.find((message: any) => message.role === "tool" && message.tool_call_id === "call_missing");

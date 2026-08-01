@@ -1,11 +1,12 @@
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
-export { SkillPackageStore, validateSkillPackage } from "./skill-packages.ts";
+import { captureAncestorIdentities, MAX_BOUNDED_UTF8_BYTES, readUtf8Prefix } from "./skill-packages.ts";
+export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { loadEnvironmentFiles } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile } from "./environment.ts";
 export { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
@@ -77,24 +78,34 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     }],
     ["workspace.readText", {
       capability: "workspace.readText",
-      description: "Read a UTF-8 text file confined to the workspace root.",
-      inputSchema: { type: "object", properties: { path: { type: "string" }, maxBytes: { type: "integer" } }, required: ["path"] },
+      description: "Read a UTF-8 text file confined to the workspace root. maxBytes is a positive byte limit capped at 8388608; content is valid UTF-8 and at most maxBytes bytes; bytesRead reports the bounded probe of up to maxBytes + 1 bytes; truncated is byte-based.",
+      inputSchema: { type: "object", properties: { path: { type: "string" }, maxBytes: { type: "integer", minimum: 1, maximum: MAX_BOUNDED_UTF8_BYTES } }, required: ["path"] },
       execute: async ({ path, maxBytes = 65_536 }: any) => {
         if (typeof path !== "string" || path.trim() === "") throw new Error("workspace.readText requires path");
+        if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_BOUNDED_UTF8_BYTES) {
+          throw new Error(`workspace.readText maxBytes must be a positive safe integer no greater than ${MAX_BOUNDED_UTF8_BYTES}`);
+        }
         const realRoot = await realpath(root);
         const lexicalTarget = resolve(realRoot, path);
         const lexicalRelative = relative(realRoot, lexicalTarget);
         if (lexicalRelative === "" || lexicalRelative.startsWith("..") || lexicalRelative.includes("..\\")) throw new Error("workspace.readText path escapes workspace root");
+        const admissionAncestors = await captureAncestorIdentities(realRoot, lexicalTarget, "workspace.readText");
+        const admissionTarget = await stat(lexicalTarget);
         const target = await realpath(lexicalTarget);
         const rel = relative(realRoot, target);
         if (rel === "" || rel.startsWith("..") || rel.includes("..\\") || target !== realRoot && !target.startsWith(`${realRoot}${sep}`)) {
           throw new Error("workspace.readText path escapes workspace root");
         }
-        const content = await readFile(target, "utf8");
+        const bounded = await readUtf8Prefix(target, maxBytes, "workspace.readText", {
+          confinementRoot: realRoot,
+          expectedAncestors: admissionAncestors,
+          expectedFileIdentity: { dev: admissionTarget.dev, ino: admissionTarget.ino }
+        });
         return {
           path: rel.replaceAll("\\", "/"),
-          truncated: Buffer.byteLength(content, "utf8") > maxBytes,
-          content: content.slice(0, maxBytes)
+          content: bounded.content,
+          bytesRead: bounded.bytesRead,
+          truncated: bounded.truncated
         };
       }
     }],

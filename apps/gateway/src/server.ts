@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -20,6 +20,7 @@ import {
 declare const __ODINN_COMPILED__: boolean | undefined;
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
 const compiledRuntime = typeof __ODINN_COMPILED__ !== "undefined";
+const SKILL_DISCOVERY_MAX_BYTES = MAX_BOUNDED_UTF8_BYTES;
 const PUBLIC_DIR = fileURLToPath(new URL(compiledRuntime ? "./public/" : "../public/", import.meta.url));
 const PACKAGE_FILE = fileURLToPath(new URL(compiledRuntime ? "../../package.json" : "../../../package.json", import.meta.url));
 const INSTALL_METADATA_FILE = fileURLToPath(new URL(compiledRuntime ? "../../install-metadata.json" : "../../../install-metadata.json", import.meta.url));
@@ -224,11 +225,16 @@ async function discoverSkills(root: string, state: string) {
       if (descriptor.source === "workspace" && resolve(path) === stateRoot) continue;
       if (entry.isDirectory()) await walk(path, depth + 1, descriptor);
       else if (entry.isFile() && entry.name === "SKILL.md") {
-        const content = await readFile(path, "utf8");
-        const frontmatter = /^---\s*\n([\s\S]*?)\n---/u.exec(content)?.[1] || "";
-        const name = /^name:\s*["']?([^\n"']+)/mu.exec(frontmatter)?.[1]?.trim() || path.split(sep).at(-2) || "skill";
-        const description = /^description:\s*["']?([^\n"']+)/mu.exec(frontmatter)?.[1]?.trim() || "No description";
-        results.push({ id: createHash("sha256").update(path).digest("hex").slice(0, 16), name, description, path, bytes: Buffer.byteLength(content), status: descriptor.status, source: descriptor.source });
+        try {
+          const bounded = await readUtf8Prefix(path, SKILL_DISCOVERY_MAX_BYTES, "SKILL.md");
+          if (bounded.truncated) continue;
+          const frontmatter = /^---\s*\n([\s\S]*?)\n---/u.exec(bounded.content)?.[1] || "";
+          const name = /^name:\s*["']?([^\n"']+)/mu.exec(frontmatter)?.[1]?.trim() || path.split(sep).at(-2) || "skill";
+          const description = /^description:\s*["']?([^\n"']+)/mu.exec(frontmatter)?.[1]?.trim() || "No description";
+          results.push({ id: createHash("sha256").update(path).digest("hex").slice(0, 16), name, description, path, bytes: bounded.bytesRead, status: descriptor.status, source: descriptor.source });
+        } catch {
+          continue;
+        }
       }
     }
   };
