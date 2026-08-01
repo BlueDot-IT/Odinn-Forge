@@ -3,6 +3,7 @@ import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, w
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { backup as backupSqlite, DatabaseSync } from "node:sqlite";
 import { FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
+import { SqliteAuditStore } from "@odinn/store-sqlite";
 import { withStateMutationLock } from "../state-mutation.ts";
 import { inspectStateSchemas, type StateInspection } from "./migration-manager.ts";
 import { STATE_SCHEMA_TARGETS, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
@@ -23,7 +24,10 @@ const EPHEMERAL_STATE_FILES = Object.freeze([
   "db/odinn.sqlite-shm",
   "db/odinn.sqlite-wal",
   "db/records.sqlite-shm",
-  "db/records.sqlite-wal"
+  "db/records.sqlite-wal",
+  "db/audit.sqlite-shm",
+  "db/audit.sqlite-wal",
+  "db/audit.sqlite.notify"
 ]);
 
 export type BackupApplicationIdentity = {
@@ -112,7 +116,7 @@ async function createStateBackupUnlocked(
       const source = join(stateRoot, file);
       const target = join(staging, file);
       await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-      if (file === "db/odinn.sqlite" || file === "db/records.sqlite") await copySqliteSnapshot(source, target);
+      if (["db/odinn.sqlite", "db/records.sqlite", "db/audit.sqlite"].includes(file)) await copySqliteSnapshot(source, target);
       else await cp(source, target, { force: false, errorOnExist: true });
       await chmod(target, 0o600);
     }
@@ -425,8 +429,15 @@ async function verifyAudit(stateRoot: string): Promise<{ valid: boolean; events:
     throw new Error("config.auditLog must be audit.jsonl or an audit-*.jsonl filename");
   }
   const path = join(stateRoot, filename);
-  if (!await exists(path)) return { valid: true, events: 0, unsigned: 0 };
-  const result = await new FileAuditStore(path).verifyIntegrity({ allowUnsigned: true });
+  const databasePath = join(stateRoot, "db", "audit.sqlite");
+  if (!await exists(databasePath) && !await exists(path)) return { valid: true, events: 0, unsigned: 0 };
+  if (!await exists(databasePath)) {
+    const result = await new FileAuditStore(path).verifyIntegrity({ allowUnsigned: true });
+    return { valid: result.valid, events: result.events, unsigned: result.unsigned };
+  }
+  const store = new SqliteAuditStore(databasePath, { keyringPath: `${path}.keys.json` });
+  const result = await store.verifyIntegrity({ allowUnsigned: true });
+  store.close();
   return { valid: result.valid, events: result.events, unsigned: result.unsigned };
 }
 
@@ -434,13 +445,17 @@ async function appendLifecycleAudit(stateRoot: string, type: string, message: st
   const config = await readJsonIfPresent(join(stateRoot, "config.json"), {});
   const filename = String(config.auditLog ?? "audit.jsonl");
   if (!/^audit(?:-[A-Za-z0-9._-]+)?\.jsonl$/u.test(filename)) return;
-  await new FileAuditStore(join(stateRoot, filename)).append({
+  const legacyPath = join(stateRoot, filename);
+  const databasePath = join(stateRoot, "db", "audit.sqlite");
+  const store = await exists(databasePath) ? new SqliteAuditStore(databasePath, { keyringPath: `${legacyPath}.keys.json` }) : new FileAuditStore(legacyPath);
+  await store.append({
     runId: `lifecycle_${randomUUID()}`,
     type,
     actor: "odinn",
     message,
     data
   });
+  if ("close" in store) store.close();
 }
 
 async function payloadFiles(root: string, includeSensitiveState: boolean, sensitiveExclusions: string[] = []): Promise<string[]> {

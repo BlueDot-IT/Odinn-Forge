@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { redactDurableValue, type DurableRedactionContext } from "@odinn/protocol";
+export { SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
+export type { AuditPage } from "./audit.ts";
 
 export const SQLITE_SCHEMA_VERSION = 3;
 export type SqliteStoreOptions = { targetVersion?: number };

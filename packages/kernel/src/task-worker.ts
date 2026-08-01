@@ -17,11 +17,12 @@ const messageError = (error: unknown) => error instanceof Error ? error.message 
 process.on("message", async (rawMessage: unknown) => {
   let runLedger;
   let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
+  let auditStore: ReturnType<typeof createAuditStore> | undefined;
   try {
     if (!rawMessage || typeof rawMessage !== "object") throw new Error("task worker received an invalid envelope");
     const { payload, stateDir, workspaceRoot, config = {}, policy } = rawMessage as TaskWorkerMessage;
     if (!payload || !stateDir || !workspaceRoot) throw new Error("task worker received an incomplete envelope");
-    const auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
+    auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
     const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
     const registryOptions = { workspaceRoot, stateDir, config, approvalStore, auditStore };
     registry = createBuiltInRegistry(registryOptions);
@@ -35,6 +36,7 @@ process.on("message", async (rawMessage: unknown) => {
   } finally {
     registry?.close();
     runLedger?.close();
+    auditStore?.close();
   }
 });
 

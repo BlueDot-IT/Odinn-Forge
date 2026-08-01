@@ -36,6 +36,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
 
 - [Runtime event ledger](architecture/event-ledger.md) — the hash-chained event
   ledger design.
+- [Audit storage operations](audit-storage.md) — indexed journal migration,
+  streaming cursors, verification, archives, retention, soak, and benchmarks.
 - [Runtime ledger](runtime-ledger.md) — structured runtime records.
 - [Gateway Protocol v2](gateway-protocol-v2.md) — protocol schema and client
   behavior.

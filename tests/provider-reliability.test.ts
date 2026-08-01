@@ -172,7 +172,7 @@ test("provider failures redact configured credentials", async () => {
         return true;
       }
     );
-    assert.doesNotMatch(await readFile(join(root, "audit.jsonl"), "utf8"), new RegExp(secret, "u"));
+    assert.doesNotMatch(JSON.stringify(await auditStore.readAll()), new RegExp(secret, "u"));
   } finally {
     if (previous === undefined) delete process.env.ODINN_PROVIDER_REDACTION_KEY;
     else process.env.ODINN_PROVIDER_REDACTION_KEY = previous;
