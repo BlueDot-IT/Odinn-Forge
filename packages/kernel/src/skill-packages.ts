@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
@@ -58,7 +58,8 @@ const DISCLOSURE_INDEX_MAX_ENTRIES = 1_024;
 const DISCLOSURE_DESCRIPTION_MAX_BYTES = 2_048;
 const DISCLOSURE_LIST_MAX_ENTRIES = 64;
 const DISCLOSURE_LIST_ITEM_MAX_BYTES = 128;
-const MANAGED_PACKAGE_FILE_MAX_BYTES = 8 * 1024 * 1024;
+export const MAX_BOUNDED_UTF8_BYTES = 8 * 1024 * 1024;
+const MANAGED_PACKAGE_FILE_MAX_BYTES = MAX_BOUNDED_UTF8_BYTES;
 
 export function validateSkillPackage(input: any) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("skill package manifest must be an object");
@@ -506,34 +507,152 @@ function digest(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-async function readUtf8Bounded(path: string, maxBytes: number, label: string) {
+export type BoundedUtf8Read = { content: string; bytesRead: number; truncated: boolean };
+
+export type FileIdentity = { path: string; dev: number; ino: number; kind: "directory" | "symbolic-link" };
+export type FileContentIdentity = { dev: number; ino: number };
+
+export async function captureAncestorIdentities(root: string, target: string, label: string): Promise<FileIdentity[]> {
+  const resolvedRoot = resolve(root);
+  const resolvedTarget = resolve(target);
+  if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(`${resolvedRoot}${sep}`)) {
+    throw new Error(`${label} escaped its confinement root`);
+  }
+  const identities: FileIdentity[] = [];
+  let cursor = resolvedRoot;
+  const ancestors = resolvedTarget.slice(resolvedRoot.length + 1).split(sep).slice(0, -1);
+  for (const component of ancestors) {
+    const metadata = await lstat(cursor);
+    if (!metadata.isSymbolicLink() && !metadata.isDirectory()) throw new Error(`${label} confinement ancestor changed`);
+    identities.push({ path: cursor, dev: metadata.dev, ino: metadata.ino, kind: metadata.isSymbolicLink() ? "symbolic-link" : "directory" });
+    cursor = resolve(cursor, component);
+  }
+  const metadata = await lstat(cursor);
+  if (!metadata.isSymbolicLink() && !metadata.isDirectory()) throw new Error(`${label} confinement ancestor changed`);
+  identities.push({ path: cursor, dev: metadata.dev, ino: metadata.ino, kind: metadata.isSymbolicLink() ? "symbolic-link" : "directory" });
+  return identities;
+}
+
+async function assertAncestorIdentities(identities: FileIdentity[], label: string) {
+  for (const expected of identities) {
+    const actual = await lstat(expected.path);
+    const kind = actual.isSymbolicLink() ? "symbolic-link" : actual.isDirectory() ? "directory" : undefined;
+    if (kind !== expected.kind || actual.dev !== expected.dev || actual.ino !== expected.ino) {
+      throw new Error(`${label} confinement ancestor changed`);
+    }
+  }
+}
+
+type OpenedFileHandle = { fd: number; stat: () => Promise<Stats> };
+
+async function canonicalHandlePath(handle: OpenedFileHandle, label: string) {
+  if (process.platform !== "linux") throw new Error(`${label} cannot bind opened handle on ${process.platform}`);
+  const descriptorPath = `/proc/self/fd/${handle.fd}`;
+  try {
+    return await realpath(descriptorPath);
+  } catch (error) {
+    throw new Error(`${label} cannot bind opened handle on ${process.platform}`, { cause: error });
+  }
+}
+
+async function assertOpenedHandleBinding(
+  handle: OpenedFileHandle,
+  target: string,
+  root: string,
+  expectedFileIdentity: FileContentIdentity | undefined,
+  label: string
+) {
+  const opened = await handle.stat();
+  if (!opened.isFile()) throw new Error(`${label} changed during secure open`);
+  if (process.platform !== "linux") {
+    if (!expectedFileIdentity || expectedFileIdentity.dev === 0 || expectedFileIdentity.ino === 0 || opened.dev === 0 || opened.ino === 0) {
+      throw new Error(`${label} cannot bind opened handle on ${process.platform}`);
+    }
+    if (opened.dev !== expectedFileIdentity.dev || opened.ino !== expectedFileIdentity.ino) {
+      throw new Error(`${label} changed during secure open`);
+    }
+    return opened;
+  }
+  const canonical = await canonicalHandlePath(handle, label);
+  const canonicalRoot = await realpath(root);
+  if (canonical !== resolve(target) || canonical !== canonicalRoot && !canonical.startsWith(`${canonicalRoot}${sep}`)) {
+    throw new Error(`${label} changed during secure open`);
+  }
+  return opened;
+}
+
+export async function readUtf8Prefix(
+  path: string,
+  maxBytes: number,
+  label: string,
+  { rejectTruncated = false, beforeOpen, afterLstatBeforeOpen, afterOpen, confinementRoot, expectedAncestors, expectedFileIdentity }: { rejectTruncated?: boolean; beforeOpen?: () => void | Promise<void>; /** @internal deterministic race-test hook only. */ afterLstatBeforeOpen?: () => void | Promise<void>; /** @internal deterministic race-test hook only. */ afterOpen?: () => void | Promise<void>; confinementRoot?: string; expectedAncestors?: FileIdentity[]; expectedFileIdentity?: FileContentIdentity } = {}
+): Promise<BoundedUtf8Read> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_BOUNDED_UTF8_BYTES) {
+    throw new Error(`${label} byte limit must be a positive safe integer no greater than ${MAX_BOUNDED_UTF8_BYTES}`);
+  }
+  const ancestors = expectedAncestors ?? (confinementRoot ? await captureAncestorIdentities(confinementRoot, path, label) : undefined);
+  await beforeOpen?.();
   const before = await lstat(path);
   if (before.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
+  if (expectedFileIdentity && (before.dev !== expectedFileIdentity.dev || before.ino !== expectedFileIdentity.ino)) {
+    throw new Error(`${label} changed during admission`);
+  }
   if (!before.isFile()) throw new Error(`${label} must be a regular file`);
-  if (before.size > maxBytes) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  if (rejectTruncated && before.size > maxBytes) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
+  await afterLstatBeforeOpen?.();
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+  const handle = await open(path, flags);
   try {
-    const opened = await handle.stat();
+    await afterOpen?.();
+    const opened = confinementRoot
+      ? await assertOpenedHandleBinding(handle, path, confinementRoot, expectedFileIdentity, label)
+      : await handle.stat();
+    if (ancestors) await assertAncestorIdentities(ancestors, label);
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
       throw new Error(`${label} changed during secure open`);
     }
-    if (opened.size > maxBytes) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
-    const chunks: Buffer[] = [];
-    let total = 0;
-    while (true) {
-      const remaining = maxBytes + 1 - total;
-      if (remaining <= 0) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
-      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remaining));
-      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
-      if (bytesRead === 0) break;
-      chunks.push(chunk.subarray(0, bytesRead));
-      total += bytesRead;
-      if (total > maxBytes) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
+    const bytes = Buffer.allocUnsafe(maxBytes + 1);
+    let rawBytesRead = 0;
+    while (rawBytesRead < bytes.length) {
+      const result = await handle.read(bytes, rawBytesRead, bytes.length - rawBytesRead, null);
+      if (result.bytesRead === 0) break;
+      rawBytesRead += result.bytesRead;
     }
-    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total));
+    const after = await handle.stat();
+    if (ancestors) await assertAncestorIdentities(ancestors, label);
+    if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino) {
+      throw new Error(`${label} changed during secure read`);
+    }
+    const truncated = rawBytesRead > maxBytes;
+    if (rejectTruncated && truncated) throw new ManagedFileLimitError(`${label} exceeds ${maxBytes} UTF-8 bytes`);
+    const retained = bytes.subarray(0, Math.min(rawBytesRead, maxBytes));
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let content: string;
+    try {
+      content = decoder.decode(retained);
+    } catch (error) {
+      if (!truncated) throw new Error(`${label} is not valid UTF-8`, { cause: error });
+      const boundary = incompleteUtf8Boundary(retained);
+      if (boundary === undefined) throw new Error(`${label} is not valid UTF-8`, { cause: error });
+      content = decoder.decode(retained.subarray(0, boundary));
+    }
+    return { content, bytesRead: rawBytesRead, truncated };
   } finally {
     await handle.close();
   }
+}
+
+function incompleteUtf8Boundary(bytes: Buffer): number | undefined {
+  let start = bytes.length - 1;
+  while (start >= 0 && (bytes[start]! & 0xc0) === 0x80) start -= 1;
+  if (start < 0) return undefined;
+  const lead = bytes[start]!;
+  const expected = lead <= 0x7f ? 1 : lead >= 0xc2 && lead <= 0xdf ? 2 : lead >= 0xe0 && lead <= 0xef ? 3 : lead >= 0xf0 && lead <= 0xf4 ? 4 : 0;
+  return expected > 0 && bytes.length - start < expected ? start : undefined;
+}
+
+async function readUtf8Bounded(path: string, maxBytes: number, label: string) {
+  return (await readUtf8Prefix(path, maxBytes, label, { rejectTruncated: true })).content;
 }
 
 class ManagedFileLimitError extends Error {}

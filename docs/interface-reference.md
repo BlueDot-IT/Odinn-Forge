@@ -83,6 +83,29 @@ exception for local script authentication.
 The tables below summarize accepted fields and response shapes; they are not
 formal JSON Schema definitions.
 
+### `workspace.readText` tool contract
+
+`workspace.readText` reads one UTF-8 text file beneath the assigned workspace
+root. Its optional `maxBytes` input is a positive, safe integer measured in
+bytes, capped at `8,388,608` bytes; the default is `65,536`. The response is:
+
+```json
+{
+  "path": "notes/example.txt",
+  "content": "...",
+  "bytesRead": 65537,
+  "truncated": true
+}
+```
+
+`content` is always valid UTF-8 and contains at most `maxBytes` encoded bytes;
+truncation never leaves a partial UTF-8 sequence. `bytesRead` reports the
+bounded probe, so it is the number of bytes observed up to `maxBytes + 1` (not
+the character count and not necessarily the retained content length).
+`truncated` is byte-based: it is `true` when the probe observes more than
+`maxBytes` bytes and `false` otherwise. Operators and clients must treat these
+fields as byte-accurate interface data.
+
 ### System and configuration routes
 
 | Method and path | Input | Output |
