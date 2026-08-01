@@ -178,7 +178,7 @@ export class CronStore {
         jobs[index] = current;
         return { claimed: false, alreadyDispatched: false, job: current };
       }
-      const scheduledFor = String(existingLease?.scheduledFor || current.scheduledFor || current.nextRunAt);
+      const scheduledFor = String(existingLease?.scheduledFor || current.nextRunAt);
       const occurrenceKey = String(existingLease?.occurrenceKey || `cron:${current.id}:${scheduledFor}`);
       const lease = {
         occurrenceKey,
@@ -201,14 +201,28 @@ export class CronStore {
     });
   }
 
-  async completeOccurrence(id: string, occurrenceKey: string, token: string, patch: Record<string, unknown>) {
+  async acknowledgeSubmitted(id: string, occurrenceKey: string, token: string) {
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item: any) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
       const current = normalizeCronJob(jobs[index]);
       const lease = current.dispatchLease && typeof current.dispatchLease === "object" ? current.dispatchLease : undefined;
       if (!lease || lease.occurrenceKey !== occurrenceKey || lease.token !== token) return current;
-      const updated = normalizeCronJob({ ...current, ...patch, dispatchLease: undefined, updatedAt: new Date().toISOString() });
+      const updated = normalizeCronJob({ ...current, dispatchLease: undefined, updatedAt: new Date().toISOString() });
+      jobs[index] = updated;
+      return updated;
+    });
+  }
+
+  async recordOutcome(id: string, scheduledFor: string, patch: Record<string, unknown>) {
+    return this.mutate((jobs) => {
+      const index = jobs.findIndex((item: any) => item.id === id);
+      if (index < 0) throw new GatewayError(404, "cron job not found");
+      const current = normalizeCronJob(jobs[index]);
+      const previous = Date.parse(String(current.lastRunAt || ""));
+      const candidate = Date.parse(scheduledFor);
+      if (!Number.isFinite(candidate) || (Number.isFinite(previous) && candidate < previous)) return current;
+      const updated = normalizeCronJob({ ...current, ...patch, lastRunAt: scheduledFor, updatedAt: new Date().toISOString() });
       jobs[index] = updated;
       return updated;
     });
@@ -586,8 +600,7 @@ export function nextCronWake(schedule: string, timezone = "UTC", after = new Dat
     if (cronMatches(schedule, candidate, timezone)) return candidate.toISOString();
     const local = cronDateParts(candidate, timezone);
     if (!parts[3].has(local.month) || !parts[2].has(local.day) || !parts[4].has(local.weekday) || !parts[1].has(local.hour)) {
-      candidate.setUTCMinutes(0, 0, 0);
-      candidate.setUTCHours(candidate.getUTCHours() + 1);
+      candidate.setUTCMinutes(candidate.getUTCMinutes() + (60 - local.minute));
     } else {
       candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
     }
@@ -615,8 +628,7 @@ async function settleCronOccurrence(store: CronStore, supervisor: JobSupervisor,
     const job = await supervisor.get(claim.occurrenceKey);
     if (job && ["completed", "failed", "cancelled", "needs-review"].includes(job.status)) {
       const ok = job.status === "completed";
-      await store.completeOccurrence(jobId, claim.occurrenceKey, claim.lease.token, {
-        lastRunAt: claim.scheduledFor,
+      await store.recordOutcome(jobId, claim.scheduledFor, {
         lastStatus: ok ? "ok" : "error",
         lastError: ok ? "" : String(job.error || `scheduled job ended with status ${job.status}`),
         lastMinuteKey: claim.scheduledFor.slice(0, 16)
@@ -648,6 +660,7 @@ async function dispatchCronOccurrence(store: CronStore, supervisor: JobSuperviso
       idempotent: true
     }
   );
+  await store.acknowledgeSubmitted(job.id, claim.occurrenceKey, claim.lease.token);
   await settleCronOccurrence(store, supervisor, claim, job.id);
 }
 

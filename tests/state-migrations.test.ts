@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cp, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { cp, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -134,11 +134,17 @@ test("cron migration refuses invalid legacy definitions before cutover", async (
     await mkdir(state, { recursive: true });
     const legacy = { schemaVersion: 1, jobs: [{ id: "broken", schedule: "60 * * * *", timezone: "UTC", tool: "text.echo" }] };
     await writeFile(join(state, "cron-jobs.json"), `${JSON.stringify(legacy, null, 2)}\n`);
+    const plan = await planStateMigration(state, { applicationVersion: "1.0.0", applicationCommit: "cron-v2" });
+    assert.equal(plan.rollbackCompatible, false);
     await assert.rejects(
       () => ensureStateCompatibility(state, { applicationVersion: "1.0.0", applicationCommit: "cron-v2" }),
       /cron migration refused legacy job broken/u
     );
     assert.deepEqual(JSON.parse(await readFile(join(state, "cron-jobs.json"), "utf8")), legacy);
+    const backupIds = await readdir(join(temporary, "state.backups"));
+    assert.equal(backupIds.length, 1);
+    const backup = JSON.parse(await readFile(join(temporary, "state.backups", backupIds[0], "state", "cron-jobs.json"), "utf8"));
+    assert.deepEqual(backup, legacy);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

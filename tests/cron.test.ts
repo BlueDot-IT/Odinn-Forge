@@ -121,7 +121,7 @@ test("independent supervisors submit and execute one occurrence exactly once", a
   await Promise.all([left.shutdown(), right.shutdown()]);
 });
 
-test("two gateway poll ticks and supervisors execute one overlapping long occurrence with its durable key", async () => {
+test("duplicate polls submit N once and submit N+1 once while N remains held for 70 seconds", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-cron-poll-overlap-"));
   const cronPath = join(root, "cron-jobs.json");
   const jobsPath = join(root, "jobs.json");
@@ -135,36 +135,42 @@ test("two gateway poll ticks and supervisors execute one overlapping long occurr
     nextRunAt: "2026-08-01T12:00:00.000Z"
   });
 
-  let executions = 0;
-  let releaseExecution!: () => void;
-  const executionStarted = new Promise<void>((resolve) => {
-    releaseExecution = resolve;
-  });
-  let markStarted!: () => void;
-  const started = new Promise<void>((resolve) => {
-    markStarted = resolve;
-  });
+  const executed: string[] = [];
+  let releaseFirst!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
   const execute = async (_payload: unknown, context: { job: { occurrenceKey?: string } }) => {
-    executions += 1;
-    assert.equal(context.job.occurrenceKey, "cron:seventy-second-job:2026-08-01T12:00:00.000Z");
-    markStarted();
-    await executionStarted;
+    const key = String(context.job.occurrenceKey);
+    executed.push(key);
+    if (key.endsWith("12:00:00.000Z")) {
+      markFirstStarted();
+      await firstHeld;
+    }
   };
-  const left = new JobSupervisor({ store: new FileJobStore(jobsPath), execute });
-  const right = new JobSupervisor({ store: new FileJobStore(jobsPath), execute });
+  const left = new JobSupervisor({ store: new FileJobStore(jobsPath), execute, concurrency: 1 });
+  const right = new JobSupervisor({ store: new FileJobStore(jobsPath), execute, concurrency: 1 });
   await Promise.all([left.start(), right.start()]);
 
+  const occurrenceN = "cron:seventy-second-job:2026-08-01T12:00:00.000Z";
+  const occurrenceN1 = "cron:seventy-second-job:2026-08-01T12:01:00.000Z";
   const firstTick = runDueCronJobs(leftCron, left, new Date("2026-08-01T12:00:30.000Z"));
-  await started;
-  const secondTick = runDueCronJobs(rightCron, right, new Date("2026-08-01T12:00:30.000Z"));
-  await secondTick;
-  assert.equal(executions, 1);
-  releaseExecution();
-  await firstTick;
+  await firstStarted;
+  const duplicateTick = runDueCronJobs(rightCron, right, new Date("2026-08-01T12:00:30.000Z"));
+  await duplicateTick;
+  const nextTick = runDueCronJobs(rightCron, right, new Date("2026-08-01T12:01:00.000Z"));
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (await right.get(occurrenceN1)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal((await right.get(occurrenceN1))?.status, "queued");
+  assert.deepEqual(executed, [occurrenceN]);
 
-  const occurrenceKey = "cron:seventy-second-job:2026-08-01T12:00:00.000Z";
-  assert.equal((await left.get(occurrenceKey))?.occurrenceKey, occurrenceKey);
-  assert.equal((await left.get(occurrenceKey))?.status, "completed");
+  releaseFirst();
+  await Promise.all([firstTick, nextTick]);
+  assert.deepEqual(executed.sort(), [occurrenceN, occurrenceN1].sort());
+  assert.equal((await left.get(occurrenceN))?.status, "completed");
+  assert.equal((await left.get(occurrenceN1))?.status, "completed");
   await Promise.all([left.shutdown(), right.shutdown()]);
 });
 
@@ -206,7 +212,55 @@ test("dispatch failure before job submission recovers the expired lease to the s
   await supervisor.shutdown();
 });
 
-test("failed cron execution records an error and releases its occurrence lease", async () => {
+test("failure after durable submit but before acknowledgment reuses the job and clears the recovered lease", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-cron-submit-ack-recovery-"));
+  const cron = new CronStore(join(root, "cron-jobs.json"));
+  await cron.create({ id: "ack-crash", schedule: "* * * * *", timezone: "UTC", tool: "text.echo", nextRunAt: "2026-08-01T12:00:00.000Z" });
+  const occurrenceKey = "cron:ack-crash:2026-08-01T12:00:00.000Z";
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let executions = 0;
+  const supervisor = new JobSupervisor({
+    store: new FileJobStore(join(root, "jobs.json")),
+    execute: async () => { executions += 1; await held; }
+  });
+  await supervisor.start();
+  const crashAfterSubmit = {
+    submit: async (...args: Parameters<JobSupervisor["submit"]>) => {
+      await supervisor.submit(...args);
+      throw new Error("synthetic crash after durable submit before acknowledgment");
+    }
+  } as unknown as JobSupervisor;
+  await runDueCronJobs(cron, crashAfterSubmit, new Date("2026-08-01T12:00:30.000Z"));
+  const leased = (await cron.list())[0];
+  assert.equal(leased.dispatchLease.occurrenceKey, occurrenceKey);
+  await cron.update("ack-crash", { dispatchLease: { ...leased.dispatchLease, expiresAt: "2026-08-01T12:00:59.000Z" } });
+
+  const recovered = runDueCronJobs(cron, supervisor, new Date("2026-08-01T12:01:00.000Z"));
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await cron.list())[0].dispatchLease === undefined) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal((await cron.list())[0].dispatchLease, undefined);
+  assert.equal(executions, 1);
+  release();
+  await recovered;
+  assert.equal((await supervisor.get(occurrenceKey))?.status, "completed");
+  await supervisor.shutdown();
+});
+
+test("out-of-order cron outcomes preserve the newest occurrence result", async () => {
+  const { left } = await cronStores();
+  await left.create({ id: "outcomes", schedule: "* * * * *", timezone: "UTC", tool: "text.echo" });
+  await left.recordOutcome("outcomes", "2026-08-01T12:01:00.000Z", { lastStatus: "ok", lastError: "" });
+  await left.recordOutcome("outcomes", "2026-08-01T12:00:00.000Z", { lastStatus: "error", lastError: "older failure" });
+  const persisted = (await left.list())[0];
+  assert.equal(persisted.lastRunAt, "2026-08-01T12:01:00.000Z");
+  assert.equal(persisted.lastStatus, "ok");
+  assert.equal(persisted.lastError, "");
+});
+
+test("failed cron execution records an error after submission acknowledgment", async () => {
   const { left } = await cronStores();
   const now = new Date("2026-08-01T12:00:30.000Z");
   await left.create({ id: "failing-job", schedule: "* * * * *", timezone: "UTC", tool: "text.echo", nextRunAt: "2026-08-01T12:00:00.000Z" });
@@ -225,8 +279,8 @@ test("failed cron execution records an error and releases its occurrence lease",
   }
   const failed = await supervisor.get(claim.occurrenceKey);
   assert.equal(failed?.status, "failed");
-  await left.completeOccurrence("failing-job", claim.occurrenceKey, claim.lease.token, {
-    lastRunAt: claim.scheduledFor,
+  await left.acknowledgeSubmitted("failing-job", claim.occurrenceKey, claim.lease.token);
+  await left.recordOutcome("failing-job", claim.scheduledFor, {
     lastStatus: "error",
     lastError: failed?.error || "unknown failure"
   });
@@ -236,8 +290,9 @@ test("failed cron execution records an error and releases its occurrence lease",
   await supervisor.shutdown();
 });
 
-test("next-wake calculation does not skip the earliest valid minute after an hour jump", () => {
-  assert.equal(nextCronWake("0 9 * * *", "UTC", new Date("2026-08-01T00:30:00.000Z")), "2026-08-01T09:00:00.000Z");
+test("next-wake hour jumps use the next local-hour boundary in UTC and fractional-offset zones", () => {
+  assert.equal(nextCronWake("0 13 * * *", "UTC", new Date("2026-08-01T12:30:00.000Z")), "2026-08-01T13:00:00.000Z");
+  assert.equal(nextCronWake("0 19 * * *", "Asia/Kolkata", new Date("2026-08-01T12:30:00.000Z")), "2026-08-01T13:30:00.000Z");
   assert.equal(nextCronWake("*/17 9-17 * * 1-5", "UTC", new Date("2026-08-03T00:00:00.000Z")), "2026-08-03T09:00:00.000Z");
 });
 
