@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { SqliteAuditStore } from "../packages/store-sqlite/src/audit.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -109,7 +110,9 @@ test("CLI runs a deterministic tool through the audited kernel path", async () =
   const result = JSON.parse(run.stdout);
   assert.equal(result.output.text, "ODINN_CLI_OK");
 
-  const audit = (await readFile(join(state, "audit.jsonl"), "utf8")).trim().split("\n").map((line: any) => JSON.parse(line));
+  const auditStore = new SqliteAuditStore(join(state, "db", "audit.sqlite"), { keyringPath: join(state, "audit.jsonl.keys.json") });
+  const audit = await auditStore.readAll();
+  auditStore.close();
   assert.deepEqual(audit.map((event: any) => event.type), ["task.policy", "task.started", "task.completed"]);
 
   const runs = spawnSync("node", ["apps/cli/src/cli.ts", "runs", "--state", state], {

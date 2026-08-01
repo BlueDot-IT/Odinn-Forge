@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./memory-index": "./src/memory-index.ts",
-    "./authoritative": "./src/authoritative.ts"
+    "./authoritative": "./src/authoritative.ts",
+    "./audit": "./src/audit.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"

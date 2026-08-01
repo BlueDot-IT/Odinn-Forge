@@ -28,12 +28,13 @@ async function handle(message: BrowserWorkerMessage) {
   queue = queue.then(async () => {
     let runLedger;
     let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
+    let auditStore: ReturnType<typeof createAuditStore> | undefined;
     try {
       const { payload, stateDir, workspaceRoot, config = {}, policy } = message;
       if (!payload?.task || !stateDir || !workspaceRoot) throw new Error("browser worker received an invalid task envelope");
-      const auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
+      auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
       const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
-      registry = createBuiltInRegistry({ workspaceRoot, stateDir, config, approvalStore });
+      registry = createBuiltInRegistry({ workspaceRoot, stateDir, config, approvalStore, auditStore });
       runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
       const result = await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: undefined, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId });
       process.send?.({ id: message.id, ok: true, result });
@@ -42,6 +43,7 @@ async function handle(message: BrowserWorkerMessage) {
     } finally {
       registry?.close();
       runLedger?.close();
+      auditStore?.close();
     }
   });
   await queue;

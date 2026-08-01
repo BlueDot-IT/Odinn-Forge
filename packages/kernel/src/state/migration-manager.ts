@@ -3,7 +3,7 @@ import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFi
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { AUDIT_SCHEMA_VERSION } from "@odinn/protocol";
 import { FileAuditStore } from "@odinn/store-file";
-import { inspectAuthoritativeRecordSchema, inspectExistingSqliteSchema } from "@odinn/store-sqlite";
+import { inspectAuthoritativeRecordSchema, inspectExistingSqliteSchema, SqliteAuditStore } from "@odinn/store-sqlite";
 import { STATE_MIGRATIONS, type StateMigrationDefinition, type StateMigrationResult } from "./migrations/index.ts";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
 import { withStateMutationLock } from "../state-mutation.ts";
@@ -555,10 +555,10 @@ async function refreshHostMetadata(
 async function verifyAuditIntegrity(stateRoot: string): Promise<{ valid: boolean; events: number; unsigned: number }> {
   const auditFilename = await auditFilenameFromConfig(stateRoot);
   const auditPath = join(stateRoot, auditFilename);
+  const databasePath = join(stateRoot, "db", `${basename(auditFilename, ".jsonl")}.sqlite`);
+  if (await exists(databasePath)) { const store = new SqliteAuditStore(databasePath, { keyringPath: `${auditPath}.keys.json` }); try { const result = await store.verifyIntegrity({ allowUnsigned: true }); return { valid: result.valid, events: result.events, unsigned: result.unsigned }; } finally { store.close(); } }
   if (!await exists(auditPath)) return { valid: true, events: 0, unsigned: 0 };
-  const store = new FileAuditStore(auditPath);
-  const result = await store.verifyIntegrity({ allowUnsigned: true });
-  return { valid: result.valid, events: result.events, unsigned: result.unsigned };
+  const store = new FileAuditStore(auditPath); const result = await store.verifyIntegrity({ allowUnsigned: true }); return { valid: result.valid, events: result.events, unsigned: result.unsigned };
 }
 
 async function auditFilenameFromConfig(stateRoot: string): Promise<string> {

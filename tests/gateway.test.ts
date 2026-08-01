@@ -19,6 +19,12 @@ import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/te
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
 
+async function readSseIds(response: Response, count: number) {
+  const reader = response.body!.getReader(); const decoder = new TextDecoder(); const ids: number[] = []; let buffer = "";
+  while (ids.length < count) { const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true }); const frames = buffer.split("\n\n"); buffer = frames.pop()!; for (const frame of frames) { const match = /^id: (\d+)$/mu.exec(frame); if (match && ids.length < count) ids.push(Number(match[1])); } }
+  return ids;
+}
+
 test("gateway exposes status, run execution, plans, and run summaries", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
@@ -71,6 +77,19 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
+});
+
+test("audit SSE uses exclusive durable sequence cursors across reconnects", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-audit-sse-")); const server = await createGatewayServer({ stateDir, workspaceRoot: root }); await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve)); const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const baseline = (await getJson(`${base}/audit`)).length; const firstAbort = new AbortController(); const first = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { signal: firstAbort.signal });
+    await postJson(`${base}/run`, { id: "sse-regression-run", tool: "text.echo", input: { text: "stream" } }); const firstIds = await readSseIds(first, 3); firstAbort.abort(); assert.deepEqual(firstIds, [baseline + 1, baseline + 2, baseline + 3]);
+    const unackedAbort = new AbortController(); const unacked = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { signal: unackedAbort.signal }); const unackedIds = await readSseIds(unacked, 1); unackedAbort.abort(); assert.deepEqual(unackedIds, [baseline + 1]);
+    assert.deepEqual(await postJson(`${base}/events/ack`, { subscriber: "sse-regression", sequence: baseline + 2 }), { ok: true, subscriber: "sse-regression", sequence: baseline + 2 });
+    const reconnectAbort = new AbortController(); const reconnect = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { signal: reconnectAbort.signal }); const reconnectIds = await readSseIds(reconnect, 1); reconnectAbort.abort(); assert.deepEqual(reconnectIds, [baseline + 3]);
+    const headerAbort = new AbortController(); const headerReconnect = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { headers: { "last-event-id": String(baseline + 2) }, signal: headerAbort.signal }); const headerIds = await readSseIds(headerReconnect, 1); headerAbort.abort(); assert.deepEqual(headerIds, [baseline + 3]);
+    await postJson(`${base}/events/ack`, { subscriber: "sse-regression", sequence: baseline + 100 }, 409);
+  } finally { await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve())); }
 });
 
 test("gateway diagnostics expose safe state and errors carry correlation metadata", async () => {

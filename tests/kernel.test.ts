@@ -31,7 +31,7 @@ test("kernel executes an allowed deterministic tool and audits the run", async (
   assert.equal(result.ok, true);
   assert.equal(result.output.text, "ODINN_KERNEL_OK");
 
-  const audit = JSON.parse(`[${(await readFile(join(root, ".odinn", "audit.jsonl"), "utf8")).trim().split("\n").join(",")}]`);
+  const audit = await auditStore.readAll();
   assert.deepEqual(audit.map((event: any) => event.type), ["task.policy", "task.started", "task.completed"]);
   assert.equal(audit[0].decision, "allow");
 
@@ -373,8 +373,7 @@ test("kernel denies unknown tools before execution and records the denial", asyn
     /unknown tool: shell\.exec/
   );
 
-  const line = (await readFile(join(root, ".odinn", "audit.jsonl"), "utf8")).trim();
-  const event = JSON.parse(line);
+  const [event] = await auditStore.readAll();
   assert.equal(event.type, "task.policy");
   assert.equal(event.decision, "deny");
 

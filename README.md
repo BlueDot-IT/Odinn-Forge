@@ -270,6 +270,9 @@ odinn audit verify    # Check the local activity record
 odinn doctor          # Create a safe diagnostic summary
 ```
 
+Audit migration, cursor streaming, verification, archive, retention, soak, and
+benchmark procedures are documented in [Audit storage operations](docs/audit-storage.md).
+
 ## Documentation
 
 - [Documentation hub](docs/README.md) — the complete navigation index for

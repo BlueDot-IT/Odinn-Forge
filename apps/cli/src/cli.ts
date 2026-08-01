@@ -549,8 +549,8 @@ async function onboard(args: any) {
   }
   const current = await status(args);
   const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
-  const runs = await store.readRuns();
-  console.log(renderOnboardingSummary({ ...current, configPath, runs }));
+  try { console.log(renderOnboardingSummary({ ...current, configPath, runs: await store.readRuns() })); }
+  finally { store.close(); }
 }
 
 function shouldRunGuidedOnboarding(args: any) {
@@ -597,7 +597,8 @@ async function guidedOnboard(args: any, state: any, configPath: any) {
         }
         if (action === "details") {
           const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
-          prompts.note(renderOnboardingDetails({ ...current, configPath, runs: await store.readRuns() }), "Technical details");
+          try { prompts.note(renderOnboardingDetails({ ...current, configPath, runs: await store.readRuns() }), "Technical details"); }
+          finally { store.close(); }
           continue;
         }
         if (action === "open") {
@@ -1247,13 +1248,12 @@ async function doctor(args: any) {
   const auditStore = createAuditStore(auditPath);
   let audit = { valid: true, events: 0, unsigned: 0, failures: [] as any[] };
   try {
-    const auditExists = await access(auditPath).then(() => true).catch(() => false);
-    if (auditExists) {
-      const verification: any = await auditStore.verifyIntegrity({ allowUnsigned: true });
-      audit = { valid: verification.valid, events: verification.events, unsigned: verification.unsigned, failures: verification.failures ?? [] };
-    }
+    const verification: any = await auditStore.verifyIntegrity({ allowUnsigned: true });
+    audit = { valid: verification.valid, events: verification.events, unsigned: verification.unsigned, failures: verification.failures ?? [] };
   } catch (error) {
     audit = { valid: false, events: 0, unsigned: 0, failures: [{ reason: "audit verification unavailable" }] };
+  } finally {
+    auditStore.close();
   }
   const approvals = createApprovalStore({ path: join(state, "approvals.json") });
   const pendingApprovals = approvals.list();
@@ -1311,6 +1311,7 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
     return { ok: false, kind: "missing-model", message: "No AI model is selected. Choose an AI connection first." };
   }
   const auditStore = createAuditStore(join(state, "onboarding-verification.jsonl"));
+  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore });
   const policy = createDefaultPolicy({
     ...config.policy,
     allowedCapabilities: Array.from(new Set([...(config.policy?.allowedCapabilities ?? []), "model.chat"]))
@@ -1331,7 +1332,7 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
       },
       auditStore,
       policy,
-      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore })
+      registry
     });
     const content = String(result?.output?.content ?? "").trim();
     if (!content) throw new Error("AI provider returned an empty response");
@@ -1345,6 +1346,9 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
     const detail = String(error?.message ?? error);
     const classified = classifyConnectionFailure(detail);
     return { ok: false, ...classified, detail };
+  } finally {
+    registry.close();
+    auditStore.close();
   }
 }
 
@@ -2496,7 +2500,8 @@ async function tui(args: any) {
   const render = async () => {
     const current = await status(args);
     const store = createAuditStore(join(current.state, current.auditLog ?? "audit.jsonl"));
-    return renderTui({ ...current, runs: await store.readRuns() });
+    try { return renderTui({ ...current, runs: await store.readRuns() }); }
+    finally { store.close(); }
   };
   if (!hasFlag(args, "--watch")) {
     console.log(await render());
@@ -2535,16 +2540,19 @@ async function run(args: any) {
     }
   } else {
     const runLedger = createRunLedger({ stateDir: state, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+    const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+    const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore });
     try {
-      const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
       result = await runTask({
         task: { tool, input, actor: "cli" },
         auditStore,
         policy,
-        registry: createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore }),
+        registry,
         runLedger
       });
     } finally {
+      registry.close();
+      auditStore.close();
       runLedger.close();
     }
   }
@@ -2584,17 +2592,21 @@ async function plan(args: any) {
     return;
   }
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+  const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore });
   try {
     const result = await runPlan({
       plan: parsedPlan,
-      auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
+      auditStore,
       policy,
-      registry: createBuiltInRegistry({ workspaceRoot, stateDir: state, config }),
+      registry,
       actor: "cli",
       runLedger
     });
     await printJson(result);
   } finally {
+    registry.close();
+    auditStore.close();
     runLedger.close();
   }
 }
@@ -2733,6 +2745,7 @@ async function extensionCommand(args: any) {
           runtime: { runLedger: runtime.ledger, auditStore, policy: createDefaultPolicy(config.policy), workspaceRoot: invocationRoot(), actor: "cli" }
         }));
       } finally {
+        auditStore.close();
         runtime.ledger.close();
       }
       break;
@@ -2904,17 +2917,20 @@ async function runRecordTool(args: any, tool: any, input: any) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+  const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore });
   try {
-    const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
     const result = await runTask({
       task: { tool, input, actor: "cli" },
       auditStore,
       policy: createDefaultPolicy(config.policy),
-      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore }),
+      registry,
       runLedger
     });
     await printJson(result.output);
   } finally {
+    registry.close();
+    auditStore.close();
     runLedger.close();
   }
 }
@@ -3007,14 +3023,14 @@ async function branchCommand(command: any, args: any) {
 }
 
 async function capsuleCommand(args: any) {
-  const [subcommand, ...rest] = args; const { state, runtime } = runtimeFor(rest); try {
+  const [subcommand, ...rest] = args; const { state, runtime } = runtimeFor(rest); let replayAuditStore: any; const replayRegistries = new Map<string, any>(); try {
     const path = rest.find((value: any) => !value.startsWith("--"));
     if (subcommand === "export") await printJson(await runtime.capsules.export(path, { output: option(rest, "--output") }));
     else if (subcommand === "inspect" || subcommand === "verify") await printJson(await runtime.capsules.verify(path));
     else if (subcommand === "replay") {
       const mode = option(rest, "--mode", "verification-only");
       const config = await readConfig(state);
-      const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+      replayAuditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
       await printJson(await runtime.capsules.replay(path, {
         mode,
         workspace: option(rest, "--workspace", ""),
@@ -3025,29 +3041,30 @@ async function capsuleCommand(args: any) {
             const issued = runtime.capabilities.issue({ runId: taskId, stepId: `replay-step-${stepIndex}`, toolName: tool, scopes: [tool], resourceConstraints: input.resource ?? {} });
             input = { ...input, capabilityToken: issued.token };
           }
+          let registry = replayRegistries.get(workspaceRoot);
+          if (!registry) { registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore: replayAuditStore }); replayRegistries.set(workspaceRoot, registry); }
           return runTask({
             task: { id: taskId, tool, input, actor: "capsule-replay" },
-            auditStore,
+            auditStore: replayAuditStore,
             policy: createDefaultPolicy(config.policy),
-            registry: createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore }),
+            registry,
             runLedger: runtime.ledger
           });
         } : undefined
       }));
     }
     else throw new Error("capsule requires export, inspect, verify, or replay");
-  } finally { runtime.ledger.close(); }
+  } finally { for (const registry of replayRegistries.values()) registry.close(); replayAuditStore?.close(); runtime.ledger.close(); }
 }
 
 async function counterfactualCommand(args: any) {
-  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
+  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); let executionAuditStore: any; const executionRegistries = new Map<string, any>(); try {
     if (subcommand === "run") {
       const files = []; for (let i = 0; i < rest.length; i += 1) if (rest[i] === "--plan-file") files.push(rest[i + 1]);
       const created = await runtime.counterfactual.create({ sourceRunId: option(rest, "--source-run"), sourceStepId: option(rest, "--from"), plans: await Promise.all(files.map(async (file: any) => parseStructuredDocument(await readFile(resolveInvocationPath(file), "utf8"), file))), workspaceRoot: invocationRoot() });
       if (!hasFlag(rest, "--execute")) { await printJson(created); return; }
       const config = await readConfig(stateDir(rest));
-      const auditStore = createAuditStore(join(stateDir(rest), config.auditLog ?? "audit.jsonl"));
-      const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: stateDir(rest), config, auditStore });
+      executionAuditStore = createAuditStore(join(stateDir(rest), config.auditLog ?? "audit.jsonl"));
       const result = await runtime.counterfactual.execute(created.groupId, {
         proof: {
           run: async (runId: any, contract: any, { workspaceRoot = invocationRoot() }: any = {}) => {
@@ -3065,7 +3082,11 @@ async function counterfactualCommand(args: any) {
         capabilities: runtime.capabilities,
         policy: createDefaultPolicy(config.policy),
         workspaceRoot: invocationRoot(),
-        executor: async (task: any, context: any) => runTask({ task, auditStore, policy: context.policy, registry: createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore }), runLedger: runtime.ledger })
+        executor: async (task: any, context: any) => {
+          let registry = executionRegistries.get(context.workspaceRoot);
+          if (!registry) { registry = createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore: executionAuditStore }); executionRegistries.set(context.workspaceRoot, registry); }
+          return runTask({ task, auditStore: executionAuditStore, policy: context.policy, registry, runLedger: runtime.ledger });
+        }
       });
       await printJson({ ...created, execution: result });
       return;
@@ -3073,7 +3094,7 @@ async function counterfactualCommand(args: any) {
     if (subcommand === "compare") { await printJson(runtime.counterfactual.compare(rest[0])); return; }
     if (subcommand === "select") { await printJson(await runtime.counterfactual.select(rest[0], option(rest, "--run"), { apply: hasFlag(rest, "--apply") })); return; }
     throw new Error("counterfactual requires run, compare, or select");
-  } finally { runtime.ledger.close(); }
+  } finally { for (const registry of executionRegistries.values()) registry.close(); executionAuditStore?.close(); runtime.ledger.close(); }
 }
 
 async function routingCommand(args: any) {
@@ -3089,16 +3110,12 @@ async function audit(args: any) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const store = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-  const subcommand = args.find((value: any) => !value.startsWith("--"));
-  if (subcommand === "verify") {
-    await printJson(await store.verifyIntegrity({ allowUnsigned: hasFlag(args, "--allow-unsigned") }));
-    return;
-  }
-  if (subcommand === "rotate-key") {
-    await printJson(await store.rotateKey());
-    return;
-  }
-  await printJson(await store.readAll());
+  try {
+    const subcommand = args.find((value: any) => !value.startsWith("--"));
+    if (subcommand === "verify") { await printJson(await store.verifyIntegrity({ allowUnsigned: hasFlag(args, "--allow-unsigned") })); return; }
+    if (subcommand === "rotate-key") { await printJson(await store.rotateKey()); return; }
+    await printJson(await store.readAll());
+  } finally { store.close(); }
 }
 
 async function runs(args: any) {
@@ -3106,7 +3123,8 @@ async function runs(args: any) {
   const config = await readConfig(state);
   const limit = Number.parseInt(option(args, "--limit", "20"), 10);
   const store = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-  await printJson((await store.readRuns()).slice(0, Number.isFinite(limit) ? limit : 20));
+  try { await printJson((await store.readRuns()).slice(0, Number.isFinite(limit) ? limit : 20)); }
+  finally { store.close(); }
 }
 
 async function show(args: any) {
@@ -3115,9 +3133,8 @@ async function show(args: any) {
   if (!runId) throw new Error("show requires --run");
   const config = await readConfig(state);
   const store = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-  const run = await store.readRun(runId);
-  if (!run) throw new Error(`run not found: ${runId}`);
-  await printJson(run);
+  try { const run = await store.readRun(runId); if (!run) throw new Error(`run not found: ${runId}`); await printJson(run); }
+  finally { store.close(); }
 }
 
 async function readConfig(state: any) {

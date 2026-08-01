@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -54,7 +54,7 @@ function toolResponse(request: any, callId: string) {
 }
 
 async function auditText(fx: Awaited<ReturnType<typeof fixture>>) {
-  return readFile(join(fx.root, ".odinn", "audit.jsonl"), "utf8");
+  return (await fx.auditStore.readAll()).map(JSON.stringify).join("\n");
 }
 
 test("malformed arguments never dispatch, audit without raw payload, and valid {} remains compatible", async () => {

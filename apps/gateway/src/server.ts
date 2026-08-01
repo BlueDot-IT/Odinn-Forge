@@ -1133,6 +1133,16 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/events") {
         return streamAuditEvents(request, response, auditStore, url);
       }
+      if (request.method === "POST" && url.pathname === "/events/ack") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const subscriber = String(body.subscriber ?? "").trim();
+        const sequence = Number(body.sequence);
+        if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(subscriber)) throw new GatewayError(400, "audit subscriber id is invalid");
+        if (!Number.isSafeInteger(sequence) || sequence < 0) throw new GatewayError(400, "audit subscriber sequence is invalid");
+        try { await auditStore.ackCursor(subscriber, sequence); }
+        catch (error: any) { throw new GatewayError(409, error?.message || "audit subscriber cursor could not be acknowledged"); }
+        return json(response, 200, { ok: true, subscriber, sequence: await auditStore.getCursor(subscriber) });
+      }
       if (request.method === "GET" && url.pathname === "/approvals") {
         return json(response, 200, approvalStore.list());
       }
@@ -1478,6 +1488,7 @@ export async function createGatewayServer({
       .then(() => {
         let registryError: unknown;
         try { registry.close(); } catch (error) { registryError = error; }
+        try { auditStore.close?.(); } catch (error) { registryError ??= error; }
         close((serverError: unknown) => callback?.(serverError ?? registryError));
       })
       .catch((error: any) => callback?.(error));
@@ -1588,8 +1599,11 @@ function safeCapsulePath(state: any, candidate: any) {
 }
 
 async function streamAuditEvents(request: any, response: any, auditStore: any, url: any) {
-  const initial = Number.parseInt(request.headers["last-event-id"] ?? url.searchParams.get("since") ?? "-1", 10);
-  let cursor = Number.isFinite(initial) ? Math.max(-1, initial) : -1;
+  const subscriber = String(url.searchParams.get("subscriber") ?? "").trim().slice(0, 200);
+  if (subscriber && !/^[A-Za-z0-9._:-]{1,128}$/u.test(subscriber)) throw new GatewayError(400, "audit subscriber id is invalid");
+  const initial = Number.parseInt(request.headers["last-event-id"] ?? url.searchParams.get("since") ?? "0", 10);
+  let cursor = Number.isFinite(initial) ? Math.max(0, initial) : 0;
+  if (subscriber && auditStore.getCursor) cursor = Math.max(cursor, await auditStore.getCursor(subscriber));
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-store",
@@ -1597,18 +1611,37 @@ async function streamAuditEvents(request: any, response: any, auditStore: any, u
     "x-content-type-options": "nosniff"
   });
   response.write("retry: 1000\n\n");
-  const poll = setInterval(async () => {
+  let draining = false;
+  let pending = true;
+  let closed = false;
+  const drain = async () => {
+    if (draining || closed) { pending = true; return; }
+    draining = true;
     try {
-      const events = await auditStore.readAll();
-      for (let index = cursor + 1; index < events.length; index += 1) {
-        response.write(`id: ${index}\ndata: ${JSON.stringify(events[index])}\n\n`);
-      }
-      cursor = events.length - 1;
+      do {
+        pending = false;
+        const page = await auditStore.readPage({ afterSequence: cursor, limit: 500 });
+        for (const item of page) {
+          if (closed) return;
+          if (!response.write(`id: ${item.sequence}\ndata: ${JSON.stringify(item.event)}\n\n`)) {
+            await new Promise<void>((resolve) => { response.once("drain", resolve); request.once("close", resolve); });
+          }
+          if (closed) return;
+          cursor = item.sequence;
+        }
+        if (page.length === 500) pending = true;
+      } while (pending && !closed);
     } catch (error: any) {
       response.write(`event: error\ndata: ${JSON.stringify(publicError(error, String(request.headers["x-odinn-request-id"] || "audit-stream")))}\n\n`);
+    } finally {
+      draining = false;
+      if (pending && !closed) void drain();
     }
-  }, 500);
-  request.on("close", () => clearInterval(poll));
+  };
+  const unsubscribe = auditStore.subscribe(() => { pending = true; void drain(); });
+  const heartbeat = setInterval(() => { if (!closed) { response.write(": keepalive\n\n"); pending = true; void drain(); } }, 15_000);
+  request.on("close", () => { closed = true; clearInterval(heartbeat); unsubscribe(); });
+  await drain();
 }
 
 const HOSTED_PROVIDER_ENDPOINTS = new Set<string>();
