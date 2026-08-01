@@ -148,10 +148,11 @@ test("bounded reader rejects an ancestor swap before helper admission", async ()
 
 test("bounded reader rejects an ancestor swap between lstat and open after restoring paths", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-reader-open-race-"));
+  const ancestor = join(root, "ancestor");
+  const originalAncestor = join(root, "ancestor-original");
+  const replacementAncestor = join(root, "replacement-ancestor");
+  let replacementInstalled = false;
   try {
-    const ancestor = join(root, "ancestor");
-    const originalAncestor = join(root, "ancestor-original");
-    const replacementAncestor = join(root, "replacement-ancestor");
     await mkdir(ancestor, { recursive: true });
     await mkdir(replacementAncestor, { recursive: true });
     await writeFile(join(ancestor, "target.txt"), "safe\n", "utf8");
@@ -167,11 +168,14 @@ test("bounded reader rejects an ancestor swap between lstat and open after resto
           afterLstatBeforeOpenRan = true;
           await rename(ancestor, originalAncestor);
           await rename(replacementAncestor, ancestor);
+          replacementInstalled = true;
         },
         afterOpen: async () => {
           afterOpenRan = true;
+          if (process.platform === "win32") return;
           await rename(ancestor, replacementAncestor);
           await rename(originalAncestor, ancestor);
+          replacementInstalled = false;
         }
       }),
       /changed during secure open/u
@@ -179,6 +183,10 @@ test("bounded reader rejects an ancestor swap between lstat and open after resto
     assert.equal(afterLstatBeforeOpenRan, true);
     assert.equal(afterOpenRan, true);
   } finally {
+    if (replacementInstalled) {
+      await rename(ancestor, replacementAncestor);
+      await rename(originalAncestor, ancestor);
+    }
     await rm(root, { recursive: true, force: true });
   }
 });
