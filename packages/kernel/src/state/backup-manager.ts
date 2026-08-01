@@ -29,6 +29,7 @@ const EPHEMERAL_STATE_FILES = Object.freeze([
   "db/audit.sqlite-wal",
   "db/audit.sqlite.notify"
 ]);
+const isEphemeralStateFile = (path: string) => EPHEMERAL_STATE_FILES.includes(path) || /^db\/.+\.sqlite-(?:shm|wal)$/u.test(path) || /^db\/.+\.sqlite\.notify$/u.test(path);
 
 export type BackupApplicationIdentity = {
   version: string;
@@ -116,10 +117,12 @@ async function createStateBackupUnlocked(
       const source = join(stateRoot, file);
       const target = join(staging, file);
       await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-      if (["db/odinn.sqlite", "db/records.sqlite", "db/audit.sqlite"].includes(file)) await copySqliteSnapshot(source, target);
+      if (/^db\/.+\.sqlite$/u.test(file)) await copySqliteSnapshot(source, target);
       else await cp(source, target, { force: false, errorOnExist: true });
       await chmod(target, 0o600);
     }
+    const stagedAudit = await verifyAudit(staging);
+    if (!stagedAudit.valid) throw new Error("state backup refused because the staged audit snapshot is inconsistent");
     const manifest: StateBackupManifest = {
       schemaVersion: BACKUP_SCHEMA_VERSION,
       kind: "odinn-state-backup",
@@ -429,7 +432,7 @@ async function verifyAudit(stateRoot: string): Promise<{ valid: boolean; events:
     throw new Error("config.auditLog must be audit.jsonl or an audit-*.jsonl filename");
   }
   const path = join(stateRoot, filename);
-  const databasePath = join(stateRoot, "db", "audit.sqlite");
+  const databasePath = join(stateRoot, "db", `${basename(filename, ".jsonl")}.sqlite`);
   if (!await exists(databasePath) && !await exists(path)) return { valid: true, events: 0, unsigned: 0 };
   if (!await exists(databasePath)) {
     const result = await new FileAuditStore(path).verifyIntegrity({ allowUnsigned: true });
@@ -446,7 +449,7 @@ async function appendLifecycleAudit(stateRoot: string, type: string, message: st
   const filename = String(config.auditLog ?? "audit.jsonl");
   if (!/^audit(?:-[A-Za-z0-9._-]+)?\.jsonl$/u.test(filename)) return;
   const legacyPath = join(stateRoot, filename);
-  const databasePath = join(stateRoot, "db", "audit.sqlite");
+  const databasePath = join(stateRoot, "db", `${basename(filename, ".jsonl")}.sqlite`);
   const store = await exists(databasePath) ? new SqliteAuditStore(databasePath, { keyringPath: `${legacyPath}.keys.json` }) : new FileAuditStore(legacyPath);
   await store.append({
     runId: `lifecycle_${randomUUID()}`,
@@ -464,7 +467,7 @@ async function payloadFiles(root: string, includeSensitiveState: boolean, sensit
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       const name = relative(root, path).replaceAll("\\", "/");
-      if (EPHEMERAL_STATE_FILES.includes(name)) continue;
+      if (isEphemeralStateFile(name)) continue;
       if (!includeSensitiveState && excludedFromNormalBackup(name, entry.isDirectory(), sensitiveExclusions)) continue;
       const metadata = await lstat(path);
       if (metadata.isSymbolicLink()) throw new Error(`state contains a symbolic link: ${name}`);

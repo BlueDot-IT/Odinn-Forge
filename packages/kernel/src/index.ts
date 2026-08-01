@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
@@ -1158,7 +1158,7 @@ export async function runPlan({
 
 export function createAuditStore(path: any = ".odinn/audit.jsonl") {
   const legacyPath = resolve(String(path));
-  const databasePath = join(dirname(legacyPath), "db", "audit.sqlite");
+  const databasePath = join(dirname(legacyPath), "db", `${basename(legacyPath, ".jsonl")}.sqlite`);
   if (existsSync(legacyPath) && !auditMigrationStatus(databasePath)?.complete) migrateLegacyAuditToSqlite({ legacyPath, databasePath, keyringPath: `${legacyPath}.keys.json` });
   return new SqliteAuditStore(databasePath, { keyringPath: `${legacyPath}.keys.json` });
 }

@@ -24,7 +24,9 @@ resumes exclusively after that sequence. Supplying a bounded `subscriber` query
 parameter also persists monotonic acknowledgement state. Appenders publish an
 advisory cross-process notification after commit; subscribers always drain
 bounded `sequence > cursor` pages, so a missed or coalesced notification cannot
-lose or duplicate an event. Keepalive comments do not query storage.
+lose or duplicate an event. The 15-second keepalive also performs a bounded
+indexed cursor drain to repair a completely lost notification without scanning
+history.
 
 ## Verification, rotation, archives, and retention
 

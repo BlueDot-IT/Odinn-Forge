@@ -1616,6 +1616,7 @@ async function streamAuditEvents(request: any, response: any, auditStore: any, u
           if (!response.write(`id: ${item.sequence}\ndata: ${JSON.stringify(item.event)}\n\n`)) {
             await new Promise<void>((resolve) => { response.once("drain", resolve); request.once("close", resolve); });
           }
+          if (closed) return;
           cursor = item.sequence;
         }
         if (page.length && subscriber && auditStore.ackCursor) await auditStore.ackCursor(subscriber, cursor);
@@ -1629,7 +1630,7 @@ async function streamAuditEvents(request: any, response: any, auditStore: any, u
     }
   };
   const unsubscribe = auditStore.subscribe(() => { pending = true; void drain(); });
-  const heartbeat = setInterval(() => { if (!closed) response.write(": keepalive\n\n"); }, 15_000);
+  const heartbeat = setInterval(() => { if (!closed) { response.write(": keepalive\n\n"); pending = true; void drain(); } }, 15_000);
   request.on("close", () => { closed = true; clearInterval(heartbeat); unsubscribe(); });
   await drain();
 }
