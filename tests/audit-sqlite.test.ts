@@ -108,6 +108,16 @@ test("retention refuses to launder a tampered online chain into a newly signed a
   store.db.prepare("UPDATE audit_events SET event_json=? WHERE sequence=1").run(JSON.stringify(event("tampered"))); await assert.rejects(store.exportArchive(join(root, "archive.jsonl"), 1), /integrity verification required/u);
 });
 
+test("archive export never clobbers or removes existing targets", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-archive-no-clobber-")); t.after(() => rm(root, { recursive: true, force: true })); const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close()); await store.append(event("one")); const archive = join(root, "archive.jsonl"); const manifest = `${archive}.manifest.json`; await writeFile(archive, "existing archive\n"); await writeFile(manifest, "existing manifest\n");
+  await assert.rejects(store.exportArchive(archive, 1), /EEXIST/u); assert.equal(await readFile(archive, "utf8"), "existing archive\n"); assert.equal(await readFile(manifest, "utf8"), "existing manifest\n");
+});
+
+test("retention requires an archive ending at the exact boundary", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-retention-boundary-")); t.after(() => rm(root, { recursive: true, force: true })); const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close()); await store.append(event("one")); await store.append(event("two")); await store.exportArchive(join(root, "archive.jsonl"), 2);
+  await assert.rejects(store.applyRetention(1), /verified archive required/u); assert.equal((await store.verifyIntegrity({ allowUnsigned: false })).valid, true);
+});
+
 test("successive retention archives remain cumulative and independently verifiable", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-audit-cumulative-")); t.after(() => rm(root, { recursive: true, force: true })); const path = join(root, "audit.sqlite"); const store = new SqliteAuditStore(path, { keyringPath: join(root, "keys.json") }); t.after(() => store.close());
   await store.append(event("one")); const firstPath = join(root, "first.jsonl"); await store.exportArchive(firstPath, 1); await store.applyRetention(1); await store.append(event("two")); const secondPath = join(root, "second.jsonl"); const second = await store.exportArchive(secondPath, 2); assert.equal(second.events, 2); await store.applyRetention(2);
@@ -119,4 +129,9 @@ test("retained segment boundaries remain bound to archived event signatures", as
   await store.append(event("one")); store.rotateSegment(); await store.append(event("two")); await store.exportArchive(join(root, "archive.jsonl"), 2); await store.applyRetention(2);
   store.db.exec("UPDATE audit_segments SET final_signature='forged' WHERE id=1; UPDATE audit_segments SET anchor_signature='forged' WHERE id=2;");
   const verification = await store.verifyIntegrity({ allowUnsigned: false }); assert.equal(verification.valid, false); assert.ok(verification.failures.some((failure) => failure.reason === "audit segment final signature mismatch"));
+});
+
+test("retained signed segment inventory detects deleted rotation history", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-retained-inventory-")); t.after(() => rm(root, { recursive: true, force: true })); const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close()); await store.append(event("one")); store.rotateSegment(); await store.append(event("two")); await store.exportArchive(join(root, "archive.jsonl"), 2); await store.applyRetention(2);
+  store.db.exec("DELETE FROM audit_segments WHERE id=1; UPDATE audit_segments SET first_sequence=1,anchor_signature=NULL WHERE id=2;"); const verification = await store.verifyIntegrity({ allowUnsigned: false }); assert.equal(verification.valid, false); assert.ok(verification.failures.some((failure) => failure.reason === "retained audit segment inventory mismatch"));
 });
