@@ -495,6 +495,15 @@ export class FileJobStore {
     });
   }
 
+  async claim(id: string, patch: JsonObject) {
+    return this.mutate((state) => {
+      const current = state.jobs[id];
+      if (!current || current.status !== "queued") return undefined;
+      state.jobs[id] = normalizeJob({ ...current, ...patch, id, updatedAt: new Date().toISOString() });
+      return state.jobs[id];
+    });
+  }
+
   async update(id: string, patch: JsonObject) {
     return this.mutate((state) => {
       const current = state.jobs[id];
@@ -587,7 +596,7 @@ function emptyJobState(): JobState {
 }
 
 function normalizeJob(job: JsonObject): Job {
-  return {
+  const normalized: Job = {
     schemaVersion: STORE_SCHEMA_VERSION,
     id: String(job.id),
     status: String(job.status ?? "queued"),
@@ -604,6 +613,11 @@ function normalizeJob(job: JsonObject): Job {
     error: job.error,
     recoveredAt: job.recoveredAt
   };
+  if (typeof job.occurrenceKey === "string") normalized.occurrenceKey = job.occurrenceKey;
+  if (typeof job.scheduledFor === "string") normalized.scheduledFor = job.scheduledFor;
+  if (typeof job.nextRunAt === "string" || job.nextRunAt === null) normalized.nextRunAt = job.nextRunAt;
+  if (job.dispatchLease && typeof job.dispatchLease === "object" && !Array.isArray(job.dispatchLease)) normalized.dispatchLease = job.dispatchLease;
+  return normalized;
 }
 
 function migrateRecord(record: unknown): StoredRecord {

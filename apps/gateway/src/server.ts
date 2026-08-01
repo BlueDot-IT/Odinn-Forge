@@ -89,31 +89,37 @@ class GatewayError extends Error {
   }
 }
 
-class CronStore {
+const CRON_SCHEMA_VERSION = 2;
+const CRON_DISPATCH_LEASE_MS = 10 * 60 * 1000;
+
+export class CronStore {
   path: string;
   writeChain: Promise<unknown> = Promise.resolve();
   constructor(path: string) { this.path = path; }
   async read() {
     try {
       const value = JSON.parse(await readFile(this.path, "utf8"));
-      return value?.schemaVersion === 1 && Array.isArray(value.jobs) ? value : { schemaVersion: 1, jobs: [] };
+      return (value?.schemaVersion === 1 || value?.schemaVersion === CRON_SCHEMA_VERSION) && Array.isArray(value.jobs)
+        ? { schemaVersion: CRON_SCHEMA_VERSION, jobs: value.jobs.map((job: any) => normalizeCronJob(job)) }
+        : { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
     } catch (error: any) {
-      if (error?.code === "ENOENT") return { schemaVersion: 1, jobs: [] };
+      if (error?.code === "ENOENT") return { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
       throw error;
     }
   }
   async list() { return (await this.read()).jobs.sort((left: any, right: any) => String(left.name).localeCompare(String(right.name))); }
   async mutate(operation: (jobs: any[]) => any) {
-    const pending = this.writeChain.then(async () => {
+    const pending = this.writeChain.then(() => withStateMutationLock(dirname(this.path), async () => {
       const state = await this.read();
       const result = await operation(state.jobs);
+      state.schemaVersion = CRON_SCHEMA_VERSION;
       await mkdir(dirname(this.path), { recursive: true });
       const temporary = `${this.path}.${process.pid}.${Date.now()}.tmp`;
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
       await rename(temporary, this.path);
       await chmod(this.path, 0o600);
       return result;
-    });
+    }));
     this.writeChain = pending.catch(() => undefined);
     return pending;
   }
@@ -129,7 +135,16 @@ class CronStore {
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
-      jobs[index] = normalizeCronJob({ ...jobs[index], ...patch, id, updatedAt: new Date().toISOString() });
+      const current = normalizeCronJob(jobs[index]);
+      const scheduleChanged = patch.schedule !== undefined || patch.timezone !== undefined;
+      if (scheduleChanged && current.dispatchLease) throw new GatewayError(409, "cannot change an active cron schedule until its occurrence lease settles");
+      jobs[index] = normalizeCronJob({
+        ...current,
+        ...patch,
+        ...(scheduleChanged ? { nextRunAt: undefined, scheduledFor: undefined, dispatchLease: undefined } : {}),
+        id,
+        updatedAt: new Date().toISOString()
+      });
       return jobs[index];
     });
   }
@@ -142,8 +157,61 @@ class CronStore {
   }
   async nextWake() {
     const enabled = (await this.list()).filter((job: any) => job.enabled);
-    const values = enabled.map((job: any) => nextCronWake(job.schedule, job.timezone)).filter(Boolean).sort();
+    const values = enabled.map((job: any) => job.nextRunAt || nextCronWake(job.schedule, job.timezone)).filter(Boolean).sort();
     return values[0] ?? null;
+  }
+
+  async claimDueOccurrence(id: string, now = new Date(), ownerId = `gateway:${process.pid}:${randomUUID()}`) {
+    return this.mutate((jobs) => {
+      const index = jobs.findIndex((item: any) => item.id === id);
+      if (index < 0) throw new GatewayError(404, "cron job not found");
+      const current = normalizeCronJob(jobs[index]);
+      const existingLease = current.dispatchLease && typeof current.dispatchLease === "object" ? current.dispatchLease : undefined;
+      const leaseExpiresAt = existingLease ? Date.parse(String(existingLease.expiresAt || "")) : Number.NaN;
+      const leaseIsActive = existingLease && Number.isFinite(leaseExpiresAt) && leaseExpiresAt > now.getTime();
+      if (current.enabled && leaseIsActive) {
+        jobs[index] = current;
+        return { claimed: false, alreadyDispatched: true, job: current };
+      }
+      const due = Boolean(existingLease && !leaseIsActive) || Boolean(current.nextRunAt && Date.parse(current.nextRunAt) <= now.getTime());
+      if (!current.enabled || !due) {
+        jobs[index] = current;
+        return { claimed: false, alreadyDispatched: false, job: current };
+      }
+      const scheduledFor = String(existingLease?.scheduledFor || current.scheduledFor || current.nextRunAt);
+      const occurrenceKey = String(existingLease?.occurrenceKey || `cron:${current.id}:${scheduledFor}`);
+      const lease = {
+        occurrenceKey,
+        scheduledFor,
+        ownerId,
+        token: randomUUID(),
+        acquiredAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + CRON_DISPATCH_LEASE_MS).toISOString()
+      };
+      const nextRunAt = existingLease ? current.nextRunAt : nextCronWake(current.schedule, current.timezone, new Date(Date.parse(scheduledFor)));
+      const updated = normalizeCronJob({
+        ...current,
+        scheduledFor,
+        nextRunAt,
+        dispatchLease: lease,
+        updatedAt: now.toISOString()
+      });
+      jobs[index] = updated;
+      return { claimed: true, recovered: Boolean(existingLease), occurrenceKey, scheduledFor, nextRunAt, lease, job: updated };
+    });
+  }
+
+  async completeOccurrence(id: string, occurrenceKey: string, token: string, patch: Record<string, unknown>) {
+    return this.mutate((jobs) => {
+      const index = jobs.findIndex((item: any) => item.id === id);
+      if (index < 0) throw new GatewayError(404, "cron job not found");
+      const current = normalizeCronJob(jobs[index]);
+      const lease = current.dispatchLease && typeof current.dispatchLease === "object" ? current.dispatchLease : undefined;
+      if (!lease || lease.occurrenceKey !== occurrenceKey || lease.token !== token) return current;
+      const updated = normalizeCronJob({ ...current, ...patch, dispatchLease: undefined, updatedAt: new Date().toISOString() });
+      jobs[index] = updated;
+      return updated;
+    });
   }
 }
 
@@ -423,33 +491,76 @@ function summarizeTasks(runs: any[], events: any[], jobs: any[], registry: any, 
 
 function normalizeCronJob(value: any) {
   const schedule = String(value.schedule || "").trim();
-  if (!cronParts(schedule)) throw new GatewayError(400, "cron schedule must contain five valid fields");
+  const parsed = cronParts(schedule);
+  if (!parsed) throw new GatewayError(400, "cron schedule must contain five valid fields within standard ranges");
   const tool = String(value.tool || "agent.run").trim();
   if (!tool) throw new GatewayError(400, "cron job requires a tool");
+  const timezone = validateCronTimezone(String(value.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"));
+  const nextRunAt = value.nextRunAt === null
+    ? null
+    : typeof value.nextRunAt === "string" && Number.isFinite(Date.parse(value.nextRunAt))
+      ? value.nextRunAt
+      : nextCronWake(schedule, timezone);
   return {
     ...value,
-    schemaVersion: 1,
+    schemaVersion: CRON_SCHEMA_VERSION,
     id: String(value.id),
     name: String(value.name || value.id).trim().slice(0, 120),
     schedule,
-    timezone: String(value.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"),
+    timezone,
     enabled: value.enabled !== false,
     tool,
     input: value.input && typeof value.input === "object" ? value.input : {},
+    nextRunAt,
+    scheduledFor: typeof value.scheduledFor === "string" ? value.scheduledFor : undefined,
+    dispatchLease: value.dispatchLease && typeof value.dispatchLease === "object" && !Array.isArray(value.dispatchLease) ? value.dispatchLease : undefined,
     updatedAt: value.updatedAt || new Date().toISOString()
   };
 }
 
-function cronParts(schedule: string) {
-  const parts = schedule.split(/\s+/u);
-  if (parts.length !== 5 || parts.some((part) => !/^(?:\*|\*\/\d+|\d+(?:,\d+)*)$/u.test(part))) return null;
-  return parts;
+function cronMutationInput(value: any, creating: boolean) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new GatewayError(400, "cron request must be a JSON object");
+  const allowed = new Set(creating ? ["id", "name", "schedule", "timezone", "enabled", "tool", "input"] : ["name", "schedule", "timezone", "enabled", "tool", "input"]);
+  const unsupported = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unsupported.length) throw new GatewayError(400, `cron request contains unsupported fields: ${unsupported.join(", ")}`);
+  if (creating && (typeof value.timezone !== "string" || !value.timezone.trim())) throw new GatewayError(400, "cron timezone is required");
+  return Object.fromEntries(Object.entries(value).filter(([key]) => allowed.has(key)));
 }
 
-function cronFieldMatches(field: string, value: number) {
-  if (field === "*") return true;
-  if (field.startsWith("*/")) return value % Number(field.slice(2)) === 0;
-  return field.split(",").map(Number).includes(value);
+function cronParts(schedule: string) {
+  const parts = schedule.split(/\s+/u);
+  if (parts.length !== 5) return null;
+  const ranges = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]] as const;
+  const fields = parts.map((part, index) => parseCronField(part, ranges[index][0], ranges[index][1]));
+  if (fields.some((field) => field === null)) return null;
+  const dayValues = fields[2]!;
+  const monthValues = fields[3]!;
+  if (![...monthValues].some((month) => [...dayValues].some((day) => day <= new Date(Date.UTC(2024, month, 0)).getUTCDate()))) return null;
+  return fields as [Set<number>, Set<number>, Set<number>, Set<number>, Set<number>];
+}
+
+function parseCronField(field: string, minimum: number, maximum: number): Set<number> | null {
+  const values = new Set<number>();
+  for (const token of field.split(",")) {
+    const match = /^(?:(\d+)(?:-(\d+))?|\*)(?:\/(\d+))?$/u.exec(token);
+    if (!match) return null;
+    const start = match[1] === undefined ? minimum : Number(match[1]);
+    const end = match[2] === undefined ? (match[1] === undefined ? maximum : start) : Number(match[2]);
+    const step = match[3] === undefined ? 1 : Number(match[3]);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || !Number.isInteger(step) || step < 1 || start < minimum || end > maximum || start > end) return null;
+    for (let value = start; value <= end; value += step) values.add(value);
+  }
+  return values.size ? values : null;
+}
+
+function validateCronTimezone(timezone: string): string {
+  if (!timezone.trim()) throw new GatewayError(400, "cron timezone is required");
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
+  } catch {
+    throw new GatewayError(400, "cron timezone must be a valid IANA timezone");
+  }
+  return timezone;
 }
 
 function cronDateParts(date: Date, timezone = "UTC") {
@@ -460,16 +571,26 @@ function cronDateParts(date: Date, timezone = "UTC") {
 function cronMatches(schedule: string, date: Date, timezone = "UTC") {
   const parts = cronParts(schedule);
   const local = cronDateParts(date, timezone);
-  return Boolean(parts && cronFieldMatches(parts[0], local.minute) && cronFieldMatches(parts[1], local.hour) && cronFieldMatches(parts[2], local.day) && cronFieldMatches(parts[3], local.month) && cronFieldMatches(parts[4], local.weekday));
+  return Boolean(parts && parts[0].has(local.minute) && parts[1].has(local.hour) && parts[2].has(local.day) && parts[3].has(local.month) && parts[4].has(local.weekday));
 }
 
-function nextCronWake(schedule: string, timezone = "UTC") {
+export function nextCronWake(schedule: string, timezone = "UTC", after = new Date()) {
+  const parts = cronParts(schedule);
+  if (!parts) return null;
   const candidate = new Date();
-  candidate.setSeconds(0, 0);
-  candidate.setMinutes(candidate.getMinutes() + 1);
-  for (let index = 0; index < 366 * 24 * 60; index += 1) {
+  candidate.setTime(after.getTime());
+  candidate.setUTCSeconds(0, 0);
+  candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
+  const deadline = candidate.getTime() + 366 * 24 * 60 * 60 * 1000;
+  for (let index = 0; candidate.getTime() <= deadline && index < 366 * 24 * 60; index += 1) {
     if (cronMatches(schedule, candidate, timezone)) return candidate.toISOString();
-    candidate.setMinutes(candidate.getMinutes() + 1);
+    const local = cronDateParts(candidate, timezone);
+    if (!parts[3].has(local.month) || !parts[2].has(local.day) || !parts[4].has(local.weekday) || !parts[1].has(local.hour)) {
+      candidate.setUTCMinutes(0, 0, 0);
+      candidate.setUTCHours(candidate.getUTCHours() + 1);
+    } else {
+      candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
+    }
   }
   return null;
 }
@@ -488,12 +609,57 @@ async function runCronJob(store: CronStore, id: string, executor: any) {
   }
 }
 
-async function runDueCronJobs(store: CronStore, executor: any) {
-  const now = new Date();
-  const minuteKey = now.toISOString().slice(0, 16);
-  for (const job of await store.list()) {
-    if (job.enabled && job.lastMinuteKey !== minuteKey && cronMatches(job.schedule, now, job.timezone)) await runCronJob(store, job.id, executor).catch(() => undefined);
+async function settleCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, jobId: string): Promise<void> {
+  const deadline = Date.now() + CRON_DISPATCH_LEASE_MS;
+  while (Date.now() < deadline) {
+    const job = await supervisor.get(claim.occurrenceKey);
+    if (job && ["completed", "failed", "cancelled", "needs-review"].includes(job.status)) {
+      const ok = job.status === "completed";
+      await store.completeOccurrence(jobId, claim.occurrenceKey, claim.lease.token, {
+        lastRunAt: claim.scheduledFor,
+        lastStatus: ok ? "ok" : "error",
+        lastError: ok ? "" : String(job.error || `scheduled job ended with status ${job.status}`),
+        lastMinuteKey: claim.scheduledFor.slice(0, 16)
+      });
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
+}
+
+async function dispatchCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, job: any): Promise<void> {
+  await supervisor.submit(
+    {
+      task: {
+        id: claim.occurrenceKey,
+        tool: job.tool,
+        input: job.input,
+        actor: "cron",
+        reason: claim.occurrenceKey,
+        occurrenceKey: claim.occurrenceKey,
+        scheduledFor: claim.scheduledFor
+      }
+    },
+    {
+      id: claim.occurrenceKey,
+      occurrenceKey: claim.occurrenceKey,
+      scheduledFor: claim.scheduledFor,
+      nextRunAt: claim.nextRunAt,
+      idempotent: true
+    }
+  );
+  await settleCronOccurrence(store, supervisor, claim, job.id);
+}
+
+export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor, now = new Date()) {
+  const dispatches: Promise<void>[] = [];
+  for (const job of await store.list()) {
+    if (!job.enabled) continue;
+    const claim = await store.claimDueOccurrence(job.id, now);
+    if (!claim.claimed) continue;
+    dispatches.push(dispatchCronOccurrence(store, supervisor, claim, job));
+  }
+  await Promise.allSettled(dispatches);
 }
 
 export async function createGatewayServer({
@@ -544,7 +710,7 @@ export async function createGatewayServer({
   });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry });
   await supervisor.start();
-  const cronTimer = setInterval(() => runDueCronJobs(cronStore, isolatedTaskExecutor).catch(() => undefined), 30_000);
+  const cronTimer = setInterval(() => runDueCronJobs(cronStore, supervisor).catch(() => undefined), 30_000);
   cronTimer.unref();
   const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
   let improvementCycle: Promise<any> | undefined;
@@ -838,11 +1004,11 @@ export async function createGatewayServer({
         return json(response, 200, { enabled: true, jobs: await cronStore.list(), nextWake: await cronStore.nextWake() });
       }
       if (request.method === "POST" && url.pathname === "/cron") {
-        return json(response, 200, { ok: true, job: await cronStore.create(await readJson(request, { maxBytes: requestMaxBytes })) });
+        return json(response, 200, { ok: true, job: await cronStore.create(cronMutationInput(await readJson(request, { maxBytes: requestMaxBytes }), true)) });
       }
       if (request.method === "PATCH" && url.pathname.startsWith("/cron/")) {
         const id = decodeURIComponent(url.pathname.slice("/cron/".length));
-        return json(response, 200, { ok: true, job: await cronStore.update(id, await readJson(request, { maxBytes: requestMaxBytes })) });
+        return json(response, 200, { ok: true, job: await cronStore.update(id, cronMutationInput(await readJson(request, { maxBytes: requestMaxBytes }), false)) });
       }
       if (request.method === "DELETE" && url.pathname.startsWith("/cron/")) {
         const id = decodeURIComponent(url.pathname.slice("/cron/".length));

@@ -20,10 +20,15 @@ export interface JobRecord {
   updatedAt?: string;
   startedAt?: string;
   completedAt?: string;
+  occurrenceKey?: string;
+  scheduledFor?: string;
+  nextRunAt?: string | null;
+  dispatchLease?: JsonObject;
 }
 
 export interface JobStore {
   create(job: JsonObject & { id: string }): Promise<JobRecord>;
+  claim(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
   update(id: string, patch: JsonObject): Promise<JobRecord>;
   get(id: string): Promise<JobRecord | undefined>;
   list(): Promise<JobRecord[]>;
@@ -88,9 +93,45 @@ export class JobSupervisor {
 
   async submit(
     payload: JsonObject,
-    { id = `job_${randomUUID()}`, timeoutMs = this.defaultTimeoutMs, requestHash, retrySafe = false }: { id?: string; timeoutMs?: number; requestHash?: string; retrySafe?: boolean } = {}
+    {
+      id = `job_${randomUUID()}`,
+      timeoutMs = this.defaultTimeoutMs,
+      requestHash,
+      retrySafe = false,
+      occurrenceKey,
+      scheduledFor,
+      nextRunAt,
+      idempotent = false
+    }: {
+      id?: string;
+      timeoutMs?: number;
+      requestHash?: string;
+      retrySafe?: boolean;
+      occurrenceKey?: string;
+      scheduledFor?: string;
+      nextRunAt?: string | null;
+      idempotent?: boolean;
+    } = {}
   ): Promise<JobRecord> {
-    const job = await this.store.create({ id, payload, requestHash, retrySafe, status: "queued", timeoutMs });
+    let job: JobRecord;
+    try {
+      job = await this.store.create({
+        id,
+        payload,
+        requestHash,
+        retrySafe,
+        status: "queued",
+        timeoutMs,
+        ...(occurrenceKey ? { occurrenceKey } : {}),
+        ...(scheduledFor ? { scheduledFor } : {}),
+        ...(nextRunAt !== undefined ? { nextRunAt } : {})
+      });
+    } catch (error) {
+      if (!idempotent) throw error;
+      const existing = await this.store.get(id);
+      if (!existing || existing.occurrenceKey !== occurrenceKey) throw error;
+      return existing;
+    }
     await this.drain();
     return job;
   }
@@ -119,7 +160,22 @@ export class JobSupervisor {
       while (this.active.size < this.concurrency) {
         const queued = (await this.store.list()).find((job) => job.status === "queued");
         if (!queued) break;
-        void this.run(queued).catch(() => undefined);
+        const attempts = queued.attempts + 1;
+        const claimed = await this.store.claim(queued.id, {
+          status: "running",
+          startedAt: new Date().toISOString(),
+          attempts,
+          ...(queued.occurrenceKey ? {
+            dispatchLease: {
+              occurrenceKey: queued.occurrenceKey,
+              token: randomUUID(),
+              acquiredAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + Math.max(queued.timeoutMs || this.defaultTimeoutMs, 120_000)).toISOString()
+            }
+          } : {})
+        });
+        if (!claimed) continue;
+        void this.run(claimed).catch(() => undefined);
       }
     } finally {
       this.draining = false;
@@ -137,11 +193,10 @@ export class JobSupervisor {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new Error("job timed out")), job.timeoutMs || this.defaultTimeoutMs);
     const promise = (async () => {
-      await this.store.update(job.id, { status: "running", startedAt: new Date().toISOString(), attempts: job.attempts + 1 });
       try {
         const result = await this.execute(job.payload, { signal: controller.signal, job });
         if (controller.signal.aborted) throw controller.signal.reason ?? new Error("job aborted");
-        await this.store.update(job.id, { status: "completed", completedAt: new Date().toISOString(), result });
+        await this.store.update(job.id, { status: "completed", completedAt: new Date().toISOString(), result, dispatchLease: undefined });
       } catch (error) {
         const current = await this.store.get(job.id);
         const reason = controller.signal.reason;
@@ -151,7 +206,8 @@ export class JobSupervisor {
         await this.store.update(job.id, {
           status: cancelled ? "cancelled" : unknownOutcome ? "needs-review" : "failed",
           completedAt: new Date().toISOString(),
-          error: message
+          error: message,
+          dispatchLease: undefined
         });
         if (!this.stopping && !cancelled && job.retrySafe === true && current && current.attempts < this.maxAttempts) {
           await this.store.update(job.id, { status: "queued", completedAt: undefined, error: message });
