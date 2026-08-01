@@ -33,6 +33,13 @@ export interface InboundChannelMessage {
   attachments?: ChannelAttachment[];
   metadata?: Record<string, unknown>;
 }
+export type ChannelExecutionState = "accepted" | "running" | "uncertain" | "reconciled" | "completed" | "delivery-failed";
+export interface ChannelExecutionStateEvent {
+  executionKey: string;
+  state: ChannelExecutionState;
+  message: InboundChannelMessage;
+  error?: string;
+}
 export interface OutboundChannelMessage {
   address: ChannelAddress;
   text?: string;
@@ -135,6 +142,7 @@ export interface ChannelRouterOptions {
   maximumMessagesPerSenderWindow?: number;
   maximumTrackedSenders?: number;
   senderWindowMs?: number;
+  onExecutionState?: (event: ChannelExecutionStateEvent) => void | Promise<void>;
   clock?: () => number;
   onError?: (error: unknown, message: InboundChannelMessage) => void;
 }
@@ -166,6 +174,15 @@ export class ChannelDeliveryError extends Error {
     super(message, options);
     this.name = "ChannelDeliveryError";
     this.receipt = receipt;
+  }
+}
+
+export class ChannelRunUncertainError extends Error {
+  readonly code = "CHANNEL_RUN_UNCERTAIN";
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ChannelRunUncertainError";
   }
 }
 
@@ -304,6 +321,10 @@ export class FileChannelDedupeStore implements ChannelDedupeStore {
 
 export function channelConversationKey(address: ChannelAddress): string {
   return [address.channel, address.accountId, address.conversationKind, address.conversationId, address.threadId ?? ""].map(encodeURIComponent).join(":");
+}
+
+export function channelExecutionKey(message: InboundChannelMessage): string {
+  return `${channelConversationKey(message.address)}:${encodeURIComponent(message.id)}`;
 }
 
 export function createAllowlistPolicy(entries: string[]): ChannelAccessPolicy {
@@ -487,25 +508,35 @@ export class ChannelRouter {
           handlerCompleted = true;
         }
         if (reply?.trim()) {
-          if (draftId && editDraft) {
-            await editDraft(message.address, draftId, {
-              address: message.address,
-              text: reply,
-              suppressEmbeds: true
-            });
-          } else {
-            await adapter.send({
-                  address: message.address,
-              text: reply,
-              replyToId: message.id
-            });
+          try {
+            if (draftId && editDraft) {
+              await editDraft(message.address, draftId, {
+                address: message.address,
+                text: reply,
+                suppressEmbeds: true
+              });
+            } else {
+              await adapter.send({
+                address: message.address,
+                text: reply,
+                replyToId: message.id
+              });
+            }
+          } catch (error) {
+            throw new ChannelDeliveryError("channel reply delivery failed", {
+              status: "failed",
+              messageIds: draftId ? [draftId] : [],
+              conversationId: message.address.conversationId,
+              sentChunks: draftId ? 1 : 0,
+              totalChunks: 1
+            }, { cause: error });
           }
         }
         await this.#acknowledge(adapter, message, "succeeded");
         await this.#dedupe.commit(deliveryKey);
         return;
       } catch (error) {
-        const retryable = error instanceof ChannelRetryableError;
+        const retryable = isRetryableChannelError(error);
         if (retryable && attempt < this.#options.maxAttempts && !this.#abort.signal.aborted) {
           if (!handlerCompleted && draftId) {
             draftText = "";
@@ -515,11 +546,22 @@ export class ChannelRouter {
           continue;
         }
         await this.#acknowledge(adapter, message, "failed");
+        if (error instanceof ChannelDeliveryError) {
+          await this.#reportExecutionState(message, "delivery-failed", error.message);
+        }
         if (retryable) await this.#dedupe.release(deliveryKey);
         else await this.#dedupe.commit(deliveryKey);
         this.#options.onError?.(error, message);
         return;
       }
+    }
+  }
+
+  async #reportExecutionState(message: InboundChannelMessage, state: ChannelExecutionState, error?: string): Promise<void> {
+    try {
+      await this.#options.onExecutionState?.({ executionKey: channelExecutionKey(message), state, message, ...(error ? { error } : {}) });
+    } catch (reportingError) {
+      this.#options.onError?.(reportingError, message);
     }
   }
 
@@ -620,6 +662,9 @@ export interface GatewayChannelHandlerOptions {
   bindings: SessionBindingStore;
   defaultModel?: string;
   historyLimit?: number;
+  pollIntervalMs?: number;
+  reconciliationTimeoutMs?: number;
+  onExecutionState?: (event: ChannelExecutionStateEvent) => void | Promise<void>;
   fetch?: typeof globalThis.fetch;
 }
 
@@ -629,6 +674,9 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
   readonly #bindings: SessionBindingStore;
   readonly #defaultModel?: string;
   readonly #historyLimit: number;
+  readonly #pollIntervalMs: number;
+  readonly #reconciliationTimeoutMs: number;
+  readonly #onExecutionState?: GatewayChannelHandlerOptions["onExecutionState"];
   readonly #fetch: typeof globalThis.fetch;
 
   constructor(options: GatewayChannelHandlerOptions) {
@@ -640,6 +688,9 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
     this.#bindings = options.bindings;
     this.#defaultModel = options.defaultModel;
     this.#historyLimit = Math.max(1, Math.min(options.historyLimit ?? 40, 200));
+    this.#pollIntervalMs = Math.max(10, options.pollIntervalMs ?? 250);
+    this.#reconciliationTimeoutMs = Math.max(1_000, options.reconciliationTimeoutMs ?? 120_000);
+    this.#onExecutionState = options.onExecutionState;
     this.#fetch = options.fetch ?? globalThis.fetch;
   }
 
@@ -668,9 +719,8 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
       input: { sessionId, messages, ...this.#defaultModel ? { model: this.#defaultModel } : {} },
       actor: `channel:${message.address.channel}`
     };
-    const result = context.onDelta
-      ? await this.#streamRequest("/run/stream", runBody, context.signal, context.onDelta)
-      : await this.#request("/run", runBody, context.signal);
+    const executionKey = channelExecutionKey(message);
+    const result = await this.#submitAndReconcile(executionKey, runBody, message, context.signal);
     const output = result.output && typeof result.output === "object" ? result.output as Record<string, unknown> : {};
     const reply = requiredString(output.content, "gateway model run returned no assistant content");
     await this.#request(`/sessions/${encodeURIComponent(sessionId)}/messages`, {
@@ -682,12 +732,61 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
     return reply;
   }
 
+  async #submitAndReconcile(executionKey: string, task: Record<string, unknown>, message: InboundChannelMessage, signal: AbortSignal): Promise<Record<string, unknown>> {
+    const submitted = await this.#request("/jobs", { task, executionKey }, signal, { "idempotency-key": executionKey });
+    const job = requiredRecord(submitted.job, "gateway did not return a durable channel run receipt");
+    await this.#reportExecutionState({ executionKey, state: submitted.replayed === true ? "reconciled" : "accepted", message });
+    return this.#reconcileJob(executionKey, job, message, signal);
+  }
+
+  async #reconcileJob(executionKey: string, initial: Record<string, unknown>, message: InboundChannelMessage, signal: AbortSignal): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + this.#reconciliationTimeoutMs;
+    let job = initial;
+    let lastState = "";
+    while (true) {
+      const status = String(job.status ?? "");
+      if (status === "completed") {
+        await this.#reportExecutionState({ executionKey, state: "completed", message });
+        return requiredRecord(job.result, "gateway completed a channel run without a result");
+      }
+      if (status === "needs-review") {
+        const error = typeof job.error === "string" ? job.error : "gateway lost the channel run outcome during restart";
+        await this.#reportExecutionState({ executionKey, state: "uncertain", message, error });
+        throw new ChannelRunUncertainError(error);
+      }
+      if (["failed", "cancelled"].includes(status)) {
+        throw new Error(typeof job.error === "string" ? job.error : `gateway channel run ended with ${status || "an unknown status"}`);
+      }
+      const state = status === "running" ? "running" : undefined;
+      if (state && state !== lastState) {
+        lastState = state;
+        await this.#reportExecutionState({ executionKey, state, message });
+      }
+      if (Date.now() >= deadline) throw new ChannelRetryableError("gateway channel run reconciliation timed out");
+      await delay(this.#pollIntervalMs, signal);
+      job = await this.#getJob(executionKey, signal);
+    }
+  }
+
+  async #reportExecutionState(event: ChannelExecutionStateEvent): Promise<void> {
+    try {
+      await this.#onExecutionState?.(event);
+    } catch (error) {
+      throw new ChannelRetryableError(`channel execution audit state could not be recorded: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
+  }
+
+  async #getJob(executionKey: string, signal: AbortSignal): Promise<Record<string, unknown>> {
+    const value = await this.#get(`/jobs/${encodeURIComponent(executionKey)}`, signal);
+    return requiredRecord(value, "gateway returned an invalid channel run status");
+  }
+
   #get(path: string, signal: AbortSignal): Promise<Record<string, unknown>> {
     return this.#call(path, { method: "GET" }, signal);
   }
 
-  #request(path: string, body: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>> {
-    return this.#call(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, signal);
+  #request(path: string, body: Record<string, unknown>, signal: AbortSignal, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
+    return this.#call(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) }, signal);
   }
 
   async #call(path: string, init: RequestInit, signal: AbortSignal): Promise<Record<string, unknown>> {
@@ -834,6 +933,16 @@ function isChatMessage(value: unknown): value is { role: string; content: string
 function requiredString(value: unknown, message: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(message);
   return value;
+}
+
+function requiredRecord(value: unknown, message: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(message);
+  return value as Record<string, unknown>;
+}
+
+function isRetryableChannelError(error: unknown): boolean {
+  return error instanceof ChannelRetryableError
+    || error instanceof ChannelDeliveryError && error.cause instanceof ChannelRetryableError;
 }
 
 function boundedPositiveInteger(value: number | undefined, fallback: number): number {
