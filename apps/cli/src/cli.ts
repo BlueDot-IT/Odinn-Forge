@@ -1247,13 +1247,12 @@ async function doctor(args: any) {
   const auditStore = createAuditStore(auditPath);
   let audit = { valid: true, events: 0, unsigned: 0, failures: [] as any[] };
   try {
-    const auditExists = await access(auditPath).then(() => true).catch(() => false);
-    if (auditExists) {
-      const verification: any = await auditStore.verifyIntegrity({ allowUnsigned: true });
-      audit = { valid: verification.valid, events: verification.events, unsigned: verification.unsigned, failures: verification.failures ?? [] };
-    }
+    const verification: any = await auditStore.verifyIntegrity({ allowUnsigned: true });
+    audit = { valid: verification.valid, events: verification.events, unsigned: verification.unsigned, failures: verification.failures ?? [] };
   } catch (error) {
     audit = { valid: false, events: 0, unsigned: 0, failures: [{ reason: "audit verification unavailable" }] };
+  } finally {
+    auditStore.close();
   }
   const approvals = createApprovalStore({ path: join(state, "approvals.json") });
   const pendingApprovals = approvals.list();
