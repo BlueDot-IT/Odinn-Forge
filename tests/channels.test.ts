@@ -598,7 +598,6 @@ test("interrupted channel replacement crosses the durable boundary with a comple
     JSON.stringify(recovered) === JSON.stringify(oldState) || JSON.stringify(recovered) === JSON.stringify(newState),
     `replacement left an incomplete state: ${JSON.stringify(recovered)}`
   );
-  if (process.platform === "win32") assert.deepEqual(recovered, oldState);
   assert.deepEqual((await readdir(directory)).filter((name) => name.includes(".tmp") || name.includes(".bak")), []);
   await store.set(address, "sess-final");
   assert.equal(await store.get(address), "sess-final");

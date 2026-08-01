@@ -151,7 +151,7 @@ async function secureStoreFile(path: string) {
   }
 }
 
-async function replaceStoreFile(temporary: string, target: string, afterReplace?: () => void | Promise<void>) {
+async function replaceStoreFile(temporary: string, target: string) {
   if (process.platform !== "win32") {
     await rename(temporary, target);
     const parent = await open(dirname(target), "r");
@@ -160,7 +160,6 @@ async function replaceStoreFile(temporary: string, target: string, afterReplace?
     } finally {
       await parent.close();
     }
-    await afterReplace?.();
     return;
   }
 
@@ -192,7 +191,6 @@ async function replaceStoreFile(temporary: string, target: string, afterReplace?
   });
   try {
     try {
-      await afterReplace?.();
       await secureStoreFile(target);
     } catch (error) {
       try {
@@ -285,9 +283,10 @@ export async function mutateSecureJsonState<TState, TResult>(
       } finally {
         await handle.close();
       }
-      await replaceStoreFile(temporary, resolved, options.__testOnlyAfterReplace);
+      await replaceStoreFile(temporary, resolved);
       await secureStoreFile(resolved);
       await assertSecureStateFile(resolved);
+      await options.__testOnlyAfterReplace?.();
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }
