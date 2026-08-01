@@ -536,3 +536,17 @@ export function createRunLedger({ stateDir = ".odinn", workspaceRoot = process.c
   const artifacts = new ArtifactStore(join(state, "artifacts"));
   return new RunLedger({ database, artifacts, workspaceRoot, stateDir: state, featureFlags });
 }
+
+export {
+  SqliteRecordStore,
+  migrateLegacyRecordsToSqlite,
+  rollbackLegacyRecordsMigration,
+  redactRecord
+} from "./authoritative.ts";
+export type {
+  LegacyRecordMigrationOptions,
+  LegacyRecordMigrationResult,
+  RecordPage,
+  RecordQuery,
+  SqliteRecordTransaction
+} from "./authoritative.ts";

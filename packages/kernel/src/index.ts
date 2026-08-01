@@ -1,10 +1,12 @@
+import { existsSync } from "node:fs";
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
-import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
+import { FileAuditStore } from "@odinn/store-file";
+import { migrateLegacyRecordsToSqlite, SqliteRecordStore } from "@odinn/store-sqlite";
 import { captureAncestorIdentities, MAX_BOUNDED_UTF8_BYTES, readUtf8Prefix } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { loadEnvironmentFiles } from "./environment.ts";
@@ -57,7 +59,11 @@ export type { AgentManifest } from "./agents.ts";
 
 export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch }: any = {}) {
   const root = resolve(workspaceRoot);
-  const recordStore = new FileRecordStore(join(resolve(stateDir), "records.jsonl"));
+  const stateRoot = resolve(stateDir);
+  const legacyRecordPath = join(stateRoot, "records.jsonl");
+  const recordDatabasePath = join(stateRoot, "records.sqlite");
+  if (existsSync(legacyRecordPath)) migrateLegacyRecordsToSqlite({ legacyPath: legacyRecordPath, databasePath: recordDatabasePath });
+  const recordStore = new SqliteRecordStore(recordDatabasePath);
   const modelConfig = normalizeModelConfig(config);
   const registry = new Map([
     ["job.healthcheck", {
@@ -474,8 +480,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   const canRememberMemory = policyAllows("memory.remember");
   const canSuggestMemory = policyAllows("memory.suggest");
   const canCompactMemory = policyAllows("memory.compact");
-  const memoryRecords = memoryStore && input.sessionId && (canRecallMemory || canRememberMemory || canSuggestMemory || canCompactMemory) ? await memoryStore.readAll() : [];
-  const currentSession = input.sessionId ? reduceSessions(memoryRecords).find((session: any) => session.id === input.sessionId) : undefined;
+  const currentSession = memoryStore && input.sessionId ? await memoryStore.findById(input.sessionId) : undefined;
   const memoryScope = { sessionId: cleanString(input.sessionId, ""), projectId: cleanString(input.projectId, currentSession?.projectId ?? "") };
   const runMemoryTool = async (tool: string, toolInput: any, reason: string) => (await runTool({ tool, input: toolInput, actor: "agent-memory", reason })).output;
   const learned = memoryStore && canSuggestMemory && memoryOptions.autoLearn

@@ -46,6 +46,7 @@
     "storage:drill": "node scripts/ci/storage-drill.ts",
     "benchmark:assurance": "node scripts/ci/assurance-benchmark.ts",
     "benchmark:memory-index": "node scripts/ci/memory-index-benchmark.ts",
+    "benchmark:authoritative-storage": "node scripts/ci/authoritative-storage-benchmark.ts",
     "benchmark:ci": "node scripts/ci/benchmark.ts && pnpm benchmark:assurance",
     "release:preflight": "node scripts/release/preflight.ts",
     "release:package": "node scripts/release/package.ts",

@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { normalizeModelConfig } from "./providers/runtime.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
+import { collectRecordPages } from "./record-queries.ts";
 
 type AnyRecord = Record<string, any>;
 
@@ -56,7 +57,7 @@ export async function learnImprovements(store: any, auditStore: any, input: any 
       advisorKey: `observation-${index + 1}`
     }));
   const advisor = await adviseImprovementGroups(repeated, modelConfig, { runModel });
-  const records = await store.readAll();
+  const records = await collectRecordPages(store, { type: "improvement.proposed" } as any, 2_000);
   const existing = new Set(records
     .filter((record: any) => record.type === "improvement.proposed")
     .flatMap((record: any) => [record.observationKey, `${record.target}:${record.title}`].filter(Boolean)));
@@ -109,7 +110,7 @@ export async function learnImprovements(store: any, auditStore: any, input: any 
 
 export async function listImprovements(store: any, input: any = {}) {
   const limit = normalizeLimit(input.limit, 20);
-  return { improvements: reduceImprovements(await store.readAll()).slice(0, limit) };
+  return { improvements: reduceImprovements(await collectRecordPages(store, { typePrefix: "improvement." } as any, 2_000)).slice(0, limit) };
 }
 
 export async function decideImprovement(store: any, input: any = {}) {
@@ -118,7 +119,7 @@ export async function decideImprovement(store: any, input: any = {}) {
   if (!IMPROVEMENT_DECISIONS.has(decision)) {
     throw new Error(`improvement decision must be one of: ${Array.from(IMPROVEMENT_DECISIONS).join(", ")}`);
   }
-  const current = reduceImprovements(await store.readAll()).find((item: any) => item.id === improvementId);
+  const current = reduceImprovements(await collectRecordPages(store, { typePrefix: "improvement." } as any, 2_000)).find((item: any) => item.id === improvementId);
   if (!current) throw new Error(`improvement not found: ${improvementId}`);
   return store.append({
     id: prefixedId("imp_evt"),
@@ -288,7 +289,7 @@ async function applyImprovement(store: any, proposal: any, { stateDir, config, s
 
 export async function rollbackImprovement(store: any, input: any = {}, { stateDir, config }: any) {
   const improvementId = cleanRequired(input.improvementId, "improve.rollback requires improvementId");
-  const current = reduceImprovements(await store.readAll()).find((item: any) => item.id === improvementId);
+  const current = reduceImprovements(await collectRecordPages(store, { typePrefix: "improvement." } as any, 2_000)).find((item: any) => item.id === improvementId);
   const applied = [...(current?.decisions ?? [])].reverse().find((item: any) => item.decision === "applied" && item.snapshotPath);
   if (!applied) throw new Error(`applied improvement snapshot not found: ${improvementId}`);
   const stateRoot = resolve(stateDir);

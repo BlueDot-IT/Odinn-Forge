@@ -49,6 +49,23 @@ Default limits are exported as `MEMORY_INDEX_LIMITS`: 512 KiB per canonical
 document, 250,000 documents per rebuild, 2 KiB/32 tokens per query, 100 results,
 and an offset of 10,000.
 
+## Authoritative record storage (#58)
+
+The active project, session, workspace, goal, lifecycle, and memory paths use
+`@odinn/store-sqlite`'s `SqliteRecordStore` as the authoritative event store.
+Logical reads are expressed through `queryRecordsPage`, which applies bounded
+page sizes and opaque sequence keyset cursors; callers must not use `OFFSET`,
+`readAll()`, or pseudo-unbounded limits. Filters are scope-bound before the
+query reaches SQLite. Message external IDs are covered by a partial unique
+index for idempotent replay.
+
+Legacy `records.jsonl` migration is backup-first and records a source hash,
+byte cursor, progress count, and completion state in SQLite. It can resume
+from an interrupted chunk and rollback by removing the SQLite target while
+retaining the pre-migration backup. Migration does not activate FTS5; the FTS
+candidate remains an opt-in, separate retrieval layer pending parity and
+cross-platform activation proof.
+
 ## Parity and activation gates
 
 FTS5 is lexical retrieval. It does not reproduce embeddings, semantic
