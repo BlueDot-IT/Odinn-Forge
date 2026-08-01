@@ -16,9 +16,11 @@ The Activity page combines the usage overview and searchable history in two tabs
 
 ## Cron Jobs
 
-Cron Jobs are stored in `.odinn/cron-jobs.json` and evaluated by the running gateway every 30 seconds. `/cron` creates and lists jobs; `/cron/<id>` updates or deletes them; `/cron/<id>/run` starts one immediately. A scheduled job invokes an existing registered tool through the same forked crash-containment worker, policy, quota, idempotency, and audit boundary as an ordinary gateway task. The worker is crash containment, not a security sandbox. The gateway must remain running for schedules to fire.
+Cron Jobs are stored in `.odinn/cron-jobs.json` and evaluated by the running gateway every 30 seconds. `/cron` creates and lists jobs; `/cron/<id>` updates or deletes them; `/cron/<id>/run` starts one immediately. Each scheduled occurrence is durably keyed as `cron:<job-id>:<scheduled ISO timestamp>` before dispatch. A second gateway process, a polling race, or a restart reuses that key rather than creating a second occurrence. A dispatch lease expires only after the bounded recovery window; an expired lease is reconciled against the same occurrence key.
 
-Cron expressions contain five fields. Each job has an explicit IANA timezone, tool, and JSON input. Treat creation or editing as a privileged control-plane mutation.
+Cron expressions contain five fields with standard minute (0-59), hour (0-23), day (1-31), month (1-12), and weekday (0-6, Sunday 0) ranges. Positive steps, lists, and ranges are accepted; step `0`, negative values, out-of-range values, impossible day/month combinations, and invalid IANA timezones are rejected at admission. Each job has an explicit IANA timezone, tool, and JSON input. Treat creation or editing as a privileged control-plane mutation.
+
+Cron state uses schema v2. On upgrade, Odinn creates the normal protected migration backup before the v1-to-v2 migration. Existing valid definitions and unknown fields are preserved; invalid legacy definitions fail before cutover with the original state untouched. `nextRunAt` is initialized lazily, and each occurrence persists its scheduled timestamp and dispatch lease before execution. Rollback to a pre-v2 binary is refused because it cannot safely read occurrence metadata; restore the protected pre-migration backup with `odinn state restore` before using that binary. Do not hand-edit a lease or occurrence key. A job left uncertain after process loss remains in the durable job store for review and is not silently replayed.
 
 ## Tasks, Runemark verification, and activity history
 

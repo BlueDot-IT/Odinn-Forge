@@ -178,6 +178,20 @@ test("independent job stores serialize asynchronous mutations without losing sta
   assert.deepEqual((await left.list()).map((job: any) => job.id).sort(), ["first", "second"]);
 });
 
+test("job stores atomically claim one queued occurrence across independent supervisors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-job-store-claim-"));
+  const path = join(root, "jobs.json");
+  const left = new FileJobStore(path);
+  const right = new FileJobStore(path);
+  await left.create({ id: "cron:hourly:occurrence", status: "queued", payload: {}, occurrenceKey: "cron:hourly:occurrence" });
+  const [first, second] = await Promise.all([
+    left.claim("cron:hourly:occurrence", { status: "running", attempts: 1, startedAt: new Date().toISOString() }),
+    right.claim("cron:hourly:occurrence", { status: "running", attempts: 1, startedAt: new Date().toISOString() })
+  ]);
+  assert.equal([first, second].filter(Boolean).length, 1);
+  assert.equal((await left.get("cron:hourly:occurrence"))?.status, "running");
+});
+
 test("job stores fail closed on orphaned locks instead of reclaiming them automatically", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-job-store-orphan-lock-"));
   const path = join(root, "jobs.json");

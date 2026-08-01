@@ -50,6 +50,10 @@ class AdversarialJobStore {
     return this.delegate.create(job);
   }
 
+  async claim(id: string, patch: any) {
+    return this.update(id, patch);
+  }
+
   async update(id: string, patch: any) {
     if (patch.status === "running") {
       this.runningClaimCalls += 1;

@@ -510,6 +510,10 @@ test("gateway backs cron, Agent SDK packages, skills, and workshop with persiste
     const cron = await postJson(`${base}/cron`, { name: "Health wake", schedule: "*/15 * * * *", timezone: "UTC", tool: "job.healthcheck", input: {} });
     assert.equal(cron.job.name, "Health wake");
     assert.equal((await getJson(`${base}/cron`)).jobs.length, 1);
+    const missingTimezone = await fetch(`${base}/cron`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "No timezone", schedule: "* * * * *", tool: "text.echo", input: {} }) });
+    assert.equal(missingTimezone.status, 400);
+    const metadataTamper = await fetch(`${base}/cron/${encodeURIComponent(cron.job.id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ dispatchLease: { occurrenceKey: "forged" } }) });
+    assert.equal(metadataTamper.status, 400);
 
     const initialAgents = await getJson(`${base}/agents`);
     assert.equal(initialAgents.sdkVersion, "1.0");

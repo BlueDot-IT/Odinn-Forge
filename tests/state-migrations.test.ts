@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cp, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { cp, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -122,6 +122,55 @@ test("legacy config, approvals, and browser recovery use explicit deterministic 
     assert.equal(recovery.schemaVersion, 1);
     assert.equal(recovery.status, "unknown");
     assert.equal(recovery.unknown, "preserve");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("cron migration refuses invalid legacy definitions before cutover", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-state-cron-invalid-"));
+  const state = join(temporary, "state");
+  try {
+    await mkdir(state, { recursive: true });
+    const legacy = { schemaVersion: 1, jobs: [{ id: "broken", schedule: "60 * * * *", timezone: "UTC", tool: "text.echo" }] };
+    await writeFile(join(state, "cron-jobs.json"), `${JSON.stringify(legacy, null, 2)}\n`);
+    const plan = await planStateMigration(state, { applicationVersion: "1.0.0", applicationCommit: "cron-v2" });
+    assert.equal(plan.rollbackCompatible, false);
+    await assert.rejects(
+      () => ensureStateCompatibility(state, { applicationVersion: "1.0.0", applicationCommit: "cron-v2" }),
+      /cron migration refused legacy job broken/u
+    );
+    assert.deepEqual(JSON.parse(await readFile(join(state, "cron-jobs.json"), "utf8")), legacy);
+    const backupIds = await readdir(join(temporary, "state.backups"));
+    assert.equal(backupIds.length, 1);
+    const backup = JSON.parse(await readFile(join(temporary, "state.backups", backupIds[0], "state", "cron-jobs.json"), "utf8"));
+    assert.deepEqual(backup, legacy);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("cron schema v1 migrates with a protected rollback backup and preserves definitions", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-state-cron-v1-"));
+  const state = join(temporary, "state");
+  try {
+    await mkdir(state, { recursive: true });
+    const legacy = {
+      schemaVersion: 1,
+      jobs: [{ id: "cron_legacy", name: "Legacy", schedule: "0 9 * * 1-5", timezone: "UTC", tool: "text.echo", futureField: { preserve: true } }]
+    };
+    await writeFile(join(state, "cron-jobs.json"), `${JSON.stringify(legacy, null, 2)}\n`);
+    const plan = await planStateMigration(state, { applicationVersion: "1.0.0", applicationCommit: "cron-v2" });
+    assert.ok(plan.steps.some((step) => step.id === "cron-v1-to-v2"));
+    assert.equal(plan.rollbackCompatible, false);
+    const report = await ensureStateCompatibility(state, { applicationVersion: "1.0.0", applicationCommit: "cron-v2" });
+    assert.ok(report?.backupLocation);
+    const migrated = JSON.parse(await readFile(join(state, "cron-jobs.json"), "utf8"));
+    assert.equal(migrated.schemaVersion, 2);
+    assert.deepEqual(migrated.jobs[0].futureField, { preserve: true });
+    const backup = JSON.parse(await readFile(join(report!.backupLocation!, "cron-jobs.json"), "utf8"));
+    assert.equal(backup.schemaVersion, 1);
+    assert.deepEqual(backup.jobs, legacy.jobs);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

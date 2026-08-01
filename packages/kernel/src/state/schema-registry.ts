@@ -15,7 +15,7 @@ export const STATE_SCHEMA_TARGETS = Object.freeze({
   projects: STORE_SCHEMA_VERSION,
   goals: STORE_SCHEMA_VERSION,
   memory: STORE_SCHEMA_VERSION,
-  cron: 1,
+  cron: 2,
   extensions: 1,
   skills: 1,
   agents: 1,

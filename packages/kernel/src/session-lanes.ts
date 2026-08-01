@@ -659,8 +659,9 @@ export class DurableSessionLaneScheduler {
       };
       const running = await this.storeWrite(
         "queued-job claim",
-        () => this.store.update(candidate.job.id, patch)
+        () => this.store.claim(candidate.job.id, patch)
       );
+      if (!running) return undefined;
       const validatedRunning = this.validateTransitionResult(running, "claim", {
         id: candidate.job.id,
         status: "running",
