@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { JsonObject } from "@odinn/protocol";
 import type { StoredRecord } from "@odinn/store-file";
+import type { RecordPage } from "@odinn/store-sqlite";
 
 export const DEFAULT_PROJECT_ID = "project_default";
 
@@ -13,6 +14,28 @@ export type WorkspaceRecord = StoredRecord;
 export interface WorkspaceRecordStore {
   readAll(): Promise<WorkspaceRecord[]>;
   append(record: JsonObject): Promise<WorkspaceRecord>;
+  queryRecordsPage?(query?: { types?: string[]; projectId?: string; sessionId?: string; scopeType?: string; scopeId?: string; cursor?: string; limit?: number; order?: "asc" | "desc" }): Promise<RecordPage> | RecordPage;
+  transaction?<T>(callback: (transaction: WorkspaceRecordStore) => Promise<T> | T): Promise<T>;
+}
+
+const WORKSPACE_RECORD_TYPES = [
+  "session.created", "session.renamed", "session.assigned", "session.updated", "session.closed", "session.deleted",
+  "message.appended", "project.created", "project.updated", "goal.created", "goal.updated"
+];
+const RECORD_PAGE_LIMIT = 200;
+const MAX_RECORD_SCAN = 100_000;
+
+async function readWorkspaceRecords(store: WorkspaceRecordStore, types = WORKSPACE_RECORD_TYPES): Promise<WorkspaceRecord[]> {
+  if (!store.queryRecordsPage) return store.readAll();
+  const records: WorkspaceRecord[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await store.queryRecordsPage({ types, limit: RECORD_PAGE_LIMIT, order: "asc", ...(cursor ? { cursor } : {}) });
+    records.push(...page.records as WorkspaceRecord[]);
+    cursor = page.nextCursor;
+    if (records.length > MAX_RECORD_SCAN) throw new Error(`workspace record scan exceeds bounded limit ${MAX_RECORD_SCAN}`);
+  } while (cursor);
+  return records;
 }
 
 export type SessionCommandInput = {
@@ -28,6 +51,7 @@ export type SessionCommandInput = {
   provider?: unknown;
   externalId?: unknown;
   limit?: unknown;
+  cursor?: unknown;
 };
 
 export type ProjectCommandInput = {
@@ -40,6 +64,7 @@ export type ProjectCommandInput = {
   tags?: unknown;
   includeArchived?: unknown;
   limit?: unknown;
+  cursor?: unknown;
 };
 
 export type GoalCommandInput = {
@@ -53,6 +78,7 @@ export type GoalCommandInput = {
   source?: unknown;
   tags?: unknown;
   limit?: unknown;
+  cursor?: unknown;
 };
 
 export type SessionView = {
@@ -96,7 +122,7 @@ export type GoalView = {
 };
 
 export async function createSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
-  const records = await store.readAll();
+  const records = await readWorkspaceRecords(store);
   const projectId = cleanString(input.projectId, DEFAULT_PROJECT_ID);
   if (!reduceProjects(records).some((project) => project.id === projectId && project.status !== "archived")) {
     throw new Error(`project not found or archived: ${projectId}`);
@@ -118,37 +144,42 @@ export async function appendSessionMessage(store: WorkspaceRecordStore, input: S
   const role = cleanString(input.role, "user");
   if (!SESSION_ROLES.has(role)) throw new Error(`session role must be one of: ${Array.from(SESSION_ROLES).join(", ")}`);
   const content = cleanRequired(input.content, "session.message requires content");
-  const records = await store.readAll();
   const externalId = cleanString(input.externalId, "");
-  if (externalId) {
-    const existing = records.find((entry: any) => (
-      entry.type === "message.appended" && entry.sessionId === sessionId && entry.externalId === externalId
-    ));
-    if (existing) return existing;
-  }
-  const session = reduceSessions(records).find((entry) => entry.id === sessionId);
-  if (!session) throw new Error(`session not found: ${sessionId}`);
-  if (session.status !== "open") throw new Error(`session is not open: ${sessionId}`);
-  const model = cleanString(input.model, "");
-  const provider = cleanString(input.provider, "");
-  return store.append({
-    id: prefixedId("msg"),
-    type: "message.appended",
-    sessionId,
-    role,
-    content,
-    actor: cleanString(input.actor, "local"),
-    source: cleanString(input.source, "local"),
-    ...(externalId ? { externalId } : {}),
-    ...(model ? { model } : {}),
-    ...(provider ? { provider } : {})
-  });
+  const append = async (target: WorkspaceRecordStore) => {
+    const records = await readWorkspaceRecords(target);
+    if (externalId && target.queryRecordsPage) {
+      const page = await target.queryRecordsPage({ types: ["message.appended"], sessionId, limit: 500, order: "asc" });
+      const existing = page.records.find((entry: any) => entry.externalId === externalId);
+      if (existing) return existing;
+    } else if (externalId) {
+      const existing = records.find((entry: any) => entry.type === "message.appended" && entry.sessionId === sessionId && entry.externalId === externalId);
+      if (existing) return existing;
+    }
+    const session = reduceSessions(records).find((entry) => entry.id === sessionId);
+    if (!session) throw new Error(`session not found: ${sessionId}`);
+    if (session.status !== "open") throw new Error(`session is not open: ${sessionId}`);
+    const model = cleanString(input.model, "");
+    const provider = cleanString(input.provider, "");
+    return target.append({
+      id: prefixedId("msg"),
+      type: "message.appended",
+      sessionId,
+      role,
+      content,
+      actor: cleanString(input.actor, "local"),
+      source: cleanString(input.source, "local"),
+      ...(externalId ? { externalId } : {}),
+      ...(model ? { model } : {}),
+      ...(provider ? { provider } : {})
+    });
+  };
+  return externalId && store.transaction ? store.transaction(append) : append(store);
 }
 
 export async function renameSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.rename requires sessionId");
   const title = cleanRequired(input.title, "session.rename requires title");
-  const session = reduceSessions(await store.readAll()).find((entry) => entry.id === sessionId);
+  const session = reduceSessions(await readWorkspaceRecords(store)).find((entry) => entry.id === sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
   if (session.status !== "open") throw new Error(`session is not open: ${sessionId}`);
   return store.append({ id: prefixedId("sess_evt"), type: "session.renamed", sessionId, title, actor: cleanString(input.actor, "local"), source: cleanString(input.source, "local") });
@@ -157,7 +188,7 @@ export async function renameSession(store: WorkspaceRecordStore, input: SessionC
 export async function assignSessionProject(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.assign requires sessionId");
   const projectId = cleanRequired(input.projectId, "session.assign requires projectId");
-  const records = await store.readAll();
+  const records = await readWorkspaceRecords(store);
   const session = reduceSessions(records).find((entry) => entry.id === sessionId);
   if (!session || session.status === "deleted") throw new Error(`session not found: ${sessionId}`);
   const project = reduceProjects(records).find((entry) => entry.id === projectId);
@@ -167,7 +198,7 @@ export async function assignSessionProject(store: WorkspaceRecordStore, input: S
 
 export async function updateSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.update requires sessionId");
-  const records = await store.readAll();
+  const records = await readWorkspaceRecords(store);
   const session = reduceSessions(records).find((entry) => entry.id === sessionId && entry.status !== "deleted");
   if (!session) throw new Error(`session not found: ${sessionId}`);
   const hasTitle = input.title !== undefined;
@@ -193,7 +224,7 @@ export async function updateSession(store: WorkspaceRecordStore, input: SessionC
 
 export async function deleteSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.delete requires sessionId");
-  const session = reduceSessions(await store.readAll()).find((entry) => entry.id === sessionId);
+  const session = reduceSessions(await readWorkspaceRecords(store)).find((entry) => entry.id === sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
   if (session.status === "deleted") throw new Error(`session already deleted: ${sessionId}`);
   return store.append({ id: prefixedId("sess_evt"), type: "session.deleted", sessionId, actor: cleanString(input.actor, "local"), source: cleanString(input.source, "local") });
@@ -201,12 +232,14 @@ export async function deleteSession(store: WorkspaceRecordStore, input: SessionC
 
 export async function listSessions(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const projectId = cleanString(input.projectId, "");
-  return { sessions: reduceSessions(await store.readAll()).filter((session) => session.status !== "deleted").filter((session) => !projectId || session.projectId === projectId).slice(0, normalizeLimit(input.limit, 20)) };
+  const sessions = reduceSessions(await readWorkspaceRecords(store)).filter((session) => session.status !== "deleted").filter((session) => !projectId || session.projectId === projectId);
+  const page = pageViews(sessions, input.cursor, normalizeLimit(input.limit, 20), (session) => session.lastEventAt);
+  return { sessions: page.items, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
 }
 
 export async function readSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.read requires sessionId");
-  const records = await store.readAll();
+  const records = await readWorkspaceRecords(store);
   const session = reduceSessions(records).find((entry) => entry.id === sessionId);
   if (!session || session.status === "deleted") throw new Error(`session not found: ${sessionId}`);
   const messages = records
@@ -217,7 +250,7 @@ export async function readSession(store: WorkspaceRecordStore, input: SessionCom
 
 export async function createProject(store: WorkspaceRecordStore, input: ProjectCommandInput = {}) {
   const name = cleanRequired(input.name, "project.create requires name");
-  const records = await store.readAll();
+  const records = await readWorkspaceRecords(store);
   const id = cleanString(input.id, prefixedId("project"));
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,119}$/u.test(id)) throw new Error("project id must be 2-120 letters, digits, dots, underscores, or hyphens");
   if (reduceProjects(records).some((project) => project.id === id)) throw new Error(`project already exists: ${id}`);
@@ -226,7 +259,7 @@ export async function createProject(store: WorkspaceRecordStore, input: ProjectC
 
 export async function updateProject(store: WorkspaceRecordStore, input: ProjectCommandInput = {}) {
   const projectId = cleanRequired(input.projectId, "project.update requires projectId");
-  const project = reduceProjects(await store.readAll()).find((entry) => entry.id === projectId);
+  const project = reduceProjects(await readWorkspaceRecords(store)).find((entry) => entry.id === projectId);
   if (!project) throw new Error(`project not found: ${projectId}`);
   const status = cleanString(input.status, project.status);
   if (!PROJECT_STATUSES.has(status)) throw new Error(`project status must be one of: ${Array.from(PROJECT_STATUSES).join(", ")}`);
@@ -243,7 +276,7 @@ export async function updateProject(store: WorkspaceRecordStore, input: ProjectC
 }
 
 export async function listProjects(store: WorkspaceRecordStore, input: ProjectCommandInput = {}) {
-  const records = await store.readAll();
+  const records = await readWorkspaceRecords(store);
   const sessions = reduceSessions(records).filter((session) => session.status !== "deleted");
   const goals = reduceGoals(records);
   const projects = reduceProjects(records)
@@ -254,11 +287,12 @@ export async function listProjects(store: WorkspaceRecordStore, input: ProjectCo
       goalCount: goals.filter((goal) => goal.projectId === project.id).length,
       activeGoalCount: goals.filter((goal) => goal.projectId === project.id && goal.status === "active").length
     }));
-  return { projects: projects.slice(0, normalizeLimit(input.limit, 100)), defaultProjectId: DEFAULT_PROJECT_ID };
+  const page = pageViews(projects, input.cursor, normalizeLimit(input.limit, 100), (project) => project.id === DEFAULT_PROJECT_ID ? "\uffff" : project.updatedAt);
+  return { projects: page.items, defaultProjectId: DEFAULT_PROJECT_ID, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
 }
 
 export async function createGoal(store: WorkspaceRecordStore, input: GoalCommandInput = {}) {
-  const records = await store.readAll();
+  const records = await readWorkspaceRecords(store);
   return store.append({
     id: prefixedId("goal"),
     type: "goal.created",
@@ -273,7 +307,7 @@ export async function createGoal(store: WorkspaceRecordStore, input: GoalCommand
 
 export async function updateGoal(store: WorkspaceRecordStore, input: GoalCommandInput = {}) {
   const goalId = cleanRequired(input.goalId, "goal.update requires goalId");
-  const current = reduceGoals(await store.readAll()).find((goal) => goal.id === goalId);
+  const current = reduceGoals(await readWorkspaceRecords(store)).find((goal) => goal.id === goalId);
   if (!current) throw new Error(`goal not found: ${goalId}`);
   const status = cleanString(input.status, current.status);
   if (!GOAL_STATUSES.has(status)) throw new Error(`goal status must be one of: ${Array.from(GOAL_STATUSES).join(", ")}`);
@@ -293,13 +327,12 @@ export async function listGoals(store: WorkspaceRecordStore, input: GoalCommandI
   const projectId = cleanString(input.projectId, "");
   const sessionId = cleanString(input.sessionId, "");
   const status = cleanString(input.status, "");
-  return {
-    goals: reduceGoals(await store.readAll())
-      .filter((goal) => !projectId || goal.projectId === projectId)
-      .filter((goal) => !sessionId || goal.sessionId === sessionId)
-      .filter((goal) => !status || goal.status === status)
-      .slice(0, normalizeLimit(input.limit, 20))
-  };
+  const goals = reduceGoals(await readWorkspaceRecords(store))
+    .filter((goal) => !projectId || goal.projectId === projectId)
+    .filter((goal) => !sessionId || goal.sessionId === sessionId)
+    .filter((goal) => !status || goal.status === status);
+  const page = pageViews(goals, input.cursor, normalizeLimit(input.limit, 20), (goal) => goal.updatedAt);
+  return { goals: page.items, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
 }
 
 export function reduceSessions(records: WorkspaceRecord[]): SessionView[] {
@@ -420,6 +453,36 @@ export function reduceGoals(records: WorkspaceRecord[]): GoalView[] {
     if (session) goal.projectId = session.projectId;
   }
   return Array.from(goals.values()).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+function pageViews<T extends { id: string }>(items: T[], cursorValue: unknown, limit: number, timestamp: (item: T) => string) {
+  const cursor = decodeViewCursor(cursorValue);
+  const filtered = cursor
+    ? items.filter((item) => timestamp(item) < cursor.at || timestamp(item) === cursor.at && item.id < cursor.id)
+    : items;
+  const page = filtered.slice(0, limit + 1);
+  const hasMore = page.length > limit;
+  const itemsOnPage = hasMore ? page.slice(0, limit) : page;
+  const last = itemsOnPage.at(-1);
+  return {
+    items: itemsOnPage,
+    ...(hasMore && last ? { nextCursor: encodeViewCursor(timestamp(last), last.id) } : {})
+  };
+}
+
+function encodeViewCursor(at: string, id: string): string {
+  return Buffer.from(JSON.stringify({ version: 1, at, id }), "utf8").toString("base64url");
+}
+
+function decodeViewCursor(value: unknown): { at: string; id: string } | undefined {
+  if (value === undefined || value === "") return undefined;
+  try {
+    const cursor = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8")) as { version?: number; at?: string; id?: string };
+    if (cursor.version !== 1 || typeof cursor.at !== "string" || typeof cursor.id !== "string" || !cursor.id) throw new Error("invalid cursor");
+    return { at: cursor.at, id: cursor.id };
+  } catch {
+    throw new Error("invalid workspace cursor");
+  }
 }
 
 function resolveGoalScope(records: WorkspaceRecord[], input: GoalCommandInput) {

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { JsonObject } from "@odinn/protocol";
 import type { StoredRecord } from "@odinn/store-file";
+import type { RecordPage } from "@odinn/store-sqlite";
 import { reduceProjects, reduceSessions } from "./workspace-records.ts";
 
 type AnyRecord = Record<string, any>;
@@ -8,6 +9,29 @@ type AnyRecord = Record<string, any>;
 export interface MemoryRecordStore {
   readAll(): Promise<StoredRecord[]>;
   append(record: JsonObject): Promise<StoredRecord>;
+  queryRecordsPage?(query?: { types?: string[]; sessionId?: string; projectId?: string; namespace?: string; scopeType?: string; scopeId?: string; text?: string; cursor?: string; limit?: number; order?: "asc" | "desc" }): Promise<RecordPage> | RecordPage;
+  transaction?<T>(callback: (transaction: MemoryRecordStore) => Promise<T> | T): Promise<T>;
+}
+
+const MEMORY_RECORD_TYPES = [
+  "memory", "memory.candidate", "memory.candidate.decision", "memory.deactivation",
+  "session.created", "session.renamed", "session.assigned", "session.updated", "session.closed", "session.deleted",
+  "message.appended", "project.created", "project.updated", "goal.created", "goal.updated"
+];
+const RECORD_PAGE_LIMIT = 200;
+const MAX_RECORD_SCAN = 100_000;
+
+async function readMemoryRecords(store: MemoryRecordStore, query: { text?: string } = {}): Promise<StoredRecord[]> {
+  if (!store.queryRecordsPage) return store.readAll();
+  const records: StoredRecord[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await store.queryRecordsPage({ types: MEMORY_RECORD_TYPES, ...(query.text ? { text: query.text } : {}), limit: RECORD_PAGE_LIMIT, order: "asc", ...(cursor ? { cursor } : {}) });
+    records.push(...page.records as StoredRecord[]);
+    cursor = page.nextCursor;
+    if (records.length > MAX_RECORD_SCAN) throw new Error(`memory record scan exceeds bounded limit ${MAX_RECORD_SCAN}`);
+  } while (cursor);
+  return records;
 }
 
 export type MemoryCommandInput = Record<string, unknown>;
@@ -19,7 +43,7 @@ export async function remember(store: MemoryRecordStore, input: MemoryCommandInp
   const text = cleanRequired(input.text, "memory.remember requires text");
   const kind = cleanString(input.kind, "project");
   if (!MEMORY_KINDS.has(kind)) throw new Error(`memory kind must be one of: ${Array.from(MEMORY_KINDS).join(", ")}`);
-  const records = await store.readAll();
+  const records = await readMemoryRecords(store);
   const subject = cleanString(input.subject, "general");
   const namespace = normalizeMemoryNamespace(input.namespace ?? input.path, kind, subject);
   const tier = normalizeMemoryTier(input.tier);
@@ -80,7 +104,7 @@ export async function suggestMemory(store: MemoryRecordStore, input: MemoryComma
   const text = cleanRequired(input.text, "memory.suggest requires text");
   const kind = cleanString(input.kind, "project");
   if (!MEMORY_KINDS.has(kind)) throw new Error(`memory kind must be one of: ${Array.from(MEMORY_KINDS).join(", ")}`);
-  const records = await store.readAll();
+  const records = await readMemoryRecords(store);
   const subject = cleanString(input.subject, "general");
   const namespace = normalizeMemoryNamespace(input.namespace ?? input.path, kind, subject);
   const tier = normalizeMemoryTier(input.tier);
@@ -126,79 +150,86 @@ export async function suggestMemory(store: MemoryRecordStore, input: MemoryComma
 export async function listMemoryCandidates(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const status = cleanString(input.status, "pending");
   const limit = normalizeLimit(input.limit, 100);
-  const candidates = reduceMemoryCandidates(await store.readAll())
-    .filter((candidate: any) => !status || candidate.status === status)
-    .slice(0, limit);
-  return { candidates, count: candidates.length };
+  const candidates = reduceMemoryCandidates(await readMemoryRecords(store))
+    .filter((candidate: any) => !status || candidate.status === status);
+  const page = pageMemory(candidates, input.cursor, limit, (candidate: any) => candidate.at);
+  return { candidates: page.items, count: page.items.length, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
 }
 
 export async function decideMemoryCandidate(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
-  const candidateId = cleanRequired(input.candidateId, "memory.decide requires candidateId");
-  const decision = cleanRequired(input.decision, "memory.decide requires accept or reject");
-  if (!new Set(["accepted", "rejected"]).has(decision)) throw new Error("memory decision must be accepted or rejected");
-  const records = await store.readAll();
-  const candidate = reduceMemoryCandidates(records).find((entry: any) => entry.id === candidateId);
-  if (!candidate) throw new Error(`memory candidate not found: ${candidateId}`);
-  if (candidate.status !== "pending") throw new Error(`memory candidate is already ${candidate.status}`);
-  let memory;
-  if (decision === "accepted") {
-    const scopeType = cleanString(input.scopeType, candidate.scopeType ?? "global");
-    const scopeId = cleanString(input.scopeId, scopeType === candidate.scopeType ? candidate.scopeId : "");
-    memory = await remember(store, {
-      kind: candidate.kind,
-      subject: candidate.subject,
-      namespace: candidate.namespace,
-      tier: candidate.tier,
-      summary: candidate.summary,
-      text: candidate.text,
-      tags: candidate.tags,
-      confidence: candidate.confidence,
-      source: "memory-cherry-pick",
-      authority: "user-curated",
-      scopeType,
-      ...(scopeId ? { scopeId } : {}),
-      ...(scopeType === "project" && scopeId ? { projectId: scopeId } : {}),
-      ...(scopeType === "session" && scopeId ? { sessionId: scopeId } : {})
+  const body = async (target: MemoryRecordStore) => {
+    const candidateId = cleanRequired(input.candidateId, "memory.decide requires candidateId");
+    const decision = cleanRequired(input.decision, "memory.decide requires accept or reject");
+    if (!new Set(["accepted", "rejected"]).has(decision)) throw new Error("memory decision must be accepted or rejected");
+    const records = await readMemoryRecords(target);
+    const candidate = reduceMemoryCandidates(records).find((entry: any) => entry.id === candidateId);
+    if (!candidate) throw new Error(`memory candidate not found: ${candidateId}`);
+    if (candidate.status !== "pending") throw new Error(`memory candidate is already ${candidate.status}`);
+    let memory;
+    if (decision === "accepted") {
+      const scopeType = cleanString(input.scopeType, candidate.scopeType ?? "global");
+      const scopeId = cleanString(input.scopeId, scopeType === candidate.scopeType ? candidate.scopeId : "");
+      memory = await remember(target, {
+        kind: candidate.kind,
+        subject: candidate.subject,
+        namespace: candidate.namespace,
+        tier: candidate.tier,
+        summary: candidate.summary,
+        text: candidate.text,
+        tags: candidate.tags,
+        confidence: candidate.confidence,
+        source: "memory-cherry-pick",
+        authority: "user-curated",
+        scopeType,
+        ...(scopeId ? { scopeId } : {}),
+        ...(scopeType === "project" && scopeId ? { projectId: scopeId } : {}),
+        ...(scopeType === "session" && scopeId ? { sessionId: scopeId } : {})
+      });
+    }
+    const record = await target.append({
+      id: prefixedId("memdecision"),
+      type: "memory.candidate.decision",
+      candidateId,
+      decision,
+      ...(memory?.id ? { memoryId: memory.id } : {}),
+      actor: cleanString(input.actor, "user")
     });
-  }
-  const record = await store.append({
-    id: prefixedId("memdecision"),
-    type: "memory.candidate.decision",
-    candidateId,
-    decision,
-    ...(memory?.id ? { memoryId: memory.id } : {}),
-    actor: cleanString(input.actor, "user")
-  });
-  return { ...record, candidate: { ...candidate, status: decision }, ...(memory ? { memory } : {}) };
+    return { ...record, candidate: { ...candidate, status: decision }, ...(memory ? { memory } : {}) };
+  };
+  return store.transaction ? store.transaction(body) : body(store);
 }
 
 export async function searchMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const limit = normalizeLimit(input.limit, 20);
-  const ranked = rankMemoryRecords(activeMemoryRecords(await store.readAll()), input);
-  const memories = ranked.memories.slice(0, limit);
+  const ranked = rankMemoryRecords(activeMemoryRecords(await readMemoryRecords(store)), input);
+  const page = pageMemory(ranked.memories, input.cursor, limit, memoryRankKey);
+  const memories = page.items;
   return {
     memories,
-    selection: memorySelectionAudit(memories, ranked)
+    selection: memorySelectionAudit(memories, ranked),
+    ...(page.nextCursor ? { nextCursor: page.nextCursor } : {})
   };
 }
 
 export async function recallMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const query = cleanRequired(input.query, "memory.recall requires query");
   const limit = normalizeLimit(input.limit, 8);
-  const ranked = rankMemoryRecords(activeMemoryRecords(await store.readAll()), { ...input, query });
-  const memories = ranked.memories.slice(0, limit);
+  const ranked = rankMemoryRecords(activeMemoryRecords(await readMemoryRecords(store)), { ...input, query });
+  const page = pageMemory(ranked.memories, input.cursor, limit, memoryRankKey);
+  const memories = page.items;
   return {
     query,
     memories,
     selection: memorySelectionAudit(memories, ranked),
     source: "odinn-memory",
-    generatedAt: new Date().toISOString()
+    generatedAt: new Date().toISOString(),
+    ...(page.nextCursor ? { nextCursor: page.nextCursor } : {})
   };
 }
 
 export async function browseMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const prefix = normalizeMemoryPrefix(input.namespace ?? input.path);
-  const records = activeMemoryRecords(await store.readAll())
+  const records = activeMemoryRecords(await readMemoryRecords(store))
     .filter((record: any) => !prefix || record.namespace === prefix || record.namespace.startsWith(`${prefix}/`));
   const namespaces = new Map();
   for (const record of records) {
@@ -215,23 +246,26 @@ export async function browseMemory(store: MemoryRecordStore, input: MemoryComman
       namespaces.set(namespace, current);
     }
   }
+  const ordered = records.slice().sort((left: any, right: any) => right.at.localeCompare(left.at) || String(right.id).localeCompare(String(left.id)));
+  const page = pageMemory(ordered, input.cursor, normalizeLimit(input.limit, 50), (record: any) => record.at);
   return {
     namespace: prefix || "",
     namespaces: Array.from(namespaces.values()).sort((left: any, right: any) => left.namespace.localeCompare(right.namespace)),
-    records: records.slice().sort((left: any, right: any) => right.at.localeCompare(left.at)).slice(0, normalizeLimit(input.limit, 50)).map(memorySummary)
+    records: page.items.map(memorySummary),
+    ...(page.nextCursor ? { nextCursor: page.nextCursor } : {})
   };
 }
 
 export async function openMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const id = cleanRequired(input.id, "memory.open requires id");
-  const record = activeMemoryRecords(await store.readAll()).find((entry: any) => entry.id === id);
+  const record = activeMemoryRecords(await readMemoryRecords(store)).find((entry: any) => entry.id === id);
   if (!record) throw new Error(`memory not found: ${id}`);
   return { memory: record };
 }
 
 export async function compactMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "memory.compact requires sessionId");
-  const records = await store.readAll();
+  const records = await readMemoryRecords(store);
   const session = reduceSessions(records).find((entry: any) => entry.id === sessionId && entry.status !== "deleted");
   if (!session) throw new Error(`session not found: ${sessionId}`);
   const messages = Array.isArray(input.messages)
@@ -289,6 +323,40 @@ function memorySummary(record: any) {
     sessionId: record.sessionId,
     at: record.at
   };
+}
+
+function memoryRankKey(memory: any): string {
+  return `${String(Math.round(Number(memory.score) * 1_000_000)).padStart(12, "0")}|${String(memory.at)}`;
+}
+
+function pageMemory(items: any[], cursorValue: unknown, limit: number, key: (item: any) => string) {
+  const cursor = decodeMemoryCursor(cursorValue);
+  const filtered = cursor
+    ? items.filter((item) => key(item) < cursor.key || key(item) === cursor.key && String(item.id) < cursor.id)
+    : items;
+  const page = filtered.slice(0, limit + 1);
+  const hasMore = page.length > limit;
+  const itemsOnPage = hasMore ? page.slice(0, limit) : page;
+  const last = itemsOnPage.at(-1);
+  return {
+    items: itemsOnPage,
+    ...(hasMore && last ? { nextCursor: encodeMemoryCursor(key(last), String(last.id)) } : {})
+  };
+}
+
+function encodeMemoryCursor(key: string, id: string): string {
+  return Buffer.from(JSON.stringify({ version: 1, key, id }), "utf8").toString("base64url");
+}
+
+function decodeMemoryCursor(value: unknown): { key: string; id: string } | undefined {
+  if (value === undefined || value === "") return undefined;
+  try {
+    const cursor = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8")) as { version?: number; key?: string; id?: string };
+    if (cursor.version !== 1 || typeof cursor.key !== "string" || typeof cursor.id !== "string" || !cursor.id) throw new Error("invalid cursor");
+    return { key: cursor.key, id: cursor.id };
+  } catch {
+    throw new Error("invalid memory cursor");
+  }
 }
 
 function normalizeMemoryTier(value: any) {
@@ -588,7 +656,7 @@ export function formatMemoryContext(memories: any) {
 export async function correctMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const targetId = cleanRequired(input.targetId, "memory.correct requires targetId");
   const text = cleanRequired(input.text, "memory.correct requires text");
-  const records = await store.readAll();
+  const records = await readMemoryRecords(store);
   const target = records.find((record: any) => record.id === targetId && record.type === "memory");
   if (!target) throw new Error(`memory not found: ${targetId}`);
   return store.append({
@@ -616,7 +684,7 @@ export async function correctMemory(store: MemoryRecordStore, input: MemoryComma
 
 export async function forgetMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const targetId = cleanRequired(input.targetId, "memory.forget requires targetId");
-  const records = await store.readAll();
+  const records = await readMemoryRecords(store);
   const target = activeMemoryRecords(records).find((record: any) => record.id === targetId);
   if (!target) throw new Error(`active memory not found: ${targetId}`);
   const record = await store.append({
@@ -633,7 +701,7 @@ export async function forgetMemory(store: MemoryRecordStore, input: MemoryComman
 
 export async function curateMemory(store: MemoryRecordStore, input: MemoryCommandInput = {}) {
   const limit = normalizeLimit(input.limit, 100);
-  const records = activeMemoryRecords(await store.readAll()).slice(-limit);
+  const records = activeMemoryRecords(await readMemoryRecords(store)).slice(-limit);
   const byKind: AnyRecord = {};
   for (const record of records) {
     byKind[record.kind] ??= [];

@@ -4,7 +4,7 @@ import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { redactDurableValue, type DurableRedactionContext } from "@odinn/protocol";
 
-export const SQLITE_SCHEMA_VERSION = 3;
+export const SQLITE_SCHEMA_VERSION = 4;
 export type SqliteStoreOptions = { targetVersion?: number };
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
@@ -280,7 +280,33 @@ const MIGRATIONS = [
     run_id TEXT PRIMARY KEY REFERENCES runs(id),
     request_digest TEXT NOT NULL,
     created_at TEXT NOT NULL
-  );`
+  );`,
+  `CREATE TABLE IF NOT EXISTS record_events (
+    sequence INTEGER PRIMARY KEY,
+    id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    external_id TEXT,
+    session_id TEXT,
+    project_id TEXT,
+    scope_type TEXT,
+    scope_id TEXT,
+    namespace TEXT,
+    kind TEXT,
+    status TEXT,
+    subject TEXT,
+    target_id TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_record_events_type_sequence ON record_events(type, sequence);
+  CREATE INDEX IF NOT EXISTS idx_record_events_session_sequence ON record_events(session_id, sequence);
+  CREATE INDEX IF NOT EXISTS idx_record_events_project_sequence ON record_events(project_id, sequence);
+  CREATE INDEX IF NOT EXISTS idx_record_events_scope_sequence ON record_events(scope_type, scope_id, sequence);
+  CREATE INDEX IF NOT EXISTS idx_record_events_namespace_sequence ON record_events(namespace, sequence);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_record_events_message_external
+    ON record_events(session_id, external_id)
+    WHERE type = 'message.appended' AND external_id IS NOT NULL;`
 ];
 
 export class SqliteStore {
@@ -346,6 +372,9 @@ export class SqliteStore {
   }
 }
 
+export { SqliteRecordStore, migrateLegacyRecordsToSqlite, MAX_RECORD_PAGE_SIZE, MAX_RECORD_SCAN, RECORD_PAGE_SIZE } from "./record-store.ts";
+export type { RecordPage, RecordQuery } from "./record-store.ts";
+
 export function inspectExistingSqliteSchema(path: string): number {
   const resolved = resolve(path);
   if (!existsSync(resolved)) return 0;
@@ -353,9 +382,15 @@ export function inspectExistingSqliteSchema(path: string): number {
   try {
     const table = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'").get();
     if (!table) return 0;
+    const integrity = database.prepare("PRAGMA integrity_check").get() as SqlRow;
+    if (integrity.integrity_check !== "ok") throw new Error(`SQLite integrity check failed: ${String(integrity.integrity_check)}`);
     const row = database.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get() as SqlRow;
     const version = Number(row.version);
     if (!Number.isInteger(version) || version < 0) throw new Error(`invalid SQLite schema version: ${String(row.version)}`);
+    if (version >= 4 && version <= SQLITE_SCHEMA_VERSION) {
+      const names = new Set((database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as SqlRow[]).map((entry) => String(entry.name)));
+      if (!names.has("record_events")) throw new Error(`SQLite schema ${version} is missing required table record_events`);
+    }
     return version;
   } finally {
     database.close();

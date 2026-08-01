@@ -5,6 +5,7 @@ import { join, relative, resolve, sep } from "node:path";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
+import { SqliteRecordStore, migrateLegacyRecordsToSqlite } from "@odinn/store-sqlite";
 import { captureAncestorIdentities, MAX_BOUNDED_UTF8_BYTES, readUtf8Prefix } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { loadEnvironmentFiles } from "./environment.ts";
@@ -55,9 +56,13 @@ export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_
 export type { AgentManifest } from "./agents.ts";
 
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch }: any = {}) {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, recordStore: suppliedRecordStore, recordDatabasePath, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch }: any = {}) {
   const root = resolve(workspaceRoot);
-  const recordStore = new FileRecordStore(join(resolve(stateDir), "records.jsonl"));
+  const legacyRecordPath = join(resolve(stateDir), "records.jsonl");
+  const activeRecordDatabasePath = recordDatabasePath ?? (stateDir === ".odinn" ? undefined : join(resolve(stateDir), "db", "odinn.sqlite"));
+  const recordStore = suppliedRecordStore ?? (activeRecordDatabasePath
+    ? (migrateLegacyRecordsToSqlite({ legacyPath: legacyRecordPath, databasePath: activeRecordDatabasePath }), new SqliteRecordStore(activeRecordDatabasePath))
+    : new FileRecordStore(legacyRecordPath));
   const modelConfig = normalizeModelConfig(config);
   const registry = new Map([
     ["job.healthcheck", {
@@ -461,6 +466,25 @@ function modelVisibleAgentToolSchemas(registry: any) {
   });
 }
 
+async function readAgentRecords(store: any, sessionId: string) {
+  if (typeof store?.queryRecordsPage !== "function") return store?.readAll?.() ?? [];
+  const records: any[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await store.queryRecordsPage({
+      types: ["memory", "memory.candidate", "memory.candidate.decision", "memory.deactivation", "session.created", "session.renamed", "session.assigned", "session.updated", "session.closed", "session.deleted", "message.appended", "project.created", "project.updated"],
+      text: sessionId,
+      limit: 200,
+      order: "asc",
+      ...(cursor ? { cursor } : {})
+    });
+    records.push(...page.records);
+    cursor = page.nextCursor;
+    if (records.length > 100_000) throw new Error("agent record context exceeds bounded limit 100000");
+  } while (cursor);
+  return records;
+}
+
 async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, auditStore, runId, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt, onAgentProgress }: any = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const agent = await loadAgent(stateDir, cleanString(input.agentId, defaultAgentId || DEFAULT_AGENT_ID));
@@ -474,7 +498,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   const canRememberMemory = policyAllows("memory.remember");
   const canSuggestMemory = policyAllows("memory.suggest");
   const canCompactMemory = policyAllows("memory.compact");
-  const memoryRecords = memoryStore && input.sessionId && (canRecallMemory || canRememberMemory || canSuggestMemory || canCompactMemory) ? await memoryStore.readAll() : [];
+  const memoryRecords = memoryStore && input.sessionId && (canRecallMemory || canRememberMemory || canSuggestMemory || canCompactMemory) ? await readAgentRecords(memoryStore, String(input.sessionId)) : [];
   const currentSession = input.sessionId ? reduceSessions(memoryRecords).find((session: any) => session.id === input.sessionId) : undefined;
   const memoryScope = { sessionId: cleanString(input.sessionId, ""), projectId: cleanString(input.projectId, currentSession?.projectId ?? "") };
   const runMemoryTool = async (tool: string, toolInput: any, reason: string) => (await runTool({ tool, input: toolInput, actor: "agent-memory", reason })).output;
