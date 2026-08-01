@@ -19,9 +19,18 @@ delivery identifiers survive restarts; abandoned claims become retryable.
 
 `GatewayChannelHandler` binds each external conversation to one local Ódinn
 session. It uses documented bearer-authenticated gateway routes to append
-messages and invoke the audited agent runtime. Streaming model deltas update
-one draft message instead of emitting a message for every token. Binding and
-deduplication state are local, owner-only, and written atomically.
+messages and submit an audited agent run through a durable `/jobs` receipt. The
+execution key is derived from the channel, account, conversation, thread, and
+inbound message ID. A dropped connection therefore reconciles the existing
+queued, running, completed, or restart-uncertain job instead of submitting a
+second run. Result delivery is a separate retry phase: a failed adapter send
+does not rerun the model. Binding and deduplication state are local,
+owner-only, and written atomically.
+
+Channel execution audit records use explicit states: `accepted`, `running`,
+`reconciled`, `completed`, `uncertain` after a restart-quarantined outcome, and
+`delivery-failed` when the terminal adapter delivery cannot be completed.
+`uncertain` is fail-closed: the router never silently re-executes that run.
 
 ## Security defaults
 

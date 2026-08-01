@@ -13,7 +13,8 @@ import {
   FileChannelDedupeStore,
   FileSessionBindingStore,
   GatewayChannelHandler,
-  createAllowlistPolicy
+  createAllowlistPolicy,
+  type ChannelExecutionStateEvent
 } from "@odinn/channels";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
@@ -532,6 +533,7 @@ export async function createGatewayServer({
     state,
     gatewayToken,
     requestMaxBytes,
+    auditStore,
     loadPlugin: channelPluginLoader
   });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry });
@@ -1959,7 +1961,7 @@ async function loadChannelPlugin(type: string) {
   }
 }
 
-async function createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes, loadPlugin }: any) {
+async function createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes, auditStore, loadPlugin }: any) {
   const configuredEntries = Object.entries(config.channels ?? {});
   const configuredTypes = [...new Set(configuredEntries.map(([, value]: any) => String(value?.type ?? "telegram")))];
   const plugins = new ChannelPluginRegistry(await Promise.all(configuredTypes.map(loadPlugin)));
@@ -2058,10 +2060,32 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
               channel.status.error = error instanceof Error ? error.message : String(error);
             }
           });
+          const recordChannelExecutionState = async (event: ChannelExecutionStateEvent) => {
+            await auditStore.append({
+              at: new Date().toISOString(),
+              runId: event.executionKey,
+              type: "channel.execution",
+              actor: `channel:${channel.type}`,
+              tool: "agent.run",
+              decision: "allow",
+              message: event.error,
+              data: {
+                executionKey: event.executionKey,
+                state: event.state,
+                channel: event.message.address.channel,
+                accountId: event.message.address.accountId,
+                conversationId: event.message.address.conversationId,
+                conversationKind: event.message.address.conversationKind,
+                threadId: event.message.address.threadId,
+                inboundMessageId: event.message.id
+              }
+            });
+          };
           const handler = new GatewayChannelHandler({
             baseUrl,
             token: gatewayToken,
             bindings: new FileSessionBindingStore(join(state, "channel-bindings.json")),
+            onExecutionState: recordChannelExecutionState,
             ...(channel.config.defaultModel ? { defaultModel: channel.config.defaultModel } : {}),
             ...(channel.config.historyLimit ? { historyLimit: channel.config.historyLimit } : {})
           });
@@ -2070,7 +2094,8 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
             dedupe,
             onError(error) {
               channel.status.error = error instanceof Error ? error.message : String(error);
-            }
+            },
+            onExecutionState: recordChannelExecutionState
           });
           await router.attach(adapter, (patch) => {
             channel.status = { ...channel.status, ...patch };

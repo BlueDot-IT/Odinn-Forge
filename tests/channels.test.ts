@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  ChannelAdmissionError, ChannelRetryableError, ChannelRouter, FileChannelDedupeStore, FileSessionBindingStore,
-  channelConversationKey, createAllowlistPolicy, splitChannelText,
+  ChannelAdmissionError, ChannelRetryableError, ChannelRouter, ChannelRunUncertainError, FileChannelDedupeStore, FileSessionBindingStore,
+  GatewayChannelHandler, channelConversationKey, channelExecutionKey, createAllowlistPolicy, splitChannelText,
   type ChannelAcknowledgement, type ChannelAdapter, type ChannelStartContext,
   type InboundChannelMessage, type OutboundChannelMessage
 } from "../packages/channels/src/index.ts";
@@ -261,6 +261,140 @@ test("channel delivery retries reuse the completed model response", async () => 
   assert.equal(sendAttempts, 2);
   assert.equal(modelRuns, 1);
   assert.equal(adapter.sent[0].text, "one model result");
+});
+
+test("channel delivery records a terminal delivery failure without rerunning the handler", async () => {
+  const adapter = new FixtureAdapter();
+  adapter.send = async () => { throw new ChannelRetryableError("transport unavailable"); };
+  const states: string[] = [];
+  let modelRuns = 0;
+  const router = new ChannelRouter({
+    async handle() {
+      modelRuns += 1;
+      return "one model result";
+    }
+  }, {
+    maxAttempts: 1,
+    onExecutionState(event) { states.push(event.state); }
+  });
+  await router.attach(adapter);
+  await adapter.deliver?.(message({ id: "26" }));
+  assert.equal(modelRuns, 1);
+  assert.deepEqual(states, ["delivery-failed"]);
+  assert.equal(adapter.acknowledgements.at(-1)?.acknowledgement, "failed");
+});
+
+test("gateway channel handler submits one durable run and reconciles its result", async () => {
+  const input = message({ id: "durable-1" });
+  const executionKey = channelExecutionKey(input);
+  const calls: Array<{ url: string; method: string; headers: Headers }> = [];
+  const states: string[] = [];
+  let jobReads = 0;
+  const fetch = async (inputUrl: string | URL, init: RequestInit = {}) => {
+    const url = String(inputUrl);
+    const method = init.method ?? "GET";
+    calls.push({ url, method, headers: new Headers(init.headers) });
+    if (method === "GET" && url.endsWith("/sessions/sess_1")) {
+      return new Response(JSON.stringify({ messages: [{ role: "user", content: "Hello" }] }), { status: 200 });
+    }
+    if (method === "POST" && url.endsWith("/sessions/sess_1/messages")) return new Response("{}", { status: 200 });
+    if (method === "POST" && url.endsWith("/jobs")) {
+      return new Response(JSON.stringify({ ok: true, replayed: false, job: { id: executionKey, status: "queued" } }), { status: 202 });
+    }
+    if (method === "GET" && url.endsWith(`/jobs/${encodeURIComponent(executionKey)}`)) {
+      jobReads += 1;
+      const job = jobReads === 1
+        ? { id: executionKey, status: "running" }
+        : { id: executionKey, status: "completed", result: { output: { content: "durable answer" } } };
+      return new Response(JSON.stringify(job), { status: 200 });
+    }
+    throw new Error(`unexpected fake gateway request: ${method} ${url}`);
+  };
+  const handler = new GatewayChannelHandler({
+    token: "test-token",
+    bindings: { async get() { return "sess_1"; }, async set() {} },
+    fetch,
+    pollIntervalMs: 10,
+    reconciliationTimeoutMs: 1_000,
+    onExecutionState(event) { states.push(event.state); }
+  });
+
+  const reply = await handler.handle(input, { signal: new AbortController().signal });
+  assert.equal(reply, "durable answer");
+  assert.deepEqual(states, ["accepted", "running", "completed"]);
+  assert.equal(calls.filter((call) => call.method === "POST" && call.url.endsWith("/jobs")).length, 1);
+  assert.equal(calls.find((call) => call.url.endsWith("/jobs"))?.headers.get("idempotency-key"), executionKey);
+});
+
+test("gateway channel handler safely resubmits the same key after an accepted receipt is lost", async () => {
+  const input = message({ id: "receipt-lost-1" });
+  const executionKey = channelExecutionKey(input);
+  let submissions = 0;
+  let accepted = false;
+  const states: string[] = [];
+  const fetch = async (inputUrl: string | URL, init: RequestInit = {}) => {
+    const url = String(inputUrl);
+    const method = init.method ?? "GET";
+    if (method === "GET" && url.endsWith("/sessions/sess_1")) return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    if (method === "POST" && url.endsWith("/sessions/sess_1/messages")) return new Response("{}", { status: 200 });
+    if (method === "POST" && url.endsWith("/jobs")) {
+      submissions += 1;
+      if (submissions === 1) {
+        accepted = true;
+        throw new TypeError("socket closed after durable acceptance");
+      }
+      assert.equal(accepted, true);
+      return new Response(JSON.stringify({ ok: true, replayed: true, job: {
+        id: executionKey,
+        status: "completed",
+        result: { output: { content: "reconciled answer" } }
+      } }), { status: 200 });
+    }
+    throw new Error(`unexpected fake gateway request: ${method} ${url}`);
+  };
+  const handler = new GatewayChannelHandler({
+    token: "test-token",
+    bindings: { async get() { return "sess_1"; }, async set() {} },
+    fetch,
+    onExecutionState(event) { states.push(event.state); }
+  });
+  await assert.rejects(
+    () => handler.handle(input, { signal: new AbortController().signal }),
+    (error: unknown) => error instanceof ChannelRetryableError
+  );
+  assert.equal(await handler.handle(input, { signal: new AbortController().signal }), "reconciled answer");
+  assert.equal(submissions, 2);
+  assert.deepEqual(states, ["reconciled", "completed"]);
+});
+
+test("gateway channel handler treats a recovered uncertain job as non-replayable", async () => {
+  const input = message({ id: "uncertain-1" });
+  const executionKey = channelExecutionKey(input);
+  const states: string[] = [];
+  const fetch = async (inputUrl: string | URL, init: RequestInit = {}) => {
+    const url = String(inputUrl);
+    const method = init.method ?? "GET";
+    if (method === "GET" && url.endsWith("/sessions/sess_1")) return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    if (method === "POST" && url.endsWith("/sessions/sess_1/messages")) return new Response("{}", { status: 200 });
+    if (method === "POST" && url.endsWith("/jobs")) return new Response(JSON.stringify({ ok: true, job: { id: executionKey, status: "queued" } }), { status: 202 });
+    if (method === "GET" && url.endsWith(`/jobs/${encodeURIComponent(executionKey)}`)) {
+      return new Response(JSON.stringify({ id: executionKey, status: "needs-review", error: "gateway restarted during execution" }), { status: 200 });
+    }
+    throw new Error(`unexpected fake gateway request: ${method} ${url}`);
+  };
+  const handler = new GatewayChannelHandler({
+    token: "test-token",
+    bindings: { async get() { return "sess_1"; }, async set() {} },
+    fetch,
+    pollIntervalMs: 10,
+    reconciliationTimeoutMs: 1_000,
+    onExecutionState(event) { states.push(event.state); }
+  });
+  await assert.rejects(
+    () => handler.handle(input, { signal: new AbortController().signal }),
+    (error: unknown) => error instanceof ChannelRunUncertainError && error.code === "CHANNEL_RUN_UNCERTAIN"
+  );
+  assert.deepEqual(states, ["accepted", "uncertain"]);
 });
 
 test("channel router streams drafts through one message and finalizes by editing", async () => {
