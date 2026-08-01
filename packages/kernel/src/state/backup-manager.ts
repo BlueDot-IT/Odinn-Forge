@@ -21,7 +21,9 @@ const DEFAULT_EXCLUSIONS = Object.freeze([
 ]);
 const EPHEMERAL_STATE_FILES = Object.freeze([
   "db/odinn.sqlite-shm",
-  "db/odinn.sqlite-wal"
+  "db/odinn.sqlite-wal",
+  "db/records.sqlite-shm",
+  "db/records.sqlite-wal"
 ]);
 
 export type BackupApplicationIdentity = {
@@ -110,7 +112,7 @@ async function createStateBackupUnlocked(
       const source = join(stateRoot, file);
       const target = join(staging, file);
       await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-      if (file === "db/odinn.sqlite") await copySqliteSnapshot(source, target);
+      if (file === "db/odinn.sqlite" || file === "db/records.sqlite") await copySqliteSnapshot(source, target);
       else await cp(source, target, { force: false, errorOnExist: true });
       await chmod(target, 0o600);
     }

@@ -14,14 +14,32 @@ class MemoryFixtureStore {
     this.records = records;
   }
 
-  async readAll() {
-    return this.records;
-  }
-
   async append(record: any) {
     const stored = { ...record, at: record.at ?? new Date().toISOString() };
     this.records.push(stored);
     return stored;
+  }
+
+  async queryRecordsPage(query: any = {}) {
+    const all = this.records.filter((record) => {
+      if (query.types?.length && !query.types.includes(record.type)) return false;
+      if (query.ids?.length && !query.ids.includes(record.id)) return false;
+      if (query.candidateIds?.length && !query.candidateIds.includes(record.candidateId)) return false;
+      if (query.namespacePrefix && !(record.namespace === query.namespacePrefix || String(record.namespace ?? "").startsWith(`${query.namespacePrefix}/`))) return false;
+      if (query.scopeAny?.length && !query.scopeAny.some((scope: any) => String(record.scopeType ?? "global") === scope.scopeType && String(record.scopeId ?? "") === String(scope.scopeId ?? ""))) return false;
+      if (query.activeMemoryOnly) {
+        if (record.type !== "memory" || record.status !== "active") return false;
+        if (record.expiresAt && String(record.expiresAt) <= new Date().toISOString()) return false;
+        if (this.records.some((entry) => entry.supersedes === record.id || (entry.type === "memory.deactivation" && entry.targetId === record.id))) return false;
+      }
+      return true;
+    });
+    if (query.order === "desc") all.reverse();
+    const start = query.cursor ? Number(Buffer.from(query.cursor, "base64url").toString("utf8")) : 0;
+    const limit = Math.min(Number(query.limit ?? 50), 200);
+    const records = all.slice(start, start + limit);
+    const hasMore = start + records.length < all.length;
+    return { records, hasMore, ...(hasMore ? { nextCursor: Buffer.from(String(start + records.length), "utf8").toString("base64url") } : {}) };
   }
 }
 

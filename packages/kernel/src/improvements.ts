@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { normalizeModelConfig } from "./providers/runtime.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
+import { queryRecordPage } from "./record-queries.ts";
 
 type AnyRecord = Record<string, any>;
 
@@ -56,16 +57,13 @@ export async function learnImprovements(store: any, auditStore: any, input: any 
       advisorKey: `observation-${index + 1}`
     }));
   const advisor = await adviseImprovementGroups(repeated, modelConfig, { runModel });
-  const records = await store.readAll();
-  const existing = new Set(records
-    .filter((record: any) => record.type === "improvement.proposed")
-    .flatMap((record: any) => [record.observationKey, `${record.target}:${record.title}`].filter(Boolean)));
   const generated = [];
   for (const group of repeated) {
     const guidance = advisor.guidance.get(group.advisorKey);
     const title = guidance?.title || `Improve reliability for ${friendlyToolName(group.tool)}`;
     const target = `runtime/${group.tool}`;
-    if (existing.has(group.observationKey) || existing.has(`${target}:${title}`)) continue;
+    const existing = await queryRecordPage(store, { types: ["improvement.proposed"], observationKey: group.observationKey, limit: 1 });
+    if (existing.records.length) continue;
     const action = deriveAutonomousAction(group, config);
     const proposal = await proposeImprovement(store, {
       title,
@@ -109,7 +107,9 @@ export async function learnImprovements(store: any, auditStore: any, input: any 
 
 export async function listImprovements(store: any, input: any = {}) {
   const limit = normalizeLimit(input.limit, 20);
-  return { improvements: reduceImprovements(await store.readAll()).slice(0, limit) };
+  if (typeof store.queryCurrentImprovementsPage !== "function") throw new Error("record store does not expose current improvement projections");
+  const page = await store.queryCurrentImprovementsPage({ limit, ...(input.cursor ? { cursor: String(input.cursor) } : {}) });
+  return { improvements: page.records, hasMore: page.hasMore, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
 }
 
 export async function decideImprovement(store: any, input: any = {}) {
@@ -118,7 +118,7 @@ export async function decideImprovement(store: any, input: any = {}) {
   if (!IMPROVEMENT_DECISIONS.has(decision)) {
     throw new Error(`improvement decision must be one of: ${Array.from(IMPROVEMENT_DECISIONS).join(", ")}`);
   }
-  const current = reduceImprovements(await store.readAll()).find((item: any) => item.id === improvementId);
+  const current = await readImprovement(store, improvementId);
   if (!current) throw new Error(`improvement not found: ${improvementId}`);
   return store.append({
     id: prefixedId("imp_evt"),
@@ -288,11 +288,10 @@ async function applyImprovement(store: any, proposal: any, { stateDir, config, s
 
 export async function rollbackImprovement(store: any, input: any = {}, { stateDir, config }: any) {
   const improvementId = cleanRequired(input.improvementId, "improve.rollback requires improvementId");
-  const current = reduceImprovements(await store.readAll()).find((item: any) => item.id === improvementId);
-  const applied = [...(current?.decisions ?? [])].reverse().find((item: any) => item.decision === "applied" && item.snapshotPath);
+  const applied = await findLatestAppliedImprovement(store, improvementId);
   if (!applied) throw new Error(`applied improvement snapshot not found: ${improvementId}`);
   const stateRoot = resolve(stateDir);
-  const snapshot = resolve(applied.snapshotPath);
+  const snapshot = resolve(String(applied.snapshotPath));
   if (relative(stateRoot, snapshot).startsWith("..")) throw new Error("improvement snapshot escapes state directory");
   return withStateMutationLock(stateRoot, async () => {
     const restored = JSON.parse(readFileSync(snapshot, "utf8"));
@@ -307,34 +306,20 @@ export async function rollbackImprovement(store: any, input: any = {}, { stateDi
   });
 }
 
-function reduceImprovements(records: any) {
-  const improvements = new Map();
-  for (const record of records) {
-    if (record.type === "improvement.proposed") {
-      improvements.set(record.id, {
-        id: record.id,
-        title: record.title,
-        rationale: record.rationale,
-        target: record.target,
-        priority: record.priority,
-        status: record.status ?? "proposed",
-        evidence: record.evidence ?? [],
-        observationKey: record.observationKey,
-        advisor: record.advisor,
-        action: record.action,
-        createdAt: record.at,
-        updatedAt: record.at,
-        decisions: []
-      });
-    } else if (typeof record.type === "string" && record.type.startsWith("improvement.") && record.improvementId) {
-      const current = improvements.get(record.improvementId);
-      if (!current) continue;
-      current.status = record.decision ?? current.status;
-      current.updatedAt = record.at;
-      current.decisions.push({ at: record.at, decision: record.decision, note: record.note, snapshotPath: record.snapshotPath, action: record.action });
-    }
-  }
-  return Array.from(improvements.values()).sort((left: any, right: any) => right.updatedAt.localeCompare(left.updatedAt));
+async function readImprovement(store: any, improvementId: string) {
+  if (typeof store.getCurrentImprovement !== "function") throw new Error("record store does not expose current improvement projections");
+  return store.getCurrentImprovement(improvementId);
+}
+
+async function findLatestAppliedImprovement(store: any, improvementId: string) {
+  let cursor: string | undefined;
+  do {
+    const page = await queryRecordPage(store, { improvementId, order: "desc", limit: 200, ...(cursor ? { cursor } : {}) });
+    const applied = page.records.find((record: any) => record.decision === "applied" && record.snapshotPath);
+    if (applied) return applied;
+    cursor = page.nextCursor;
+  } while (cursor);
+  return undefined;
 }
 
 function prefixedId(prefix: string) {

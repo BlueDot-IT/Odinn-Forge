@@ -29,6 +29,11 @@ async function readWorkspace(fixture: Awaited<ReturnType<typeof workspaceFixture
   });
 }
 
+async function closeWorkspaceFixture(fixture: Awaited<ReturnType<typeof workspaceFixture>>) {
+  fixture.registry.close();
+  await rm(fixture.root, { recursive: true, force: true });
+}
+
 test("workspace.readText reads only a bounded sparse prefix and reports byte semantics", async () => {
   const fixture = await workspaceFixture();
   try {
@@ -41,7 +46,7 @@ test("workspace.readText reads only a bounded sparse prefix and reports byte sem
     assert.equal(result.output.truncated, true);
     assert.equal(Buffer.byteLength(result.output.content, "utf8"), 1_024);
   } finally {
-    await rm(fixture.root, { recursive: true, force: true });
+    await closeWorkspaceFixture(fixture);
   }
 });
 
@@ -55,7 +60,7 @@ test("workspace.readText truncates only at valid UTF-8 boundaries", async () => 
     assert.equal(result.output.truncated, true);
     assert.equal(result.output.content.includes("�"), false);
   } finally {
-    await rm(fixture.root, { recursive: true, force: true });
+    await closeWorkspaceFixture(fixture);
   }
 });
 
@@ -70,7 +75,7 @@ test("workspace.readText rejects invalid and over-cap maxBytes values", async ()
       );
     }
   } finally {
-    await rm(fixture.root, { recursive: true, force: true });
+    await closeWorkspaceFixture(fixture);
   }
 });
 
@@ -80,7 +85,7 @@ test("workspace.readText rejects directories", async () => {
     await mkdir(join(fixture.root, "directory"));
     await assert.rejects(readWorkspace(fixture, "directory-read", { path: "directory" }), /regular file/u);
   } finally {
-    await rm(fixture.root, { recursive: true, force: true });
+    await closeWorkspaceFixture(fixture);
   }
 });
 
@@ -91,7 +96,7 @@ test("workspace.readText rejects FIFOs", { skip: process.platform === "win32" },
     await execFileAsync("mkfifo", [fifo]);
     await assert.rejects(readWorkspace(fixture, "fifo-read", { path: "pipe" }), /regular file/u);
   } finally {
-    await rm(fixture.root, { recursive: true, force: true });
+    await closeWorkspaceFixture(fixture);
   }
 });
 
@@ -103,7 +108,7 @@ test("workspace.readText rejects symlinked paths", { skip: process.platform === 
     await symlink(outside, join(fixture.root, "replacement"));
     await assert.rejects(readWorkspace(fixture, "replacement-read", { path: "replacement/secret.txt" }), /path escapes workspace root/u);
   } finally {
-    await rm(fixture.root, { recursive: true, force: true });
+    await closeWorkspaceFixture(fixture);
     await rm(outside, { recursive: true, force: true });
   }
 });

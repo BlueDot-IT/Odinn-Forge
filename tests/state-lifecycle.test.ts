@@ -11,6 +11,7 @@ import {
   restoreStateBackup,
   stateLifecycleStatus
 } from "../packages/kernel/src/index.ts";
+import { migrateLegacyRecordsToSqlite, SqliteRecordStore } from "../packages/store-sqlite/src/authoritative.ts";
 
 async function preparedState() {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-state-lifecycle-"));
@@ -114,6 +115,41 @@ test("restore verifies into staging, backs up current state, and activates atomi
     assert.equal(status.compatibility.minimumApplicationVersion, "0.4.0");
     assert.ok(status.audit.events >= 1);
     assert.ok(status.backups.available >= 1);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("backup snapshots and restores the authoritative record database without WAL sidecars", async () => {
+  const fixture = await preparedState();
+  const backup = join(fixture.temporary, "sqlite-backup");
+  const legacyPath = join(fixture.state, "records.jsonl");
+  const databasePath = join(fixture.state, "db", "records.sqlite");
+  try {
+    migrateLegacyRecordsToSqlite({ legacyPath, databasePath });
+    const created = await createStateBackup(fixture.state, backup, { applicationVersion: "1.0.0", applicationCommit: "sqlite-records" });
+    assert.ok(created.manifest.files.some((file) => file.path === "db/records.sqlite"));
+    assert.equal(created.manifest.files.some((file) => /db\/records\.sqlite-(?:wal|shm)$/u.test(file.path)), false);
+    const backupStore = new SqliteRecordStore(join(backup, "db", "records.sqlite"));
+    try {
+      assert.equal(await backupStore.countRecords(), 1);
+    } finally {
+      backupStore.close();
+    }
+    const liveStore = new SqliteRecordStore(databasePath);
+    try {
+      await liveStore.append({ id: "memory-2", type: "memory", status: "active", namespace: "tests/backup", text: "newer" });
+      assert.equal(await liveStore.countRecords(), 2);
+    } finally {
+      liveStore.close();
+    }
+    await restoreStateBackup(backup, fixture.state, { applicationVersion: "1.0.1", applicationCommit: "sqlite-restore" });
+    const restoredStore = new SqliteRecordStore(databasePath);
+    try {
+      assert.equal(await restoredStore.countRecords(), 1);
+    } finally {
+      restoredStore.close();
+    }
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
   }

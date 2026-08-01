@@ -1,20 +1,20 @@
 import { AUDIT_SCHEMA_VERSION } from "@odinn/protocol";
 import { STORE_SCHEMA_VERSION } from "@odinn/store-file";
-import { SQLITE_SCHEMA_VERSION } from "@odinn/store-sqlite";
+import { AUTHORITATIVE_RECORD_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION } from "@odinn/store-sqlite";
 
 export const STATE_SCHEMA_MINIMUM_APPLICATION_VERSION = "0.4.0";
 
 export const STATE_SCHEMA_TARGETS = Object.freeze({
   config: 1,
-  records: STORE_SCHEMA_VERSION,
+  records: AUTHORITATIVE_RECORD_SCHEMA_VERSION,
   jobs: STORE_SCHEMA_VERSION,
   audit: AUDIT_SCHEMA_VERSION,
   approvals: 1,
   browserRecovery: 1,
-  sessions: STORE_SCHEMA_VERSION,
-  projects: STORE_SCHEMA_VERSION,
-  goals: STORE_SCHEMA_VERSION,
-  memory: STORE_SCHEMA_VERSION,
+  sessions: AUTHORITATIVE_RECORD_SCHEMA_VERSION,
+  projects: AUTHORITATIVE_RECORD_SCHEMA_VERSION,
+  goals: AUTHORITATIVE_RECORD_SCHEMA_VERSION,
+  memory: AUTHORITATIVE_RECORD_SCHEMA_VERSION,
   cron: 2,
   extensions: 1,
   skills: 1,
@@ -36,15 +36,15 @@ export type StateSchemaOwner = {
 
 export const STATE_SCHEMA_OWNERS: Readonly<Record<StateSurface, StateSchemaOwner>> = Object.freeze({
   config: { owner: "@odinn/kernel/config", location: "config.json", support: "stable", description: "Configuration and security policy" },
-  records: { owner: "@odinn/store-file", location: "records.jsonl", support: "stable", description: "Typed append-only product records" },
+  records: { owner: "@odinn/store-sqlite", location: "db/records.sqlite", support: "stable", description: "Typed append-only product records" },
   jobs: { owner: "@odinn/store-file", location: "jobs.json", support: "stable", description: "Tasks, jobs, retries, and uncertain outcomes" },
   audit: { owner: "@odinn/protocol + @odinn/store-file", location: "audit*.jsonl", support: "stable", description: "Audit events and verification keyring" },
   approvals: { owner: "@odinn/kernel/approvals", location: "approvals.json", support: "stable", description: "Pending and consumed approvals" },
   browserRecovery: { owner: "@odinn/kernel/browser", location: "browser-recovery.json + browser-tabs.json", support: "stable", description: "Browser uncertain-outcome recovery and durable handles" },
-  sessions: { owner: "@odinn/kernel/sessions", location: "records.jsonl:session.*", support: "stable", description: "Sessions and messages" },
-  projects: { owner: "@odinn/kernel/projects", location: "records.jsonl:project.*", support: "stable", description: "Projects" },
-  goals: { owner: "@odinn/kernel/goals", location: "records.jsonl:goal.*", support: "stable", description: "Goals" },
-  memory: { owner: "@odinn/kernel/memory", location: "records.jsonl:memory.*", support: "stable", description: "Memory records" },
+  sessions: { owner: "@odinn/kernel/sessions", location: "db/records.sqlite:session.*", support: "stable", description: "Sessions and messages" },
+  projects: { owner: "@odinn/kernel/projects", location: "db/records.sqlite:project.*", support: "stable", description: "Projects" },
+  goals: { owner: "@odinn/kernel/goals", location: "db/records.sqlite:goal.*", support: "stable", description: "Goals" },
+  memory: { owner: "@odinn/kernel/memory", location: "db/records.sqlite:memory.*", support: "stable", description: "Memory records" },
   cron: { owner: "@odinn/gateway/cron", location: "cron-jobs.json", support: "stable", description: "Cron definitions and run metadata" },
   extensions: { owner: "@odinn/kernel/extensions", location: "extensions.json", support: "experimental", description: "Third-party extension registry" },
   skills: { owner: "@odinn/kernel/skills", location: "skills/registry.json", support: "experimental", description: "Skill package registry" },
