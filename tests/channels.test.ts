@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -470,6 +470,27 @@ test("channel persistence serializes binding updates and competing claims across
   assert.equal(claims.filter(({ stdout }) => stdout.trim() === "false").length, 1);
 });
 
+test("child processes preserve concurrent dedupe commit, release, and unrelated updates", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-dedupe-lifecycle-"));
+  const path = join(directory, "dedupe.json");
+  const moduleUrl = new URL("../packages/channels/src/index.ts", import.meta.url).href;
+  const run = async (body: string) => execFile(process.execPath, ["--input-type=module", "-e", body], { cwd: process.cwd() });
+  const worker = (unrelated: string, release = false) => run(`
+    import { FileChannelDedupeStore } from ${JSON.stringify(moduleUrl)};
+    const store = new FileChannelDedupeStore(${JSON.stringify(path)});
+    if (await store.claim("committed")) await store.commit("committed");
+    if (${JSON.stringify(release)} && await store.claim("released")) await store.release("released");
+    await store.claim(${JSON.stringify(unrelated)});
+  `);
+  await Promise.all([worker("unrelated-a", true), worker("unrelated-b")]);
+
+  const store = new FileChannelDedupeStore(path);
+  assert.equal(await store.claim("committed"), false);
+  assert.equal(await store.claim("released"), true);
+  assert.equal(await store.claim("unrelated-a"), false);
+  assert.equal(await store.claim("unrelated-b"), false);
+});
+
 test("binding persistence recovers after a failed write and rejects corrupt or insecure state", async () => {
   const directory = await mkdtemp(join(tmpdir(), "odinn-channel-recovery-"));
   const blocker = join(directory, "blocked");
@@ -609,14 +630,45 @@ test("Windows channel persistence applies owner-only replacement semantics", { s
   assert.equal(JSON.parse(await readFile(path, "utf8")).schemaVersion, 1);
 });
 
-test("channel state lock ownership is fail-closed and never deletes another token", async () => {
+test("a killed lock owner leaves an explicit stale token until operator-verified removal", async () => {
   const directory = await mkdtemp(join(tmpdir(), "odinn-channel-lock-"));
   const path = join(directory, "bindings.json");
   const lockPath = `${path}.lock`;
-  await writeFile(lockPath, `${JSON.stringify({ token: "other-process", pid: 123, createdAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+  const moduleUrl = new URL("../packages/store-file/src/index.ts", import.meta.url).href;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { mutateSecureJsonState } from ${JSON.stringify(moduleUrl)};
+    await mutateSecureJsonState(${JSON.stringify(path)}, {
+      initial: () => ({ schemaVersion: 1, bindings: {} }),
+      parse: value => value,
+      mutate: async () => {
+        console.log("LOCKED");
+        await new Promise(() => {});
+      }
+    });
+  `], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  await new Promise<void>((resolve, reject) => {
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      if (output.includes("LOCKED")) resolve();
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`lock owner exited before acquisition: ${code}`)));
+  });
+  const foreignToken = JSON.parse(await readFile(lockPath, "utf8")).token;
+  child.kill("SIGKILL");
+  await new Promise<void>((resolve) => child.once("close", () => resolve()));
+
   const store = new FileSessionBindingStore(path, { lockTimeoutMs: 25 });
   await assert.rejects(() => store.set(message().address, "sess-blocked"), /timed out acquiring store lock/u);
-  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).token, "other-process");
+  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).token, foreignToken);
+
+  // Simulate the documented operator check: the owning process is known dead before stale evidence is removed.
+  assert.equal(child.killed, true);
+  await rm(lockPath);
+  await store.set(message().address, "sess-recovered");
+  assert.equal(await store.get(message().address), "sess-recovered");
 });
 
 test("file session bindings isolate channel conversations", async () => {
