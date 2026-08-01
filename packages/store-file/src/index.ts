@@ -1,7 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, lstat, rm, stat } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { normalizeAuditEvent, redactDurableValue, type AuditEvent, type JsonObject } from "@odinn/protocol";
 
@@ -87,8 +87,13 @@ async function windowsOwnerOnly(path: string) {
   }
 }
 
-async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>, timeoutMs = 30_000): Promise<T> {
-  await ensureSecureStateDirectory(dirname(lockPath));
+async function withInterprocessLock<T>(
+  lockPath: string,
+  operation: () => Promise<T>,
+  timeoutMs = 30_000,
+  label = "store"
+): Promise<T> {
+  await prepareSecureStoreDirectory(dirname(lockPath), "store lock");
   const token = randomUUID();
   const deadline = Date.now() + timeoutMs;
   while (true) {
@@ -99,9 +104,13 @@ async function withInterprocessLock<T>(lockPath: string, operation: () => Promis
       } finally {
         await handle.close();
       }
+      // `prepareSecureStoreDirectory` establishes a protected, inheritable
+      // Windows ACL before creation; POSIX `wx` creates this file as 0600.
+      // Avoid a second ACL publication phase that contenders could observe.
       break;
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
+      await inspectExistingStoreLock(lockPath, label, deadline);
       if (Date.now() >= deadline) {
         throw new Error(`timed out acquiring store lock: ${lockPath}; verify that no Odinn process is using the store before manually removing this lock`);
       }
@@ -208,6 +217,218 @@ export class StoreCorruptionError extends Error {
     this.line = line;
     this.cause = cause;
   }
+}
+
+export type SecureJsonFileStoreOptions<State> = {
+  label: string;
+  create: () => State;
+  validate: (value: unknown) => State;
+  lockTimeoutMs?: number;
+};
+
+/**
+ * Crash-safe JSON read-modify-replace for small control-plane stores.
+ *
+ * The caller owns the logical schema. This primitive owns in-process recovery,
+ * token-checked interprocess exclusion, owner-only paths, durable temporary
+ * writes, and atomic replacement on Windows and POSIX.
+ */
+export class SecureJsonFileStore<State> {
+  readonly path: string;
+  readonly lockPath: string;
+  readonly lockTimeoutMs: number;
+  readonly #label: string;
+  readonly #create: () => State;
+  readonly #validate: (value: unknown) => State;
+  #writeChain: Promise<unknown> = Promise.resolve();
+
+  constructor(path: string, options: SecureJsonFileStoreOptions<State>) {
+    if (!path) throw new Error("SecureJsonFileStore requires a path");
+    if (!options?.label?.trim()) throw new Error("SecureJsonFileStore requires a label");
+    if (typeof options.create !== "function" || typeof options.validate !== "function") {
+      throw new Error("SecureJsonFileStore requires create and validate functions");
+    }
+    const lockTimeoutMs = options.lockTimeoutMs ?? 30_000;
+    if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1) {
+      throw new Error("SecureJsonFileStore lock timeout must be a positive integer");
+    }
+    this.path = resolve(path);
+    this.lockPath = `${this.path}.lock`;
+    this.lockTimeoutMs = lockTimeoutMs;
+    this.#label = options.label.trim();
+    this.#create = options.create;
+    this.#validate = options.validate;
+  }
+
+  async read(): Promise<State> {
+    return withInterprocessLock(
+      this.lockPath,
+      () => this.#readPrepared(),
+      this.lockTimeoutMs,
+      this.#label
+    );
+  }
+
+  async #readPrepared(): Promise<State> {
+    if (!await assertSecureRegularFile(this.path, this.#label, true)) return this.#validated(this.#create());
+    let content: string;
+    try {
+      content = await readFile(this.path, "utf8");
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return this.#validated(this.#create());
+      throw error;
+    }
+    await assertSecureRegularFile(this.path, this.#label);
+    try {
+      return this.#validated(JSON.parse(content));
+    } catch (error) {
+      if (error instanceof StoreCorruptionError) throw error;
+      throw new StoreCorruptionError(this.path, 1, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  mutate<Result>(operation: (state: State) => MutableResult<Result>): Promise<Result> {
+    const pending = this.#writeChain.then(async () => {
+      return withInterprocessLock(this.lockPath, async () => {
+        const state = await this.#readPrepared();
+        const result = await operation(state);
+        const validated = this.#validated(state);
+        const temporary = join(dirname(this.path), `.${basename(this.path)}.${process.pid}.${randomUUID()}.tmp`);
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          handle = await open(temporary, "wx", 0o600);
+          await handle.writeFile(`${JSON.stringify(validated, null, 2)}\n`);
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          await replaceStoreFile(temporary, this.path);
+          await assertSecureRegularFile(this.path, this.#label);
+          await syncCommittedStore(this.path);
+          return result;
+        } finally {
+          await handle?.close().catch(() => undefined);
+          await rm(temporary, { force: true }).catch(() => undefined);
+        }
+      }, this.lockTimeoutMs, this.#label);
+    });
+    this.#writeChain = pending.catch(() => undefined);
+    return pending;
+  }
+
+  #validated(value: unknown): State {
+    try {
+      return this.#validate(value);
+    } catch (error) {
+      throw new StoreCorruptionError(this.path, 1, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+}
+
+async function prepareSecureStoreDirectory(path: string, label: string) {
+  let exists = false;
+  try {
+    const existing = await lstat(path);
+    exists = true;
+    if (existing.isSymbolicLink() || !existing.isDirectory()) throw new Error(`${label} directory must not be a symbolic link: ${path}`);
+    if (process.platform !== "win32" && typeof process.geteuid === "function" && existing.uid !== process.geteuid()) {
+      throw new Error(`${label} directory is not owned by the current user: ${path}`);
+    }
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+  if (exists && await isOwnerOnlyPath(path)) return;
+  await ensureSecureStateDirectory(path);
+  const secured = await lstat(path);
+  if (secured.isSymbolicLink() || !secured.isDirectory() || !await isOwnerOnlyPath(path)) {
+    throw new Error(`${label} directory must be owner-only: ${path}`);
+  }
+}
+
+async function assertSecureRegularFile(path: string, label: string, allowMissing = false): Promise<boolean> {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (allowMissing && errorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error(`${label} must be a regular non-symbolic file: ${path}`);
+  if (process.platform !== "win32" && typeof process.geteuid === "function" && metadata.uid !== process.geteuid()) {
+    throw new Error(`${label} is not owned by the current user: ${path}`);
+  }
+  if (!await isOwnerOnlyPath(path)) throw new Error(`${label} must be owner-only: ${path}`);
+  return true;
+}
+
+async function inspectExistingStoreLock(lockPath: string, label: string, deadline = Date.now()) {
+  while (true) {
+    let metadata;
+    try {
+      metadata = await lstat(lockPath);
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return;
+      throw error;
+    }
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new Error(`${label} lock must be a regular non-symbolic file: ${lockPath}`);
+    }
+    if (process.platform !== "win32" && typeof process.geteuid === "function" && metadata.uid !== process.geteuid()) {
+      throw new Error(`${label} lock is not owned by the current user: ${lockPath}`);
+    }
+
+    let owner: { token?: unknown; pid?: unknown; createdAt?: unknown } | undefined;
+    try {
+      owner = JSON.parse(await readFile(lockPath, "utf8"));
+    } catch (error) {
+      if (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        continue;
+      }
+      throw new Error(`${label} lock metadata is invalid; verify that no Odinn process owns ${lockPath} before recovering it`, { cause: error });
+    }
+    if (
+      typeof owner?.token !== "string"
+      || owner.token.length === 0
+      || !Number.isSafeInteger(owner.pid)
+      || Number(owner.pid) < 1
+      || typeof owner.createdAt !== "string"
+      || !Number.isFinite(Date.parse(owner.createdAt))
+    ) {
+      if (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        continue;
+      }
+      throw new Error(`${label} lock metadata is invalid; verify that no Odinn process owns ${lockPath} before recovering it`);
+    }
+    // Windows lock security is inherited atomically from the protected parent
+    // verified by `withInterprocessLock`; POSIX security is the file's 0600 mode.
+    if (process.platform !== "win32" && !await isOwnerOnlyPath(lockPath)) {
+      throw new Error(`${label} lock must be owner-only: ${lockPath}`);
+    }
+    if (!processExists(Number(owner.pid))) {
+      throw new Error(`${label} has an orphaned lock; verify that no Odinn process is using the store before manually removing this lock; recover safely by moving ${lockPath} aside`);
+    }
+    return;
+  }
+}
+
+function processExists(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) !== "ESRCH";
+  }
+}
+
+async function syncCommittedStore(path: string) {
+  // The temporary file is fsynced before replacement. Windows does not allow
+  // fsync on the read-only replacement handle, while POSIX additionally needs
+  // the parent directory entry flushed after rename.
+  if (process.platform === "win32") return;
+  const directory = await open(dirname(path), "r");
+  try { await directory.sync(); }
+  finally { await directory.close(); }
 }
 
 export class FileAuditStore {

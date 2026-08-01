@@ -55,6 +55,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   trigger and schedule primitives.
 - [Cached MCP host foundation](cached-mcp-host.md) — MCP process reuse and
   lifecycle foundations.
+- [Channel state persistence and recovery](channel-state-recovery.md) — atomic
+  binding/dedupe writes, lock recovery, and rollback guidance.
 
 ## Advanced capability notes
 
