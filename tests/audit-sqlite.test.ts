@@ -73,6 +73,10 @@ test("legacy migration is backup-first, bounded, idempotent and preserves the ch
   await writeFile(legacy, "changed after migration\n"); const rollback = rollbackLegacyAuditMigration({ legacyPath: legacy, databasePath: database }); assert.equal(await readFile(legacy, "utf8"), lines); assert.ok(rollback.displacedDatabase);
 });
 
+test("legacy migration reconstructs signed rotation topology without user projections", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-migrate-rotations-")); t.after(() => rm(root, { recursive: true, force: true })); const legacy = join(root, "audit.jsonl"); const keys = `${legacy}.keys.json`; const source = new SqliteAuditStore(join(root, "source.sqlite"), { keyringPath: keys }); await source.append(event("one")); source.rotateSegment(); await source.append(event("two")); const lines = (await source.readAll()).map(JSON.stringify).join("\n") + "\n"; source.close(); await writeFile(legacy, lines); const database = join(root, "db", "audit.sqlite"); const migrated = migrateLegacyAuditToSqlite({ legacyPath: legacy, databasePath: database, keyringPath: keys }); assert.equal(migrated.events, 3); const store = new SqliteAuditStore(database, { keyringPath: keys }); assert.equal((await store.verifyIntegrity({ allowUnsigned: false })).valid, true); assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_segments").get() as any).count, 2); assert.equal((await store.readRuns()).some((run) => String(run.id).startsWith("audit-rotation-")), false); store.close();
+});
+
 test("interrupted migration rolls back SQLite and retains its source backup", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-audit-interrupt-")); t.after(() => rm(root, { recursive: true, force: true }));
   const legacy = join(root, "audit.jsonl"); const database = join(root, "db", "audit.sqlite"); await writeFile(legacy, `${JSON.stringify(event("valid"))}\n{broken\n`);
