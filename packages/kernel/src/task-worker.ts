@@ -16,6 +16,7 @@ const messageError = (error: unknown) => error instanceof Error ? error.message 
 
 process.on("message", async (rawMessage: unknown) => {
   let runLedger;
+  let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
   try {
     if (!rawMessage || typeof rawMessage !== "object") throw new Error("task worker received an invalid envelope");
     const { payload, stateDir, workspaceRoot, config = {}, policy } = rawMessage as TaskWorkerMessage;
@@ -23,7 +24,7 @@ process.on("message", async (rawMessage: unknown) => {
     const auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
     const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
     const registryOptions = { workspaceRoot, stateDir, config, approvalStore, auditStore };
-    const registry = createBuiltInRegistry(registryOptions);
+    registry = createBuiltInRegistry(registryOptions);
     runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
     const result = payload.plan
       ? await runPlan({ plan: payload.plan, auditStore, policy, registry, runLedger, actor: payload.actor })
@@ -32,6 +33,7 @@ process.on("message", async (rawMessage: unknown) => {
   } catch (error) {
     process.send?.({ ok: false, error: messageError(error) });
   } finally {
+    registry?.close();
     runLedger?.close();
   }
 });

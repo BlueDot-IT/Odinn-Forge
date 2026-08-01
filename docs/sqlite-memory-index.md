@@ -49,6 +49,49 @@ Default limits are exported as `MEMORY_INDEX_LIMITS`: 512 KiB per canonical
 document, 250,000 documents per rebuild, 2 KiB/32 tokens per query, 100 results,
 and an offset of 10,000.
 
+## Authoritative record storage (#58)
+
+The active project, session, workspace, goal, lifecycle, and memory paths use
+`@odinn/store-sqlite`'s `SqliteRecordStore` as the authoritative event store.
+Logical reads are expressed through `queryRecordsPage`, which applies bounded
+page sizes and opaque sequence keyset cursors; callers must not use `OFFSET`,
+`readAll()`, or pseudo-unbounded limits. Filters are scope-bound before the
+query reaches SQLite. Message external IDs are covered by a partial unique
+index for idempotent replay.
+
+Session, project, and goal lists and point reads use transactionally maintained
+current-state projections. A write publishes its immutable event and projection
+change in the same `BEGIN IMMEDIATE` transaction. Projection versioning performs
+a one-time ordered rebuild for databases created by an older pre-release schema;
+ordinary startup does not replay the journal. Session reassignment also updates
+session-scoped goal projections and project counts in that transaction. Message
+counts and last-message metadata are projected, so ordinary session reads do not
+replay message history.
+
+Memory browse namespace totals are computed by an indexed, active-record
+aggregation instead of the current display page. Ranked search and recall use a
+bounded candidate window. Their opaque cursor carries any ranked-but-unreturned
+IDs before advancing the underlying sequence cursor, preventing pagination from
+discarding records between pages. FTS5 remains separate and inactive; no parity
+or performance claim is made for it here.
+
+Legacy `records.jsonl` migration is backup-first and records a source hash,
+byte cursor, progress count, and completion state in SQLite. Import reads from
+the verified immutable backup, not the live source. It can resume from an
+interrupted chunk. Rollback first stages and verifies the backup, atomically
+restores the legacy path, and only then removes the SQLite target and sidecars.
+Migration does not activate FTS5; the FTS
+candidate remains an opt-in, separate retrieval layer pending parity and
+cross-platform activation proof.
+
+`pnpm benchmark:authoritative-storage` runs 10K, 100K, and 1M mixed event
+corpora by default. It asserts row and scope correctness, exercises current
+session/project/goal lists, message paging, external-ID lookup, memory search,
+and namespace browse, and reports per-operation p50/p95/p99 latency plus sampled
+peak heap and RSS deltas. `BENCHMARK_SIZES`, `BENCHMARK_SAMPLES`, and
+`BENCHMARK_CHUNK_SIZE` provide explicit smoke/soak controls without changing the
+default evidence sizes.
+
 ## Parity and activation gates
 
 FTS5 is lexical retrieval. It does not reproduce embeddings, semantic

@@ -1475,7 +1475,11 @@ export async function createGatewayServer({
     if (improvementTimer) clearInterval(improvementTimer);
     clearInterval(cronTimer);
     Promise.allSettled([channelSupervisor.stop(), supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
-      .then(() => close(callback))
+      .then(() => {
+        let registryError: unknown;
+        try { registry.close(); } catch (error) { registryError = error; }
+        close((serverError: unknown) => callback?.(serverError ?? registryError));
+      })
       .catch((error: any) => callback?.(error));
     return server;
   };

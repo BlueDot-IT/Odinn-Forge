@@ -1,18 +1,91 @@
 import { randomUUID } from "node:crypto";
 import type { JsonObject } from "@odinn/protocol";
-import type { StoredRecord } from "@odinn/store-file";
+import { findMessageByExternalId, pageInput, queryRecordPage, type QueryRecord, type QueryableRecordStore } from "./record-queries.ts";
 
 export const DEFAULT_PROJECT_ID = "project_default";
 
 const SESSION_ROLES = new Set(["system", "user", "assistant", "tool", "note"]);
 const GOAL_STATUSES = new Set(["active", "completed", "blocked", "paused", "cancelled"]);
 const PROJECT_STATUSES = new Set(["active", "archived"]);
+export type WorkspaceRecord = QueryRecord;
 
-export type WorkspaceRecord = StoredRecord;
+export interface WorkspaceRecordStore extends QueryableRecordStore {}
 
-export interface WorkspaceRecordStore {
-  readAll(): Promise<WorkspaceRecord[]>;
-  append(record: JsonObject): Promise<WorkspaceRecord>;
+export async function resolveProject(store: WorkspaceRecordStore, projectId: string): Promise<ProjectView | undefined> {
+  if (projectId === DEFAULT_PROJECT_ID) return reduceProjects([])[0];
+  if (typeof store.getCurrentProject !== "function") throw new Error("record store does not expose current project projections");
+  return await store.getCurrentProject(projectId) as ProjectView | undefined;
+}
+
+export async function resolveSession(store: WorkspaceRecordStore, sessionId: string): Promise<SessionView | undefined> {
+  if (typeof store.getCurrentSession !== "function") throw new Error("record store does not expose current session projections");
+  return await store.getCurrentSession(sessionId) as SessionView | undefined;
+}
+
+export async function resolveGoal(store: WorkspaceRecordStore, goalId: string): Promise<GoalView | undefined> {
+  if (typeof store.getCurrentGoal !== "function") throw new Error("record store does not expose current goal projections");
+  return await store.getCurrentGoal(goalId) as GoalView | undefined;
+}
+
+async function listSessionPage(store: WorkspaceRecordStore, input: SessionCommandInput) {
+  const page = pageInput(input as Record<string, unknown>, 20);
+  const projectId = cleanString(input.projectId, "");
+  if (typeof store.queryCurrentSessionsPage !== "function") throw new Error("record store does not expose current session projections");
+  const currentPage = await store.queryCurrentSessionsPage({ ...page, ...(projectId ? { projectId } : {}) });
+  const createdPage = { records: currentPage.records, hasMore: currentPage.hasMore, nextCursor: currentPage.nextCursor };
+  const sessions: SessionView[] = [];
+  for (const created of createdPage.records) {
+    const current = created as SessionView;
+    if (current && current.status !== "deleted") sessions.push(current);
+  }
+  return { sessions: sessions.filter((session) => !projectId || session.projectId === projectId), ...(createdPage.nextCursor ? { nextCursor: createdPage.nextCursor, hasMore: true } : {}) };
+}
+
+async function projectCounts(store: WorkspaceRecordStore, projectId: string) {
+  if (typeof store.projectEntityCounts !== "function") throw new Error("record store does not expose projected entity counts");
+  return store.projectEntityCounts(projectId);
+}
+
+async function listProjectPage(store: WorkspaceRecordStore, input: ProjectCommandInput) {
+  const page = pageInput(input as Record<string, unknown>, 100);
+  if (typeof store.queryCurrentProjectsPage !== "function") throw new Error("record store does not expose current project projections");
+  const currentPage = await store.queryCurrentProjectsPage({ ...page, includeArchived: input.includeArchived === true });
+  const createdPage = { records: currentPage.records, hasMore: currentPage.hasMore, nextCursor: currentPage.nextCursor };
+  const projects: ProjectView[] = input.cursor
+    ? []
+    : [{ ...reduceProjects([])[0]!, ...(await projectCounts(store, DEFAULT_PROJECT_ID)) }];
+  for (const created of createdPage.records) {
+    const current = created as ProjectView;
+    if (current && (input.includeArchived === true || current.status !== "archived")) {
+      projects.push({ ...current, ...(await projectCounts(store, current.id)) });
+    }
+  }
+  return { projects, defaultProjectId: DEFAULT_PROJECT_ID, ...(createdPage.nextCursor ? { nextCursor: createdPage.nextCursor, hasMore: true } : {}) };
+}
+
+async function listGoalPage(store: WorkspaceRecordStore, input: GoalCommandInput) {
+  const page = pageInput(input as Record<string, unknown>, 20);
+  const requestedProjectId = cleanString(input.projectId, "");
+  const requestedSessionId = cleanString(input.sessionId, "");
+  const requestedStatus = cleanString(input.status, "");
+  if (typeof store.queryCurrentGoalsPage !== "function") throw new Error("record store does not expose current goal projections");
+  const currentPage = await store.queryCurrentGoalsPage({
+      ...page,
+      ...(requestedProjectId ? { projectId: requestedProjectId } : {}),
+      ...(requestedSessionId ? { sessionId: requestedSessionId } : {}),
+      ...(requestedStatus ? { status: requestedStatus } : {})
+    });
+  const createdPage = { records: currentPage.records, hasMore: currentPage.hasMore, nextCursor: currentPage.nextCursor };
+  const goals: GoalView[] = [];
+  for (const created of createdPage.records) {
+    const current = created as GoalView;
+    if (!current) continue;
+    if (requestedProjectId && current.projectId !== requestedProjectId) continue;
+    if (requestedSessionId && current.sessionId !== requestedSessionId) continue;
+    if (requestedStatus && current.status !== requestedStatus) continue;
+    goals.push(current);
+  }
+  return { goals, ...(createdPage.nextCursor ? { nextCursor: createdPage.nextCursor, hasMore: true } : {}) };
 }
 
 export type SessionCommandInput = {
@@ -27,6 +100,7 @@ export type SessionCommandInput = {
   model?: unknown;
   provider?: unknown;
   externalId?: unknown;
+  cursor?: unknown;
   limit?: unknown;
 };
 
@@ -39,6 +113,7 @@ export type ProjectCommandInput = {
   source?: unknown;
   tags?: unknown;
   includeArchived?: unknown;
+  cursor?: unknown;
   limit?: unknown;
 };
 
@@ -52,6 +127,7 @@ export type GoalCommandInput = {
   note?: unknown;
   source?: unknown;
   tags?: unknown;
+  cursor?: unknown;
   limit?: unknown;
 };
 
@@ -96,9 +172,9 @@ export type GoalView = {
 };
 
 export async function createSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
-  const records = await store.readAll();
   const projectId = cleanString(input.projectId, DEFAULT_PROJECT_ID);
-  if (!reduceProjects(records).some((project) => project.id === projectId && project.status !== "archived")) {
+  const project = await resolveProject(store, projectId);
+  if (!project || project.status === "archived") {
     throw new Error(`project not found or archived: ${projectId}`);
   }
   return store.append({
@@ -118,15 +194,12 @@ export async function appendSessionMessage(store: WorkspaceRecordStore, input: S
   const role = cleanString(input.role, "user");
   if (!SESSION_ROLES.has(role)) throw new Error(`session role must be one of: ${Array.from(SESSION_ROLES).join(", ")}`);
   const content = cleanRequired(input.content, "session.message requires content");
-  const records = await store.readAll();
   const externalId = cleanString(input.externalId, "");
   if (externalId) {
-    const existing = records.find((entry: any) => (
-      entry.type === "message.appended" && entry.sessionId === sessionId && entry.externalId === externalId
-    ));
+    const existing = await findMessageByExternalId(store, sessionId, externalId);
     if (existing) return existing;
   }
-  const session = reduceSessions(records).find((entry) => entry.id === sessionId);
+  const session = await resolveSession(store, sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
   if (session.status !== "open") throw new Error(`session is not open: ${sessionId}`);
   const model = cleanString(input.model, "");
@@ -148,7 +221,7 @@ export async function appendSessionMessage(store: WorkspaceRecordStore, input: S
 export async function renameSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.rename requires sessionId");
   const title = cleanRequired(input.title, "session.rename requires title");
-  const session = reduceSessions(await store.readAll()).find((entry) => entry.id === sessionId);
+  const session = await resolveSession(store, sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
   if (session.status !== "open") throw new Error(`session is not open: ${sessionId}`);
   return store.append({ id: prefixedId("sess_evt"), type: "session.renamed", sessionId, title, actor: cleanString(input.actor, "local"), source: cleanString(input.source, "local") });
@@ -157,18 +230,16 @@ export async function renameSession(store: WorkspaceRecordStore, input: SessionC
 export async function assignSessionProject(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.assign requires sessionId");
   const projectId = cleanRequired(input.projectId, "session.assign requires projectId");
-  const records = await store.readAll();
-  const session = reduceSessions(records).find((entry) => entry.id === sessionId);
+  const session = await resolveSession(store, sessionId);
   if (!session || session.status === "deleted") throw new Error(`session not found: ${sessionId}`);
-  const project = reduceProjects(records).find((entry) => entry.id === projectId);
+  const project = await resolveProject(store, projectId);
   if (!project || project.status === "archived") throw new Error(`project not found or archived: ${projectId}`);
   return store.append({ id: prefixedId("sess_evt"), type: "session.assigned", sessionId, projectId, actor: cleanString(input.actor, "local"), source: cleanString(input.source, "local") });
 }
 
 export async function updateSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.update requires sessionId");
-  const records = await store.readAll();
-  const session = reduceSessions(records).find((entry) => entry.id === sessionId && entry.status !== "deleted");
+  const session = await resolveSession(store, sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
   const hasTitle = input.title !== undefined;
   const hasProject = input.projectId !== undefined;
@@ -176,7 +247,8 @@ export async function updateSession(store: WorkspaceRecordStore, input: SessionC
   const title = hasTitle ? cleanRequired(input.title, "session.update requires a non-empty title") : undefined;
   if (hasTitle && session.status !== "open") throw new Error(`session is not open: ${sessionId}`);
   const projectId = hasProject ? cleanRequired(input.projectId, "session.update requires projectId") : undefined;
-  if (projectId && !reduceProjects(records).some((entry) => entry.id === projectId && entry.status !== "archived")) {
+  const targetProject = projectId ? await resolveProject(store, projectId) : undefined;
+  if (projectId && (!targetProject || targetProject.status === "archived")) {
     throw new Error(`project not found or archived: ${projectId}`);
   }
   const event = await store.append({
@@ -193,40 +265,47 @@ export async function updateSession(store: WorkspaceRecordStore, input: SessionC
 
 export async function deleteSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.delete requires sessionId");
-  const session = reduceSessions(await store.readAll()).find((entry) => entry.id === sessionId);
+  const session = await resolveSession(store, sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
   if (session.status === "deleted") throw new Error(`session already deleted: ${sessionId}`);
   return store.append({ id: prefixedId("sess_evt"), type: "session.deleted", sessionId, actor: cleanString(input.actor, "local"), source: cleanString(input.source, "local") });
 }
 
 export async function listSessions(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
-  const projectId = cleanString(input.projectId, "");
-  return { sessions: reduceSessions(await store.readAll()).filter((session) => session.status !== "deleted").filter((session) => !projectId || session.projectId === projectId).slice(0, normalizeLimit(input.limit, 20)) };
+  return listSessionPage(store, input);
 }
 
 export async function readSession(store: WorkspaceRecordStore, input: SessionCommandInput = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.read requires sessionId");
-  const records = await store.readAll();
-  const session = reduceSessions(records).find((entry) => entry.id === sessionId);
+  const session = await resolveSession(store, sessionId);
   if (!session || session.status === "deleted") throw new Error(`session not found: ${sessionId}`);
-  const messages = records
-    .filter((record) => record.type === "message.appended" && record.sessionId === sessionId)
+  const messagePage = await queryRecordPage(store, {
+    types: ["message.appended"],
+    sessionId,
+    order: "asc",
+    ...pageInput(input as Record<string, unknown>, 100)
+  });
+  const messages = messagePage.records
     .map(({ id, at, role, content, actor, source, model, provider }) => ({ id, at, role, content, actor, source, model, provider }));
-  return { session, messages };
+  return {
+    session,
+    messages,
+    hasMore: messagePage.hasMore,
+    ...(messagePage.nextCursor ? { nextCursor: messagePage.nextCursor } : {})
+  };
 }
 
 export async function createProject(store: WorkspaceRecordStore, input: ProjectCommandInput = {}) {
   const name = cleanRequired(input.name, "project.create requires name");
-  const records = await store.readAll();
   const id = cleanString(input.id, prefixedId("project"));
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,119}$/u.test(id)) throw new Error("project id must be 2-120 letters, digits, dots, underscores, or hyphens");
-  if (reduceProjects(records).some((project) => project.id === id)) throw new Error(`project already exists: ${id}`);
+  if (await resolveProject(store, id)) throw new Error(`project already exists: ${id}`);
   return store.append({ id, type: "project.created", status: "active", name, description: cleanString(input.description, ""), tags: normalizeTags(input.tags), source: cleanString(input.source, "local") });
 }
 
 export async function updateProject(store: WorkspaceRecordStore, input: ProjectCommandInput = {}) {
   const projectId = cleanRequired(input.projectId, "project.update requires projectId");
-  const project = reduceProjects(await store.readAll()).find((entry) => entry.id === projectId);
+  const project = await resolveProject(store, projectId);
   if (!project) throw new Error(`project not found: ${projectId}`);
   const status = cleanString(input.status, project.status);
   if (!PROJECT_STATUSES.has(status)) throw new Error(`project status must be one of: ${Array.from(PROJECT_STATUSES).join(", ")}`);
@@ -243,22 +322,11 @@ export async function updateProject(store: WorkspaceRecordStore, input: ProjectC
 }
 
 export async function listProjects(store: WorkspaceRecordStore, input: ProjectCommandInput = {}) {
-  const records = await store.readAll();
-  const sessions = reduceSessions(records).filter((session) => session.status !== "deleted");
-  const goals = reduceGoals(records);
-  const projects = reduceProjects(records)
-    .filter((project) => input.includeArchived === true || project.status !== "archived")
-    .map((project) => ({
-      ...project,
-      sessionCount: sessions.filter((session) => session.projectId === project.id).length,
-      goalCount: goals.filter((goal) => goal.projectId === project.id).length,
-      activeGoalCount: goals.filter((goal) => goal.projectId === project.id && goal.status === "active").length
-    }));
-  return { projects: projects.slice(0, normalizeLimit(input.limit, 100)), defaultProjectId: DEFAULT_PROJECT_ID };
+  return listProjectPage(store, input);
 }
 
 export async function createGoal(store: WorkspaceRecordStore, input: GoalCommandInput = {}) {
-  const records = await store.readAll();
+  const scope = await resolveGoalScope(store, input);
   return store.append({
     id: prefixedId("goal"),
     type: "goal.created",
@@ -267,13 +335,13 @@ export async function createGoal(store: WorkspaceRecordStore, input: GoalCommand
     description: cleanString(input.description, ""),
     tags: normalizeTags(input.tags),
     source: cleanString(input.source, "local"),
-    ...resolveGoalScope(records, input)
+    ...scope
   });
 }
 
 export async function updateGoal(store: WorkspaceRecordStore, input: GoalCommandInput = {}) {
   const goalId = cleanRequired(input.goalId, "goal.update requires goalId");
-  const current = reduceGoals(await store.readAll()).find((goal) => goal.id === goalId);
+  const current = await resolveGoal(store, goalId);
   if (!current) throw new Error(`goal not found: ${goalId}`);
   const status = cleanString(input.status, current.status);
   if (!GOAL_STATUSES.has(status)) throw new Error(`goal status must be one of: ${Array.from(GOAL_STATUSES).join(", ")}`);
@@ -290,16 +358,7 @@ export async function updateGoal(store: WorkspaceRecordStore, input: GoalCommand
 }
 
 export async function listGoals(store: WorkspaceRecordStore, input: GoalCommandInput = {}) {
-  const projectId = cleanString(input.projectId, "");
-  const sessionId = cleanString(input.sessionId, "");
-  const status = cleanString(input.status, "");
-  return {
-    goals: reduceGoals(await store.readAll())
-      .filter((goal) => !projectId || goal.projectId === projectId)
-      .filter((goal) => !sessionId || goal.sessionId === sessionId)
-      .filter((goal) => !status || goal.status === status)
-      .slice(0, normalizeLimit(input.limit, 20))
-  };
+  return listGoalPage(store, input);
 }
 
 export function reduceSessions(records: WorkspaceRecord[]): SessionView[] {
@@ -422,17 +481,18 @@ export function reduceGoals(records: WorkspaceRecord[]): GoalView[] {
   return Array.from(goals.values()).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
-function resolveGoalScope(records: WorkspaceRecord[], input: GoalCommandInput) {
+async function resolveGoalScope(store: WorkspaceRecordStore, input: GoalCommandInput) {
   const sessionId = cleanString(input.sessionId, "");
   const requestedProjectId = cleanString(input.projectId, "");
   if (sessionId) {
-    const session = reduceSessions(records).find((entry) => entry.id === sessionId && entry.status !== "deleted");
+    const session = await resolveSession(store, sessionId);
     if (!session) throw new Error(`session not found: ${sessionId}`);
     if (requestedProjectId && requestedProjectId !== session.projectId) throw new Error("goal projectId must match the selected session's project");
     return { scopeType: "session", scopeId: sessionId, sessionId, projectId: session.projectId };
   }
   const projectId = requestedProjectId || DEFAULT_PROJECT_ID;
-  if (!reduceProjects(records).some((entry) => entry.id === projectId && entry.status !== "archived")) {
+  const project = await resolveProject(store, projectId);
+  if (!project || project.status === "archived") {
     throw new Error(`project not found or archived: ${projectId}`);
   }
   return { scopeType: "project", scopeId: projectId, projectId };

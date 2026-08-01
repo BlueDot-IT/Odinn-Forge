@@ -1,10 +1,12 @@
+import { existsSync } from "node:fs";
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
-import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
+import { FileAuditStore } from "@odinn/store-file";
+import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore } from "@odinn/store-sqlite";
 import { captureAncestorIdentities, MAX_BOUNDED_UTF8_BYTES, readUtf8Prefix } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { loadEnvironmentFiles } from "./environment.ts";
@@ -15,7 +17,7 @@ import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPER
 import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, DarwinRouter, OdinnRuntimeError, Sentinel } from "./differentiated-runtime.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
-import { appendSessionMessage, assignSessionProject, createGoal, createProject, createSession, DEFAULT_PROJECT_ID, deleteSession, listGoals, listProjects, listSessions, readSession, reduceProjects, reduceSessions, renameSession, updateGoal, updateProject, updateSession } from "./workspace-records.ts";
+import { appendSessionMessage, assignSessionProject, createGoal, createProject, createSession, DEFAULT_PROJECT_ID, deleteSession, listGoals, listProjects, listSessions, readSession, renameSession, resolveSession, updateGoal, updateProject, updateSession } from "./workspace-records.ts";
 import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, formatMemoryContext, learnFromConversation, listMemoryCandidates, normalizeMemoryOptions, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
 import { createApprovalStore } from "./approvals.ts";
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
@@ -55,9 +57,16 @@ export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_
 export type { AgentManifest } from "./agents.ts";
 
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch }: any = {}) {
+export type BuiltInRegistry = Map<string, any> & { close(): void };
+
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
-  const recordStore = new FileRecordStore(join(resolve(stateDir), "records.jsonl"));
+  const stateRoot = resolve(stateDir);
+  const legacyRecordPath = join(stateRoot, "records.jsonl");
+  const recordDatabasePath = join(stateRoot, "db", "records.sqlite");
+  const migration = legacyRecordMigrationStatus({ legacyPath: legacyRecordPath, databasePath: recordDatabasePath });
+  if (existsSync(legacyRecordPath) && !migration?.complete) migrateLegacyRecordsToSqlite({ legacyPath: legacyRecordPath, databasePath: recordDatabasePath });
+  const recordStore = new SqliteRecordStore(recordDatabasePath);
   const modelConfig = normalizeModelConfig(config);
   const registry = new Map([
     ["job.healthcheck", {
@@ -438,7 +447,16 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       description: "Rollback an autonomously applied improvement to its captured configuration snapshot.",
       execute: async (input: any) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config })
     }]
-  ]);
+  ]) as BuiltInRegistry;
+  let closed = false;
+  Object.defineProperty(registry, "close", {
+    enumerable: false,
+    value: () => {
+      if (closed) return;
+      closed = true;
+      recordStore.close();
+    }
+  });
   const discordSchemas = new Map(DISCORD_AGENT_TOOL_SCHEMAS.map((schema: any) => [schema.function.name, schema.function.parameters]));
   for (const [name, tool] of createDiscordAgentTools({ config, approvalStore, fetch: discordFetch })) {
     registry.set(name, { ...tool, inputSchema: discordSchemas.get(name) });
@@ -474,8 +492,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   const canRememberMemory = policyAllows("memory.remember");
   const canSuggestMemory = policyAllows("memory.suggest");
   const canCompactMemory = policyAllows("memory.compact");
-  const memoryRecords = memoryStore && input.sessionId && (canRecallMemory || canRememberMemory || canSuggestMemory || canCompactMemory) ? await memoryStore.readAll() : [];
-  const currentSession = input.sessionId ? reduceSessions(memoryRecords).find((session: any) => session.id === input.sessionId) : undefined;
+  const currentSession = memoryStore && input.sessionId ? await resolveSession(memoryStore, cleanString(input.sessionId, "")) : undefined;
   const memoryScope = { sessionId: cleanString(input.sessionId, ""), projectId: cleanString(input.projectId, currentSession?.projectId ?? "") };
   const runMemoryTool = async (tool: string, toolInput: any, reason: string) => (await runTool({ tool, input: toolInput, actor: "agent-memory", reason })).output;
   const learned = memoryStore && canSuggestMemory && memoryOptions.autoLearn

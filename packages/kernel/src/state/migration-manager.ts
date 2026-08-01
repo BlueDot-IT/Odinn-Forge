@@ -3,7 +3,7 @@ import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFi
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { AUDIT_SCHEMA_VERSION } from "@odinn/protocol";
 import { FileAuditStore } from "@odinn/store-file";
-import { inspectExistingSqliteSchema } from "@odinn/store-sqlite";
+import { inspectAuthoritativeRecordSchema, inspectExistingSqliteSchema } from "@odinn/store-sqlite";
 import { STATE_MIGRATIONS, type StateMigrationDefinition, type StateMigrationResult } from "./migrations/index.ts";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
 import { withStateMutationLock } from "../state-mutation.ts";
@@ -114,7 +114,10 @@ export async function inspectStateSchemas(stateDir: string): Promise<StateInspec
 
   const config = await inspectConfig(stateRoot);
   put(statuses, "config", config);
-  const records = await inspectJsonLines(join(stateRoot, "records.jsonl"), 1, "record");
+  const authoritativeRecordPath = join(stateRoot, "db", "records.sqlite");
+  const records = await exists(authoritativeRecordPath)
+    ? presentInspection(inspectAuthoritativeRecordSchema(authoritativeRecordPath), "authoritative SQLite record store is readable")
+    : await inspectJsonLines(join(stateRoot, "records.jsonl"), 1, "record");
   put(statuses, "records", records);
   for (const surface of ["sessions", "projects", "goals", "memory"] as const) put(statuses, surface, records);
   put(statuses, "jobs", await inspectVersionedObject(join(stateRoot, "jobs.json"), "jobs", "object"));

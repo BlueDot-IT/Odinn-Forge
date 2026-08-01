@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./memory-index": "./src/memory-index.ts"
+    "./memory-index": "./src/memory-index.ts",
+    "./authoritative": "./src/authoritative.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
