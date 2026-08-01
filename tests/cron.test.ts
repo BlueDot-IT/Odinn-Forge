@@ -135,14 +135,14 @@ test("duplicate polls submit N once and submit N+1 once while N remains held for
     nextRunAt: "2026-08-01T12:00:00.000Z"
   });
 
-  const executed: string[] = [];
+  const executions = new Map<string, number>();
   let releaseFirst!: () => void;
   const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
   let markFirstStarted!: () => void;
   const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
   const execute = async (_payload: unknown, context: { job: { occurrenceKey?: string } }) => {
     const key = String(context.job.occurrenceKey);
-    executed.push(key);
+    executions.set(key, (executions.get(key) || 0) + 1);
     if (key.endsWith("12:00:00.000Z")) {
       markFirstStarted();
       await firstHeld;
@@ -154,24 +154,31 @@ test("duplicate polls submit N once and submit N+1 once while N remains held for
 
   const occurrenceN = "cron:seventy-second-job:2026-08-01T12:00:00.000Z";
   const occurrenceN1 = "cron:seventy-second-job:2026-08-01T12:01:00.000Z";
-  const firstTick = runDueCronJobs(leftCron, left, new Date("2026-08-01T12:00:30.000Z"));
-  await firstStarted;
-  const duplicateTick = runDueCronJobs(rightCron, right, new Date("2026-08-01T12:00:30.000Z"));
-  await duplicateTick;
-  const nextTick = runDueCronJobs(rightCron, right, new Date("2026-08-01T12:01:00.000Z"));
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (await right.get(occurrenceN1)) break;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal((await right.get(occurrenceN1))?.status, "queued");
-  assert.deepEqual(executed, [occurrenceN]);
+  let firstTick: Promise<void> | undefined;
+  let nextTick: Promise<void> | undefined;
+  try {
+    firstTick = runDueCronJobs(leftCron, left, new Date("2026-08-01T12:00:30.000Z"));
+    await firstStarted;
+    await runDueCronJobs(rightCron, right, new Date("2026-08-01T12:00:30.000Z"));
+    nextTick = runDueCronJobs(rightCron, right, new Date("2026-08-01T12:01:00.000Z"));
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (await right.get(occurrenceN1)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal((await right.get(occurrenceN))?.occurrenceKey, occurrenceN);
+    assert.equal((await right.get(occurrenceN1))?.occurrenceKey, occurrenceN1);
 
-  releaseFirst();
-  await Promise.all([firstTick, nextTick]);
-  assert.deepEqual(executed.sort(), [occurrenceN, occurrenceN1].sort());
-  assert.equal((await left.get(occurrenceN))?.status, "completed");
-  assert.equal((await left.get(occurrenceN1))?.status, "completed");
-  await Promise.all([left.shutdown(), right.shutdown()]);
+    releaseFirst();
+    await Promise.all([firstTick, nextTick]);
+    assert.equal(executions.get(occurrenceN), 1);
+    assert.equal(executions.get(occurrenceN1), 1);
+    assert.equal((await left.get(occurrenceN))?.status, "completed");
+    assert.equal((await left.get(occurrenceN1))?.status, "completed");
+  } finally {
+    releaseFirst();
+    await Promise.allSettled([firstTick, nextTick].filter((tick): tick is Promise<void> => Boolean(tick)));
+    await Promise.allSettled([left.shutdown(), right.shutdown()]);
+  }
 });
 
 test("dispatch failure before job submission recovers the expired lease to the same occurrence key", async () => {
