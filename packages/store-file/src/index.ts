@@ -237,8 +237,12 @@ async function assertSecureStateParent(path: string): Promise<void> {
 }
 
 async function assertSecureStateFile(path: string): Promise<void> {
-  const info = await lstat(path);
+  let info = await lstat(path);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error(`state path must be a regular file: ${path}`);
+  if (process.platform === "win32") {
+    await secureStoreFile(path);
+    info = await lstat(path);
+  }
   if (!await isOwnerOnlyPath(path)) throw new Error(`state file is not owner-only: ${path}`);
 }
 
