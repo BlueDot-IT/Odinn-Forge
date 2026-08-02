@@ -46,11 +46,7 @@ export async function readWorkspaceText(workspaceRoot: string, { path, maxBytes 
 }
 
 export async function executeWorkspaceProcess(workspaceRoot: string, input: any = {}, signal?: AbortSignal) {
-  if (signal?.aborted) {
-    const error = new Error("process.exec cancelled");
-    error.name = "AbortError";
-    throw error;
-  }
+  if (signal?.aborted) throw processCancellationError();
   const command = cleanCommand(input.command);
   const args = cleanArguments(input.args);
   const cwd = await resolveExistingWorkspacePath(workspaceRoot, input.cwd ?? ".", "process.exec", true);
@@ -60,14 +56,7 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
   const startedAt = Date.now();
 
   return await new Promise((resolveProcess, rejectProcess) => {
-    const child = spawn(command, args, {
-      cwd: cwd.target,
-      env: processEnvironment(cwd.target),
-      detached: process.platform !== "win32",
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
-    });
+    let child: ReturnType<typeof spawn> | undefined;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let stdoutBytes = 0;
@@ -78,13 +67,36 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
     let settled = false;
 
     const terminate = () => {
-      if (!child.pid) return;
+      const activeChild = child;
+      if (!activeChild?.pid) return;
       if (process.platform === "win32") {
-        spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).unref();
+        spawn("taskkill", ["/pid", String(activeChild.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).unref();
       } else {
-        try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+        try { process.kill(-activeChild.pid, "SIGKILL"); } catch { activeChild.kill("SIGKILL"); }
       }
     };
+    const abort = () => terminate();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) {
+      signal.removeEventListener("abort", abort);
+      rejectProcess(processCancellationError());
+      return;
+    }
+    try {
+      child = spawn(command, args, {
+        cwd: cwd.target,
+        env: processEnvironment(cwd.target),
+        detached: process.platform !== "win32",
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true
+      });
+    } catch (error) {
+      signal?.removeEventListener("abort", abort);
+      rejectProcess(error);
+      return;
+    }
+    const activeChild = child!;
     const collect = (chunks: Buffer[], chunk: Buffer, stream: "stdout" | "stderr") => {
       const available = Math.max(0, maxOutputBytes - capturedBytes);
       if (available) chunks.push(chunk.subarray(0, available));
@@ -97,30 +109,26 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
         terminate();
       }
     };
-    child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk, "stdout"));
-    child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk, "stderr"));
-    child.once("error", (error) => {
+    activeChild.stdout!.on("data", (chunk: Buffer) => collect(stdout, chunk, "stdout"));
+    activeChild.stderr!.on("data", (chunk: Buffer) => collect(stderr, chunk, "stderr"));
+    activeChild.once("error", (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
       rejectProcess(error);
     });
-    const abort = () => terminate();
-    signal?.addEventListener("abort", abort, { once: true });
     const timer = setTimeout(() => {
       timedOut = true;
       terminate();
     }, timeoutMs);
-    child.once("close", (exitCode, childSignal) => {
+    activeChild.once("close", (exitCode, childSignal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
       if (signal?.aborted) {
-        const error = new Error("process.exec cancelled");
-        error.name = "AbortError";
-        rejectProcess(error);
+        rejectProcess(processCancellationError());
         return;
       }
       resolveProcess({
@@ -139,6 +147,12 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
       });
     });
   });
+}
+
+function processCancellationError() {
+  const error = new Error("process.exec cancelled");
+  error.name = "AbortError";
+  return error;
 }
 
 function cleanCommand(value: unknown) {
