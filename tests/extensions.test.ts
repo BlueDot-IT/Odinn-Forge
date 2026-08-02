@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -180,6 +180,41 @@ test("extension execution uses an owner-only snapshot after integrity verificati
     await new Promise((resolve) => setTimeout(resolve, 50));
     await writeFile(join(bundle, "payload.ts"), 'export const value = "replaced";\n');
     assert.deepEqual(await invocation, { value: "verified" });
+  } finally {
+    runtime.differentiated.ledger.close();
+  }
+});
+
+test("extension execution rejects symlinked dependencies before external code runs", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-extension-symlink-snapshot-"));
+  const bundle = join(root, "bundle");
+  const executionMarker = join(root, "external-code-ran");
+  const externalDependency = join(root, "mutable-payload.ts");
+  await mkdir(bundle);
+  const entrypointSource = `process.stdin.resume(); const payload = await import("./payload.ts"); process.stdout.write(JSON.stringify({ result: { value: payload.value } }) + "\\n");\n`;
+  await writeFile(join(bundle, "tool.ts"), entrypointSource);
+  await writeFile(externalDependency, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(executionMarker)}, "executed"); export const value = "external";\n`);
+  await symlink(externalDependency, join(bundle, "payload.ts"), "file");
+  const registry = new ExtensionRegistry(join(root, "extensions.json"));
+  await registry.install({
+    id: "symlink-snapshot-tool",
+    version: "1.0.0",
+    type: "tool",
+    entrypoint: "bundle/tool.ts",
+    bundleRoot: "bundle",
+    capabilities: ["text.echo"],
+    sandbox: "unconfined-process",
+    contentDigest: digest(entrypointSource)
+  });
+  await registry.enable("symlink-snapshot-tool", { grants: ["text.echo"], trust: true, allowUnsafeSandbox: true });
+  const runtime = auditedExtensionRuntime(root, "symlink-snapshot");
+  try {
+    await assert.rejects(
+      () => new ExtensionExecutor(registry, { workspaceRoot: root, defaultTimeoutMs: 2_000 })
+        .invoke("symlink-snapshot-tool", {}, { runtime: runtime.value }),
+      /extension bundle contains a symbolic link/u
+    );
+    await assert.rejects(access(executionMarker), { code: "ENOENT" });
   } finally {
     runtime.differentiated.ledger.close();
   }

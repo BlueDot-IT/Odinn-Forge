@@ -212,8 +212,10 @@ async function createExtensionExecutionSnapshot(extension: ExtensionManifest, en
   await chmod(directory, 0o700);
   const snapshotPath = join(directory, "bundle");
   try {
+    if (extension.sandbox === "unconfined-process") await digestExtensionBundle(bundleRoot);
     await cp(bundleRoot, snapshotPath, { recursive: true, dereference: false, errorOnExist: true, force: false });
     const snapshotRoot = await realpath(snapshotPath);
+    const snapshotBundleDigest = await digestExtensionBundle(snapshotRoot);
     const relativeEntrypoint = relative(bundleRoot, entrypoint);
     if (!relativeEntrypoint || relativeEntrypoint.startsWith("..") || relativeEntrypoint.includes(`..${sep}`)) {
       throw new Error("extension entrypoint must remain inside its immutable execution snapshot");
@@ -226,7 +228,7 @@ async function createExtensionExecutionSnapshot(extension: ExtensionManifest, en
     if (extension.sandbox === "unconfined-process" && extension.contentDigest !== contentDigest) {
       throw new Error(`extension entrypoint changed while creating its execution snapshot: ${extension.id}`);
     }
-    if (extension.sandbox === "container" && extension.bundleDigest !== await digestExtensionBundle(snapshotRoot)) {
+    if (extension.sandbox === "container" && extension.bundleDigest !== snapshotBundleDigest) {
       throw new Error(`extension bundle changed while creating its execution snapshot: ${extension.id}`);
     }
     return { directory, bundleRoot: snapshotRoot, entrypoint: snapshotEntrypoint };
