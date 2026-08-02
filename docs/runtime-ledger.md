@@ -19,6 +19,15 @@ The three hard limits are:
 
 - [x] Unified execution admission is active for the shared `runTask` spine. Gateway run and streaming requests, CLI runs, browser workers, plan steps, and nested agent tool calls persist strict immutable `ExecutionEnvelopeV1` records before execution, with mutable attempts and cancellation controls stored separately. Policy denial remains pre-admission, and cancelled non-retry-safe effects settle as `needs-review`. See [Execution admission architecture](architecture/execution-admission.md).
 - [x] Runtime jobs, owner/epoch-fenced active leases, lease history, portable legacy-import provenance, envelope/attempt bindings, cancellation correlation, and restart reconciliation live in runtime SQLite schema v5. `jobs.json` is a one-time validated import source retained as rollback evidence; Gateway no longer writes it. Cron definitions retain their compatibility store, while each occurrence uses one admitted job/run identity. Exact inputs changed by persistence redaction remain volatile and fail closed after restart rather than replaying placeholders.
+- [x] Five bounded workspace inspection tools provide deterministic listing,
+  metadata, literal search, UTF-8-safe reads, and text diffs under the trusted
+  `workspace.inspect` mapping. They enforce portable relative paths,
+  sensitive-file and ignore rules, traversal/read/result ceilings,
+  request-bound cursors, cooperative cancellation, and content-free audit and
+  ledger projections. Portable pre/open/post identity checks detect tested
+  replacement races without claiming atomic macOS/Windows ABA exclusion;
+  the planned Stage 4 sandbox remains the hard boundary for untrusted
+  execution.
 
 - [x] Durable queued jobs with persisted state, cancellation, timeouts, restart recovery, content-bound idempotent submission, and graceful supervisor shutdown. Retries require an explicit safe/idempotent tool descriptor; interrupted unsafe work stops in `needs-review` instead of replaying an unknown external outcome.
 - [x] Forked crash-containment workers for every gateway-submitted task. These workers retain the parent OS identity, environment, filesystem, and network authority and are not described as a security sandbox; the local CLI remains an explicitly local operator path.

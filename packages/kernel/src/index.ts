@@ -1,12 +1,11 @@
 import { existsSync } from "node:fs";
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
-import { realpath, stat } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed } from "@odinn/policy";
-import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
+import { createRunId, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
-import { captureAncestorIdentities, MAX_BOUNDED_UTF8_BYTES, readUtf8Prefix } from "./skill-packages.ts";
+import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile } from "./environment.ts";
@@ -25,7 +24,8 @@ import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, list
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
 import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.ts";
-import { executeWorkspaceProcess } from "./workspace-tools.ts";
+import { executeWorkspaceProcess, readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
+export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
@@ -59,6 +59,28 @@ export type { AgentManifest } from "./agents.ts";
 
 export type BuiltInRegistry = Map<string, any> & { close(): void };
 
+function boundedWorkspaceBytesSchema() {
+  return { type: "integer", minimum: 1, maximum: MAX_BOUNDED_UTF8_BYTES };
+}
+
+function workspaceTraversalSchema(search: boolean) {
+  return {
+    type: "object",
+    properties: {
+      path: { type: "string" },
+      ...(search ? { query: { type: "string", minLength: 1, maxLength: 1_024 }, caseSensitive: { type: "boolean" } } : { recursive: { type: "boolean" } }),
+      cursor: { type: "string", maxLength: 4_096 },
+      limit: { type: "integer", minimum: 1, maximum: 1_000 },
+      maxDepth: { type: "integer", minimum: 0, maximum: 32 },
+      maxFiles: { type: "integer", minimum: 1, maximum: 100_000 },
+      maxBytes: boundedWorkspaceBytesSchema(),
+      ignoreFiles: { type: "array", items: { type: "string", maxLength: 256 }, maxItems: 16 }
+    },
+    ...(search ? { required: ["query"] } : {}),
+    additionalProperties: false
+  };
+}
+
 export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
@@ -89,34 +111,37 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       capability: "workspace.readText",
       description: "Read a UTF-8 text file confined to the workspace root. maxBytes is a positive byte limit capped at 8388608; content is valid UTF-8 and at most maxBytes bytes; bytesRead reports the bounded probe of up to maxBytes + 1 bytes; truncated is byte-based.",
       inputSchema: { type: "object", properties: { path: { type: "string" }, maxBytes: { type: "integer", minimum: 1, maximum: MAX_BOUNDED_UTF8_BYTES } }, required: ["path"] },
-      execute: async ({ path, maxBytes = 65_536 }: any) => {
-        if (typeof path !== "string" || path.trim() === "") throw new Error("workspace.readText requires path");
-        if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_BOUNDED_UTF8_BYTES) {
-          throw new Error(`workspace.readText maxBytes must be a positive safe integer no greater than ${MAX_BOUNDED_UTF8_BYTES}`);
-        }
-        const realRoot = await realpath(root);
-        const lexicalTarget = resolve(realRoot, path);
-        const lexicalRelative = relative(realRoot, lexicalTarget);
-        if (lexicalRelative === "" || lexicalRelative.startsWith("..") || lexicalRelative.includes("..\\")) throw new Error("workspace.readText path escapes workspace root");
-        const admissionAncestors = await captureAncestorIdentities(realRoot, lexicalTarget, "workspace.readText");
-        const admissionTarget = await stat(lexicalTarget);
-        const target = await realpath(lexicalTarget);
-        const rel = relative(realRoot, target);
-        if (rel === "" || rel.startsWith("..") || rel.includes("..\\") || target !== realRoot && !target.startsWith(`${realRoot}${sep}`)) {
-          throw new Error("workspace.readText path escapes workspace root");
-        }
-        const bounded = await readUtf8Prefix(target, maxBytes, "workspace.readText", {
-          confinementRoot: realRoot,
-          expectedAncestors: admissionAncestors,
-          expectedFileIdentity: { dev: admissionTarget.dev, ino: admissionTarget.ino }
-        });
-        return {
-          path: rel.replaceAll("\\", "/"),
-          content: bounded.content,
-          bytesRead: bounded.bytesRead,
-          truncated: bounded.truncated
-        };
-      }
+      execute: async (input: any, context: any) => readWorkspaceText(root, input, { signal: context.signal, security: context.policy?.security?.workspace })
+    }],
+    ["workspace.list", {
+      capability: "workspace.list",
+      description: "List a deterministic, cursor-paginated, bounded set of entries beneath the workspace without following links.",
+      inputSchema: workspaceTraversalSchema(false),
+      execute: async (input: any, context: any) => workspaceList(root, input, { signal: context.signal, security: context.policy?.security?.workspace })
+    }],
+    ["workspace.stat", {
+      capability: "workspace.stat",
+      description: "Inspect bounded metadata and a content digest for one confined workspace file or directory.",
+      inputSchema: { type: "object", properties: { path: { type: "string" }, maxBytes: boundedWorkspaceBytesSchema() }, required: ["path"], additionalProperties: false },
+      execute: async (input: any, context: any) => workspaceStat(root, input, { signal: context.signal, security: context.policy?.security?.workspace })
+    }],
+    ["workspace.search", {
+      capability: "workspace.search",
+      description: "Search literal text across a bounded, ignored, deterministic workspace traversal with cursor pagination.",
+      inputSchema: workspaceTraversalSchema(true),
+      execute: async (input: any, context: any) => workspaceSearch(root, input, { signal: context.signal, security: context.policy?.security?.workspace })
+    }],
+    ["workspace.read", {
+      capability: "workspace.read",
+      description: "Read a bounded workspace file with binary identification, UTF-8-safe truncation, and content digest metadata.",
+      inputSchema: { type: "object", properties: { path: { type: "string" }, maxBytes: boundedWorkspaceBytesSchema() }, required: ["path"], additionalProperties: false },
+      execute: async (input: any, context: any) => workspaceRead(root, input, { signal: context.signal, security: context.policy?.security?.workspace })
+    }],
+    ["workspace.diff", {
+      capability: "workspace.diff",
+      description: "Render a bounded deterministic text diff against another confined workspace file or provided bounded baseline.",
+      inputSchema: { type: "object", properties: { path: { type: "string" }, basePath: { type: "string" }, before: { type: "string" }, beforePath: { type: "string", minLength: 1, maxLength: 256 }, maxBytes: boundedWorkspaceBytesSchema() }, required: ["path"], additionalProperties: false },
+      execute: async (input: any, context: any) => workspaceDiff(root, input, { signal: context.signal, security: context.policy?.security?.workspace })
     }],
     ["process.exec", {
       capability: "process.exec",
@@ -1152,7 +1177,16 @@ async function executeTaskThroughAdmission({
       throw error;
     }
     const completed = [...prior.events].reverse().find((event: any) => event.type === "task.completed");
-    return { id: request.id, tool: request.tool, capability: tool?.capability, capabilities: tool?.capabilities ?? [], ok: true, replayed: true, output: completed?.data?.output };
+    return {
+      id: request.id,
+      tool: request.tool,
+      capability: tool?.capability,
+      capabilities: tool?.capabilities ?? [],
+      ok: true,
+      replayed: true,
+      ...(isWorkspaceContentTool(request.tool) ? { contentUnavailableOnReplay: true } : {}),
+      output: completed?.data?.output
+    };
   }
   const recoveryReplay = runBinding?.replay === true && trustedRecovery === true;
   if (runBinding?.replay && !recoveryReplay) {
@@ -1165,7 +1199,7 @@ async function executeTaskThroughAdmission({
   const safety = toolSafetyDescriptor(request.tool, tool);
   let ledgerStep;
   if (runLedger) {
-    ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: request.input, safety, metadata: { actor: request.actor } });
+    ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: projectDurableToolInput(request.tool, request.input), safety, metadata: { actor: request.actor } });
   }
   const decision = evaluateTaskPolicy({ policy, request, tool });
 
@@ -1239,7 +1273,7 @@ async function executeTaskThroughAdmission({
       capabilities: tool.capabilities,
       attemptId: admission?.attemptId,
       auditCorrelationId: admission?.envelope?.auditCorrelationId,
-      input: safeAuditValue(request.input)
+      input: safeAuditValue(projectDurableToolInput(request.tool, request.input))
     }
   });
 
@@ -1291,6 +1325,7 @@ async function executeTaskThroughAdmission({
     backendReturned = true;
     throwIfAborted(signal);
     const awaitingApproval = output?.type === "approval.required";
+    const durableOutput = projectDurableToolOutput(request.tool, output);
     await auditStore.append({
       at: now(),
       runId: request.id,
@@ -1302,9 +1337,9 @@ async function executeTaskThroughAdmission({
       message: awaitingApproval ? output.summary : undefined,
       data: awaitingApproval
         ? { approvalId: output.approvalId, expiresInSeconds: output.expiresInSeconds, attemptId: admission?.attemptId, auditCorrelationId: admission?.envelope?.auditCorrelationId }
-        : { output: safeAuditValue(output), attemptId: admission?.attemptId, auditCorrelationId: admission?.envelope?.auditCorrelationId }
+        : { output: safeAuditValue(durableOutput), attemptId: admission?.attemptId, auditCorrelationId: admission?.envelope?.auditCorrelationId }
     });
-    const outputArtifact = runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output, status: awaitingApproval ? "blocked" : "succeeded" });
+    const outputArtifact = runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output: durableOutput, status: awaitingApproval ? "blocked" : "succeeded" });
     ledgerFinished = Boolean(runLedger);
     if (awaitingApproval) admissionService.awaitApproval(admission);
     else admissionService.complete(admission, outputArtifact?.digest);

@@ -42,6 +42,8 @@ The stable local, single-user product includes:
 - Tasks, jobs, and cron jobs
 - Provider inference through documented adapter contracts
 - Audited tool execution
+- Bounded workspace listing, metadata inspection, literal search, reads, and
+  diffs
 - Public web reads
 - Isolated browser operation
 - Approval before browser mutations
@@ -148,6 +150,22 @@ fields. Existing required fields will not be silently repurposed.
 The physical journal encoding, file segmentation, key storage layout, and
 internal TypeScript types are implementation details. A migration that must
 re-establish integrity records a deliberate migration event.
+
+### Workspace inspection
+
+The documented `workspace.list`, `workspace.stat`, `workspace.search`,
+`workspace.read`, and `workspace.diff` contracts are additive stable v1
+interfaces. Portable relative-path confinement, configured sensitive-file
+filtering, deterministic ordering, documented bounds, request-bound cursors,
+cooperative cancellation, and content-free audit and ledger projections are
+part of that contract. Host filesystem identity details and the internal
+resolver algorithm remain platform-dependent implementation details.
+
+`workspace.readText` remains a compatible text-read surface. Existing response
+fields retain their meanings, and additive digest metadata is allowed. A
+legacy tool-shaped capability grant remains scoped to `workspace.readText`; it
+does not silently authorize the broader registry v1 `workspace.inspect`
+surface.
 
 ### Provider adapter contracts
 

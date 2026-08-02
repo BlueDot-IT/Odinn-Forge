@@ -57,6 +57,9 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   trigger and schedule primitives.
 - [Cached MCP host foundation](cached-mcp-host.md) — MCP process reuse and
   lifecycle foundations.
+- [Bounded workspace inspection](workspace-inspection.md) — read-only listing,
+  metadata, literal search, bounded reads and diffs, sensitive-file policy,
+  cursors, and platform limits.
 
 ## Advanced capability notes
 

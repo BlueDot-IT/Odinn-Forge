@@ -50,6 +50,36 @@ promise.
 `ODINN_ASSURANCE_BENCHMARK_WARMUPS` can change the bounded sample counts. Any
 published result must record non-default values.
 
+### Bounded large-workspace inspection gate
+
+`pnpm benchmark:workspace-inspection` runs
+`scripts/ci/workspace-inspection-benchmark.ts` with explicit garbage
+collection enabled. The default synthetic fixture contains 10,000 flat text
+files plus a bounded nested directory. The benchmark enforces:
+
+- deterministic consumption of every cursor page with the exact expected
+  component-wise preorder, no omissions, and no duplicates;
+- a maximum of 128 results per page and a recursive depth of four;
+- explicit `maxFiles` rejection and bounded, resumable search `maxBytes`
+  behavior;
+- no more than 96 MiB of measured heap growth; and
+- no more than 15 seconds for the timed first-page recursive listing and 120
+  seconds for complete pagination of the default fixture.
+
+The JSON report records the gates, host platform, architecture, Node.js
+version, timings, heap measurements, counts, and every Boolean check at
+`dist/benchmark/workspace-inspection.json`. The file-count and duration gates
+can be changed for slower-platform diagnosis with
+`ODINN_WORKSPACE_BENCHMARK_FILES` and
+`ODINN_WORKSPACE_BENCHMARK_MAX_MS`. The complete-pagination diagnostic gate
+uses `ODINN_WORKSPACE_BENCHMARK_PAGINATION_MAX_MS`; any evidence must disclose
+overrides.
+
+This is a deterministic filesystem guardrail, not a claim about all real
+repositories. It does not represent arbitrary directory shapes, slow or remote
+filesystems, concurrent workspace mutation, ignore-pattern complexity, model
+latency, or hostile-code containment.
+
 ### Synthetic memory-index profiling
 
 `pnpm benchmark:memory-index` runs
@@ -121,6 +151,11 @@ reports, must not be cited as benchmark raw data unless they actually contain
 the complete output being discussed. Do not reconstruct precise historical
 values from a green status.
 
+The workspace inspection gate writes
+`dist/benchmark/workspace-inspection.json`. Treat that report as transient
+unless the workflow for the cited revision explicitly retains it as an
+artifact.
+
 Local outputs are transient unless the operator deliberately captures them.
 Store them outside personal state, review them for secrets, and record their
 digest before sharing. If the raw JSON omits required environment fields,
@@ -134,12 +169,14 @@ From a clean checkout with the repository's declared Node.js and pnpm versions:
 pnpm install --frozen-lockfile
 pnpm benchmark:ci
 pnpm benchmark:assurance
+pnpm benchmark:recovery
+pnpm benchmark:workspace-inspection
 pnpm benchmark:memory-index
 ```
 
-`benchmark:ci` already invokes the assurance microbenchmarks after the enforced
-protocol gate. Running `benchmark:assurance` separately is useful when
-investigating its envelope gate and observational scenarios.
+`benchmark:ci` already invokes the assurance, recovery, and workspace
+inspection benchmarks after the enforced protocol gate. Running an individual
+command remains useful when investigating its own scenario and report.
 
 ## Interpretation limits
 
@@ -151,6 +188,8 @@ investigating its envelope gate and observational scenarios.
   time, and most real task work.
 - Synthetic memory profiling does not establish semantic quality, privacy
   properties, or production-data behavior.
+- Synthetic workspace inspection does not establish performance or race
+  freedom for every host filesystem or repository shape.
 - Runtime-plus-model evaluation is provider-, model-, policy-, configuration-,
   and scenario-dependent. Missing or mismatched metadata prevents a
   runtime-only conclusion.

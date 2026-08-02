@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
-import { digestExecutionEnvelopeV1, redactDurableValue, validateExecutionEnvelopeV1, type JsonObject } from "@odinn/protocol";
+import { digestExecutionEnvelopeV1, isWorkspaceContentTool, projectDurableToolInput, projectDurableToolOutput, redactDurableValue, validateExecutionEnvelopeV1, type JsonObject } from "@odinn/protocol";
 import type { ExecutionAttemptState, RunLedger } from "./index.ts";
 
 const TERMINAL_JOB_STATES = new Set(["completed", "failed", "cancelled", "needs-review"]);
@@ -76,7 +76,7 @@ function normalizeJob(input: Record<string, unknown> & { id: string }, current?:
   if (!JOB_STATES.has(status)) throw new Error(`runtime job ${id} has invalid status: ${status}`);
   const payloadSource = input.payload ?? current?.payload ?? {};
   if (!payloadSource || typeof payloadSource !== "object" || Array.isArray(payloadSource)) throw new Error(`runtime job ${id} payload must be an object`);
-  const payload = redactDurableValue(payloadSource, { input: true }) as JsonObject;
+  const payload = redactDurableValue(projectRuntimeJobPayload(payloadSource as Record<string, unknown>), { input: true }) as JsonObject;
   const recoveryInputAvailable = current?.recoveryInputAvailable
     ?? JSON.stringify(payloadSource) === JSON.stringify(payload);
   const attempts = Number(input.attempts ?? current?.attempts ?? 0);
@@ -84,7 +84,9 @@ function normalizeJob(input: Record<string, unknown> & { id: string }, current?:
   if (!Number.isSafeInteger(attempts) || attempts < 0) throw new Error(`runtime job ${id} attempts must be a non-negative integer`);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 86_400_000) throw new Error(`runtime job ${id} timeoutMs is invalid`);
   const now = new Date().toISOString();
-  const result = "result" in input ? redactDurableValue(input.result) : current?.result;
+  const result = "result" in input
+    ? redactDurableValue(projectRuntimeJobResult(runtimeJobTool(payloadSource as Record<string, unknown>), input.result))
+    : current?.result;
   const lease = input.dispatchLease && typeof input.dispatchLease === "object" && !Array.isArray(input.dispatchLease)
     ? input.dispatchLease as JsonObject
     : "dispatchLease" in input ? undefined : current?.dispatchLease;
@@ -124,6 +126,38 @@ function normalizeJob(input: Record<string, unknown> & { id: string }, current?:
     leaseEpoch: optionalString(lease?.epoch) ?? null,
     leaseAcquiredAt: optionalString(lease?.acquiredAt) ?? null,
     leaseExpiresAt: optionalString(lease?.expiresAt) ?? null
+  };
+}
+
+function runtimeJobTool(payload: Record<string, unknown>): string {
+  const task = payload.task;
+  return task && typeof task === "object" && !Array.isArray(task) && typeof (task as JsonObject).tool === "string"
+    ? String((task as JsonObject).tool)
+    : "";
+}
+
+function projectRuntimeJobPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const task = payload.task;
+  if (!task || typeof task !== "object" || Array.isArray(task)) return payload;
+  const taskRecord = task as JsonObject;
+  const toolName = typeof taskRecord.tool === "string" ? taskRecord.tool : "";
+  return {
+    ...payload,
+    task: {
+      ...taskRecord,
+      input: projectDurableToolInput(toolName, taskRecord.input)
+    }
+  };
+}
+
+function projectRuntimeJobResult(toolName: string, result: unknown): unknown {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return projectDurableToolOutput(toolName, result);
+  const record = result as JsonObject;
+  if (!("output" in record)) return projectDurableToolOutput(toolName, result);
+  return {
+    ...record,
+    ...(isWorkspaceContentTool(toolName) ? { contentUnavailableOnReplay: true } : {}),
+    output: projectDurableToolOutput(toolName, record.output)
   };
 }
 

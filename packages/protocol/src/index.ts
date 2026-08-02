@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export {
   EXECUTION_ENVELOPE_VERSION,
@@ -77,6 +77,73 @@ export function redactDurableValue(value: unknown, context: DurableRedactionCont
     depth: 0,
     key: ""
   });
+}
+
+const WORKSPACE_CONTENT_TOOLS = new Set(["workspace.readText", "workspace.read", "workspace.search", "workspace.diff"]);
+
+export function isWorkspaceContentTool(toolName: unknown): boolean {
+  return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
+}
+
+/**
+ * Remove workspace content-bearing request fields before durable persistence.
+ * The live request remains unchanged for first dispatch; only this projection
+ * may cross audit, ledger, or runtime-job persistence boundaries.
+ */
+export function projectDurableToolInput(toolName: string, input: unknown): unknown {
+  if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
+  const projected = { ...(input as JsonObject) };
+  if (typeof projected.before === "string") {
+    projected.beforeDigest = sha256Reference(projected.before);
+    projected.beforeBytes = Buffer.byteLength(projected.before, "utf8");
+    delete projected.before;
+  }
+  if (toolName === "workspace.search" && typeof projected.query === "string") {
+    projected.queryDigest = sha256Reference(projected.query);
+    projected.queryBytes = Buffer.byteLength(projected.query, "utf8");
+    delete projected.query;
+  }
+  return projected;
+}
+
+/** Project workspace results to bounded metadata before durable persistence. */
+export function projectDurableToolOutput(toolName: string, output: unknown): unknown {
+  if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
+  const record = output as JsonObject;
+  if (toolName === "workspace.read" || toolName === "workspace.readText") {
+    return pickWorkspaceMetadata(record, ["path", "resolvedPath", "type", "binary", "bytes", "bytesRead", "truncated", "digest", "digestComplete"]);
+  }
+  if (toolName === "workspace.search") {
+    return {
+      ...pickWorkspaceMetadata(record, ["path", "resolvedPath", "nextCursor", "searchedFiles", "searchedBytes"]),
+      matchCount: Array.isArray(record.matches) ? record.matches.length : 0,
+      matches: Array.isArray(record.matches) ? record.matches.map((match) => ({
+        ...pickWorkspaceMetadata(match as JsonObject, ["path", "resolvedPath", "digest", "digestComplete", "truncated"]),
+        matchCount: Array.isArray((match as JsonObject).matches) ? ((match as JsonObject).matches as unknown[]).length : 0
+      })) : []
+    };
+  }
+  if (toolName === "workspace.diff") {
+    return pickWorkspaceMetadata(record, ["path", "resolvedPath", "basePath", "beforeDigest", "digest", "digestComplete", "diffDigest", "truncated"]);
+  }
+  if (toolName === "workspace.list") {
+    return {
+      ...pickWorkspaceMetadata(record, ["path", "resolvedPath", "nextCursor", "visited", "omittedSensitive", "limits"]),
+      entryCount: Array.isArray(record.entries) ? record.entries.length : 0
+    };
+  }
+  if (toolName === "workspace.stat") {
+    return pickWorkspaceMetadata(record, ["path", "resolvedPath", "type", "binary", "bytes", "modifiedAt", "mode", "digest", "digestComplete"]);
+  }
+  return output;
+}
+
+function sha256Reference(value: string) {
+  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function pickWorkspaceMetadata(value: JsonObject, keys: readonly string[]) {
+  return Object.fromEntries(keys.flatMap((key) => value[key] === undefined ? [] : [[key, value[key]]]));
 }
 
 function redactDurableNode(value: unknown, state: DurableRedactionContext & { depth: number; key: string }): unknown {

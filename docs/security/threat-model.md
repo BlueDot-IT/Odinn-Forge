@@ -20,7 +20,20 @@
 - The gateway rejects hostile `Host` headers before issuing its bootstrap cookie.
 - Public web fetch validates all DNS answers and uses a validated address for the connection; redirects are revalidated and oversized responses are terminated immediately under an absolute deadline.
 - Browser traffic is forced through a loopback egress proxy that validates every DNS answer and connects to a pinned public address. Playwright request and WebSocket routing enforce domain policy, and service workers are disabled.
-- Workspace reads resolve symlinks before opening files.
+- Workspace inspection accepts only portable workspace-relative paths and does
+  not follow symlinks, junctions, or hard-linked regular files. Content access
+  rejects those targets, special files, ambiguous platform paths, and
+  configured sensitive-file patterns. The resolver validates target and
+  ancestor identities before and after open or enumeration. Linux also checks
+  the opened descriptor through `/proc/self/fd`. The portable Node.js
+  pre/open/post checks detect tested replacement races but do not claim a
+  single kernel-atomic resolver or complete ABA-race exclusion on macOS or
+  Windows.
+- Workspace listing and literal search are deterministically ordered, bounded
+  by entry/depth/byte/result ceilings, ignore-aware, cursor-bound to the request
+  and policy, and cooperatively cancellable. File contents, search query text,
+  matching lines, supplied baselines, and rendered diffs are projected to
+  bounded digest-and-count metadata before audit or run-ledger persistence.
 - Job shutdown sets a stopping barrier before aborting work, preventing retry/requeue races. Only tools explicitly classified as safe and idempotent may retry; unsafe interrupted work requires operator review.
 - State directories and records are repaired to owner-only permissions; restores reject symlinks, hardlinks, and special files before copying; run IDs and job idempotency keys are bound to canonical request digests.
 - Signed audit appends and job-state mutations use token-owned interprocess locks so forked workers cannot create sibling successors from one previous state. Locks are never reclaimed automatically: after a timeout, Odinn fails closed. An operator may remove a stale lock only after verifying that no Odinn process is using that store; automatic age- or PID-based deletion can race a new owner.
@@ -30,4 +43,4 @@
 
 ## Residual risk
 
-No local runtime can reverse sent email, purchases, or arbitrary remote mutations. Browser sessions and imported credentials remain high-value secrets. `unconfined-process` extensions still run as the Odinn operating-system user: capability grants authorize invocation, not filesystem or network confinement. Full deterministic replay of remote services and nondeterministic models is not claimed. The multi-user host rejects overlapping workspaces, reloads user disablement without restart, evicts idle tenant gateways, strips untrusted proxy headers, and enforces storage, active-job, browser-action, model-call, and model-token quotas. It remains application-level tenant isolation, not kernel containment; mutually hostile tenants require separate operating-system users or containers.
+No local runtime can reverse sent email, purchases, or arbitrary remote mutations. Browser sessions and imported credentials remain high-value secrets. Workspace inspection reduces accidental disclosure and detects known link and replacement races; it is not hostile-code containment, a data-loss-prevention system, or a substitute for operating-system permissions. Content returned during an agent run may be sent to the configured model provider even though audit and ledger persistence is content-free. The planned Stage 4 sandbox backend remains the hard boundary for untrusted execution. `unconfined-process` extensions still run as the Odinn operating-system user: capability grants authorize invocation, not filesystem or network confinement. Full deterministic replay of remote services and nondeterministic models is not claimed. The multi-user host rejects overlapping workspaces, reloads user disablement without restart, evicts idle tenant gateways, strips untrusted proxy headers, and enforces storage, active-job, browser-action, model-call, and model-token quotas. It remains application-level tenant isolation, not kernel containment; mutually hostile tenants require separate operating-system users or containers.

@@ -90,6 +90,14 @@ the CLI, authenticated loopback API, and operator console. Preview is pure and
 returns `executes: false`; it does not create a run, audit event, execution
 envelope, or attempt. Live admission remains authoritative at dispatch time.
 
+The bounded workspace inspection tools preserve live content for the immediate
+caller while projecting only content-free metadata into audit events and run
+ledger artifacts. Search queries and provided diff baselines become SHA-256
+digests plus byte counts; read content, matching-line text, and rendered diffs
+are omitted. Output projections retain normalized paths, bounds, counts,
+truncation state, and digests needed for correlation without turning the
+durable execution record into a copy of inspected workspace data.
+
 Approval execution is correlated back to the originating job and attempt. Claiming an approval atomically moves the original attempt from `awaiting-approval` to `running`; a definitive result settles it, while failure or uncertain interruption becomes `needs-review`. Cancelling before claim revokes the pending approval. Cancelling after claim returns `cancelling` until the in-flight approved action reaches a terminal projection.
 
 `pnpm benchmark:assurance` enforces the 10 ms p95 gate on the atomic execution-envelope ledger transaction. It separately reports complete admission with the authoritative signed audit commit. That second store uses `synchronous=FULL` and remains observational; its durability is not reduced for latency cosmetics.
