@@ -1311,6 +1311,7 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
     return { ok: false, kind: "missing-model", message: "No AI model is selected. Choose an AI connection first." };
   }
   const auditStore = createAuditStore(join(state, "onboarding-verification.jsonl"));
+  const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore });
   const policy = createDefaultPolicy({
     ...config.policy,
@@ -1332,7 +1333,8 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
       },
       auditStore,
       policy,
-      registry
+      registry,
+      runLedger
     });
     const content = String(result?.output?.content ?? "").trim();
     if (!content) throw new Error("AI provider returned an empty response");
@@ -1349,6 +1351,7 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
   } finally {
     registry.close();
     auditStore.close();
+    runLedger.close();
   }
 }
 

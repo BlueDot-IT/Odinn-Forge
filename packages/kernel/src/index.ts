@@ -948,7 +948,7 @@ export class ExecutionAdmissionService {
   async admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId }: any) {
     const runLedger = this.options.runLedger;
     if (!runLedger) return undefined;
-    const inputDigest = createHash("sha256").update(stableTaskValue(request.input ?? {}), "utf8").digest("hex");
+    const inputDigest = ledgerStep.inputArtifact.digest;
     const decisionReference = policyEvent?.id ? `policy-event:${policyEvent.id}` : executionReference("policy", `${request.id}:${tool.capability}`);
     const persisted = runLedger.admitExecution({
       version: 1,
@@ -995,6 +995,11 @@ export class ExecutionAdmissionService {
   complete(admission: any, outcomeDigest?: string) {
     if (!admission || !this.options.runLedger) return;
     this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: "running", to: "completed", outcomeDigest });
+  }
+
+  awaitApproval(admission: any) {
+    if (!admission || !this.options.runLedger) return;
+    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: "running", to: "awaiting-approval" });
   }
 
   fail(admission: any, error: unknown, { cancelled = false, uncertain = false }: { cancelled?: boolean; uncertain?: boolean } = {}) {
@@ -1144,6 +1149,7 @@ async function executeTaskThroughAdmission({
   });
 
   let ledgerFinished = false;
+  let backendReturned = false;
   try {
     throwIfAborted(signal);
     const output = await tool.execute(request.input, {
@@ -1186,6 +1192,7 @@ async function executeTaskThroughAdmission({
         onAgentProgress
       })
     });
+    backendReturned = true;
     throwIfAborted(signal);
     const awaitingApproval = output?.type === "approval.required";
     await auditStore.append({
@@ -1203,24 +1210,29 @@ async function executeTaskThroughAdmission({
     });
     const outputArtifact = runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output, status: awaitingApproval ? "blocked" : "succeeded" });
     ledgerFinished = Boolean(runLedger);
-    admissionService.complete(admission, outputArtifact?.digest);
+    if (awaitingApproval) admissionService.awaitApproval(admission);
+    else admissionService.complete(admission, outputArtifact?.digest);
     return { id: request.id, tool: request.tool, capability: tool.capability, ok: true, output };
   } catch (error) {
     const failure = error instanceof Error ? error : new Error(String(error));
     const cancelled = signal?.aborted === true || failure.name === "AbortError";
-    await auditStore.append({
-      at: now(),
-      runId: request.id,
-      type: cancelled ? "task.cancelled" : "task.failed",
-      actor: request.actor,
-      tool: request.tool,
-      capability: tool.capability,
-      decision: "allow",
-      message: cancelled ? "task cancelled" : failure.message
-    });
     if (!ledgerFinished) runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "failed", error: cancelled ? "task cancelled" : failure.message });
-    const uncertain = cancelled && safety.retrySafe !== true && safety.reversibility !== "pure";
+    const uncertain = (cancelled || backendReturned) && safety.retrySafe !== true && safety.reversibility !== "pure";
     admissionService.fail(admission, failure, { cancelled, uncertain });
+    try {
+      await auditStore.append({
+        at: now(),
+        runId: request.id,
+        type: cancelled ? "task.cancelled" : "task.failed",
+        actor: request.actor,
+        tool: request.tool,
+        capability: tool.capability,
+        decision: "allow",
+        message: cancelled ? "task cancelled" : failure.message
+      });
+    } catch (auditError) {
+      Object.defineProperty(failure, "auditError", { value: auditError, configurable: true });
+    }
     throw error;
   }
 }

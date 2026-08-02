@@ -119,6 +119,10 @@ export function validateExecutionEnvelopeV1(input: unknown): ExecutionEnvelopeV1
     ...(value.verificationContractReference === undefined ? {} : { verificationContractReference: reference(value.verificationContractReference, "verificationContractReference") })
   };
 
+  if (envelope.inputReference !== `artifact:sha256:${envelope.inputDigest}`) {
+    throw invalid("inputReference must identify the artifact authenticated by inputDigest", "EXECUTION_INPUT_REFERENCE_MISMATCH");
+  }
+
   const canonical = canonicalizeJson(envelope);
   if (Buffer.byteLength(canonical, "utf8") > MAX_EXECUTION_ENVELOPE_BYTES) {
     throw invalid(`execution envelope exceeds ${MAX_EXECUTION_ENVELOPE_BYTES} bytes`, "EXECUTION_ENVELOPE_TOO_LARGE");

@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/teams/src/index.ts";
+import { createRunLedger } from "../packages/kernel/src/index.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
@@ -31,6 +32,7 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
+  let admittedRunId = "";
   try {
     const status = await getJson(`${base}/status`);
     assert.equal(status.ok, true);
@@ -56,8 +58,12 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.equal((await coreProof.json()).status, "passed");
 
     const run = await postJson(`${base}/run`, { tool: "text.echo", input: { text: "ODINN_GATEWAY_OK" } });
+    admittedRunId = run.id;
     assert.equal(run.ok, true);
     assert.equal(run.output.text, "ODINN_GATEWAY_OK");
+
+    const projects = await getJson(`${base}/projects`);
+    assert.ok(Array.isArray(projects.projects));
 
     const plan = await postJson(`${base}/plan`, {
       id: "plan_gateway",
@@ -77,6 +83,14 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.ok(runDetail.events.some((event: any) => event.type === "execution.admitted"));
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  try {
+    assert.equal(ledger.getExecutionEnvelope(admittedRunId)?.envelope.execution.id, "text.echo");
+    const envelopes = ledger.database.db.prepare("SELECT envelope_json FROM execution_envelopes").all() as Array<{ envelope_json: string }>;
+    assert.ok(envelopes.some((row) => JSON.parse(row.envelope_json).execution.id === "project.list"));
+  } finally {
+    ledger.close();
   }
 });
 

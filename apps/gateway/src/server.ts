@@ -707,7 +707,7 @@ export async function createGatewayServer({
     store: new FileJobStore(join(state, "jobs.json")),
     execute: isolatedTaskExecutor
   });
-  const runTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
+  const runIsolatedTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
   const quotaGate = createQuotaGate(quotas);
   const cronStore = new CronStore(join(state, "cron-jobs.json"));
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
@@ -1165,7 +1165,7 @@ export async function createGatewayServer({
         const projectId = url.searchParams.get("projectId") ?? "";
         const sessionId = url.searchParams.get("sessionId") ?? "";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.search", input: { query, kind, subject, scopeType, scopeId, projectId, sessionId, limit }, actor: "gateway" },
           auditStore,
           policy,
@@ -1178,7 +1178,7 @@ export async function createGatewayServer({
         const projectId = url.searchParams.get("projectId") ?? "";
         const sessionId = url.searchParams.get("sessionId") ?? "";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "8", 10);
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.recall", input: { query, kind, projectId, sessionId, limit }, actor: "gateway" },
           auditStore,
           policy,
@@ -1188,7 +1188,7 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/memory/browse") {
         const namespace = url.searchParams.get("namespace") ?? "";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.browse", input: { namespace, limit }, actor: "gateway" },
           auditStore,
           policy,
@@ -1215,7 +1215,7 @@ export async function createGatewayServer({
           autoCompact: agentRun && allows("memory.compact") && config.memory?.autoCompact !== false
         };
         if (!integration.readAllowed) return json(response, 200, { working: false, records: null, namespaces: null, latestAt: null, integration });
-        const curated = await runTask({ task: { tool: "memory.curate", input: { limit: 1000 }, actor: "gateway" }, auditStore, policy, registry });
+        const curated = await runIsolatedTask({ task: { tool: "memory.curate", input: { limit: 1000 }, actor: "gateway" }, auditStore, policy, registry });
         const records = Object.values(curated.output.kinds || {}).flat() as any[];
         const namespaces = new Set<string>();
         for (const record of records) {
@@ -1232,7 +1232,7 @@ export async function createGatewayServer({
       }
       if (request.method === "GET" && url.pathname.startsWith("/memory/") && !["/memory/recall", "/memory/browse", "/memory/curated", "/memory/status", "/memory/candidates"].includes(url.pathname)) {
         const id = decodeURIComponent(url.pathname.slice("/memory/".length));
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.open", input: { id }, actor: "gateway" },
           auditStore,
           policy,
@@ -1240,7 +1240,7 @@ export async function createGatewayServer({
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/memory/compact") {
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.compact", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -1248,7 +1248,7 @@ export async function createGatewayServer({
         })).output);
       }
       if (request.method === "GET" && url.pathname === "/memory/curated") {
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.curate", input: {}, actor: "gateway" },
           auditStore,
           policy,
@@ -1258,7 +1258,7 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/memory/candidates") {
         const status = url.searchParams.get("status") ?? "pending";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.candidates", input: { status, limit }, actor: "gateway" },
           auditStore,
           policy,
@@ -1268,7 +1268,7 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname.startsWith("/memory/candidates/") && url.pathname.endsWith("/decision")) {
         const candidateId = decodeURIComponent(url.pathname.slice("/memory/candidates/".length, -"/decision".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.decide", input: { ...body, candidateId }, actor: "gateway" },
           auditStore,
           policy,
@@ -1276,7 +1276,7 @@ export async function createGatewayServer({
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/memory") {
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.remember", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -1284,7 +1284,7 @@ export async function createGatewayServer({
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/memory/corrections") {
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.correct", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -1294,7 +1294,7 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname.startsWith("/memory/") && url.pathname.endsWith("/forget")) {
         const targetId = decodeURIComponent(url.pathname.slice("/memory/".length, -"/forget".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "memory.forget", input: { ...body, targetId }, actor: "gateway" },
           auditStore,
           policy,
@@ -1304,7 +1304,7 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/sessions") {
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
         const projectId = url.searchParams.get("projectId") ?? "";
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "session.list", input: { limit, projectId }, actor: "gateway" },
           auditStore,
           policy,
@@ -1312,7 +1312,7 @@ export async function createGatewayServer({
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/sessions") {
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "session.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -1322,7 +1322,7 @@ export async function createGatewayServer({
       if (request.method === "PATCH" && url.pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "session.update", input: { ...body, sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -1331,7 +1331,7 @@ export async function createGatewayServer({
       }
       if (request.method === "DELETE" && url.pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length));
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "session.delete", input: { sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -1340,7 +1340,7 @@ export async function createGatewayServer({
       }
       if (request.method === "GET" && url.pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length));
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "session.read", input: { sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -1349,7 +1349,7 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname.startsWith("/sessions/") && url.pathname.endsWith("/messages")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length, -"/messages".length));
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "session.message", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -1361,7 +1361,7 @@ export async function createGatewayServer({
         const projectId = url.searchParams.get("projectId") ?? "";
         const sessionId = url.searchParams.get("sessionId") ?? "";
         const status = url.searchParams.get("status") ?? "";
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "goal.list", input: { limit, projectId, sessionId, status }, actor: "gateway" },
           auditStore,
           policy,
@@ -1369,7 +1369,7 @@ export async function createGatewayServer({
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/goals") {
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "goal.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -1378,7 +1378,7 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname.startsWith("/goals/") && url.pathname.endsWith("/updates")) {
         const id = decodeURIComponent(url.pathname.slice("/goals/".length, -"/updates".length));
-        return json(response, 200, (await runTask({
+        return json(response, 200, (await runIsolatedTask({
           task: { tool: "goal.update", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), goalId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -1387,14 +1387,14 @@ export async function createGatewayServer({
       }
       if (request.method === "GET" && url.pathname === "/projects") {
         const includeArchived = url.searchParams.get("includeArchived") === "true";
-        return json(response, 200, (await runTask({ task: { tool: "project.list", input: { includeArchived, limit: 100 }, actor: "gateway" }, auditStore, policy, registry })).output);
+        return json(response, 200, (await runIsolatedTask({ task: { tool: "project.list", input: { includeArchived, limit: 100 }, actor: "gateway" }, auditStore, policy, registry })).output);
       }
       if (request.method === "POST" && url.pathname === "/projects") {
-        return json(response, 200, (await runTask({ task: { tool: "project.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" }, auditStore, policy, registry })).output);
+        return json(response, 200, (await runIsolatedTask({ task: { tool: "project.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" }, auditStore, policy, registry })).output);
       }
       if (request.method === "PATCH" && url.pathname.startsWith("/projects/")) {
         const id = decodeURIComponent(url.pathname.slice("/projects/".length));
-        return json(response, 200, (await runTask({ task: { tool: "project.update", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), projectId: id }, actor: "gateway" }, auditStore, policy, registry })).output);
+        return json(response, 200, (await runIsolatedTask({ task: { tool: "project.update", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), projectId: id }, actor: "gateway" }, auditStore, policy, registry })).output);
       }
       if (request.method === "GET" && url.pathname === "/improvements") {
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
@@ -1458,7 +1458,7 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname === "/run") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         quotaGate.checkTool(body.tool);
-        const result = await runTask({
+        const result = await runIsolatedTask({
           task: { id: body.id ?? request.headers["idempotency-key"], tool: body.tool, input: body.input, reason: body.reason, actor: "gateway" },
           auditStore,
           policy,

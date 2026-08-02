@@ -134,7 +134,7 @@ async function benchmarkExecutionEnvelopePersistence() {
       principalId: "principal:benchmark",
       execution: { kind: "tool", id: "text.echo" },
       inputDigest: "a".repeat(64),
-      inputReference: `artifact:sha256:${"b".repeat(64)}`,
+      inputReference: `artifact:sha256:${"a".repeat(64)}`,
       capabilityDecisionReferences: [`policy:benchmark-${index}`],
       approvalRequirements: [],
       timeoutMs: 120_000,

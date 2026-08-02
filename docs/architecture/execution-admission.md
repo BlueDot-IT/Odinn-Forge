@@ -32,7 +32,7 @@
 ## Binding decisions
 
 1. `ExecutionEnvelopeV1` is trusted runtime data, not model-authored authority.
-2. The envelope is immutable after admission and stores references and digests, never raw prompts, results, secrets, approval tokens, or live cancellation signals.
+2. The envelope is immutable after admission and stores references and digests, never raw prompts, results, secrets, approval tokens, or live cancellation signals. Its input digest is the digest of the redacted input artifact named by `inputReference`, not a separately persisted fingerprint of raw input.
 3. Idempotency is scoped by principal and key and is bound to the full canonical envelope digest.
 4. Mutable attempts and cancellation controls are stored separately from immutable intent.
 5. The shared `runTask` compatibility surface delegates to the kernel-owned `ExecutionAdmissionService`; callers do not maintain a second admission path.
@@ -61,7 +61,7 @@ The following paths now use the shared admission service when a run ledger is pr
 
 Admission occurs after the base policy decision and before capability-token checks or tool execution. One atomic run-ledger transaction persists the immutable envelope, creates and moves the attempt from `queued` to `running`, and appends the `execution-admitted` ledger event. The service then commits the authoritative `execution.admitted` signed audit event before backend dispatch. If that audit commit fails, dispatch is blocked and the running attempt is settled as `failed` with `AUDIT_CORRELATION_FAILED`.
 
-Policy denial creates no executable envelope. Completed work settles the attempt with the result-artifact digest. Cancelled non-retry-safe, non-pure work becomes `needs-review`; it is never silently replayed.
+Policy denial creates no executable envelope. Completed work settles the attempt with the result-artifact digest. Approval requests remain `awaiting-approval` rather than claiming execution completed. Cancelled non-retry-safe, non-pure work becomes `needs-review`; it is never silently replayed. If terminal audit persistence fails after an effectful backend returns, ledger settlement still runs and the attempt becomes `needs-review`.
 
 Ledger-less custom callers still pass through the same application service but cannot claim durable admission. Normal Gateway and CLI execution supply the ledger. Runtime job leases remain in `jobs.json` pending the dedicated job-state migration.
 

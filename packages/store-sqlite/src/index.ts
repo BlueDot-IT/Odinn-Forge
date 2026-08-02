@@ -20,7 +20,7 @@ type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
 type FeatureFlags = Record<string, boolean>;
 type Artifact = { digest: string; path: string; mediaType: string; sizeBytes: number };
-export type ExecutionAttemptState = "proposed" | "admitted" | "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "needs-review";
+export type ExecutionAttemptState = "proposed" | "admitted" | "queued" | "running" | "awaiting-approval" | "cancelling" | "completed" | "failed" | "cancelled" | "needs-review";
 type InitialExecutionAttemptState = "proposed" | "admitted" | "queued";
 const INITIAL_EXECUTION_ATTEMPT_STATES = new Set<ExecutionAttemptState>(["proposed", "admitted", "queued"]);
 const TERMINAL_EXECUTION_ATTEMPT_STATES = new Set<ExecutionAttemptState>(["completed", "failed", "cancelled", "needs-review"]);
@@ -28,7 +28,8 @@ const EXECUTION_ATTEMPT_TRANSITIONS: Readonly<Record<ExecutionAttemptState, Read
   proposed: new Set<ExecutionAttemptState>(["admitted", "failed", "cancelled"]),
   admitted: new Set<ExecutionAttemptState>(["queued", "failed", "cancelled"]),
   queued: new Set<ExecutionAttemptState>(["running", "failed", "cancelled"]),
-  running: new Set<ExecutionAttemptState>(["cancelling", "completed", "failed", "cancelled", "needs-review"]),
+  running: new Set<ExecutionAttemptState>(["awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review"]),
+  "awaiting-approval": new Set<ExecutionAttemptState>(["running", "completed", "failed", "cancelled"]),
   cancelling: new Set<ExecutionAttemptState>(["completed", "failed", "cancelled", "needs-review"]),
   completed: new Set<ExecutionAttemptState>(),
   failed: new Set<ExecutionAttemptState>(),
@@ -320,7 +321,7 @@ const MIGRATIONS = [
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES execution_envelopes(run_id),
     attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
-    state TEXT NOT NULL CHECK(state IN ('proposed', 'admitted', 'queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled', 'needs-review')),
+    state TEXT NOT NULL CHECK(state IN ('proposed', 'admitted', 'queued', 'running', 'awaiting-approval', 'cancelling', 'completed', 'failed', 'cancelled', 'needs-review')),
     created_at TEXT NOT NULL,
     started_at TEXT,
     settled_at TEXT,

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,6 +23,7 @@ test("plan steps execute through admission with durable parent correlation", asy
     const stepEnvelope = ledger.getExecutionEnvelope("plan_admitted:echo")?.envelope;
     assert.equal(stepEnvelope?.parentRunId, "plan_admitted");
     assert.equal(stepEnvelope?.execution.id, "text.echo");
+    assert.equal(stepEnvelope?.inputReference, `artifact:sha256:${stepEnvelope?.inputDigest}`);
     assert.deepEqual(ledger.listExecutionAttempts("plan_admitted:echo").map((attempt) => attempt.state), ["completed"]);
   } finally {
     registry.close();
@@ -125,6 +126,102 @@ test("signed audit failure blocks backend dispatch and settles admission as fail
     assert.equal(attempt.errorCode, "AUDIT_CORRELATION_FAILED");
   } finally {
     durableAudit.close();
+    ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("terminal audit failure settles post-dispatch effectful work as needs-review", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-admission-terminal-audit-"));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  const durableAudit = createAuditStore(join(stateDir, "audit.jsonl"));
+  let executed = false;
+  const auditStore = {
+    append(value: unknown) {
+      if (value && typeof value === "object" && "type" in value && ["task.completed", "task.failed"].includes(String(value.type))) {
+        return Promise.reject(new Error("fixture terminal audit unavailable"));
+      }
+      return durableAudit.append(value);
+    },
+    readRun(id: string) { return durableAudit.readRun(id); }
+  };
+  const registry = new Map<string, unknown>([["fixture.effect.audit", {
+    capability: "fixture.effect",
+    execute: async () => {
+      executed = true;
+      return { applied: true };
+    }
+  }]]);
+  try {
+    await assert.rejects(() => runTask({
+      task: { id: "run_terminal_audit_failure", tool: "fixture.effect.audit", input: {}, actor: "test" },
+      auditStore,
+      policy: createDefaultPolicy({ allowedCapabilities: ["fixture.effect"] }),
+      registry,
+      runLedger: ledger
+    }), /fixture terminal audit unavailable/u);
+    assert.equal(executed, true);
+    const [attempt] = ledger.listExecutionAttempts("run_terminal_audit_failure");
+    assert.equal(attempt.state, "needs-review");
+    assert.equal(attempt.errorCode, "EXECUTION_OUTCOME_UNCERTAIN");
+    assert.equal(ledger.getRun("run_terminal_audit_failure")?.status, "failed");
+  } finally {
+    durableAudit.close();
+    ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("approval-required output leaves the attempt awaiting approval", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-admission-awaiting-approval-"));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const registry = new Map<string, unknown>([["browser.click", {
+    capability: "browser.act",
+    execute: async () => ({ type: "approval.required", approvalId: "approval_fixture", summary: "Approve fixture", expiresInSeconds: 300 })
+  }]]);
+  try {
+    const result = await runTask({
+      task: { id: "run_awaiting_approval", tool: "browser.click", input: { selector: "#apply" }, actor: "test" },
+      auditStore,
+      registry,
+      runLedger: ledger
+    });
+    assert.equal(result.output.type, "approval.required");
+    const [attempt] = ledger.listExecutionAttempts("run_awaiting_approval");
+    assert.equal(attempt.state, "awaiting-approval");
+    assert.equal(attempt.settledAt, undefined);
+    assert.equal(ledger.getRun("run_awaiting_approval")?.status, "blocked");
+  } finally {
+    auditStore.close();
+    ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("input digest authenticates the redacted artifact without a raw secret fingerprint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-admission-redacted-input-"));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir, auditStore });
+  try {
+    await runTask({
+      task: { id: "run_redacted_input", tool: "text.echo", input: { text: "ok", password: "guessable-secret" }, actor: "test" },
+      auditStore,
+      registry,
+      runLedger: ledger
+    });
+    const envelope = ledger.getExecutionEnvelope("run_redacted_input")!.envelope;
+    assert.equal(envelope.inputReference, `artifact:sha256:${envelope.inputDigest}`);
+    const artifact = await readFile(join(ledger.artifacts.root, "sha256", envelope.inputDigest.slice(0, 2), envelope.inputDigest), "utf8");
+    assert.doesNotMatch(artifact, /guessable-secret/u);
+    assert.match(artifact, /\[redacted\]/u);
+  } finally {
+    registry.close();
+    auditStore.close();
     ledger.close();
     await rm(root, { recursive: true, force: true });
   }

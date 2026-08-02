@@ -62,6 +62,10 @@ test("ExecutionEnvelopeV1 rejects unknown versions, fields, duplicate JSON keys,
   );
   assert.throws(() => validateExecutionEnvelopeV1({ ...envelope(), prompt: "do not persist this" }), /unknown field: prompt/u);
   assert.throws(() => validateExecutionEnvelopeV1({ ...envelope(), inputReference: "full prompt text is not a reference" }), /opaque non-secret reference/u);
+  assert.throws(
+    () => validateExecutionEnvelopeV1({ ...envelope(), inputReference: `artifact:sha256:${"b".repeat(64)}` }),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "EXECUTION_INPUT_REFERENCE_MISMATCH"
+  );
 
   const source = JSON.stringify(envelope()).replace('"runId":"run_execution_1"', '"runId":"run_execution_1","runId":"run_execution_2"');
   assert.throws(
