@@ -106,6 +106,35 @@ the character count and not necessarily the retained content length).
 `maxBytes` bytes and `false` otherwise. Operators and clients must treat these
 fields as byte-accurate interface data.
 
+### `process.exec` tool contract
+
+`process.exec` starts one executable directly with a separate argument array;
+it never invokes a shell. Its working directory must resolve beneath the
+assigned workspace. `timeoutMs` is bounded from 100 to 120,000 milliseconds and
+defaults to 30,000. Combined captured output is bounded from 1,024 to 1,000,000
+bytes and defaults to 128,000; exceeding the limit terminates the process tree
+and sets `outputTruncated`.
+
+This is intentionally not an operating-system sandbox. A child runs under the
+same OS identity as Odinn and may use available executables or network access.
+Odinn limits the inherited environment and assigns the workspace as child
+`HOME` and `USERPROFILE`, but operators must still use a disposable workspace
+and a suitably restricted host identity. The tool requires both an explicit
+`process.exec` policy capability and the following configuration acknowledgement:
+
+```json
+{
+  "runtime": {
+    "allowUnconfinedProcessExec": true
+  }
+}
+```
+
+The result reports the normalized `command`, `args`, workspace-relative `cwd`,
+`exitCode`, terminating `signal`, bounded `stdout` and `stderr`, captured byte
+counts, `timedOut`, `outputTruncated`, and `durationMs`. Process execution is
+classified as irreversible and non-retry-safe.
+
 ### System and configuration routes
 
 | Method and path | Input | Output |
