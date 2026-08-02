@@ -21,3 +21,42 @@ capability in its trusted registry declaration; request input, Skill metadata,
 and MCP metadata cannot grant capabilities. See
 [Capability Registry and Gatewatch Preview](../capability-gatewatch.md) for the
 registry, delegation intersection, and non-executing preview contract.
+
+## Workspace inspection security
+
+`security.workspace` configures application-level filtering for the bounded
+workspace inspection tools:
+
+```json
+{
+  "security": {
+    "workspace": {
+      "deniedPatterns": [
+        ".env",
+        ".env.*",
+        "**/.env",
+        "**/.env.*",
+        "**/*.key",
+        "**/*.pem",
+        "**/.ssh/**",
+        ".git/**",
+        ".odinn/**"
+      ],
+      "ignoreFiles": [".gitignore", ".odinnignore"]
+    }
+  }
+}
+```
+
+`deniedPatterns` accepts at most 128 non-empty glob strings of at most 256
+characters. Direct access to a matching target fails closed; list and search
+omit matching entries and do not descend into matching directories. An empty
+array disables the default sensitive-file patterns and therefore represents an
+explicit weakening of the application-level filter.
+
+`ignoreFiles` accepts at most 16 non-empty file names of at most 256 characters.
+Names cannot contain path separators or be `.` or `..`. Traversal reads these
+files from the workspace root and selected start directory, subject to the
+safety and size limits in
+[Bounded workspace inspection](../workspace-inspection.md). A per-request
+`ignoreFiles` value replaces this policy list for that operation.

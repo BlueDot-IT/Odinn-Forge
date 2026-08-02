@@ -46,6 +46,8 @@ const tool = (name: string, capabilities: readonly CapabilityId[], legacyCapabil
 
 const inspectTools = [
   ["job.healthcheck", "job.healthcheck"], ["text.echo", "text.echo"], ["workspace.readText", "workspace.readText"],
+  ["workspace.list", "workspace.list"], ["workspace.stat", "workspace.stat"], ["workspace.search", "workspace.search"],
+  ["workspace.read", "workspace.read"], ["workspace.diff", "workspace.diff"],
   ["memory.candidates", "memory.read"], ["memory.search", "memory.read"], ["memory.recall", "memory.read"],
   ["memory.browse", "memory.read"], ["memory.open", "memory.read"], ["memory.curate", "memory.read"],
   ["session.list", "session.read"], ["session.read", "session.read"], ["project.list", "session.read"],

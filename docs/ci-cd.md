@@ -168,7 +168,8 @@ silent `NaN` comparison. The local Forgejo integration runner executes inside
 nested Docker and uses a documented 4-second cold-start allowance; all other
 workflows retain the 2-second default. Set the threshold only when diagnosing a
 slower host; do not use it to hide a release regression. It then runs the
-observational assurance microbenchmarks described below.
+assurance microbenchmarks, 10,000-record restart-recovery gate, and bounded
+large-workspace inspection gate described below.
 
 The gate uses 20 samples by default. `ODINN_BENCHMARK_SAMPLES` accepts a
 positive integer for bounded diagnostic or cross-platform entrypoint checks;
@@ -194,6 +195,7 @@ hosted-runner result; compare reports from equivalent host classes.
 pnpm install --frozen-lockfile
 pnpm benchmark:ci
 cat dist/benchmark/benchmark.json
+cat dist/benchmark/workspace-inspection.json
 ```
 
 `benchmark:assurance` measures the synchronous paths added by the core advanced
@@ -214,6 +216,12 @@ diagnosis. Atomic execution-envelope persistence has an enforced 10 ms p95
 budget. The separate `synchronous=FULL` signed-audit commit and the other
 assurance scenarios remain observational so durability is not weakened to win
 a benchmark. The packaged-gateway threshold remains separately enforced.
+
+`benchmark:workspace-inspection` creates a deterministic 10,000-file fixture
+and proves bounded deterministic pages, cursor separation, depth, file and byte
+ceilings, heap growth, and a 15-second first-page traversal gate. It writes
+`dist/benchmark/workspace-inspection.json`; see
+[Benchmark evidence and limitations](benchmarks.md) before citing the result.
 
 To inspect release output without publishing:
 

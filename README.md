@@ -38,6 +38,8 @@ have separate support boundaries.
 - Use the web without mixing its browser activity into your personal browser
   profile.
 - Review a clear history of tool use and important decisions.
+- Inspect workspace directories, metadata, text, literal matches, and diffs
+  through bounded read-only tools with sensitive-file filtering.
 
 ### Small business owners and independent professionals
 

@@ -96,6 +96,55 @@ test("live dispatch uses volatile input while restart fails closed when redacted
   await restarted.shutdown();
 });
 
+test("workspace job payloads and results persist only shared durable projections", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-workspace-projection-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  const querySentinel = "WORKSPACE_JOB_QUERY_47f18d";
+  const beforeSentinel = "WORKSPACE_JOB_BEFORE_8b02a1";
+  const resultSentinel = "WORKSPACE_JOB_RESULT_1d930c";
+  const received: string[] = [];
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async (payload) => {
+      const task = payload.task as JsonObject;
+      const input = task.input as JsonObject;
+      if (task.tool === "workspace.search") {
+        received.push(String(input.query));
+        return { id: task.id, output: {
+          path: ".", resolvedPath: ".", searchedFiles: 1, searchedBytes: 32,
+          matches: [{ path: "note.txt", resolvedPath: "note.txt", digest: `sha256:${"a".repeat(64)}`, matches: [{ line: 1, text: resultSentinel }] }]
+        } };
+      }
+      received.push(String(input.before));
+      return { id: task.id, output: {
+        path: "note.txt", resolvedPath: "note.txt", basePath: "/provided",
+        beforeDigest: `sha256:${"b".repeat(64)}`, digest: `sha256:${"c".repeat(64)}`,
+        diffDigest: `sha256:${"d".repeat(64)}`, diff: resultSentinel, truncated: false
+      } };
+    }
+  });
+  await supervisor.start();
+  await supervisor.submit({ task: { tool: "workspace.search", input: { query: querySentinel } } }, { id: "workspace-search-job" });
+  await waitForJob(store, "workspace-search-job", "completed");
+  await supervisor.submit({ task: { tool: "workspace.diff", input: { path: "note.txt", before: beforeSentinel } } }, { id: "workspace-diff-job" });
+  await waitForJob(store, "workspace-diff-job", "completed");
+  assert.deepEqual(received, [querySentinel, beforeSentinel]);
+  for (const id of ["workspace-search-job", "workspace-diff-job"]) {
+    const row = ledger.database.db.prepare("SELECT payload_json, result_json, payload_recoverable FROM runtime_jobs WHERE id = ?").get(id) as {
+      payload_json: string; result_json: string; payload_recoverable: number;
+    };
+    assert.equal(row.payload_recoverable, 0);
+    assert.doesNotMatch(row.payload_json, new RegExp(`${querySentinel}|${beforeSentinel}`, "u"));
+    assert.doesNotMatch(row.result_json, new RegExp(resultSentinel, "u"));
+    assert.match(row.payload_json, /(?:query|before)Digest/u);
+    assert.equal((JSON.parse(row.result_json) as JsonObject).contentUnavailableOnReplay, true);
+  }
+  await supervisor.shutdown();
+});
+
 test("SQLite runtime jobs import legacy state once and preserve the source as rollback evidence", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-import-"));
   t.after(() => rm(root, { recursive: true, force: true }));

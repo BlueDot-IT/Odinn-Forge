@@ -63,6 +63,19 @@ test("unknown capability identifiers fail closed", async (t) => {
   }), /unknown capability identifier/u);
 });
 
+test("workspace policy enforces the runtime ignore-file ceiling without reducing denial capacity", () => {
+  const sixteenIgnoreFiles = Array.from({ length: 16 }, (_, index) => `.ignore-${index}`);
+  const oneHundredTwentyEightDenials = Array.from({ length: 128 }, (_, index) => `private-${index}/**`);
+  const policy = createDefaultPolicy({
+    security: { workspace: { ignoreFiles: sixteenIgnoreFiles, deniedPatterns: oneHundredTwentyEightDenials } }
+  });
+  assert.deepEqual(policy.security.workspace.ignoreFiles, sixteenIgnoreFiles);
+  assert.deepEqual(policy.security.workspace.deniedPatterns, oneHundredTwentyEightDenials);
+  assert.throws(() => createDefaultPolicy({
+    security: { workspace: { ignoreFiles: [...sixteenIgnoreFiles, ".ignore-16"] } }
+  }), /ignoreFiles must be an array of at most 16/u);
+});
+
 test("legacy grants migrate to exact tool scopes without widening", async (t) => {
   const { registry } = await fixture(t);
   const policy = createDefaultPolicy({ allowedCapabilities: ["web.read"] });

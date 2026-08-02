@@ -45,6 +45,26 @@ authority and any request outside the parent or tool declaration are denied.
 Skill and MCP capability declarations are requests for authority only. They
 appear in previews for inspection and always report `grantsAuthority: false`.
 
+## Workspace inspection mapping
+
+Registry v1 maps `workspace.list`, `workspace.stat`, `workspace.search`,
+`workspace.read`, and `workspace.diff` to `workspace.inspect`. Gatewatch shows
+that trusted mapping before execution; the input cannot select a different
+capability. The legacy `workspace.readText` tool is mapped to the same registry
+capability, but migration of a versionless `workspace.readText` grant creates
+an exact tool-scoped grant for that compatibility tool only. It does not
+authorize the five-tool inspection surface.
+
+A global registry v1 `workspace.inspect` grant is not limited to filesystem
+inspection. It authorizes every trusted built-in mapped to that capability;
+operators should inspect the exact per-tool mapping in Gatewatch or `/status`.
+
+The workspace policy's sensitive-file denylist and the resolver's path checks
+remain runtime enforcement in addition to capability admission. A Gatewatch
+allow decision means the caller has authority to request inspection; it is not
+a promise that a particular path, file type, cursor, or filesystem identity
+will pass live validation.
+
 ## Preview before execution
 
 Use the CLI to inspect the complete decision without executing the tool:

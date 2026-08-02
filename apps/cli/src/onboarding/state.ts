@@ -97,7 +97,8 @@ export function applyAccessProfile(policyInput: unknown, profileId: Exclude<Acce
         enabled: profile.browser,
         allowPrivateNetwork: false,
         requireApproval: true
-      }
+      },
+      workspace: { ...policy.security.workspace }
     }
   };
 }

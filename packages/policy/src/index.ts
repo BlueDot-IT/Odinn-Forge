@@ -37,6 +37,11 @@ export type SecuritySurface = {
   allowUploads?: boolean;
 };
 
+export type WorkspaceSecuritySurface = {
+  deniedPatterns: string[];
+  ignoreFiles: string[];
+};
+
 export interface RuntimePolicy {
   id?: string;
   deniedTools: string[];
@@ -45,7 +50,7 @@ export interface RuntimePolicy {
   scopedCapabilities: CapabilityGrant[];
   capabilityMigration: CapabilityMigrationReport;
   maxInputBytes: number;
-  security: { web: SecuritySurface; browser: SecuritySurface };
+  security: { web: SecuritySurface; browser: SecuritySurface; workspace: WorkspaceSecuritySurface };
   invariants: PolicyInvariant[];
 }
 
@@ -74,7 +79,7 @@ type PolicyOverrides = Partial<Omit<RuntimePolicy, "security" | "allowedCapabili
   capabilityRegistryVersion?: 1;
   allowedCapabilities?: string[];
   scopedCapabilities?: CapabilityGrant[];
-  security?: { web?: Partial<SecuritySurface>; browser?: Partial<SecuritySurface> };
+  security?: { web?: Partial<SecuritySurface>; browser?: Partial<SecuritySurface>; workspace?: Partial<WorkspaceSecuritySurface> };
 };
 
 export class PolicyError extends Error {
@@ -109,7 +114,13 @@ export function createDefaultPolicy(overrides: PolicyOverrides = {}): RuntimePol
       ...defaultsSecurity,
       ...(overrides.security ?? {}),
       web: { ...defaultsSecurity.web, ...(overrides.security?.web ?? {}) },
-      browser: { ...defaultsSecurity.browser, ...(overrides.security?.browser ?? {}) }
+      browser: { ...defaultsSecurity.browser, ...(overrides.security?.browser ?? {}) },
+      workspace: {
+        ...defaultsSecurity.workspace,
+        ...(overrides.security?.workspace ?? {}),
+        deniedPatterns: normalizeWorkspacePatterns(overrides.security?.workspace?.deniedPatterns, defaultsSecurity.workspace.deniedPatterns, "security.workspace.deniedPatterns", 128),
+        ignoreFiles: normalizeWorkspacePatterns(overrides.security?.workspace?.ignoreFiles, defaultsSecurity.workspace.ignoreFiles, "security.workspace.ignoreFiles", 16)
+      }
     }
   };
   return defaults;
@@ -130,8 +141,20 @@ const defaultsSecurity = {
     requireApproval: true,
     allowDownloads: false,
     allowUploads: false
+  },
+  workspace: {
+    deniedPatterns: [".env", ".env.*", "**/.env", "**/.env.*", "**/*.key", "**/*.pem", "**/.ssh/**", ".git/**", ".odinn/**"],
+    ignoreFiles: [".gitignore", ".odinnignore"]
   }
 };
+
+function normalizeWorkspacePatterns(value: unknown, fallback: readonly string[], label: string, maximum: number) {
+  if (value === undefined) return [...fallback];
+  if (!Array.isArray(value) || value.length > maximum || value.some((entry) => typeof entry !== "string" || !entry.trim() || entry.length > 256 || entry.includes("\0"))) {
+    throw new PolicyError(`${label} must be an array of at most ${maximum} bounded strings`);
+  }
+  return [...new Set(value.map((entry) => entry.trim()))];
+}
 
 function mergeScopedCapabilityGrants(migrated: readonly CapabilityGrant[], configured: unknown): CapabilityGrant[] {
   const grants = new Map<string, CapabilityGrant>(migrated.map((grant) => [`${grant.tool}\0${grant.capability}`, grant]));

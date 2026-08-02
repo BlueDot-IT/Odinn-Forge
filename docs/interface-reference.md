@@ -84,7 +84,22 @@ exception for local script authentication.
 The tables below summarize accepted fields and response shapes; they are not
 formal JSON Schema definitions.
 
-### `workspace.readText` tool contract
+### Workspace inspection tool contracts
+
+The trusted `workspace.list`, `workspace.stat`, `workspace.search`,
+`workspace.read`, and `workspace.diff` built-ins require the
+`workspace.inspect` capability. They accept only portable workspace-relative
+paths, do not follow links or hard-linked regular files, apply the configured
+sensitive-file policy, and return bounded results. Direct content access
+rejects those unsafe targets. Traversal is deterministic, ignore-aware,
+cancellation-aware, and cursor-paginated. Content returned to a live caller is
+projected to content-free metadata before audit and run-ledger persistence.
+
+The complete inputs, outputs, defaults, ceilings, cursor binding, ignore
+semantics, durable-evidence behavior, and platform boundary are documented in
+[Bounded workspace inspection](workspace-inspection.md).
+
+### `workspace.readText` compatibility contract
 
 `workspace.readText` reads one UTF-8 text file beneath the assigned workspace
 root. Its optional `maxBytes` input is a positive, safe integer measured in
@@ -95,7 +110,8 @@ bytes, capped at `8,388,608` bytes; the default is `65,536`. The response is:
   "path": "notes/example.txt",
   "content": "...",
   "bytesRead": 65537,
-  "truncated": true
+  "truncated": true,
+  "digest": "sha256:..."
 }
 ```
 
@@ -105,7 +121,11 @@ bounded probe, so it is the number of bytes observed up to `maxBytes + 1` (not
 the character count and not necessarily the retained content length).
 `truncated` is byte-based: it is `true` when the probe observes more than
 `maxBytes` bytes and `false` otherwise. Operators and clients must treat these
-fields as byte-accurate interface data.
+fields as byte-accurate interface data. `digest` covers the retained bounded
+bytes. The compatibility tool now shares the same sensitive-file policy,
+confinement, race-detection, and cancellation implementation as
+`workspace.read`; a legacy tool-scoped grant authorizes only
+`workspace.readText`.
 
 ### `process.exec` tool contract
 

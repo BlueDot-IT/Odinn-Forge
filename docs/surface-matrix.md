@@ -11,6 +11,7 @@ This matrix applies the terms from the authoritative
 | Projects, sessions, messages, goals, and memory | **Stable v1 interface** | Documented records and user workflows receive compatible schema migrations. Physical store layout is internal. |
 | Tasks, durable jobs, cron jobs, approvals, restart recovery, and uncertain-outcome recovery | **Stable v1 interface** | Safe work with a complete durable input recovers after restart. Inputs removed by persistence redaction require resubmission. Approval outcomes settle their originating job, and unknown external outcomes remain blocked for review rather than being silently replayed. |
 | Audited tool execution, diagnostics, and audit verification | **Stable v1 interface** | Documented event meaning, integrity verification, redaction, and correlation behavior are stable. Journal encoding is internal. |
+| Bounded workspace inspection (`workspace.list`, `workspace.stat`, `workspace.search`, `workspace.read`, `workspace.diff`, and compatible `workspace.readText`) | **Stable v1 interface** | Portable relative-path confinement, sensitive-file filtering, bounds, deterministic traversal, cursor binding, content-free durable evidence, and cancellation are stable. Filesystem identity and race detection are platform-dependent; no atomic macOS/Windows ABA guarantee or hostile-code containment is claimed. |
 | Public web reads, isolated browser operation, and browser mutation approval | **Stable v1 interface** | Network policy, private-network blocking, redirect validation, separate browser data, approval, and recovery boundaries remain enforced. Site availability is provider-dependent behavior; rendering can be platform-dependent behavior. |
 | Installation, update, rollback, backup, restore, uninstall, and state migration | **Stable v1 interface** | Built releases verify identity, preserve recoverable state, and reject incompatible application or state combinations. Version-directory and pointer layout is internal. |
 | OpenAI / ChatGPT, OpenRouter, Ollama, and custom OpenAI-compatible endpoints | **Stable v1 interface** | The first-class paths and generic adapter receive stable configuration, normalized inference, response parsing, redaction, retry, model selection, diagnostics, and onboarding contracts. |
@@ -34,6 +35,9 @@ This matrix applies the terms from the authoritative
 - Forked workers are crash containment, not a security sandbox.
 - Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
 - External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
+
+Workspace inspection is read-only application enforcement. The planned Stage
+4 sandbox remains the hard boundary for untrusted execution.
 
 When a surface is not covered by the compatibility policy or this matrix, treat
 it as **Unsupported behavior** until the documentation explicitly says
