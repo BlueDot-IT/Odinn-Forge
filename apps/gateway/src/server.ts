@@ -4,9 +4,9 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, runTask as executeTask, SkillPackageStore, SqliteJobStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
-import { FileJobStore, ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
+import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
   ChannelPluginRegistry,
   ChannelRouter,
@@ -639,7 +639,7 @@ async function settleCronOccurrence(store: CronStore, supervisor: JobSupervisor,
   }
 }
 
-async function dispatchCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, job: any): Promise<void> {
+async function dispatchCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, job: any, retrySafe = false): Promise<void> {
   await supervisor.submit(
     {
       task: {
@@ -657,6 +657,7 @@ async function dispatchCronOccurrence(store: CronStore, supervisor: JobSuperviso
       occurrenceKey: claim.occurrenceKey,
       scheduledFor: claim.scheduledFor,
       nextRunAt: claim.nextRunAt,
+      retrySafe,
       idempotent: true
     }
   );
@@ -664,13 +665,13 @@ async function dispatchCronOccurrence(store: CronStore, supervisor: JobSuperviso
   await settleCronOccurrence(store, supervisor, claim, job.id);
 }
 
-export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor, now = new Date()) {
+export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor, now = new Date(), retrySafeFor: (tool: string) => boolean = () => false) {
   const dispatches: Promise<void>[] = [];
   for (const job of await store.list()) {
     if (!job.enabled) continue;
     const claim = await store.claimDueOccurrence(job.id, now);
     if (!claim.claimed) continue;
-    dispatches.push(dispatchCronOccurrence(store, supervisor, claim, job));
+    dispatches.push(dispatchCronOccurrence(store, supervisor, claim, job, retrySafeFor(job.tool)));
   }
   await Promise.allSettled(dispatches);
 }
@@ -704,7 +705,7 @@ export async function createGatewayServer({
   const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
   const supervisor = new JobSupervisor({
-    store: new FileJobStore(join(state, "jobs.json")),
+    store: new SqliteJobStore(runtime.ledger, { legacyPath: join(state, "jobs.json") }),
     execute: isolatedTaskExecutor
   });
   const runIsolatedTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
@@ -723,7 +724,12 @@ export async function createGatewayServer({
   });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry, runLedger: runtime.ledger });
   await supervisor.start();
-  const cronTimer = setInterval(() => runDueCronJobs(cronStore, supervisor).catch(() => undefined), 30_000);
+  const cronTimer = setInterval(() => runDueCronJobs(
+    cronStore,
+    supervisor,
+    new Date(),
+    (tool) => toolSafetyDescriptor(tool, registry.get(tool)).retrySafe === true
+  ).catch(() => undefined), 30_000);
   cronTimer.unref();
   const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
   let improvementCycle: Promise<any> | undefined;
@@ -1060,6 +1066,9 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/cancel")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length, -"/cancel".length));
+        for (const approval of approvalStore.list()) {
+          if (approval.runId === id && approval.id) approvalStore.revoke(approval.id);
+        }
         return json(response, 200, { ok: true, job: await supervisor.cancel(id) });
       }
       if (request.method === "GET" && url.pathname === "/audit") {
@@ -1148,13 +1157,37 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/approve")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/approve".length));
+        const preview = approvalStore.list().find((approval: any) => approval.id === id);
+        let linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
+        if (linkedJob && linkedJob.status !== "awaiting-approval") {
+          approvalStore.revoke(id);
+          return json(response, 409, { ok: false, error: "the originating job is no longer awaiting approval" });
+        }
+        if (linkedJob) {
+          try {
+            linkedJob = await supervisor.beginApproval(linkedJob.id);
+          } catch {
+            approvalStore.revoke(id);
+            return json(response, 409, { ok: false, error: "the originating job approval was already claimed or cancelled" });
+          }
+        }
         const pending = approvalStore.claim(id);
-        if (!pending) return json(response, 404, { ok: false, error: "approval not found or expired" });
-        return json(response, 200, await isolatedTaskExecutor({
-          approvalId: id,
-          approvalRunId: pending.runId,
-          task: { id: `${pending.runId}:approval:${randomUUID()}`, tool: pending.tool, input: pending.input, actor: "approval-executor", reason: "explicit user approval" },
-        }));
+        if (!pending) {
+          if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
+          return json(response, 404, { ok: false, error: "approval not found or expired" });
+        }
+        try {
+          const result = await isolatedTaskExecutor({
+            approvalId: id,
+            approvalRunId: pending.runId,
+            task: { id: `${pending.runId}:approval:${randomUUID()}`, tool: pending.tool, input: pending.input, actor: "approval-executor", reason: "explicit user approval" },
+          });
+          if (linkedJob) await supervisor.settleApproval(linkedJob.id, { result });
+          return json(response, 200, result);
+        } catch (error) {
+          if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error }).catch(() => undefined);
+          throw error;
+        }
       }
       if (request.method === "GET" && url.pathname === "/memory") {
         const query = url.searchParams.get("query") ?? "";

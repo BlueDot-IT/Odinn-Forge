@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { AUDIT_SCHEMA_VERSION } from "@odinn/protocol";
 import { FileAuditStore } from "@odinn/store-file";
 import { inspectAuthoritativeRecordSchema, inspectExistingSqliteSchema, SqliteAuditStore } from "@odinn/store-sqlite";
@@ -120,7 +121,7 @@ export async function inspectStateSchemas(stateDir: string): Promise<StateInspec
     : await inspectJsonLines(join(stateRoot, "records.jsonl"), 1, "record");
   put(statuses, "records", records);
   for (const surface of ["sessions", "projects", "goals", "memory"] as const) put(statuses, surface, records);
-  put(statuses, "jobs", await inspectVersionedObject(join(stateRoot, "jobs.json"), "jobs", "object"));
+  put(statuses, "jobs", await inspectRuntimeJobs(stateRoot));
 
   const auditFilename = config.present ? await auditFilenameFromConfig(stateRoot) : "audit.jsonl";
   const audit = await inspectJsonLines(join(stateRoot, auditFilename), AUDIT_SCHEMA_VERSION, "audit event");
@@ -487,6 +488,22 @@ async function inspectAuditKeyring(path: string): Promise<void> {
 async function inspectRuntimeDatabase(path: string): Promise<BasicInspection> {
   if (!await exists(path)) return absentInspection(STATE_SCHEMA_TARGETS.runtimeDatabase);
   return presentInspection(inspectExistingSqliteSchema(path), "SQLite migration ledger is readable");
+}
+
+async function inspectRuntimeJobs(stateRoot: string): Promise<BasicInspection> {
+  const databasePath = join(stateRoot, "db", "odinn.sqlite");
+  if (await exists(databasePath) && inspectExistingSqliteSchema(databasePath) === STATE_SCHEMA_TARGETS.runtimeDatabase) {
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const table = database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_jobs'").get();
+      if (!table) throw new Error("runtime database schema 5 is missing runtime_jobs");
+      database.prepare("SELECT id, status FROM runtime_jobs ORDER BY id LIMIT 1").get();
+      return presentInspection(STATE_SCHEMA_TARGETS.jobs, "SQLite runtime job and lease tables are readable; jobs.json is legacy import evidence");
+    } finally {
+      database.close();
+    }
+  }
+  return inspectVersionedObject(join(stateRoot, "jobs.json"), "jobs", "object");
 }
 
 async function inspectHostMetadata(stateRoot: string, hasState: boolean): Promise<BasicInspection> {

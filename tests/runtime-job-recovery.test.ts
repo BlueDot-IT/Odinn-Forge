@@ -1,0 +1,453 @@
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import type { ExecutionEnvelopeV1, JsonObject } from "../packages/protocol/src/index.ts";
+import { createDefaultPolicy } from "../packages/policy/src/index.ts";
+import { createAuditStore, createRunLedger, JobSupervisor, runTask, SqliteJobStore } from "../packages/kernel/src/index.ts";
+
+function executionEnvelope(root: string, runId: string, retrySafe: boolean): ExecutionEnvelopeV1 {
+  const digest = "a".repeat(64);
+  return {
+    version: 1,
+    runId,
+    principalId: "principal:test",
+    execution: { kind: "tool", id: "text.echo" },
+    inputDigest: digest,
+    inputReference: `artifact:sha256:${digest}`,
+    capabilityDecisionReferences: [`policy:${runId}`],
+    approvalRequirements: [],
+    timeoutMs: 30_000,
+    resourceLimits: { maxInputBytes: 16_384, maxOutputBytes: 65_536, maxPersistedStateBytes: 131_072, maxConcurrency: 1 },
+    idempotencyKey: `request:${runId}`,
+    retrySafety: retrySafe ? "retry-safe" : "not-retry-safe",
+    workspaceRoot: root,
+    sandboxProfile: "inspect-only",
+    auditCorrelationId: `audit:${runId}`,
+    cancellationControlReference: `cancel:${runId}`
+  };
+}
+
+async function createRunningJob(store: SqliteJobStore, id: string, retrySafe: boolean, lease = false) {
+  await store.create({ id, status: "queued", payload: { task: { id, tool: "text.echo", input: { text: id } } }, retrySafe });
+  return store.claim(id, {
+    status: "running",
+    attempts: 1,
+    startedAt: new Date().toISOString(),
+    ...(lease ? { dispatchLease: {
+      token: `lease-${id}`, owner: "test-supervisor", epoch: "test-epoch",
+      acquiredAt: new Date(Date.now() - 120_000).toISOString(), expiresAt: new Date(Date.now() - 60_000).toISOString()
+    } } : {})
+  });
+}
+
+async function waitForJob(store: SqliteJobStore, id: string, status: string) {
+  let current: Awaited<ReturnType<SqliteJobStore["get"]>>;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    current = await store.get(id);
+    if (current?.status === status) return current;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+  throw new Error(`runtime job ${id} did not reach ${status}: ${JSON.stringify(current)}`);
+}
+
+test("live dispatch uses volatile input while restart fails closed when redacted input is unavailable", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-volatile-input-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  let receivedValue: unknown;
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async (payload) => {
+      receivedValue = ((payload.task as JsonObject).input as JsonObject).value;
+      return { ok: true };
+    }
+  });
+  await supervisor.start();
+  await supervisor.submit({ task: { tool: "browser.type", input: { value: "live secret text" } } }, { id: "volatile-live" });
+  await waitForJob(store, "volatile-live", "completed");
+  assert.equal(receivedValue, "live secret text");
+  const durable = await store.get("volatile-live");
+  assert.equal(((durable?.payload.task as JsonObject).input as JsonObject).value, "[redacted]");
+  assert.equal(durable?.recoveryInputAvailable, false);
+  await supervisor.shutdown();
+
+  await store.create({
+    id: "volatile-after-restart",
+    status: "queued",
+    payload: { task: { id: "volatile-after-restart", tool: "browser.type", input: { value: "lost secret text" } } },
+    retrySafe: true
+  });
+  let restartedExecutions = 0;
+  const restarted = new JobSupervisor({
+    store,
+    execute: async () => {
+      restartedExecutions += 1;
+      return { ok: true };
+    }
+  });
+  await restarted.start();
+  const failed = await waitForJob(store, "volatile-after-restart", "failed");
+  assert.match(failed.error ?? "", /volatile execution input is unavailable/u);
+  assert.equal(restartedExecutions, 0);
+  await restarted.shutdown();
+});
+
+test("SQLite runtime jobs import legacy state once and preserve the source as rollback evidence", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-import-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const legacyPath = join(stateDir, "jobs.json");
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(legacyPath, `${JSON.stringify({
+    schemaVersion: 1,
+    jobs: {
+      legacy: {
+        schemaVersion: 1, id: "legacy", status: "queued", payload: { task: { id: "legacy", tool: "text.echo", input: { text: "legacy" } } },
+        retrySafe: true, attempts: 0, timeoutMs: 1_000, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+      },
+      legacy_unsafe_running: {
+        schemaVersion: 1, id: "legacy_unsafe_running", status: "running", payload: { task: { id: "legacy_unsafe_running", tool: "session.create", input: { title: "uncertain" } } },
+        retrySafe: false, attempts: 1, timeoutMs: 1_000, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"
+      }
+    }
+  }, null, 2)}\n`);
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger, { legacyPath });
+
+  const recovery = await store.recover({ maxAttempts: 3 });
+  assert.equal(recovery.queued, 1);
+  assert.equal(recovery.needsReview, 1);
+  assert.equal((await store.get("legacy_unsafe_running"))?.status, "needs-review");
+  assert.equal((await store.get("legacy"))?.payload.task instanceof Object, true);
+  assert.equal((await store.importLegacy()).imported, false);
+  assert.match(await readFile(legacyPath, "utf8"), /"legacy"/u);
+  const marker = ledger.database.db.prepare("SELECT imported_jobs, source_digest FROM runtime_job_imports").get() as { imported_jobs: number; source_digest: string };
+  assert.equal(Number(marker.imported_jobs), 2);
+  assert.match(marker.source_digest, /^[a-f0-9]{64}$/u);
+  await writeFile(legacyPath, `${JSON.stringify({ schemaVersion: 1, jobs: {} })}\n`);
+  await assert.rejects(() => store.importLegacy(), /changed after SQLite cutover/u);
+});
+
+test("SQLite runtime jobs atomically claim leases and bind terminal execution identity", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-claim-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const leftLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const rightLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => { leftLedger.close(); rightLedger.close(); });
+  const left = new SqliteJobStore(leftLedger);
+  const right = new SqliteJobStore(rightLedger);
+  const runId = "runtime-claim";
+  leftLedger.ensureRun({ runId, objective: "claim once" });
+  const admitted = leftLedger.admitExecution(executionEnvelope(root, runId, true));
+  await left.create({ id: runId, status: "queued", payload: { task: { id: runId, tool: "text.echo", input: {} } }, retrySafe: true });
+  const lease = {
+    token: "lease-runtime-claim", owner: "test-supervisor", epoch: "test-epoch",
+    acquiredAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString()
+  };
+  const [first, second] = await Promise.all([
+    left.claim(runId, { status: "running", attempts: 1, dispatchLease: lease }),
+    right.claim(runId, { status: "running", attempts: 1, dispatchLease: { ...lease, token: "lease-other" } })
+  ]);
+  assert.equal([first, second].filter(Boolean).length, 1);
+  leftLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  const completed = await left.update(runId, { status: "completed", completedAt: new Date().toISOString(), result: { ok: true }, dispatchLease: undefined });
+  assert.equal(completed.executionAttemptId, admitted.attempt.id);
+  assert.equal(completed.envelopeDigest, admitted.envelopeDigest);
+  assert.equal(completed.auditCorrelationId, `audit:${runId}`);
+  assert.equal(completed.cancellationControlReference, `cancel:${runId}`);
+  assert.equal(leftLedger.getExecutionAttempt(admitted.attempt.id)?.state, "completed");
+  const leaseRow = leftLedger.database.db.prepare("SELECT released_at, release_reason FROM runtime_job_leases WHERE job_id = ?").get(runId) as { released_at: string; release_reason: string };
+  assert.ok(leaseRow.released_at);
+  assert.equal(leaseRow.release_reason, "completed");
+});
+
+test("restart recovery classifies every crash boundary without replaying unsafe work", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+
+  await createRunningJob(store, "before-admission", false);
+
+  ledger.ensureRun({ runId: "admitted-not-dispatched", objective: "queued attempt" });
+  const queued = ledger.admitExecution(executionEnvelope(root, "admitted-not-dispatched", false));
+  await createRunningJob(store, "admitted-not-dispatched", false);
+
+  ledger.ensureRun({ runId: "unsafe-dispatched", objective: "unsafe dispatch" });
+  const unsafe = ledger.admitExecution(executionEnvelope(root, "unsafe-dispatched", false));
+  ledger.transitionExecutionAttempt({ attemptId: unsafe.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, "unsafe-dispatched", false, true);
+
+  ledger.ensureRun({ runId: "safe-dispatched", objective: "safe dispatch" });
+  const safe = ledger.admitExecution(executionEnvelope(root, "safe-dispatched", true));
+  ledger.transitionExecutionAttempt({ attemptId: safe.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, "safe-dispatched", true);
+
+  ledger.ensureRun({ runId: "approval-pending", objective: "approval" });
+  const approval = ledger.admitExecution(executionEnvelope(root, "approval-pending", false));
+  ledger.transitionExecutionAttempt({ attemptId: approval.attempt.id, from: "queued", to: "running" });
+  ledger.transitionExecutionAttempt({ attemptId: approval.attempt.id, from: "running", to: "awaiting-approval" });
+  await createRunningJob(store, "approval-pending", false);
+
+  ledger.ensureRun({ runId: "settled-before-projection", objective: "settled" });
+  const settled = ledger.admitExecution(executionEnvelope(root, "settled-before-projection", false));
+  ledger.transitionExecutionAttempt({ attemptId: settled.attempt.id, from: "queued", to: "running" });
+  ledger.transitionExecutionAttempt({ attemptId: settled.attempt.id, from: "running", to: "completed", outcomeDigest: "b".repeat(64) });
+  await createRunningJob(store, "settled-before-projection", false);
+
+  const counts = await store.recover({ maxAttempts: 3 });
+  assert.equal((await store.get("before-admission"))?.status, "queued");
+  assert.equal((await store.get("admitted-not-dispatched"))?.status, "queued");
+  assert.equal(ledger.getExecutionAttempt(queued.attempt.id)?.state, "queued");
+  assert.equal((await store.get("unsafe-dispatched"))?.status, "needs-review");
+  assert.equal(ledger.getExecutionAttempt(unsafe.attempt.id)?.state, "needs-review");
+  assert.equal((await store.get("safe-dispatched"))?.status, "queued");
+  assert.equal(ledger.getExecutionAttempt(safe.attempt.id)?.state, "failed");
+  assert.equal((await store.get("approval-pending"))?.status, "awaiting-approval");
+  assert.equal(ledger.getExecutionAttempt(approval.attempt.id)?.state, "awaiting-approval");
+  assert.equal((await store.get("settled-before-projection"))?.status, "completed");
+  assert.deepEqual(counts, { queued: 3, running: 0, awaitingApproval: 1, completed: 1, failed: 0, cancelled: 0, needsReview: 1 });
+});
+
+test("runtime job cancellation correlates cancellation control and uncertainty", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-cancel-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  const runId = "cancel-correlated";
+  ledger.ensureRun({ runId, objective: "cancel" });
+  const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, runId, false);
+  const cancelling = await store.cancel(runId, { requestedBy: "test", reason: "stop" });
+  assert.equal(cancelling.status, "cancelling");
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "cancelling");
+  const control = ledger.database.db.prepare("SELECT requested_by, reason, acknowledged_at, settled_at FROM cancellation_controls WHERE run_id = ?").get(runId) as JsonObject;
+  assert.equal(control.requested_by, "test");
+  assert.equal(control.reason, "stop");
+  assert.ok(control.acknowledged_at);
+  assert.equal(control.settled_at, null);
+  await store.recover({ maxAttempts: 3 });
+  const settledControl = ledger.database.db.prepare("SELECT settled_at FROM cancellation_controls WHERE run_id = ?").get(runId) as JsonObject;
+  assert.ok(settledControl.settled_at);
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "needs-review");
+});
+
+test("terminal execution attempts override a conflicting terminal job projection", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-terminal-authority-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  const runId = "terminal-authority";
+  ledger.ensureRun({ runId, objective: "terminal authority" });
+  const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, runId, false);
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "needs-review", errorCode: "TERMINAL_AUDIT_FAILED" });
+  const projected = await store.update(runId, { status: "failed", error: "worker reported a generic failure", completedAt: new Date().toISOString() });
+  assert.equal(projected.status, "needs-review");
+  assert.equal(projected.error, "worker reported a generic failure");
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "needs-review");
+});
+
+test("unexpired owner leases prevent recovery and stale workers cannot settle a recovered generation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-live-lease-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const ownerLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const recoveryLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => { ownerLedger.close(); recoveryLedger.close(); });
+  const owner = new SqliteJobStore(ownerLedger);
+  const recovery = new SqliteJobStore(recoveryLedger);
+  const runId = "live-lease";
+  ownerLedger.ensureRun({ runId, objective: "live lease" });
+  const admitted = ownerLedger.admitExecution(executionEnvelope(root, runId, false));
+  ownerLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await owner.create({ id: runId, status: "queued", payload: { task: { id: runId, tool: "session.create", input: {} } }, retrySafe: false });
+  const lease = {
+    token: "live-owner-token", owner: "supervisor:owner", epoch: "owner-epoch",
+    acquiredAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString()
+  };
+  await owner.claim(runId, { status: "running", attempts: 1, dispatchLease: lease });
+  await recovery.recover({ maxAttempts: 3 });
+  assert.equal((await recovery.get(runId))?.status, "running");
+  assert.equal(recoveryLedger.getExecutionAttempt(admitted.attempt.id)?.state, "running");
+
+  recoveryLedger.database.db.prepare("UPDATE runtime_jobs SET lease_expires_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 1_000).toISOString(), runId);
+  await recovery.recover({ maxAttempts: 3 });
+  assert.equal((await recovery.get(runId))?.status, "needs-review");
+  await assert.rejects(
+    () => owner.update(runId, { status: "completed", expectedLeaseToken: lease.token, result: { stale: true } }),
+    (error: unknown) => (error as { code?: string }).code === "STALE_DISPATCH_LEASE"
+  );
+});
+
+test("retry-safe shutdown and failed-attempt crash windows remain dispatchable", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-retry-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  let firstStarted!: () => void;
+  const started = new Promise<void>((resolvePromise) => { firstStarted = resolvePromise; });
+  const first = new JobSupervisor({
+    store,
+    execute: async (_payload, { signal }) => {
+      firstStarted();
+      await new Promise((resolvePromise, rejectPromise) => {
+        signal.addEventListener("abort", () => rejectPromise(signal.reason), { once: true });
+      });
+    }
+  });
+  await first.start();
+  await first.submit({ task: { tool: "text.echo", input: { text: "retry after shutdown" } } }, { id: "shutdown-retry", retrySafe: true });
+  await started;
+  await first.shutdown();
+  assert.equal((await store.get("shutdown-retry"))?.status, "queued");
+  let restartedExecutions = 0;
+  const restarted = new JobSupervisor({ store, execute: async () => { restartedExecutions += 1; return { ok: true }; } });
+  await restarted.start();
+  await waitForJob(store, "shutdown-retry", "completed");
+  assert.equal(restartedExecutions, 1);
+  await restarted.shutdown();
+
+  const runId = "failed-attempt-window";
+  ledger.ensureRun({ runId, objective: "failed attempt crash" });
+  const admitted = ledger.admitExecution(executionEnvelope(root, runId, true));
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await store.create({ id: runId, status: "queued", payload: { task: { id: runId, tool: "text.echo", input: { text: "retry" } } }, retrySafe: true });
+  await store.claim(runId, {
+    status: "running", attempts: 1,
+    dispatchLease: {
+      token: "failed-window", owner: "dead-owner", epoch: "dead-epoch",
+      acquiredAt: new Date(Date.now() - 120_000).toISOString(), expiresAt: new Date(Date.now() - 60_000).toISOString()
+    }
+  });
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "failed", errorCode: "PROCESS_EXIT" });
+  await store.recover({ maxAttempts: 3 });
+  assert.equal((await store.get(runId))?.status, "queued");
+});
+
+test("correlated retry-safe shutdown resumes after its cancelled attempt", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-correlated-shutdown-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  t.after(() => { auditStore.close(); ledger.close(); });
+  const store = new SqliteJobStore(ledger);
+  let backendStarts = 0;
+  let firstStarted!: () => void;
+  const started = new Promise<void>((resolvePromise) => { firstStarted = resolvePromise; });
+  const registry = new Map<string, unknown>([["text.echo", {
+    capability: "core.echo",
+    execute: async (_input: unknown, { signal }: { signal: AbortSignal }) => {
+      backendStarts += 1;
+      if (backendStarts > 1) return { text: "recovered" };
+      firstStarted();
+      await new Promise((resolvePromise, rejectPromise) => {
+        signal.addEventListener("abort", () => rejectPromise(signal.reason), { once: true });
+      });
+    }
+  }]]);
+  const execute = (payload: JsonObject, { signal, job }: { signal: AbortSignal; job: { attempts: number } }) => runTask({
+    task: payload.task,
+    auditStore,
+    policy: createDefaultPolicy({ allowedCapabilities: ["core.echo"] }),
+    registry,
+    runLedger: ledger,
+    signal,
+    trustedRecovery: job.attempts > 1
+  });
+  const first = new JobSupervisor({ store, execute });
+  await first.start();
+  await first.submit({ task: { tool: "text.echo", input: { text: "same" }, actor: "test" } }, { id: "correlated-shutdown", retrySafe: true });
+  await started;
+  await first.shutdown();
+  assert.equal((await store.get("correlated-shutdown"))?.status, "queued");
+  assert.deepEqual(ledger.listExecutionAttempts("correlated-shutdown").map((attempt) => attempt.state), ["cancelled"]);
+
+  const restarted = new JobSupervisor({ store, execute });
+  await restarted.start();
+  await waitForJob(store, "correlated-shutdown", "completed");
+  assert.equal(backendStarts, 2);
+  assert.deepEqual(ledger.listExecutionAttempts("correlated-shutdown").map((attempt) => attempt.state), ["cancelled", "completed"]);
+  await restarted.shutdown();
+});
+
+test("explicitly cancelled retry-safe work never inherits shutdown retry intent", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-explicit-safe-cancel-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  for (const terminal of ["cancelled", "failed"] as const) {
+    const runId = `explicit-safe-cancel-${terminal}`;
+    ledger.ensureRun({ runId, objective: "explicit cancellation" });
+    const admitted = ledger.admitExecution(executionEnvelope(root, runId, true));
+    ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+    await createRunningJob(store, runId, true);
+    assert.equal((await store.cancel(runId)).status, "cancelling");
+    ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "cancelling", to: terminal });
+    await store.recover({ maxAttempts: 3 });
+    assert.equal((await store.get(runId))?.status, terminal);
+    assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, terminal);
+    const control = ledger.database.db.prepare("SELECT requested_at, settled_at FROM cancellation_controls WHERE run_id = ?").get(runId) as JsonObject;
+    assert.ok(control.requested_at);
+    assert.ok(control.settled_at);
+  }
+});
+
+test("cancellation defers to every already-terminal execution attempt", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-cancel-terminal-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  for (const terminal of ["completed", "failed", "cancelled", "needs-review"] as const) {
+    const runId = `cancel-terminal-${terminal}`;
+    ledger.ensureRun({ runId, objective: terminal });
+    const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
+    ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+    await createRunningJob(store, runId, false);
+    ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: terminal });
+    const projected = await store.cancel(runId);
+    assert.equal(projected.status, terminal);
+    const control = ledger.database.db.prepare("SELECT requested_at, acknowledged_at, settled_at FROM cancellation_controls WHERE run_id = ?").get(runId) as JsonObject;
+    assert.equal(control.requested_at, null);
+    assert.equal(control.acknowledged_at, null);
+    assert.ok(control.settled_at);
+  }
+});
+
+test("claimed approvals expose cancellation as in flight until terminal settlement", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-approval-race-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  const supervisor = new JobSupervisor({ store, execute: async () => ({ ok: true }) });
+  const runId = "approval-cancel-race";
+  ledger.ensureRun({ runId, objective: "approval cancellation race" });
+  const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, runId, false);
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
+  await store.update(runId, { status: "awaiting-approval" });
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "awaiting-approval");
+  assert.equal((await supervisor.beginApproval(runId)).status, "running");
+  assert.equal((await supervisor.cancel(runId)).status, "cancelling");
+  const settled = await supervisor.settleApproval(runId, { result: { applied: true } });
+  assert.equal(settled.status, "completed");
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "completed");
+});

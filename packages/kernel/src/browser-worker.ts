@@ -13,6 +13,7 @@ interface BrowserWorkerMessage {
   workspaceRoot?: string;
   config?: { auditLog?: string; experimental?: unknown };
   policy?: RuntimePolicy;
+  trustedRecovery?: boolean;
 }
 
 const messageError = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -36,7 +37,7 @@ async function handle(message: BrowserWorkerMessage) {
       const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
       registry = createBuiltInRegistry({ workspaceRoot, stateDir, config, approvalStore, auditStore });
       runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
-      const result = await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: undefined, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId });
+      const result = await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: undefined, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: message.trustedRecovery === true });
       process.send?.({ id: message.id, ok: true, result });
     } catch (error) {
       process.send?.({ id: message.id, ok: false, error: messageError(error) });

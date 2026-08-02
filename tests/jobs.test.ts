@@ -44,7 +44,7 @@ test("job supervisor persists completion and replays recovered work", async () =
   await recovered.shutdown();
 });
 
-test("job supervisor supports cancellation and timeout recovery", async () => {
+test("job supervisor quarantines uncertain cancellation and supports retry-safe timeout recovery", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-jobs-control-"));
   const store = new FileJobStore(join(root, "jobs.json"));
   const supervisor = new JobSupervisor({
@@ -58,7 +58,7 @@ test("job supervisor supports cancellation and timeout recovery", async () => {
   await supervisor.start();
   await supervisor.submit({ action: "cancel" }, { id: "job_cancel" });
   await supervisor.cancel("job_cancel");
-  assert.equal((await waitFor(async () => (await supervisor.get("job_cancel"))?.status === "cancelled" ? supervisor.get("job_cancel") : undefined)).status, "cancelled");
+  assert.equal((await waitFor(async () => (await supervisor.get("job_cancel"))?.status === "needs-review" ? supervisor.get("job_cancel") : undefined)).status, "needs-review");
 
   await supervisor.submit({ action: "timeout" }, { id: "job_timeout", timeoutMs: 10, retrySafe: true });
   const failed = await waitFor(async () => (await supervisor.get("job_timeout"))?.status === "failed" ? supervisor.get("job_timeout") : undefined);
@@ -106,6 +106,32 @@ test("job supervisor never retries unsafe failures and quarantines unknown outco
   const review = await waitFor(async () => (await supervisor.get("job_unsafe_timeout"))?.status === "needs-review" ? supervisor.get("job_unsafe_timeout") : undefined);
   assert.equal(review.attempts, 1);
   assert.equal(executions, 1);
+  await supervisor.shutdown();
+});
+
+test("job supervisor quarantines effectful work when completion persistence fails after backend return", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-settlement-"));
+  const durable = new FileJobStore(join(root, "jobs.json"));
+  let rejectedCompletion = false;
+  const store = {
+    create: durable.create.bind(durable),
+    claim: durable.claim.bind(durable),
+    get: durable.get.bind(durable),
+    list: durable.list.bind(durable),
+    recover: durable.recover.bind(durable),
+    async update(id: string, patch: any) {
+      if (patch.status === "completed" && !rejectedCompletion) {
+        rejectedCompletion = true;
+        throw new Error("fixture completion persistence failed");
+      }
+      return durable.update(id, patch);
+    }
+  };
+  const supervisor = new JobSupervisor({ store, execute: async () => ({ applied: true }) });
+  await supervisor.start();
+  await supervisor.submit({ action: "effect" }, { id: "job_settlement_uncertain", retrySafe: false });
+  const review = await waitFor(async () => (await supervisor.get("job_settlement_uncertain"))?.status === "needs-review" ? supervisor.get("job_settlement_uncertain") : undefined);
+  assert.match(review.error, /completion persistence failed/u);
   await supervisor.shutdown();
 });
 

@@ -31,6 +31,7 @@ export interface ApprovalStore {
   claim(id: unknown): ApprovalAction | undefined;
   consume(id: unknown, action: ApprovalAction): ApprovalAction | undefined;
   take(id: unknown): ApprovalAction | undefined;
+  revoke(id: unknown): boolean;
   list(): ApprovalAction[];
 }
 
@@ -183,6 +184,16 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
     take(id) {
       const action = this.claim(id);
       return action ? this.consume(id, action) : undefined;
+    },
+    revoke(id) {
+      return withLock(() => {
+        refresh();
+        const key = String(id ?? "");
+        const removed = pending.delete(key);
+        volatile.delete(key);
+        persist();
+        return removed;
+      });
     },
     list() {
       return withLock(() => {

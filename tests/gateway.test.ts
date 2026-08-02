@@ -650,6 +650,47 @@ test("gateway approval POST restores and executes the exact volatile browser inp
     assert.equal(approved.output.type, "browser.action.completed");
     assert.equal(approved.output.title, sentinel);
     assert.deepEqual(JSON.parse(await readFile(join(stateDir, "approvals.json"), "utf8")).approvals, []);
+
+    const snapshot = await postJson(`${base}/run`, { tool: "browser.snapshot", input: { tabId: opened.output.id } });
+    const jobSentinel = "SENTINEL_APPROVED_JOB_VALUE_2b71";
+    const jobResponse = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "sealed-browser-job" },
+      body: JSON.stringify({ task: { tool: "browser.type", input: {
+        tabId: opened.output.id,
+        snapshotId: snapshot.output.snapshotId,
+        expectedUrl: snapshot.output.url,
+        selector: "#secretary",
+        value: jobSentinel
+      } } })
+    });
+    assert.equal(jobResponse.status, 202);
+    let approvalJob: any;
+    const approvalDeadline = Date.now() + 10_000;
+    while (Date.now() < approvalDeadline) {
+      approvalJob = await (await fetch(`${base}/jobs/sealed-browser-job`)).json();
+      if (approvalJob.status === "awaiting-approval") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(approvalJob.status, "awaiting-approval");
+    const jobApproval = (await getJson(`${base}/approvals`)).find((approval: any) => approval.runId === approvalJob.id);
+    assert.ok(jobApproval?.id);
+    const jobApprovalResponse = await fetch(`${base}/approvals/${jobApproval.id}/approve`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+    });
+    assert.equal(jobApprovalResponse.status, 200);
+    assert.equal((await jobApprovalResponse.json()).output.title, jobSentinel);
+    const completionDeadline = Date.now() + 10_000;
+    while (Date.now() < completionDeadline) {
+      approvalJob = await (await fetch(`${base}/jobs/sealed-browser-job`)).json();
+      if (approvalJob.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(approvalJob.status, "completed");
+    assert.equal(approvalJob.result.output.title, jobSentinel);
+    const jobLedger = createRunLedger({ stateDir, workspaceRoot: root });
+    assert.equal(jobLedger.getExecutionAttempt(approvalJob.executionAttemptId)?.state, "completed");
+    jobLedger.close();
   } finally {
     await new Promise((resolve: any) => server.close(() => resolve()));
     await new Promise((resolve: any) => fixture.close(() => resolve()));
