@@ -135,7 +135,7 @@ test("run ledger persists content-bound, principal-scoped envelopes and attempt 
   }
 });
 
-test("runtime schema v4 migration is additive and the live task path uses admitted envelopes", async () => {
+test("runtime schema v5 migration is additive and the live task path uses admitted envelopes", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-execution-migration-"));
   const stateDir = join(root, ".odinn");
   const databasePath = join(stateDir, "db", "odinn.sqlite");
@@ -143,7 +143,7 @@ test("runtime schema v4 migration is additive and the live task path uses admitt
   versionThree.close();
   const migrated = new SqliteStore(databasePath);
   migrated.close();
-  assert.equal(inspectExistingSqliteSchema(databasePath), 4);
+  assert.equal(inspectExistingSqliteSchema(databasePath), 5);
 
   const ledger = createRunLedger({ stateDir, workspaceRoot: root });
   const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));

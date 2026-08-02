@@ -14,7 +14,7 @@ import {
 export { SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
 export type { AuditPage } from "./audit.ts";
 
-export const SQLITE_SCHEMA_VERSION = 4;
+export const SQLITE_SCHEMA_VERSION = 5;
 export type SqliteStoreOptions = { targetVersion?: number };
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
@@ -339,7 +339,58 @@ const MIGRATIONS = [
     settled_at TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_execution_envelopes_principal ON execution_envelopes(principal_id, admitted_at);
-  CREATE INDEX IF NOT EXISTS idx_execution_attempts_state ON execution_attempts(state, created_at);`
+  CREATE INDEX IF NOT EXISTS idx_execution_attempts_state ON execution_attempts(state, created_at);`,
+  `CREATE TABLE IF NOT EXISTS runtime_jobs (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'awaiting-approval', 'cancelling', 'completed', 'failed', 'cancelled', 'needs-review')),
+    payload_json TEXT NOT NULL CHECK(length(CAST(payload_json AS BLOB)) <= 1048576),
+    payload_recoverable INTEGER NOT NULL CHECK(payload_recoverable IN (0, 1)),
+    request_hash TEXT CHECK(request_hash IS NULL OR length(request_hash) <= 512),
+    retry_safe INTEGER NOT NULL CHECK(retry_safe IN (0, 1)),
+    attempts INTEGER NOT NULL CHECK(attempts >= 0),
+    timeout_ms INTEGER NOT NULL CHECK(timeout_ms > 0),
+    result_json TEXT CHECK(result_json IS NULL OR length(CAST(result_json AS BLOB)) <= 1048576),
+    error TEXT CHECK(error IS NULL OR length(CAST(error AS BLOB)) <= 16384),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    recovered_at TEXT,
+    occurrence_key TEXT UNIQUE,
+    scheduled_for TEXT,
+    next_run_at TEXT,
+    execution_run_id TEXT,
+    execution_attempt_id TEXT UNIQUE REFERENCES execution_attempts(id),
+    envelope_digest TEXT,
+    audit_correlation_id TEXT,
+    cancellation_control_reference TEXT,
+    imported_from_legacy INTEGER NOT NULL DEFAULT 0 CHECK(imported_from_legacy IN (0, 1)),
+    lease_token TEXT UNIQUE,
+    lease_owner TEXT,
+    lease_epoch TEXT,
+    lease_acquired_at TEXT,
+    lease_expires_at TEXT
+  );
+  CREATE TABLE IF NOT EXISTS runtime_job_imports (
+    source_path TEXT PRIMARY KEY,
+    source_digest TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    imported_jobs INTEGER NOT NULL CHECK(imported_jobs >= 0)
+  );
+  CREATE TABLE IF NOT EXISTS runtime_job_leases (
+    token TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES runtime_jobs(id),
+    occurrence_key TEXT,
+    owner TEXT NOT NULL,
+    epoch TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT,
+    release_reason TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status ON runtime_jobs(status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_runtime_jobs_execution ON runtime_jobs(execution_run_id, execution_attempt_id);
+  CREATE INDEX IF NOT EXISTS idx_runtime_job_leases_job ON runtime_job_leases(job_id, acquired_at);`
 ];
 
 export class SqliteStore {
@@ -503,10 +554,9 @@ export class RunLedger {
         throw error;
       }
       const attemptNumber = Number((db.prepare("SELECT COALESCE(MAX(attempt_number), 0) AS attempt_number FROM execution_attempts WHERE run_id = ?").get(envelope.runId) as SqlRow).attempt_number) + 1;
-      db.prepare(`INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at, started_at)
-        VALUES (?, ?, ?, 'queued', ?, ?)`)
-        .run(attemptId, envelope.runId, attemptNumber, timestamp, timestamp);
-      db.prepare("UPDATE execution_attempts SET state = 'running' WHERE id = ? AND state = 'queued'").run(attemptId);
+      db.prepare(`INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at)
+        VALUES (?, ?, ?, 'queued', ?)`)
+        .run(attemptId, envelope.runId, attemptNumber, timestamp);
       this.appendEventUnsafe(db, {
         runId: envelope.runId,
         type: "execution-admitted",
@@ -515,7 +565,69 @@ export class RunLedger {
       });
       return {
         ...persisted,
-        attempt: { id: attemptId, runId: envelope.runId, attemptNumber, state: "running" as const, createdAt: timestamp, startedAt: timestamp }
+        attempt: { id: attemptId, runId: envelope.runId, attemptNumber, state: "queued" as const, createdAt: timestamp }
+      };
+    });
+  }
+
+  resumeExecution({ runId, executionId, inputDigest, principalId }: {
+    runId: string;
+    executionId: string;
+    inputDigest: string;
+    principalId: string;
+  }) {
+    return this.database.transaction((db) => {
+      const envelopeRow = db.prepare(`SELECT envelope_digest, envelope_json, admitted_at
+        FROM execution_envelopes WHERE run_id = ?`).get(runId) as SqlRow | undefined;
+      if (!envelopeRow) {
+        const error = new Error(`execution envelope not found: ${runId}`) as Error & { code?: string };
+        error.code = "EXECUTION_ENVELOPE_NOT_FOUND";
+        throw error;
+      }
+      const persisted = this.hydrateExecutionEnvelope(envelopeRow);
+      const envelope = persisted.envelope;
+      if (envelope.execution.id !== executionId || envelope.inputDigest !== inputDigest || envelope.principalId !== principalId) {
+        const error = new Error(`execution recovery content does not match immutable envelope: ${runId}`) as Error & { code?: string };
+        error.code = "EXECUTION_RECOVERY_CONFLICT";
+        throw error;
+      }
+      const latest = db.prepare(`SELECT id, attempt_number, state, created_at, started_at, settled_at, outcome_digest, error_code
+        FROM execution_attempts WHERE run_id = ? ORDER BY attempt_number DESC LIMIT 1`).get(runId) as SqlRow | undefined;
+      if (latest?.state === "queued") {
+        return {
+          ...persisted,
+          replay: true,
+          attempt: {
+            id: String(latest.id), runId, attemptNumber: Number(latest.attempt_number), state: "queued" as const,
+            createdAt: String(latest.created_at)
+          }
+        };
+      }
+      if (envelope.retrySafety !== "retry-safe") {
+        const error = new Error(`execution ${runId} is not eligible for automatic retry`) as Error & { code?: string };
+        error.code = "EXECUTION_RETRY_UNSAFE";
+        throw error;
+      }
+      if (!latest || !["failed", "cancelled"].includes(String(latest.state))) {
+        const error = new Error(`execution ${runId} has no failed retry-safe attempt to resume`) as Error & { code?: string };
+        error.code = "EXECUTION_RECOVERY_NOT_ELIGIBLE";
+        throw error;
+      }
+      const attemptId = `attempt_${randomUUID()}`;
+      const attemptNumber = Number(latest.attempt_number) + 1;
+      const createdAt = new Date().toISOString();
+      db.prepare(`INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at)
+        VALUES (?, ?, ?, 'queued', ?)`).run(attemptId, runId, attemptNumber, createdAt);
+      this.appendEventUnsafe(db, {
+        runId,
+        type: "execution-retry-queued",
+        timestamp: createdAt,
+        payload: { attemptId, priorAttemptId: String(latest.id), envelopeDigest: persisted.envelopeDigest }
+      });
+      return {
+        ...persisted,
+        replay: true,
+        attempt: { id: attemptId, runId, attemptNumber, state: "queued" as const, createdAt }
       };
     });
   }
@@ -557,6 +669,20 @@ export class RunLedger {
       outcomeDigest: row.outcome_digest === null ? undefined : String(row.outcome_digest),
       errorCode: row.error_code === null ? undefined : String(row.error_code)
     }));
+  }
+
+  getExecutionAttempt(attemptId: string) {
+    const row = this.database.db.prepare(`SELECT id, run_id, attempt_number, state, created_at, started_at, settled_at, outcome_digest, error_code
+      FROM execution_attempts WHERE id = ?`).get(attemptId) as SqlRow | undefined;
+    if (!row) return undefined;
+    return {
+      id: String(row.id), runId: String(row.run_id), attemptNumber: Number(row.attempt_number),
+      state: row.state as ExecutionAttemptState, createdAt: String(row.created_at),
+      startedAt: row.started_at === null ? undefined : String(row.started_at),
+      settledAt: row.settled_at === null ? undefined : String(row.settled_at),
+      outcomeDigest: row.outcome_digest === null ? undefined : String(row.outcome_digest),
+      errorCode: row.error_code === null ? undefined : String(row.error_code)
+    };
   }
 
   transitionExecutionAttempt({ attemptId, from, to, outcomeDigest, errorCode }: {
@@ -782,3 +908,5 @@ export type {
   RecordQuery,
   SqliteRecordTransaction
 } from "./authoritative.ts";
+export { SqliteJobStore } from "./runtime-jobs.ts";
+export type { RuntimeJobRecord } from "./runtime-jobs.ts";

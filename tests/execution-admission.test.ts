@@ -226,3 +226,125 @@ test("input digest authenticates the redacted artifact without a raw secret fing
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("only trusted recovery creates a fresh attempt for an identical retry-safe envelope", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-admission-retry-"));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  let executions = 0;
+  const registry = new Map<string, unknown>([["text.echo", {
+    capability: "core.echo",
+    execute: async () => {
+      executions += 1;
+      if (executions === 1) throw new Error("retry fixture failed");
+      return { text: "recovered" };
+    }
+  }]]);
+  const options = {
+    task: { id: "run_retry_safe", tool: "text.echo", input: { text: "same" }, actor: "test" },
+    auditStore,
+    policy: createDefaultPolicy({ allowedCapabilities: ["core.echo"] }),
+    registry,
+    runLedger: ledger
+  };
+  try {
+    await assert.rejects(() => runTask(options), /retry fixture failed/u);
+    await assert.rejects(() => runTask(options), (error: unknown) => error instanceof Error && "code" in error && error.code === "IDEMPOTENCY_REUSE");
+    const recovered = await runTask({ ...options, trustedRecovery: true });
+    assert.equal(recovered.output.text, "recovered");
+    assert.equal(executions, 2);
+    assert.deepEqual(ledger.listExecutionAttempts("run_retry_safe").map((attempt) => attempt.state), ["failed", "completed"]);
+    const readmitted = (await auditStore.readRun("run_retry_safe")).events.filter((event: any) => event.type === "execution.readmitted");
+    assert.equal(readmitted.length, 1);
+    assert.equal(readmitted[0].data.auditCorrelationId, ledger.getExecutionEnvelope("run_retry_safe")?.envelope.auditCorrelationId);
+  } finally {
+    auditStore.close();
+    ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trusted recovery admits a request bound before any envelope was persisted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-admission-pre-envelope-recovery-"));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  const durableAudit = createAuditStore(join(stateDir, "audit.jsonl"));
+  let failPolicy = true;
+  let executions = 0;
+  const auditStore = {
+    append(value: any) {
+      if (failPolicy && value?.type === "task.policy") {
+        failPolicy = false;
+        return Promise.reject(new Error("crash before admission"));
+      }
+      return durableAudit.append(value);
+    },
+    readRun(id: string) { return durableAudit.readRun(id); }
+  };
+  const registry = new Map<string, unknown>([["fixture.pre-admission", {
+    capability: "fixture.read",
+    execute: async () => { executions += 1; return { recovered: true }; }
+  }]]);
+  const options = {
+    task: { id: "run_pre_admission_crash", tool: "fixture.pre-admission", input: {}, actor: "test" },
+    auditStore,
+    policy: createDefaultPolicy({ allowedCapabilities: ["fixture.read"] }),
+    registry,
+    runLedger: ledger
+  };
+  try {
+    await assert.rejects(() => runTask(options), /crash before admission/u);
+    assert.equal(ledger.getExecutionEnvelope("run_pre_admission_crash"), undefined);
+    const recovered = await runTask({ ...options, trustedRecovery: true });
+    assert.equal(recovered.output.recovered, true);
+    assert.equal(executions, 1);
+    assert.deepEqual(ledger.listExecutionAttempts("run_pre_admission_crash").map((attempt) => attempt.state), ["completed"]);
+  } finally {
+    durableAudit.close();
+    ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trusted recovery dispatches an unsafe attempt that never crossed the backend boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-admission-queued-unsafe-recovery-"));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  const durableAudit = createAuditStore(join(stateDir, "audit.jsonl"));
+  let failStart = true;
+  let executions = 0;
+  const auditStore = {
+    append(value: any) {
+      if (failStart && value?.type === "task.started") {
+        failStart = false;
+        return Promise.reject(new Error("crash before dispatch"));
+      }
+      return durableAudit.append(value);
+    },
+    readRun(id: string) { return durableAudit.readRun(id); }
+  };
+  const registry = new Map<string, unknown>([["fixture.effect.queued", {
+    capability: "fixture.effect",
+    execute: async () => { executions += 1; return { applied: true }; }
+  }]]);
+  const options = {
+    task: { id: "run_queued_unsafe", tool: "fixture.effect.queued", input: {}, actor: "test" },
+    auditStore,
+    policy: createDefaultPolicy({ allowedCapabilities: ["fixture.effect"] }),
+    registry,
+    runLedger: ledger
+  };
+  try {
+    await assert.rejects(() => runTask(options), /crash before dispatch/u);
+    assert.deepEqual(ledger.listExecutionAttempts("run_queued_unsafe").map((attempt) => attempt.state), ["queued"]);
+    const recovered = await runTask({ ...options, trustedRecovery: true });
+    assert.equal(recovered.output.applied, true);
+    assert.equal(executions, 1);
+    assert.deepEqual(ledger.listExecutionAttempts("run_queued_unsafe").map((attempt) => attempt.state), ["completed"]);
+  } finally {
+    durableAudit.close();
+    ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

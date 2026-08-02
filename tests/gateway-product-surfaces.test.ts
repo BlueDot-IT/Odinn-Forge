@@ -7,8 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
-import { createAuditStore, isOwnerOnlyPath } from "../packages/kernel/src/index.ts";
-import { FileJobStore } from "../packages/store-file/src/index.ts";
+import { createAuditStore, createRunLedger, isOwnerOnlyPath, SqliteJobStore } from "../packages/kernel/src/index.ts";
 
 const DEFAULT_PROJECT_ID = "project_default";
 
@@ -26,6 +25,7 @@ async function gatewayFixture(prefix: string, config?: Record<string, unknown>) 
   return {
     base: `http://127.0.0.1:${address.port}`,
     stateDir,
+    workspaceRoot,
     close: () => new Promise<void>((resolve, reject) => server.close((error: Error | undefined) => error ? reject(error) : resolve()))
   };
 }
@@ -280,7 +280,8 @@ test("tasks hide system reads, expose real detail, and enforce replay safety", a
     const rejected = await postJson(`${gateway.base}/runs/${encodeURIComponent(unsafeTask.id)}/replay`, { id: "unsafe-copy" }, 409);
     assert.match(rejected.error, /not declared retry-safe/);
 
-    const orphanedJobStore = new FileJobStore(join(gateway.stateDir, "jobs.json"));
+    const orphanedLedger = createRunLedger({ stateDir: gateway.stateDir, workspaceRoot: gateway.workspaceRoot });
+    const orphanedJobStore = new SqliteJobStore(orphanedLedger);
     await orphanedJobStore.create({
       id: "job_needs_operator_review",
       status: "needs-review",
@@ -288,6 +289,7 @@ test("tasks hide system reads, expose real detail, and enforce replay safety", a
       error: "gateway stopped before an audit run was recorded",
       retrySafe: false
     });
+    orphanedLedger.close();
     const withOrphanedJob = await requestJson(`${gateway.base}/tasks`);
     const orphaned = withOrphanedJob.tasks.find((task: any) => task.id === "job_needs_operator_review");
     assert.equal(orphaned?.status, "needs-review");

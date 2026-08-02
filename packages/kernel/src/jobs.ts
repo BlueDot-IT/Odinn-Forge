@@ -14,6 +14,7 @@ export interface JobRecord {
   timeoutMs: number;
   requestHash?: string;
   retrySafe?: boolean;
+  recoveryInputAvailable?: boolean;
   result?: unknown;
   error?: string;
   createdAt?: string;
@@ -29,10 +30,13 @@ export interface JobRecord {
 export interface JobStore {
   create(job: JsonObject & { id: string }): Promise<JobRecord>;
   claim(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
+  claimApproval?(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
   update(id: string, patch: JsonObject): Promise<JobRecord>;
   get(id: string): Promise<JobRecord | undefined>;
   list(): Promise<JobRecord[]>;
   recover(options: { maxAttempts: number }): Promise<unknown>;
+  cancel?(id: string, options?: { requestedBy?: string; reason?: string }): Promise<JobRecord>;
+  renewLease?(id: string, lease: { token: string; owner: string; epoch: string; expiresAt: string }): Promise<boolean>;
 }
 
 export interface JobExecutionContext {
@@ -64,6 +68,10 @@ export class JobSupervisor {
   readonly maxAttempts: number;
   readonly defaultTimeoutMs: number;
   private readonly active: Map<string, ActiveJob>;
+  private readonly volatilePayloads: Map<string, JsonObject>;
+  private readonly leaseOwner: string;
+  private readonly leaseEpoch: string;
+  private recoveryTimer?: NodeJS.Timeout;
   private started: boolean;
   private draining: boolean;
   private stopping: boolean;
@@ -78,6 +86,9 @@ export class JobSupervisor {
     this.maxAttempts = Math.max(1, Number(maxAttempts) || 1);
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.active = new Map();
+    this.volatilePayloads = new Map();
+    this.leaseOwner = `supervisor:${process.pid}`;
+    this.leaseEpoch = randomUUID();
     this.started = false;
     this.draining = false;
     this.stopping = false;
@@ -86,8 +97,9 @@ export class JobSupervisor {
   async start(): Promise<void> {
     if (this.started) return;
     this.stopping = false;
-    await this.store.recover({ maxAttempts: this.maxAttempts });
+    const recovery = await this.store.recover({ maxAttempts: this.maxAttempts });
     this.started = true;
+    this.scheduleLeaseRecovery(recovery);
     await this.drain();
   }
 
@@ -113,11 +125,14 @@ export class JobSupervisor {
       idempotent?: boolean;
     } = {}
   ): Promise<JobRecord> {
+    const normalizedPayload = payload.task && typeof payload.task === "object" && !Array.isArray(payload.task)
+      ? { ...payload, task: { ...payload.task, id } }
+      : payload;
     let job: JobRecord;
     try {
       job = await this.store.create({
         id,
-        payload,
+        payload: normalizedPayload,
         requestHash,
         retrySafe,
         status: "queued",
@@ -126,6 +141,7 @@ export class JobSupervisor {
         ...(scheduledFor ? { scheduledFor } : {}),
         ...(nextRunAt !== undefined ? { nextRunAt } : {})
       });
+      this.volatilePayloads.set(id, normalizedPayload);
     } catch (error) {
       if (!idempotent) throw error;
       const existing = await this.store.get(id);
@@ -142,16 +158,45 @@ export class JobSupervisor {
     if (["completed", "failed", "cancelled", "needs-review"].includes(job.status)) return job;
     const running = this.active.get(id);
     if (running) {
+      const cancelling = this.store.cancel
+        ? await this.store.cancel(id, { requestedBy: "operator", reason: "job cancelled by user" })
+        : await this.store.update(id, { status: "cancelling" });
       running.controller.abort(new Error("job cancelled by user"));
-      return this.store.update(id, { status: "cancelling" });
+      return cancelling;
     }
-    const cancelled = await this.store.update(id, { status: "cancelled", completedAt: new Date().toISOString() });
+    const cancelled = this.store.cancel
+      ? await this.store.cancel(id, { requestedBy: "operator", reason: "job cancelled by user" })
+      : await this.store.update(id, { status: "cancelled", completedAt: new Date().toISOString() });
+    this.volatilePayloads.delete(id);
     await this.drain();
     return cancelled;
   }
 
   async get(id: string): Promise<JobRecord | undefined> { return this.store.get(id); }
   async list(): Promise<JobRecord[]> { return this.store.list(); }
+
+  async settleApproval(id: string, { result, error }: { result?: unknown; error?: unknown }): Promise<JobRecord> {
+    const current = await this.store.get(id);
+    if (!current || !["running", "cancelling"].includes(current.status)) {
+      throw new Error(`runtime job ${id} has no claimed approval execution`);
+    }
+    return this.store.update(id, error === undefined ? {
+      status: "completed",
+      completedAt: new Date().toISOString(),
+      result
+    } : {
+      status: "needs-review",
+      completedAt: new Date().toISOString(),
+      error: errorMessage(error)
+    });
+  }
+
+  async beginApproval(id: string): Promise<JobRecord> {
+    if (!this.store.claimApproval) throw new Error("runtime job store does not support approval claims");
+    const claimed = await this.store.claimApproval(id, { status: "running", error: undefined });
+    if (!claimed) throw new Error(`runtime job ${id} is no longer awaiting approval`);
+    return claimed;
+  }
 
   async drain(): Promise<void> {
     if (!this.started || this.stopping || this.draining) return;
@@ -165,17 +210,27 @@ export class JobSupervisor {
           status: "running",
           startedAt: new Date().toISOString(),
           attempts,
-          ...(queued.occurrenceKey ? {
-            dispatchLease: {
-              occurrenceKey: queued.occurrenceKey,
-              token: randomUUID(),
-              acquiredAt: new Date().toISOString(),
-              expiresAt: new Date(Date.now() + Math.max(queued.timeoutMs || this.defaultTimeoutMs, 120_000)).toISOString()
-            }
-          } : {})
+          dispatchLease: {
+            ...(queued.occurrenceKey ? { occurrenceKey: queued.occurrenceKey } : {}),
+            token: randomUUID(),
+            owner: this.leaseOwner,
+            epoch: this.leaseEpoch,
+            acquiredAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + Math.max((queued.timeoutMs || this.defaultTimeoutMs) + 30_000, 120_000)).toISOString()
+          }
         });
         if (!claimed) continue;
-        void this.run(claimed).catch(() => undefined);
+        const volatilePayload = this.volatilePayloads.get(claimed.id);
+        if (claimed.recoveryInputAvailable === false && !volatilePayload) {
+          await this.store.update(claimed.id, {
+            status: "failed",
+            completedAt: new Date().toISOString(),
+            error: "volatile execution input is unavailable after restart; resubmit the job with fresh input",
+            dispatchLease: undefined
+          });
+          continue;
+        }
+        void this.run({ ...claimed, payload: volatilePayload ?? claimed.payload }).catch(() => undefined);
       }
     } finally {
       this.draining = false;
@@ -185,41 +240,97 @@ export class JobSupervisor {
   async shutdown(): Promise<void> {
     this.stopping = true;
     this.started = false;
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     for (const active of this.active.values()) active.controller.abort(new Error("supervisor shutting down"));
     await Promise.allSettled(Array.from(this.active.values(), (active) => active.promise));
   }
 
   private run(job: JobRecord): Promise<void> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(new Error("job timed out")), job.timeoutMs || this.defaultTimeoutMs);
+    const timeoutMs = job.timeoutMs || this.defaultTimeoutMs;
+    const leaseWindowMs = Math.max(timeoutMs + 30_000, 120_000);
+    const timeout = setTimeout(() => controller.abort(new Error("job timed out")), timeoutMs);
+    const leaseToken = typeof job.dispatchLease?.token === "string" ? job.dispatchLease.token : undefined;
+    const heartbeat = leaseToken && this.store.renewLease
+      ? setInterval(() => {
+          void this.store.renewLease!(job.id, {
+            token: leaseToken,
+            owner: String(job.dispatchLease?.owner),
+            epoch: String(job.dispatchLease?.epoch),
+            expiresAt: new Date(Date.now() + leaseWindowMs).toISOString()
+          }).then((renewed) => {
+            if (!renewed) controller.abort(new Error("job dispatch lease was lost"));
+          }).catch(() => controller.abort(new Error("job dispatch lease renewal failed")));
+        }, Math.min(30_000, Math.max(1_000, Math.floor(leaseWindowMs / 3))))
+      : undefined;
+    heartbeat?.unref?.();
     const promise = (async () => {
+      let backendReturned = false;
       try {
         const result = await this.execute(job.payload, { signal: controller.signal, job });
+        backendReturned = true;
         if (controller.signal.aborted) throw controller.signal.reason ?? new Error("job aborted");
-        await this.store.update(job.id, { status: "completed", completedAt: new Date().toISOString(), result, dispatchLease: undefined });
+        const awaitingApproval = Boolean(result && typeof result === "object"
+          && (result as { output?: { type?: unknown } }).output?.type === "approval.required");
+        await this.store.update(job.id, {
+          status: awaitingApproval ? "awaiting-approval" : "completed",
+          ...(awaitingApproval ? {} : { completedAt: new Date().toISOString() }),
+          result,
+          expectedLeaseToken: leaseToken,
+          dispatchLease: undefined
+        });
       } catch (error) {
         const current = await this.store.get(job.id);
         const reason = controller.signal.reason;
         const cancelled = controller.signal.aborted && reason instanceof Error && reason.message.includes("cancel");
         const message = errorMessage(error);
-        const unknownOutcome = !job.retrySafe && (controller.signal.aborted || /worker exited unexpectedly|gateway stopped during execution/i.test(message));
+        const unknownOutcome = !job.retrySafe && (backendReturned || controller.signal.aborted || /worker exited unexpectedly|gateway stopped during execution/i.test(message));
+        const retry = !cancelled && job.retrySafe === true && job.recoveryInputAvailable !== false
+          && current && current.attempts < this.maxAttempts;
         await this.store.update(job.id, {
-          status: cancelled ? "cancelled" : unknownOutcome ? "needs-review" : "failed",
-          completedAt: new Date().toISOString(),
+          status: retry ? "queued" : unknownOutcome ? "needs-review" : cancelled ? "cancelled" : "failed",
+          completedAt: retry ? undefined : new Date().toISOString(),
           error: message,
+          expectedLeaseToken: leaseToken,
           dispatchLease: undefined
         });
-        if (!this.stopping && !cancelled && job.retrySafe === true && current && current.attempts < this.maxAttempts) {
-          await this.store.update(job.id, { status: "queued", completedAt: undefined, error: message });
-        }
       } finally {
         clearTimeout(timeout);
+        if (heartbeat) clearInterval(heartbeat);
         this.active.delete(job.id);
+        try {
+          const current = await this.store.get(job.id);
+          if (current?.status !== "queued") this.volatilePayloads.delete(job.id);
+        } catch {
+          this.volatilePayloads.delete(job.id);
+        }
         if (!this.stopping) await this.drain();
       }
     })();
     this.active.set(job.id, { controller, promise });
     return promise;
+  }
+
+  private scheduleLeaseRecovery(recovery: unknown) {
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    const expiresAt = recovery && typeof recovery === "object" && "nextLeaseExpiry" in recovery
+      ? (recovery as { nextLeaseExpiry?: unknown }).nextLeaseExpiry
+      : undefined;
+    if (typeof expiresAt !== "string") return;
+    const delay = Math.max(1, Date.parse(expiresAt) - Date.now() + 5);
+    this.recoveryTimer = setTimeout(() => {
+      void (async () => {
+        if (!this.started || this.stopping) return;
+        const next = await this.store.recover({ maxAttempts: this.maxAttempts });
+        this.scheduleLeaseRecovery(next);
+        await this.drain();
+      })().catch(() => {
+        if (this.started && !this.stopping) {
+          this.scheduleLeaseRecovery({ nextLeaseExpiry: new Date(Date.now() + 1_000).toISOString() });
+        }
+      });
+    }, delay);
+    this.recoveryTimer.unref?.();
   }
 }
 
@@ -232,7 +343,7 @@ interface WorkerPayload extends JsonObject {
   task?: JsonObject & { tool?: string };
 }
 
-interface ExecutorOptions { signal?: AbortSignal }
+interface ExecutorOptions { signal?: AbortSignal; job?: JobRecord }
 type TaskExecutor = ((payload: WorkerPayload, options?: ExecutorOptions) => Promise<unknown>) & { shutdown(): Promise<void> };
 
 interface WorkerConfiguration {
@@ -270,13 +381,14 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
   ));
   const browserExecutor = createPersistentWorkerExecutor({ workerPath: browserWorkerPath, stateDir, workspaceRoot: authoritativeRoot, config, policy });
   const children = new Set<ChildProcess>();
-  const execute = ((payload: WorkerPayload, { signal }: ExecutorOptions = {}) => {
+  const execute = ((payload: WorkerPayload, { signal, job }: ExecutorOptions = {}) => {
+    const trustedRecovery = Number(job?.attempts ?? 0) > 1;
     const taskWorkspaceRoot = resolve(payload.workspaceRoot || authoritativeRoot);
     if (taskWorkspaceRoot !== authoritativeRoot && !taskWorkspaceRoot.startsWith(`${authoritativeRoot}${sep}`)) {
       return Promise.reject(new Error("task workspaceRoot must remain inside the gateway workspace"));
     }
     if (String(payload.task?.tool || "").startsWith("browser.")) {
-      return browserExecutor({ ...payload, workspaceRoot: taskWorkspaceRoot }, { signal });
+      return browserExecutor({ ...payload, workspaceRoot: taskWorkspaceRoot }, { signal, job });
     }
     return new Promise<unknown>((resolve, reject) => {
       const child = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
@@ -306,7 +418,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
         if (!settled) finish(new Error(`forked task worker exited unexpectedly: ${code ?? exitSignal}`));
       });
       signal?.addEventListener("abort", abort, { once: true });
-      child.send({ payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy });
+      child.send({ payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy, trustedRecovery });
     });
   }) as TaskExecutor;
   execute.shutdown = async () => {
@@ -350,7 +462,7 @@ function createPersistentWorkerExecutor(options: WorkerConfiguration & { workerP
     return currentChild;
   };
 
-  const execute = ((payload: WorkerPayload, { signal }: ExecutorOptions = {}) => new Promise<unknown>((resolve, reject) => {
+  const execute = ((payload: WorkerPayload, { signal, job }: ExecutorOptions = {}) => new Promise<unknown>((resolve, reject) => {
     if (shuttingDown) return reject(new Error("persistent worker is shutting down"));
     const id = `request_${++sequence}`;
     let settled = false;
@@ -370,7 +482,7 @@ function createPersistentWorkerExecutor(options: WorkerConfiguration & { workerP
     pending.set(id, { finish });
     signal?.addEventListener("abort", abort, { once: true });
     try {
-      ensureChild().send({ type: "task", id, payload, stateDir, workspaceRoot, config, policy }, (error) => {
+      ensureChild().send({ type: "task", id, payload, stateDir, workspaceRoot, config, policy, trustedRecovery: Number(job?.attempts ?? 0) > 1 }, (error) => {
         if (error) {
           pending.delete(id);
           finish(error);

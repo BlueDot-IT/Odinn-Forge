@@ -321,14 +321,30 @@ export async function stateLifecycleStatus(stateDir: string): Promise<{
   } catch {
     browserError = "browser recovery journal is invalid or unreadable";
   }
-  let jobsState: Record<string, any> = { jobs: {} };
+  let jobs: Array<{ status?: string }> = [];
+  let runtimeJobsPresent = false;
   let jobsError = "";
   try {
-    jobsState = await readJsonIfPresent(join(stateRoot, "jobs.json"), { jobs: {} });
+    const runtimeDatabase = join(stateRoot, "db", "odinn.sqlite");
+    if (await exists(runtimeDatabase)) {
+      const database = new DatabaseSync(runtimeDatabase, { readOnly: true });
+      try {
+        const table = database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_jobs'").get();
+        if (table) {
+          runtimeJobsPresent = true;
+          jobs = database.prepare("SELECT status FROM runtime_jobs").all() as Array<{ status?: string }>;
+        }
+      } finally {
+        database.close();
+      }
+    }
+    if (!runtimeJobsPresent) {
+      const legacy = await readJsonIfPresent(join(stateRoot, "jobs.json"), { jobs: {} });
+      jobs = Object.values(legacy.jobs ?? {}) as Array<{ status?: string }>;
+    }
   } catch {
     jobsError = "job store is invalid or unreadable";
   }
-  const jobs = Object.values(jobsState.jobs ?? {}) as Array<{ status?: string }>;
   let audit = { valid: true, events: 0, unsigned: 0 };
   let auditError = "";
   try {

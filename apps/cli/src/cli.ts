@@ -7,6 +7,7 @@ import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, r
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
@@ -1239,6 +1240,21 @@ async function readJsonIfPresent(path: string, fallback: any) {
   catch (error: any) { if (error?.code === "ENOENT") return fallback; throw error; }
 }
 
+async function readRuntimeJobs(state: string) {
+  const databasePath = join(state, "db", "odinn.sqlite");
+  if (existsSync(databasePath)) {
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const table = database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_jobs'").get();
+      if (table) return database.prepare("SELECT status FROM runtime_jobs").all() as Array<{ status: string }>;
+    } finally {
+      database.close();
+    }
+  }
+  const legacy = await readJsonIfPresent(join(state, "jobs.json"), { jobs: {} });
+  return Object.values(legacy?.jobs ?? {}) as Array<{ status: string }>;
+}
+
 async function doctor(args: any) {
   const state = stateDir(args);
   await recoverInterruptedOnboardingTransactions(state);
@@ -1257,8 +1273,7 @@ async function doctor(args: any) {
   }
   const approvals = createApprovalStore({ path: join(state, "approvals.json") });
   const pendingApprovals = approvals.list();
-  const jobsState = await readJsonIfPresent(join(state, "jobs.json"), { jobs: {} });
-  const jobs = Object.values(jobsState?.jobs ?? {}) as any[];
+  const jobs = await readRuntimeJobs(state);
   const jobCounts = {
     queued: jobs.filter((job) => job.status === "queued").length,
     running: jobs.filter((job) => job.status === "running").length,

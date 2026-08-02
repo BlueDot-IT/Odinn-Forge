@@ -79,17 +79,25 @@ test("release-candidate SQLite state migrates transactionally and preserves its 
     await mkdir(dirname(databasePath), { recursive: true });
     const database = new SqliteStore(databasePath, { targetVersion: 2 });
     database.close();
+    const legacyJobs = `${JSON.stringify({ schemaVersion: 1, jobs: {
+      migrated_job: { schemaVersion: 1, id: "migrated_job", status: "queued", payload: { task: { id: "migrated_job", tool: "text.echo", input: { text: "preserve" } } }, retrySafe: true, attempts: 0, timeoutMs: 1_000 }
+    } }, null, 2)}\n`;
+    await writeFile(join(candidate.state, "jobs.json"), legacyJobs);
     const plan = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4"]);
-    assert.equal(plan.rollbackCompatible, true);
+    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4", "runtime-database-v4-to-v5"]);
+    assert.equal(plan.rollbackCompatible, false);
     const report = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(report?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 4);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 5);
     assert.equal(inspectExistingSqliteSchema(join(report.backupLocation!, "db", "odinn.sqlite")), 2);
+    const migratedDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    assert.equal((migratedDatabase.prepare("SELECT status FROM runtime_jobs WHERE id = 'migrated_job'").get() as { status: string }).status, "queued");
+    migratedDatabase.close();
+    assert.equal(await readFile(join(candidate.state, "jobs.json"), "utf8"), legacyJobs);
     const manifest = JSON.parse(await readFile(join(candidate.state, "state-schema.json"), "utf8"));
-    assert.equal(manifest.minimumApplicationVersion, "1.0.0-rc.1");
+    assert.equal(manifest.minimumApplicationVersion, "1.0.0");
     assert.equal(manifest.applicationVersion, "1.0.0");
-    assert.equal(manifest.storeVersions.runtimeDatabase, 4);
+    assert.equal(manifest.storeVersions.runtimeDatabase, 5);
   } finally {
     await rm(candidate.temporary, { recursive: true, force: true });
   }

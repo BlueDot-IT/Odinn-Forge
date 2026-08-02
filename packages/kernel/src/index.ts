@@ -12,7 +12,7 @@ export { loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS } from "./environm
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile } from "./environment.ts";
 export { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
 export type { LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
-import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
+import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, DarwinRouter, OdinnRuntimeError, Sentinel } from "./differentiated-runtime.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
@@ -32,7 +32,7 @@ export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
 export { ExtensionRegistry, ExtensionExecutor } from "./extensions.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
-export { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
+export { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
 export type { AdvancedFeature } from "./features.ts";
 export { withStateMutationLock } from "./state-mutation.ts";
 export { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions } from "./state/schema-registry.ts";
@@ -945,12 +945,12 @@ export class ExecutionAdmissionService {
     return executeTaskThroughAdmission({ ...this.options, task, admissionService: this });
   }
 
-  async admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId }: any) {
+  async admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId, recoveryReplay = false }: any) {
     const runLedger = this.options.runLedger;
     if (!runLedger) return undefined;
     const inputDigest = ledgerStep.inputArtifact.digest;
     const decisionReference = policyEvent?.id ? `policy-event:${policyEvent.id}` : executionReference("policy", `${request.id}:${tool.capability}`);
-    const persisted = runLedger.admitExecution({
+    const envelope = {
       version: 1,
       runId: request.id,
       ...(parentRunId ? { parentRunId } : {}),
@@ -973,40 +973,67 @@ export class ExecutionAdmissionService {
       sandboxProfile: executionSandboxProfile(safety),
       auditCorrelationId: executionReference("audit", request.id),
       cancellationControlReference: executionReference("cancel", request.id)
-    });
+    };
+    const resuming = recoveryReplay && Boolean(runLedger.getExecutionEnvelope(request.id));
+    const persisted = resuming
+      ? runLedger.resumeExecution({
+          runId: request.id,
+          executionId: request.tool,
+          inputDigest,
+          principalId: executionReference("principal", request.actor)
+        })
+      : runLedger.admitExecution(envelope);
     try {
       await this.options.auditStore.append({
         at: this.options.now(),
         runId: request.id,
-        type: "execution.admitted",
+        type: resuming ? "execution.readmitted" : "execution.admitted",
         actor: request.actor,
         tool: request.tool,
         capability: tool.capability,
         decision: "allow",
-        data: { envelopeDigest: persisted.envelopeDigest, attemptId: persisted.attempt.id, inputDigest, inputReference: persisted.envelope.inputReference }
+        data: {
+          envelopeDigest: persisted.envelopeDigest,
+          attemptId: persisted.attempt.id,
+          attemptNumber: persisted.attempt.attemptNumber,
+          auditCorrelationId: persisted.envelope.auditCorrelationId,
+          cancellationControlReference: persisted.envelope.cancellationControlReference,
+          inputDigest,
+          inputReference: persisted.envelope.inputReference
+        }
       });
     } catch (error) {
-      runLedger.transitionExecutionAttempt({ attemptId: persisted.attempt.id, from: "running", to: "failed", errorCode: "AUDIT_CORRELATION_FAILED" });
+      runLedger.transitionExecutionAttempt({ attemptId: persisted.attempt.id, from: "queued", to: "failed", errorCode: "AUDIT_CORRELATION_FAILED" });
       throw error;
     }
-    return { ...persisted, attemptId: persisted.attempt.id };
+    return { ...persisted, attemptId: persisted.attempt.id, state: "queued" };
+  }
+
+  start(admission: any) {
+    if (!admission || !this.options.runLedger) return;
+    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: "queued", to: "running" });
+    admission.state = "running";
   }
 
   complete(admission: any, outcomeDigest?: string) {
     if (!admission || !this.options.runLedger) return;
-    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: "running", to: "completed", outcomeDigest });
+    const current = this.options.runLedger.getExecutionAttempt(admission.attemptId);
+    if (!current || ["completed", "failed", "cancelled", "needs-review"].includes(current.state)) return;
+    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: current.state, to: "completed", outcomeDigest });
   }
 
   awaitApproval(admission: any) {
     if (!admission || !this.options.runLedger) return;
-    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: "running", to: "awaiting-approval" });
+    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: admission.state ?? "running", to: "awaiting-approval" });
   }
 
   fail(admission: any, error: unknown, { cancelled = false, uncertain = false }: { cancelled?: boolean; uncertain?: boolean } = {}) {
     if (!admission || !this.options.runLedger) return;
+    const current = this.options.runLedger.getExecutionAttempt(admission.attemptId);
+    if (!current || ["completed", "failed", "cancelled", "needs-review"].includes(current.state)) return;
     this.options.runLedger.transitionExecutionAttempt({
       attemptId: admission.attemptId,
-      from: "running",
+      from: current.state,
       to: uncertain ? "needs-review" : cancelled ? "cancelled" : "failed",
       errorCode: executionErrorCode(error, uncertain ? "EXECUTION_OUTCOME_UNCERTAIN" : cancelled ? "EXECUTION_CANCELLED" : "EXECUTION_FAILED")
     });
@@ -1030,6 +1057,7 @@ async function executeTaskThroughAdmission({
   onAgentProgress,
   trustedApprovalId,
   trustedApprovalRunId,
+  trustedRecovery = false,
   parentRunId,
   admissionService
 }: any) {
@@ -1067,7 +1095,8 @@ async function executeTaskThroughAdmission({
     const completed = [...prior.events].reverse().find((event: any) => event.type === "task.completed");
     return { id: request.id, tool: request.tool, capability: tool?.capability, ok: true, replayed: true, output: completed?.data?.output };
   }
-  if (runBinding?.replay) {
+  const recoveryReplay = runBinding?.replay === true && trustedRecovery === true;
+  if (runBinding?.replay && !recoveryReplay) {
     const error = new Error(`run id ${request.id} is already bound to an unfinished or failed request and will not be executed again`) as NodeError;
     error.code = "IDEMPOTENCY_REUSE";
     throw error;
@@ -1102,7 +1131,7 @@ async function executeTaskThroughAdmission({
     throw error;
   }
 
-  const admission = await admissionService.admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId });
+  const admission = await admissionService.admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId, recoveryReplay });
 
   let capabilityClaims;
   try {
@@ -1142,8 +1171,10 @@ async function executeTaskThroughAdmission({
     capability: tool.capability,
     decision: "allow",
     data: {
-      inputDigest: createHash("sha256").update(JSON.stringify(request.input)).digest("hex"),
+      inputDigest: ledgerStep?.inputArtifact.digest,
       requestDigest,
+      attemptId: admission?.attemptId,
+      auditCorrelationId: admission?.envelope?.auditCorrelationId,
       input: safeAuditValue(request.input)
     }
   });
@@ -1152,6 +1183,7 @@ async function executeTaskThroughAdmission({
   let backendReturned = false;
   try {
     throwIfAborted(signal);
+    admissionService.start(admission);
     const output = await tool.execute(request.input, {
       request,
       policy,
@@ -1205,8 +1237,8 @@ async function executeTaskThroughAdmission({
       decision: awaitingApproval ? "pending" : "allow",
       message: awaitingApproval ? output.summary : undefined,
       data: awaitingApproval
-        ? { approvalId: output.approvalId, expiresInSeconds: output.expiresInSeconds }
-        : { output: safeAuditValue(output) }
+        ? { approvalId: output.approvalId, expiresInSeconds: output.expiresInSeconds, attemptId: admission?.attemptId, auditCorrelationId: admission?.envelope?.auditCorrelationId }
+        : { output: safeAuditValue(output), attemptId: admission?.attemptId, auditCorrelationId: admission?.envelope?.auditCorrelationId }
     });
     const outputArtifact = runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output, status: awaitingApproval ? "blocked" : "succeeded" });
     ledgerFinished = Boolean(runLedger);
@@ -1228,7 +1260,8 @@ async function executeTaskThroughAdmission({
         tool: request.tool,
         capability: tool.capability,
         decision: "allow",
-        message: cancelled ? "task cancelled" : failure.message
+        message: cancelled ? "task cancelled" : failure.message,
+        data: { attemptId: admission?.attemptId, auditCorrelationId: admission?.envelope?.auditCorrelationId }
       });
     } catch (auditError) {
       Object.defineProperty(failure, "auditError", { value: auditError, configurable: true });
