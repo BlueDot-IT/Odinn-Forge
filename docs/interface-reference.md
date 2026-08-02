@@ -106,6 +106,48 @@ the character count and not necessarily the retained content length).
 `maxBytes` bytes and `false` otherwise. Operators and clients must treat these
 fields as byte-accurate interface data.
 
+### `workspace.writeText` tool contract
+
+`workspace.writeText` atomically creates or replaces one UTF-8 text file beneath
+the assigned workspace root. It rejects lexical and symbolic-link escapes,
+non-file targets, and content larger than `1,000,000` bytes. The optional
+`createDirectories` field defaults to `true`; the optional `maxBytes` field may
+lower, but cannot raise, the runtime byte limit. The response contains the
+workspace-relative `path`, UTF-8 `bytes`, whether the file was `created`, and a
+SHA-256 digest of the written content.
+
+The tool remains denied unless `workspace.writeText` is present in the active
+policy's allowed capabilities.
+
+### `process.exec` tool contract
+
+`process.exec` starts one executable directly with a separate argument array;
+it never invokes a shell. Its working directory must resolve beneath the
+assigned workspace. `timeoutMs` is bounded from 100 to 120,000 milliseconds and
+defaults to 30,000. Combined captured output is bounded from 1,024 to 1,000,000
+bytes and defaults to 128,000; exceeding the limit terminates the process tree
+and sets `outputTruncated`.
+
+This is intentionally not an operating-system sandbox. A child runs under the
+same OS identity as Odinn and may use available executables or network access.
+Odinn limits the inherited environment and assigns the workspace as child
+`HOME` and `USERPROFILE`, but operators must still use a disposable workspace
+and a suitably restricted host identity. The tool requires both an explicit
+`process.exec` policy capability and the following configuration acknowledgement:
+
+```json
+{
+  "runtime": {
+    "allowUnconfinedProcessExec": true
+  }
+}
+```
+
+The result reports the normalized `command`, `args`, workspace-relative `cwd`,
+`exitCode`, terminating `signal`, bounded `stdout` and `stderr`, captured byte
+counts, `timedOut`, `outputTruncated`, and `durationMs`. Process execution is
+classified as irreversible and non-retry-safe.
+
 ### System and configuration routes
 
 | Method and path | Input | Output |
