@@ -83,7 +83,12 @@ test("security policy is safe by default and supports explicit posture changes",
     "session.read", "session.write", "goal.read", "goal.write",
     "memory.read", "memory.write", "improve.read", "improve.write"
   ] });
-  assert.ok(legacy.allowedCapabilities.includes("browser.read"));
+  assert.equal(legacy.allowedCapabilities.includes("browser.read"), false);
+  assert.deepEqual(legacy.allowedCapabilities, [
+    "job.healthcheck", "text.echo", "workspace.readText", "model.chat",
+    "session.read", "session.write", "goal.read", "goal.write",
+    "memory.read", "memory.write", "improve.read", "improve.write"
+  ]);
 });
 
 test("kernel routes model.chat through an OpenAI-compatible provider", async () => {
@@ -522,6 +527,26 @@ test("web.fetch rejects a public-looking hostname that resolves to loopback", as
     runTask({ task: { id: "run-dns-rebind", tool: "web.fetch", input: { url: "http://public.example/" }, actor: "test" }, auditStore, registry }),
     /private|link-local/
   );
+});
+
+test("web.search enforces the same private-network policy as web.fetch", async () => {
+  const { root, auditStore } = await fixture();
+  const previousEndpoint = process.env.ODINN_SEARCH_ENDPOINT;
+  process.env.ODINN_SEARCH_ENDPOINT = "http://search.example/";
+  const registry = createBuiltInRegistry({
+    workspaceRoot: root,
+    stateDir: join(root, ".odinn"),
+    resolveNetworkAddresses: async () => ["127.0.0.1"]
+  });
+  try {
+    await assert.rejects(
+      runTask({ task: { id: "run-search-dns-rebind", tool: "web.search", input: { query: "test" }, actor: "test" }, auditStore, registry }),
+      /private|link-local/
+    );
+  } finally {
+    if (previousEndpoint === undefined) delete process.env.ODINN_SEARCH_ENDPOINT;
+    else process.env.ODINN_SEARCH_ENDPOINT = previousEndpoint;
+  }
 });
 
 test("browser.open rejects a public-looking hostname that resolves to loopback before navigation", async () => {

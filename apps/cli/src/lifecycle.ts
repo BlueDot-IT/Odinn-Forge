@@ -17,6 +17,7 @@ import {
 
 const DEFAULT_PREFIX = join(homedir(), ".local", "share", "odinn");
 const DEFAULT_RELEASE_API = "https://api.github.com/repos/BlueDot-IT/Odinn-Forge/releases/latest";
+const DEFAULT_REPOSITORY_API = "https://api.github.com/repos/BlueDot-IT/Odinn-Forge";
 const MAX_METADATA_BYTES = 2 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024;
 
@@ -91,7 +92,7 @@ export async function checkForUpdate(options: UpdateCheckOptions) {
     applicationRollbackCompatible: rollbackCompatible,
     downloadSize: release.sizes[artifactName] ?? null,
     releaseNotesLocation: release.releaseNotesLocation,
-    verificationRequirements: ["SHA-256 checksum", "Odinn release manifest identity", "package release-info identity"],
+    verificationRequirements: ["immutable Git tag commit", "SHA-256 checksum", "Odinn release manifest identity", "package release-info identity"],
     artifact: artifactName,
     manifestLocation: release.manifestLocation
   };
@@ -429,7 +430,10 @@ async function discoverRelease(options: UpdateCheckOptions): Promise<ReleaseSour
   const manifestAsset = assets.get("release-manifest.json");
   if (!manifestAsset?.browser_download_url) throw new Error("release does not contain release-manifest.json");
   const manifest = validateReleaseManifest(JSON.parse(await readTextResource(String(manifestAsset.browser_download_url), MAX_METADATA_BYTES)));
-  if (String(release.tag_name) !== `v${manifest.version}`) throw new Error("release tag and manifest version do not match");
+  const tagName = String(release.tag_name);
+  if (tagName !== `v${manifest.version}`) throw new Error("release tag and manifest version do not match");
+  const tagCommit = await resolveGitHubTagCommit(tagName);
+  if (tagCommit !== manifest.commit) throw new Error("release manifest commit does not match the immutable Git tag");
   const checksumAsset = assets.get("SHA256SUMS.txt");
   if (!checksumAsset?.browser_download_url) throw new Error("release does not contain SHA256SUMS.txt");
   const artifactLocations: Record<string, string> = {};
@@ -449,6 +453,32 @@ async function discoverRelease(options: UpdateCheckOptions): Promise<ReleaseSour
     channel: release.prerelease ? "prerelease" : "stable",
     sizes
   };
+}
+
+export async function resolveGitHubTagCommit(tagName: string, fetchImplementation: typeof fetch = globalThis.fetch): Promise<string> {
+  if (!/^v[0-9A-Za-z][0-9A-Za-z._-]*$/u.test(tagName)) throw new Error("release tag name is invalid");
+  const refResponse = await fetchImplementation(`${DEFAULT_REPOSITORY_API}/git/ref/tags/${encodeURIComponent(tagName)}`, {
+    headers: { accept: "application/vnd.github+json", "user-agent": "odinn-update-check" },
+    redirect: "error"
+  });
+  if (!refResponse.ok) throw new Error(`release tag lookup failed with HTTP ${refResponse.status}`);
+  const ref = await boundedJson(refResponse, MAX_METADATA_BYTES);
+  if (ref?.ref !== `refs/tags/${tagName}`) throw new Error("release tag lookup returned the wrong ref");
+  let object = ref?.object;
+  for (let depth = 0; depth < 4; depth += 1) {
+    const sha = String(object?.sha ?? "");
+    const type = String(object?.type ?? "");
+    if (!/^[a-f0-9]{40}$/u.test(sha)) throw new Error("release tag object has an invalid commit identity");
+    if (type === "commit") return sha;
+    if (type !== "tag") throw new Error(`release tag resolved to unsupported object type: ${type || "missing"}`);
+    const tagResponse = await fetchImplementation(`${DEFAULT_REPOSITORY_API}/git/tags/${sha}`, {
+      headers: { accept: "application/vnd.github+json", "user-agent": "odinn-update-check" },
+      redirect: "error"
+    });
+    if (!tagResponse.ok) throw new Error(`annotated release tag lookup failed with HTTP ${tagResponse.status}`);
+    object = (await boundedJson(tagResponse, MAX_METADATA_BYTES))?.object;
+  }
+  throw new Error("release tag indirection exceeds the verification limit");
 }
 
 function validateReleaseManifest(value: unknown): ReleaseManifest {

@@ -56,3 +56,28 @@ test("supports bootstrapping a state directory from the workspace .env file", as
   assert.equal(environment.ODINN_STATE_DIR, "private-state");
   assert.equal(environment.SHARED, "state");
 });
+
+test("workspace .env cannot select operator executables or network endpoints", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-env-untrusted-controls-"));
+  const state = join(root, ".odinn");
+  await mkdir(state);
+  await writeFile(join(root, ".env"), [
+    "ODINN_CHROMIUM_PATH=/workspace/chromium",
+    "ODINN_EXTENSION_CONTAINER_RUNTIME=/workspace/runtime",
+    "ODINN_SEARCH_ENDPOINT=http://127.0.0.1/",
+    "SAFE_WORKSPACE_VALUE=loaded"
+  ].join("\n"));
+  await writeFile(join(state, ".env"), [
+    "ODINN_CHROMIUM_PATH=/operator/chromium",
+    "ODINN_EXTENSION_CONTAINER_RUNTIME=/operator/runtime",
+    "ODINN_SEARCH_ENDPOINT=https://search.example/"
+  ].join("\n"));
+  const environment: NodeJS.ProcessEnv = {};
+
+  loadEnvironmentFiles({ workspaceRoot: root, stateDir: state, environment });
+
+  assert.equal(environment.SAFE_WORKSPACE_VALUE, "loaded");
+  assert.equal(environment.ODINN_CHROMIUM_PATH, "/operator/chromium");
+  assert.equal(environment.ODINN_EXTENSION_CONTAINER_RUNTIME, "/operator/runtime");
+  assert.equal(environment.ODINN_SEARCH_ENDPOINT, "https://search.example/");
+});

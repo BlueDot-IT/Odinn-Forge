@@ -76,9 +76,7 @@ export function createDefaultPolicy(overrides: PolicyOverrides = {}): RuntimePol
     "improve.write"
   ];
   const configuredCapabilities = Array.isArray(overrides.allowedCapabilities) ? overrides.allowedCapabilities : undefined;
-  const allowedCapabilities = configuredCapabilities && sameCapabilities(configuredCapabilities, LEGACY_DEFAULT_CAPABILITIES)
-    ? defaultCapabilities
-    : configuredCapabilities ?? defaultCapabilities;
+  const allowedCapabilities = configuredCapabilities ?? defaultCapabilities;
   const defaults = {
     deniedTools: [],
     maxInputBytes: 16_384,
@@ -93,25 +91,6 @@ export function createDefaultPolicy(overrides: PolicyOverrides = {}): RuntimePol
     }
   };
   return defaults;
-}
-
-const LEGACY_DEFAULT_CAPABILITIES = [
-  "job.healthcheck",
-  "text.echo",
-  "workspace.readText",
-  "model.chat",
-  "session.read",
-  "session.write",
-  "goal.read",
-  "goal.write",
-  "memory.read",
-  "memory.write",
-  "improve.read",
-  "improve.write"
-];
-
-function sameCapabilities(left: string[], right: string[]) {
-  return left.length === right.length && [...left].sort().every((value, index) => value === [...right].sort()[index]);
 }
 
 const defaultsSecurity = {

@@ -39,7 +39,7 @@ local single-user workflow. Experimental packages, unconfined execution, and
 multi-user hosting remain outside that normal compatibility promise.
 
 - Do not expose the Gateway directly to the public internet.
-- Do not run unreviewed tools, skills, MCP servers, or channel adapters. Installed extensions are disabled and untrusted by default. Container extensions require a verified whole-bundle digest and explicit grants; unconfined process execution additionally requires explicit trust and unsafe-mode acknowledgement.
+- Do not run unreviewed tools, skills, MCP servers, or channel adapters. Installed extensions are disabled and untrusted by default. Container extensions require a verified whole-bundle digest and explicit grants; unconfined process execution additionally requires explicit trust and unsafe-mode acknowledgement. Every enabled extension runs from an owner-only snapshot reverified after copying, so the mutable source bundle is never launched after its integrity check.
 - Use dedicated credentials with minimal permissions.
 - Keep provider keys and channel tokens out of source control.
 - Treat generated skills and imported configuration as untrusted until reviewed.
@@ -58,6 +58,12 @@ odinn config security set --surface browser --require-approval false
 
 Private-network access can expose local services and metadata endpoints. Disabling browser approval allows the model to drive external accounts without a human checkpoint. Those settings are operator decisions, not safe defaults.
 
+Workspace `.env` files cannot set executable selectors or network service
+endpoints. `ODINN_CHROMIUM_PATH`, `ODINN_EXTENSION_CONTAINER_RUNTIME`, and
+`ODINN_SEARCH_ENDPOINT` are accepted only from the parent process or the
+operator-owned state `.env`. Explicit capability arrays remain exact across
+upgrades and are never widened by default migration.
+
 The web tools follow redirects through the same URL policy and enforce blocked/allowed domains at each hop. `web.fetch` resolves DNS, rejects private/link-local/metadata ranges, and pins the validated address into the request so validation and connection do not use separate DNS answers. Browser navigation and post-action snapshots are checked against the same network and domain rules. Workspace reads resolve real paths and reject escaping symlinks. Ódinn does not expose file upload or download tools.
 
 ### Update, migration, and backup safety
@@ -66,7 +72,8 @@ Remote lifecycle resources require HTTPS. `odinn update` requires checksum
 metadata, verifies the release manifest, archive digest, package identity,
 version, and commit, and rejects archive traversal and linked files before
 installation. Versions are immutable and the active pointer changes
-atomically. State migrations validate all stores, create a protected backup,
+atomically. Remote release assets must also identify the exact immutable Git
+tag commit resolved independently through the repository API. State migrations validate all stores, create a protected backup,
 operate on a staging tree, verify audit integrity, and fail closed on unknown
 future schemas.
 
@@ -106,6 +113,7 @@ Runemark is evidence-based: model text cannot set `verified`. Gatewatch decision
 - Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled. The default container adapter verifies the complete immutable bundle, uses read-only scoped mounts, disables network access, drops capabilities, enables no-new-privileges, and enforces CPU, memory, PID, temporary-filesystem, timeout, and output limits. The `unconfined-process` adapter is restricted to trusted local code with a verified entrypoint digest and explicit unsafe acknowledgement; it still runs with the Ódinn operating-system user's authority.
 - Public web content is untrusted data and may contain prompt injection. Ódinn Forge must not treat page instructions as operator authorization.
 - State directories are repaired to `0700` and sensitive JSON/JSONL records to `0600` when the gateway opens them. Idempotency keys are bound to a canonical request hash; reusing a key with different content returns `409`.
+- Durable external-channel session bindings are capped at 10,000 entries. New conversations fail closed at that ceiling while existing bindings remain usable.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
 - The single-user gateway remains loopback-only. Remote deployment uses `host.ts`; non-loopback startup fails without a certificate, key, and exact public origin. Passwords are scrypt-derived, sessions are signed, cookies are HttpOnly/SameSite=Strict/Secure under TLS, and tenants never share state roots or gateway bearer tokens.
 
