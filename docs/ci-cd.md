@@ -198,10 +198,11 @@ cat dist/benchmark/benchmark.json
 
 `benchmark:assurance` measures the synchronous paths added by the core advanced
 services: ordinary tool dispatch with zero, one, three, and ten Gatewatch
-invariants, pinned Raven Route selection, and evidence-based selection over
-100, 1,000, and 10,000 observations. The report includes p50, p95, and maximum
-latency plus the p95 difference between zero-invariant and three-invariant
-dispatch.
+invariants, atomic execution-envelope persistence, complete admission with its
+separate signed audit commit, pinned Raven Route selection, and evidence-based
+selection over 100, 1,000, and 10,000 observations. The report includes p50,
+p95, and maximum latency plus the p95 difference between zero-invariant and
+three-invariant dispatch.
 
 ```bash
 pnpm benchmark:assurance
@@ -209,10 +210,10 @@ pnpm benchmark:assurance
 
 Use `ODINN_ASSURANCE_BENCHMARK_SAMPLES` and
 `ODINN_ASSURANCE_BENCHMARK_WARMUPS` to adjust the bounded sample counts during
-diagnosis. These measurements are initially observational: the existing
-packaged-gateway threshold remains the only enforced latency budget until
-stable baselines from CI and representative operator hardware establish
-portable regression limits.
+diagnosis. Atomic execution-envelope persistence has an enforced 10 ms p95
+budget. The separate `synchronous=FULL` signed-audit commit and the other
+assurance scenarios remain observational so durability is not weakened to win
+a benchmark. The packaged-gateway threshold remains separately enforced.
 
 To inspect release output without publishing:
 

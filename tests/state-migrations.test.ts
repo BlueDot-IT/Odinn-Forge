@@ -80,16 +80,16 @@ test("release-candidate SQLite state migrates transactionally and preserves its 
     const database = new SqliteStore(databasePath, { targetVersion: 2 });
     database.close();
     const plan = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3"]);
+    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4"]);
     assert.equal(plan.rollbackCompatible, true);
     const report = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(report?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 3);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 4);
     assert.equal(inspectExistingSqliteSchema(join(report.backupLocation!, "db", "odinn.sqlite")), 2);
     const manifest = JSON.parse(await readFile(join(candidate.state, "state-schema.json"), "utf8"));
     assert.equal(manifest.minimumApplicationVersion, "1.0.0-rc.1");
     assert.equal(manifest.applicationVersion, "1.0.0");
-    assert.equal(manifest.storeVersions.runtimeDatabase, 3);
+    assert.equal(manifest.storeVersions.runtimeDatabase, 4);
   } finally {
     await rm(candidate.temporary, { recursive: true, force: true });
   }

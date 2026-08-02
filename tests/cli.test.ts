@@ -113,7 +113,7 @@ test("CLI runs a deterministic tool through the audited kernel path", async () =
   const auditStore = new SqliteAuditStore(join(state, "db", "audit.sqlite"), { keyringPath: join(state, "audit.jsonl.keys.json") });
   const audit = await auditStore.readAll();
   auditStore.close();
-  assert.deepEqual(audit.map((event: any) => event.type), ["task.policy", "task.started", "task.completed"]);
+  assert.deepEqual(audit.map((event: any) => event.type), ["task.policy", "execution.admitted", "task.started", "task.completed"]);
 
   const runs = spawnSync("node", ["apps/cli/src/cli.ts", "runs", "--state", state], {
     cwd: root,
@@ -131,7 +131,7 @@ test("CLI runs a deterministic tool through the audited kernel path", async () =
   assert.equal(show.status, 0, show.stderr || show.stdout);
   const detail = JSON.parse(show.stdout);
   assert.equal(detail.id, result.id);
-  assert.equal(detail.events.length, 3);
+  assert.equal(detail.events.length, 4);
 });
 
 test("one-shot CLI browser reads close Chromium and exit", async (t) => {

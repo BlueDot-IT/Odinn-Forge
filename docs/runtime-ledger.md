@@ -17,6 +17,9 @@ The three hard limits are:
 
 ## Current state
 
+- [x] Unified execution admission is active for the shared `runTask` spine. Gateway run and streaming requests, CLI runs, browser workers, plan steps, and nested agent tool calls persist strict immutable `ExecutionEnvelopeV1` records before execution, with mutable attempts and cancellation controls stored separately. Policy denial remains pre-admission, and cancelled non-retry-safe effects settle as `needs-review`. See [Execution admission architecture](architecture/execution-admission.md).
+- [ ] Runtime job records still live in `jobs.json`; moving job leases and restart recovery into execution attempts remains a separate migration. Cron-dispatched task occurrences use admitted tasks, but cron definitions retain their compatibility store.
+
 - [x] Durable queued jobs with persisted state, cancellation, timeouts, restart recovery, content-bound idempotent submission, and graceful supervisor shutdown. Retries require an explicit safe/idempotent tool descriptor; interrupted unsafe work stops in `needs-review` instead of replaying an unknown external outcome.
 - [x] Forked crash-containment workers for every gateway-submitted task. These workers retain the parent OS identity, environment, filesystem, and network authority and are not described as a security sandbox; the local CLI remains an explicitly local operator path.
 - [x] Extension manifests with type, version, digest, provenance, sandbox declaration, capability grants, enable/disable, and rollback. Installed extensions remain disabled and untrusted by default.

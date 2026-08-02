@@ -6,7 +6,9 @@ import {
   createAuditStore,
   createBuiltInRegistry,
   createDifferentiatedRuntime,
-  runTask
+  ExecutionAdmissionService,
+  runTask,
+  toolSafetyDescriptor
 } from "../../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../../packages/policy/src/index.ts";
 
@@ -93,6 +95,66 @@ async function benchmarkToolDispatch(invariantCount: number) {
   }
 }
 
+async function benchmarkExecutionAdmission() {
+  const root = await mkdtemp(join(tmpdir(), "odinn-assurance-admission-"));
+  const stateDir = join(root, ".odinn");
+  const runtime = createDifferentiatedRuntime({ stateDir, workspaceRoot: root });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const registry = createBuiltInRegistry({ stateDir, workspaceRoot: root, auditStore });
+  const policy = invariantPolicy(0);
+  const service = new ExecutionAdmissionService({ auditStore, registry, policy, runLedger: runtime.ledger });
+  const tool = registry.get("text.echo");
+  const safety = toolSafetyDescriptor("text.echo", tool);
+  const contexts = Array.from({ length: sampleCount + warmupCount }, (_, index) => {
+    const request = { id: `benchmark-admission-${index}`, tool: "text.echo", input: { text: "benchmark" }, actor: "benchmark" };
+    runtime.ledger.ensureRun({ runId: request.id, objective: "benchmark admission" });
+    const ledgerStep = runtime.ledger.beginTool({ runId: request.id, toolName: request.tool, input: request.input, safety, metadata: { actor: request.actor } });
+    const policyEvent = runtime.ledger.recordPolicy({ runId: request.id, stepId: ledgerStep.stepId, decision: "allow", reason: "benchmark policy allowed task" });
+    return { request, tool, safety, ledgerStep, policyEvent };
+  });
+  try {
+    return await measure("execution_admission.with_signed_audit", (index) => service.admit(contexts[index]));
+  } finally {
+    registry.close();
+    auditStore.close();
+    runtime.ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function benchmarkExecutionEnvelopePersistence() {
+  const root = await mkdtemp(join(tmpdir(), "odinn-assurance-envelope-"));
+  const runtime = createDifferentiatedRuntime({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  const envelopes = Array.from({ length: sampleCount + warmupCount }, (_, index) => {
+    const runId = `benchmark-envelope-${index}`;
+    runtime.ledger.ensureRun({ runId, objective: "benchmark envelope persistence" });
+    return {
+      version: 1,
+      runId,
+      principalId: "principal:benchmark",
+      execution: { kind: "tool", id: "text.echo" },
+      inputDigest: "a".repeat(64),
+      inputReference: `artifact:sha256:${"b".repeat(64)}`,
+      capabilityDecisionReferences: [`policy:benchmark-${index}`],
+      approvalRequirements: [],
+      timeoutMs: 120_000,
+      resourceLimits: { maxInputBytes: 16_384, maxOutputBytes: 1_000_000, maxPersistedStateBytes: 1_000_000, maxConcurrency: 1 },
+      idempotencyKey: `request:benchmark-${index}`,
+      retrySafety: "retry-safe",
+      workspaceRoot: root,
+      sandboxProfile: "inspect-only",
+      auditCorrelationId: `audit:benchmark-${index}`,
+      cancellationControlReference: `cancel:benchmark-${index}`
+    };
+  });
+  try {
+    return await measure("execution_envelope.persist", (index) => runtime.ledger.admitExecution(envelopes[index]));
+  } finally {
+    runtime.ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 function seedRoutingObservations(runtime: any, taskClass: string, count: number) {
   const runId = `benchmark-observations-${count}`;
   runtime.ledger.ensureRun({ runId, objective: `seed ${count} routing observations` });
@@ -168,6 +230,8 @@ const dispatchWithoutInvariants = await benchmarkToolDispatch(0);
 const dispatchWithOneInvariant = await benchmarkToolDispatch(1);
 const dispatchWithThreeInvariants = await benchmarkToolDispatch(3);
 const dispatchWithTenInvariants = await benchmarkToolDispatch(10);
+const executionEnvelopePersistence = await benchmarkExecutionEnvelopePersistence();
+const executionAdmission = await benchmarkExecutionAdmission();
 const routing = await benchmarkRouting();
 const report = {
   schemaVersion: 1,
@@ -183,14 +247,23 @@ const report = {
     dispatchWithOneInvariant,
     dispatchWithThreeInvariants,
     dispatchWithTenInvariants,
+    executionEnvelopePersistence,
+    executionAdmission,
     ...routing
   ],
   comparisons: {
     gatewatchThreeInvariantP95AddedMs: Number(
       (dispatchWithThreeInvariants.p95Ms - dispatchWithoutInvariants.p95Ms).toFixed(3)
-    )
+    ),
+    executionEnvelopePersistenceP95Ms: executionEnvelopePersistence.p95Ms,
+    executionAdmissionWithSignedAuditP95Ms: executionAdmission.p95Ms
   },
-  enforcement: "observational"
+  gates: {
+    executionEnvelopePersistenceP95MaxMs: 10,
+    executionEnvelopePersistencePassed: executionEnvelopePersistence.p95Ms <= 10
+  },
+  enforcement: "execution envelope persistence gate is enforced; signed cross-store audit and other assurance comparisons remain observational"
 };
 
 console.log(JSON.stringify(report, null, 2));
+if (!report.gates.executionEnvelopePersistencePassed) process.exitCode = 1;

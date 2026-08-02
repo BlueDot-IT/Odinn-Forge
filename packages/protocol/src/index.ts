@@ -1,5 +1,23 @@
 import { randomUUID } from "node:crypto";
 
+export {
+  EXECUTION_ENVELOPE_VERSION,
+  MAX_EXECUTION_ENVELOPE_BYTES,
+  ExecutionEnvelopeValidationError,
+  canonicalizeExecutionEnvelopeV1,
+  digestExecutionEnvelopeV1,
+  parseExecutionEnvelopeV1,
+  validateExecutionEnvelopeV1
+} from "./execution-envelope.ts";
+export type {
+  ExecutionApprovalRequirementV1,
+  ExecutionEnvelopeV1,
+  ExecutionIdentityV1,
+  ExecutionKindV1,
+  ExecutionResourceLimitsV1,
+  ExecutionRetrySafetyV1
+} from "./execution-envelope.ts";
+
 export const AUDIT_SCHEMA_VERSION = 1;
 
 export type JsonObject = { [key: string]: unknown };

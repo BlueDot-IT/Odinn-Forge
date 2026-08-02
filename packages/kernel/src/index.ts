@@ -892,7 +892,127 @@ function taskRequestDigest(request: any): string {
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input: request.input ?? {}, actor: request.actor ?? "unknown" })).digest("hex");
 }
 
-export async function runTask({
+function executionReference(namespace: string, value: unknown): string {
+  return `${namespace}:sha256:${createHash("sha256").update(String(value), "utf8").digest("hex")}`;
+}
+
+function executionTimeoutMs(input: any): number {
+  return Number.isSafeInteger(input?.timeoutMs) && input.timeoutMs >= 1 && input.timeoutMs <= 86_400_000
+    ? input.timeoutMs
+    : 120_000;
+}
+
+function executionOutputLimit(input: any): number {
+  return Number.isSafeInteger(input?.maxOutputBytes) && input.maxOutputBytes >= 1
+    ? input.maxOutputBytes
+    : 1_000_000;
+}
+
+function executionInputLimit(policy: any): number {
+  return Number.isSafeInteger(policy?.maxInputBytes) && policy.maxInputBytes >= 1
+    ? policy.maxInputBytes
+    : 16_384;
+}
+
+function executionSandboxProfile(safety: ReturnType<typeof toolSafetyDescriptor>): string {
+  if (safety.effects.includes("process")) return "host-approved";
+  if (safety.effects.includes("external-state")) return "network-allowlisted";
+  if (safety.effects.includes("filesystem-write")) return "workspace-write";
+  if (safety.effects.includes("network")) return "network-allowlisted";
+  return "inspect-only";
+}
+
+function executionErrorCode(error: unknown, fallback = "EXECUTION_FAILED"): string {
+  const candidate = error && typeof error === "object" && "code" in error ? String(error.code) : fallback;
+  const normalized = candidate.toUpperCase().replaceAll(/[^A-Z0-9_]/gu, "_").slice(0, 128);
+  return /^[A-Z]/u.test(normalized) ? normalized : fallback;
+}
+
+export class ExecutionAdmissionService {
+  readonly options: AnyRecord;
+
+  constructor(options: AnyRecord) {
+    if (!options.auditStore) throw new Error("ExecutionAdmissionService requires an auditStore");
+    this.options = {
+      ...options,
+      policy: options.policy ?? createDefaultPolicy(),
+      registry: options.registry ?? createBuiltInRegistry(),
+      now: options.now ?? (() => new Date().toISOString())
+    };
+  }
+
+  executeTask(task: any) {
+    return executeTaskThroughAdmission({ ...this.options, task, admissionService: this });
+  }
+
+  async admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId }: any) {
+    const runLedger = this.options.runLedger;
+    if (!runLedger) return undefined;
+    const inputDigest = createHash("sha256").update(stableTaskValue(request.input ?? {}), "utf8").digest("hex");
+    const decisionReference = policyEvent?.id ? `policy-event:${policyEvent.id}` : executionReference("policy", `${request.id}:${tool.capability}`);
+    const persisted = runLedger.admitExecution({
+      version: 1,
+      runId: request.id,
+      ...(parentRunId ? { parentRunId } : {}),
+      principalId: executionReference("principal", request.actor),
+      execution: { kind: "tool", id: request.tool },
+      inputDigest,
+      inputReference: `artifact:sha256:${ledgerStep.inputArtifact.digest}`,
+      capabilityDecisionReferences: [decisionReference],
+      approvalRequirements: safety.requiresApproval ? [{ capability: tool.capability }] : [],
+      timeoutMs: executionTimeoutMs(request.input),
+      resourceLimits: {
+        maxInputBytes: executionInputLimit(this.options.policy),
+        maxOutputBytes: executionOutputLimit(request.input),
+        maxPersistedStateBytes: 1_000_000,
+        maxConcurrency: 1
+      },
+      idempotencyKey: executionReference("request", request.id),
+      retrySafety: safety.retrySafe ? "retry-safe" : "not-retry-safe",
+      workspaceRoot: runLedger.workspaceRoot,
+      sandboxProfile: executionSandboxProfile(safety),
+      auditCorrelationId: executionReference("audit", request.id),
+      cancellationControlReference: executionReference("cancel", request.id)
+    });
+    try {
+      await this.options.auditStore.append({
+        at: this.options.now(),
+        runId: request.id,
+        type: "execution.admitted",
+        actor: request.actor,
+        tool: request.tool,
+        capability: tool.capability,
+        decision: "allow",
+        data: { envelopeDigest: persisted.envelopeDigest, attemptId: persisted.attempt.id, inputDigest, inputReference: persisted.envelope.inputReference }
+      });
+    } catch (error) {
+      runLedger.transitionExecutionAttempt({ attemptId: persisted.attempt.id, from: "running", to: "failed", errorCode: "AUDIT_CORRELATION_FAILED" });
+      throw error;
+    }
+    return { ...persisted, attemptId: persisted.attempt.id };
+  }
+
+  complete(admission: any, outcomeDigest?: string) {
+    if (!admission || !this.options.runLedger) return;
+    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: "running", to: "completed", outcomeDigest });
+  }
+
+  fail(admission: any, error: unknown, { cancelled = false, uncertain = false }: { cancelled?: boolean; uncertain?: boolean } = {}) {
+    if (!admission || !this.options.runLedger) return;
+    this.options.runLedger.transitionExecutionAttempt({
+      attemptId: admission.attemptId,
+      from: "running",
+      to: uncertain ? "needs-review" : cancelled ? "cancelled" : "failed",
+      errorCode: executionErrorCode(error, uncertain ? "EXECUTION_OUTCOME_UNCERTAIN" : cancelled ? "EXECUTION_CANCELLED" : "EXECUTION_FAILED")
+    });
+  }
+}
+
+export async function runTask({ task, ...options }: any) {
+  return new ExecutionAdmissionService(options).executeTask(task);
+}
+
+async function executeTaskThroughAdmission({
   task,
   auditStore,
   policy = createDefaultPolicy(),
@@ -904,7 +1024,9 @@ export async function runTask({
   onProviderAttempt,
   onAgentProgress,
   trustedApprovalId,
-  trustedApprovalRunId
+  trustedApprovalRunId,
+  parentRunId,
+  admissionService
 }: any) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
@@ -920,7 +1042,8 @@ export async function runTask({
       runId: request.id,
       objective: request.reason ?? `execute ${request.tool}`,
       providerId: separator > 0 ? modelRef.slice(0, separator) : "",
-      modelId: separator > 0 ? modelRef.slice(separator + 1) : modelRef
+      modelId: separator > 0 ? modelRef.slice(separator + 1) : modelRef,
+      parentRunId
     });
     runBinding = runLedger.bindRunRequest({ runId: request.id, requestDigest });
   }
@@ -965,7 +1088,7 @@ export async function runTask({
     data: "details" in decision ? decision.details : undefined
   });
 
-  runLedger?.recordPolicy({ runId: request.id, stepId: ledgerStep?.stepId, decision: decision.decision, reason: "reason" in decision ? decision.reason : "policy allowed task", details: "details" in decision ? decision.details : undefined });
+  const policyEvent = runLedger?.recordPolicy({ runId: request.id, stepId: ledgerStep?.stepId, decision: decision.decision, reason: "reason" in decision ? decision.reason : "policy allowed task", details: "details" in decision ? decision.details : undefined });
 
   try {
     assertAllowed(decision);
@@ -973,6 +1096,8 @@ export async function runTask({
     runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "blocked", error: error instanceof Error ? error.message : String(error) });
     throw error;
   }
+
+  const admission = await admissionService.admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId });
 
   let capabilityClaims;
   try {
@@ -999,6 +1124,7 @@ export async function runTask({
     const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError;
     await auditStore.append({ at: now(), runId: request.id, type: "task.blocked", actor: request.actor, tool: request.tool, capability: tool?.capability, decision: "deny", message: failure.message, data: { code: failure.code ?? "POLICY_VIOLATION" } });
     runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "blocked", error: failure.message });
+    admissionService.fail(admission, failure);
     throw error;
   }
 
@@ -1017,6 +1143,7 @@ export async function runTask({
     }
   });
 
+  let ledgerFinished = false;
   try {
     throwIfAborted(signal);
     const output = await tool.execute(request.input, {
@@ -1053,6 +1180,7 @@ export async function runTask({
         now,
         signal,
         runLedger: nestedTask.runLedger ?? runLedger,
+        parentRunId: request.id,
         onModelDelta,
         onProviderAttempt,
         onAgentProgress
@@ -1073,7 +1201,9 @@ export async function runTask({
         ? { approvalId: output.approvalId, expiresInSeconds: output.expiresInSeconds }
         : { output: safeAuditValue(output) }
     });
-    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output, status: awaitingApproval ? "blocked" : "succeeded" });
+    const outputArtifact = runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output, status: awaitingApproval ? "blocked" : "succeeded" });
+    ledgerFinished = Boolean(runLedger);
+    admissionService.complete(admission, outputArtifact?.digest);
     return { id: request.id, tool: request.tool, capability: tool.capability, ok: true, output };
   } catch (error) {
     const failure = error instanceof Error ? error : new Error(String(error));
@@ -1088,7 +1218,9 @@ export async function runTask({
       decision: "allow",
       message: cancelled ? "task cancelled" : failure.message
     });
-    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: cancelled ? "failed" : "failed", error: cancelled ? "task cancelled" : failure.message });
+    if (!ledgerFinished) runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "failed", error: cancelled ? "task cancelled" : failure.message });
+    const uncertain = cancelled && safety.retrySafe !== true && safety.reversibility !== "pure";
+    admissionService.fail(admission, failure, { cancelled, uncertain });
     throw error;
   }
 }
@@ -1134,7 +1266,8 @@ export async function runPlan({
         policy,
         registry,
         now,
-        runLedger
+        runLedger,
+        parentRunId: normalized.id
       });
       steps.push({ id: step.id, ok: true, result });
     }

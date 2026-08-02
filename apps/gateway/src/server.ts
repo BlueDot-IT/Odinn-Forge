@@ -721,7 +721,7 @@ export async function createGatewayServer({
     auditStore,
     loadPlugin: channelPluginLoader
   });
-  const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry });
+  const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry, runLedger: runtime.ledger });
   await supervisor.start();
   const cronTimer = setInterval(() => runDueCronJobs(cronStore, supervisor).catch(() => undefined), 30_000);
   cronTimer.unref();

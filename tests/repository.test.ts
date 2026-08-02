@@ -48,9 +48,10 @@ test("CI records assurance hot-path latency without weakening the cold-start gat
   assert.match(coldBenchmark, /benchmark\.json/);
   assert.match(assuranceBenchmark, /benchmarkToolDispatch\(0\)/);
   assert.match(assuranceBenchmark, /benchmarkToolDispatch\(10\)/);
+  assert.match(assuranceBenchmark, /executionEnvelopePersistenceP95MaxMs: 10/);
   assert.match(assuranceBenchmark, /\[100, 1_000, 10_000\]/);
-  assert.match(assuranceBenchmark, /enforcement: "observational"/);
-  assert.match(ciDocumentation, /existing\s+packaged-gateway threshold remains the only enforced latency budget/);
+  assert.match(assuranceBenchmark, /execution envelope persistence gate is enforced/);
+  assert.match(ciDocumentation, /execution-envelope persistence has an enforced 10 ms p95\s+budget/iu);
 });
 
 test("required CI/CD workflows exist", async () => {
