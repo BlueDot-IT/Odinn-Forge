@@ -212,9 +212,9 @@ test("audit query paginates and filters while usage shares its summary semantics
     );
     assert.deepEqual(
       { events: audit.summary.events, runs: audit.summary.runs, modelRuns: audit.summary.modelRuns, errors: audit.summary.errors },
-      { events: 36, runs: 12, modelRuns: 0, errors: 0 }
+      { events: 48, runs: 12, modelRuns: 0, errors: 0 }
     );
-    assert.equal(audit.facets.tools.find((facet: any) => facet.value === "text.echo")?.count, 36);
+    assert.equal(audit.facets.tools.find((facet: any) => facet.value === "text.echo")?.count, 48);
     assert.equal(audit.facets.outcomes.find((facet: any) => facet.value === "completed")?.count, 12);
 
     const usage = await requestJson(`${gateway.base}/usage`);
@@ -265,8 +265,8 @@ test("tasks hide system reads, expose real detail, and enforce replay safety", a
 
     const detail = await requestJson(`${gateway.base}/tasks/run_task_surface_echo`);
     assert.equal(detail.task.id, "run_task_surface_echo");
-    assert.equal(detail.task.eventCount, 3);
-    assert.equal(detail.task.events.length, 3);
+    assert.equal(detail.task.eventCount, 4);
+    assert.equal(detail.task.events.length, 4);
     assert.equal(detail.task.replayable, true);
     assert.equal(detail.run.status, "completed");
 

@@ -26,7 +26,11 @@ test("Phase 0 records a real tool call as a durable redacted hash chain", async 
     assert.equal(run.steps.length, 1);
     assert.equal(run.steps[0].type, "tool-request");
     assert.equal(run.steps[0].status, "succeeded");
-    assert.deepEqual(run.events.map((event: any) => event.type), ["tool-request", "policy-check", "tool-result"]);
+    assert.deepEqual(run.events.map((event: any) => event.type), ["tool-request", "policy-check", "execution-admitted", "tool-result"]);
+    assert.equal(ledger.getExecutionEnvelope("run_phase0_echo")?.envelope.execution.id, "text.echo");
+    assert.deepEqual(ledger.listExecutionAttempts("run_phase0_echo").map((attempt: any) => attempt.state), ["completed"]);
+    const persistedEnvelope = ledger.database.db.prepare("SELECT envelope_json FROM execution_envelopes WHERE run_id = ?").get("run_phase0_echo") as { envelope_json: string };
+    assert.doesNotMatch(persistedEnvelope.envelope_json, /ODINN_PHASE0_OK|sk-do-not-persist-this/u);
     assert.equal(ledger.hasRun("run_phase0_echo"), true);
     assert.equal(ledger.hasRun("run_phase0_missing"), false);
     assert.equal(ledger.verify("run_phase0_echo").valid, true);

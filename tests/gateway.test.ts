@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/teams/src/index.ts";
+import { createRunLedger } from "../packages/kernel/src/index.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
@@ -31,6 +32,7 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
+  let admittedRunId = "";
   try {
     const status = await getJson(`${base}/status`);
     assert.equal(status.ok, true);
@@ -56,8 +58,12 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.equal((await coreProof.json()).status, "passed");
 
     const run = await postJson(`${base}/run`, { tool: "text.echo", input: { text: "ODINN_GATEWAY_OK" } });
+    admittedRunId = run.id;
     assert.equal(run.ok, true);
     assert.equal(run.output.text, "ODINN_GATEWAY_OK");
+
+    const projects = await getJson(`${base}/projects`);
+    assert.ok(Array.isArray(projects.projects));
 
     const plan = await postJson(`${base}/plan`, {
       id: "plan_gateway",
@@ -73,9 +79,18 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
 
     const runDetail = await getJson(`${base}/runs/${encodeURIComponent(run.id)}`);
     assert.equal(runDetail.id, run.id);
-    assert.equal(runDetail.events.length, 3);
+    assert.equal(runDetail.events.length, 4);
+    assert.ok(runDetail.events.some((event: any) => event.type === "execution.admitted"));
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  try {
+    assert.equal(ledger.getExecutionEnvelope(admittedRunId)?.envelope.execution.id, "text.echo");
+    const envelopes = ledger.database.db.prepare("SELECT envelope_json FROM execution_envelopes").all() as Array<{ envelope_json: string }>;
+    assert.ok(envelopes.some((row) => JSON.parse(row.envelope_json).execution.id === "project.list"));
+  } finally {
+    ledger.close();
   }
 });
 
@@ -83,11 +98,11 @@ test("audit SSE uses exclusive durable sequence cursors across reconnects", asyn
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-audit-sse-")); const server = await createGatewayServer({ stateDir, workspaceRoot: root }); await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve)); const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const baseline = (await getJson(`${base}/audit`)).length; const firstAbort = new AbortController(); const first = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { signal: firstAbort.signal });
-    await postJson(`${base}/run`, { id: "sse-regression-run", tool: "text.echo", input: { text: "stream" } }); const firstIds = await readSseIds(first, 3); firstAbort.abort(); assert.deepEqual(firstIds, [baseline + 1, baseline + 2, baseline + 3]);
+    await postJson(`${base}/run`, { id: "sse-regression-run", tool: "text.echo", input: { text: "stream" } }); const firstIds = await readSseIds(first, 4); firstAbort.abort(); assert.deepEqual(firstIds, [baseline + 1, baseline + 2, baseline + 3, baseline + 4]);
     const unackedAbort = new AbortController(); const unacked = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { signal: unackedAbort.signal }); const unackedIds = await readSseIds(unacked, 1); unackedAbort.abort(); assert.deepEqual(unackedIds, [baseline + 1]);
-    assert.deepEqual(await postJson(`${base}/events/ack`, { subscriber: "sse-regression", sequence: baseline + 2 }), { ok: true, subscriber: "sse-regression", sequence: baseline + 2 });
-    const reconnectAbort = new AbortController(); const reconnect = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { signal: reconnectAbort.signal }); const reconnectIds = await readSseIds(reconnect, 1); reconnectAbort.abort(); assert.deepEqual(reconnectIds, [baseline + 3]);
-    const headerAbort = new AbortController(); const headerReconnect = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { headers: { "last-event-id": String(baseline + 2) }, signal: headerAbort.signal }); const headerIds = await readSseIds(headerReconnect, 1); headerAbort.abort(); assert.deepEqual(headerIds, [baseline + 3]);
+    assert.deepEqual(await postJson(`${base}/events/ack`, { subscriber: "sse-regression", sequence: baseline + 3 }), { ok: true, subscriber: "sse-regression", sequence: baseline + 3 });
+    const reconnectAbort = new AbortController(); const reconnect = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { signal: reconnectAbort.signal }); const reconnectIds = await readSseIds(reconnect, 1); reconnectAbort.abort(); assert.deepEqual(reconnectIds, [baseline + 4]);
+    const headerAbort = new AbortController(); const headerReconnect = await fetch(`${base}/events?since=${baseline}&subscriber=sse-regression`, { headers: { "last-event-id": String(baseline + 3) }, signal: headerAbort.signal }); const headerIds = await readSseIds(headerReconnect, 1); headerAbort.abort(); assert.deepEqual(headerIds, [baseline + 4]);
     await postJson(`${base}/events/ack`, { subscriber: "sse-regression", sequence: baseline + 100 }, 409);
   } finally { await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve())); }
 });

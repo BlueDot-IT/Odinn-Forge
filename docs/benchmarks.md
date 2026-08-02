@@ -24,22 +24,27 @@ an enforced regression gate for that bounded protocol path. It is not a
 measurement of live cloud-model latency, end-user task completion time, model
 quality, or throughput under production traffic.
 
-### Observational assurance microbenchmarks
+### Assurance microbenchmarks
 
 `pnpm benchmark:assurance` runs
 `scripts/ci/assurance-benchmark.ts`. Its default configuration uses 10 warmups
 and 80 measured samples for:
 
 - built-in tool dispatch with zero, one, three, and ten policy invariants;
+- atomic execution-envelope persistence;
+- complete admission including the separate signed audit commit;
 - pinned Raven Route selection; and
 - evidence-based Raven Route selection over 100, 1,000, and 10,000 synthetic
   observations.
 
 The report includes p50, p95, maximum latency, and the observed p95 difference
-between zero-invariant and three-invariant dispatch. The script labels its
-output `observational`; it has no pass/fail latency threshold. These numbers are
-useful for investigation and trend detection on comparable hosts, not for a
-product-wide performance promise.
+between zero-invariant and three-invariant dispatch. Atomic execution-envelope
+persistence has an enforced 10 ms p95 gate. Complete admission includes a
+second authoritative SQLite store configured with `synchronous=FULL`; that
+signed-audit cost remains visible but observational. Other assurance scenarios
+also remain observational. These numbers are useful for investigation and
+trend detection on comparable hosts, not for a product-wide performance
+promise.
 
 `ODINN_ASSURANCE_BENCHMARK_SAMPLES` and
 `ODINN_ASSURANCE_BENCHMARK_WARMUPS` can change the bounded sample counts. Any
@@ -134,7 +139,7 @@ pnpm benchmark:memory-index
 
 `benchmark:ci` already invokes the assurance microbenchmarks after the enforced
 protocol gate. Running `benchmark:assurance` separately is useful when
-investigating that observational report alone.
+investigating its envelope gate and observational scenarios.
 
 ## Interpretation limits
 

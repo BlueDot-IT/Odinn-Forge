@@ -2,16 +2,40 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
-import { redactDurableValue, type DurableRedactionContext } from "@odinn/protocol";
+import {
+  MAX_EXECUTION_ENVELOPE_BYTES,
+  canonicalizeExecutionEnvelopeV1,
+  digestExecutionEnvelopeV1,
+  redactDurableValue,
+  validateExecutionEnvelopeV1,
+  type DurableRedactionContext,
+  type ExecutionEnvelopeV1
+} from "@odinn/protocol";
 export { SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
 export type { AuditPage } from "./audit.ts";
 
-export const SQLITE_SCHEMA_VERSION = 3;
+export const SQLITE_SCHEMA_VERSION = 4;
 export type SqliteStoreOptions = { targetVersion?: number };
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
 type FeatureFlags = Record<string, boolean>;
 type Artifact = { digest: string; path: string; mediaType: string; sizeBytes: number };
+export type ExecutionAttemptState = "proposed" | "admitted" | "queued" | "running" | "awaiting-approval" | "cancelling" | "completed" | "failed" | "cancelled" | "needs-review";
+type InitialExecutionAttemptState = "proposed" | "admitted" | "queued";
+const INITIAL_EXECUTION_ATTEMPT_STATES = new Set<ExecutionAttemptState>(["proposed", "admitted", "queued"]);
+const TERMINAL_EXECUTION_ATTEMPT_STATES = new Set<ExecutionAttemptState>(["completed", "failed", "cancelled", "needs-review"]);
+const EXECUTION_ATTEMPT_TRANSITIONS: Readonly<Record<ExecutionAttemptState, ReadonlySet<ExecutionAttemptState>>> = Object.freeze({
+  proposed: new Set<ExecutionAttemptState>(["admitted", "failed", "cancelled"]),
+  admitted: new Set<ExecutionAttemptState>(["queued", "failed", "cancelled"]),
+  queued: new Set<ExecutionAttemptState>(["running", "failed", "cancelled"]),
+  running: new Set<ExecutionAttemptState>(["awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review"]),
+  "awaiting-approval": new Set<ExecutionAttemptState>(["running", "completed", "failed", "cancelled"]),
+  cancelling: new Set<ExecutionAttemptState>(["completed", "failed", "cancelled", "needs-review"]),
+  completed: new Set<ExecutionAttemptState>(),
+  failed: new Set<ExecutionAttemptState>(),
+  cancelled: new Set<ExecutionAttemptState>(),
+  "needs-review": new Set<ExecutionAttemptState>()
+});
 
 function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
@@ -282,7 +306,40 @@ const MIGRATIONS = [
     run_id TEXT PRIMARY KEY REFERENCES runs(id),
     request_digest TEXT NOT NULL,
     created_at TEXT NOT NULL
-  );`
+  );`,
+  `CREATE TABLE IF NOT EXISTS execution_envelopes (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    principal_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    envelope_digest TEXT NOT NULL,
+    envelope_json TEXT NOT NULL CHECK(length(CAST(envelope_json AS BLOB)) <= ${MAX_EXECUTION_ENVELOPE_BYTES}),
+    admitted_at TEXT NOT NULL,
+    UNIQUE(principal_id, idempotency_key)
+  );
+  CREATE TABLE IF NOT EXISTS execution_attempts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES execution_envelopes(run_id),
+    attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+    state TEXT NOT NULL CHECK(state IN ('proposed', 'admitted', 'queued', 'running', 'awaiting-approval', 'cancelling', 'completed', 'failed', 'cancelled', 'needs-review')),
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    settled_at TEXT,
+    outcome_digest TEXT,
+    error_code TEXT,
+    UNIQUE(run_id, attempt_number)
+  );
+  CREATE TABLE IF NOT EXISTS cancellation_controls (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES execution_envelopes(run_id),
+    requested_at TEXT,
+    requested_by TEXT,
+    reason TEXT,
+    acknowledged_at TEXT,
+    settled_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_execution_envelopes_principal ON execution_envelopes(principal_id, admitted_at);
+  CREATE INDEX IF NOT EXISTS idx_execution_attempts_state ON execution_attempts(state, created_at);`
 ];
 
 export class SqliteStore {
@@ -425,6 +482,173 @@ export class RunLedger {
       if (!existing) db.prepare("INSERT INTO run_request_bindings(run_id, request_digest, created_at) VALUES (?, ?, ?)").run(runId, requestDigest, new Date().toISOString());
       return { runId, requestDigest, replay: Boolean(existing) };
     });
+  }
+
+  recordExecutionEnvelope(input: unknown) {
+    const envelope = validateExecutionEnvelopeV1(input);
+    const canonical = canonicalizeExecutionEnvelopeV1(envelope);
+    const envelopeDigest = digestExecutionEnvelopeV1(envelope);
+    return this.database.transaction((db) => this.recordExecutionEnvelopeUnsafe(db, envelope, canonical, envelopeDigest, new Date().toISOString()));
+  }
+
+  admitExecution(input: unknown, { attemptId = `attempt_${randomUUID()}`, timestamp = new Date().toISOString() }: { attemptId?: string; timestamp?: string } = {}) {
+    const envelope = validateExecutionEnvelopeV1(input);
+    const canonical = canonicalizeExecutionEnvelopeV1(envelope);
+    const envelopeDigest = digestExecutionEnvelopeV1(envelope);
+    return this.database.transaction((db) => {
+      const persisted = this.recordExecutionEnvelopeUnsafe(db, envelope, canonical, envelopeDigest, timestamp);
+      if (persisted.replay) {
+        const error = new Error(`execution envelope ${envelope.runId} was already admitted`) as Error & { code?: string };
+        error.code = "EXECUTION_ADMISSION_REPLAY";
+        throw error;
+      }
+      const attemptNumber = Number((db.prepare("SELECT COALESCE(MAX(attempt_number), 0) AS attempt_number FROM execution_attempts WHERE run_id = ?").get(envelope.runId) as SqlRow).attempt_number) + 1;
+      db.prepare(`INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at, started_at)
+        VALUES (?, ?, ?, 'queued', ?, ?)`)
+        .run(attemptId, envelope.runId, attemptNumber, timestamp, timestamp);
+      db.prepare("UPDATE execution_attempts SET state = 'running' WHERE id = ? AND state = 'queued'").run(attemptId);
+      this.appendEventUnsafe(db, {
+        runId: envelope.runId,
+        type: "execution-admitted",
+        timestamp,
+        payload: { envelopeDigest, attemptId, inputDigest: envelope.inputDigest, inputReference: envelope.inputReference }
+      });
+      return {
+        ...persisted,
+        attempt: { id: attemptId, runId: envelope.runId, attemptNumber, state: "running" as const, createdAt: timestamp, startedAt: timestamp }
+      };
+    });
+  }
+
+  getExecutionEnvelope(runId: string) {
+    const row = this.database.db.prepare(`SELECT envelope_digest, envelope_json, admitted_at
+      FROM execution_envelopes WHERE run_id = ?`).get(runId) as SqlRow | undefined;
+    if (!row) return undefined;
+    return this.hydrateExecutionEnvelope(row);
+  }
+
+  createExecutionAttempt({ runId, attemptId = `attempt_${randomUUID()}`, state = "queued" }: { runId: string; attemptId?: string; state?: InitialExecutionAttemptState }) {
+    if (!INITIAL_EXECUTION_ATTEMPT_STATES.has(state)) throw new Error(`unsupported initial execution attempt state: ${state}`);
+    return this.database.transaction((db) => {
+      if (!db.prepare("SELECT 1 FROM execution_envelopes WHERE run_id = ?").get(runId)) {
+        const error = new Error(`execution envelope not found: ${runId}`) as Error & { code?: string };
+        error.code = "EXECUTION_ENVELOPE_NOT_FOUND";
+        throw error;
+      }
+      const attemptNumber = Number((db.prepare("SELECT COALESCE(MAX(attempt_number), 0) AS attempt_number FROM execution_attempts WHERE run_id = ?").get(runId) as SqlRow).attempt_number) + 1;
+      const createdAt = new Date().toISOString();
+      db.prepare(`INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at)
+        VALUES (?, ?, ?, ?, ?)`)
+        .run(attemptId, runId, attemptNumber, state, createdAt);
+      return { id: attemptId, runId, attemptNumber, state, createdAt };
+    });
+  }
+
+  listExecutionAttempts(runId: string) {
+    return (this.database.db.prepare(`SELECT id, run_id, attempt_number, state, created_at, started_at, settled_at, outcome_digest, error_code
+      FROM execution_attempts WHERE run_id = ? ORDER BY attempt_number`).all(runId) as SqlRow[]).map((row) => ({
+      id: String(row.id),
+      runId: String(row.run_id),
+      attemptNumber: Number(row.attempt_number),
+      state: row.state as ExecutionAttemptState,
+      createdAt: String(row.created_at),
+      startedAt: row.started_at === null ? undefined : String(row.started_at),
+      settledAt: row.settled_at === null ? undefined : String(row.settled_at),
+      outcomeDigest: row.outcome_digest === null ? undefined : String(row.outcome_digest),
+      errorCode: row.error_code === null ? undefined : String(row.error_code)
+    }));
+  }
+
+  transitionExecutionAttempt({ attemptId, from, to, outcomeDigest, errorCode }: {
+    attemptId: string;
+    from: ExecutionAttemptState;
+    to: ExecutionAttemptState;
+    outcomeDigest?: string;
+    errorCode?: string;
+  }) {
+    if (!EXECUTION_ATTEMPT_TRANSITIONS[from]?.has(to)) throw new Error(`invalid execution attempt transition: ${from} -> ${to}`);
+    if (outcomeDigest !== undefined && !/^[a-f0-9]{64}$/u.test(outcomeDigest)) throw new Error("execution attempt outcomeDigest must be a lowercase SHA-256 digest");
+    if (errorCode !== undefined && !/^[A-Z][A-Z0-9_]{0,127}$/u.test(errorCode)) throw new Error("execution attempt errorCode is invalid");
+    return this.database.transaction((db) => {
+      const row = db.prepare("SELECT run_id, attempt_number, state, created_at, started_at FROM execution_attempts WHERE id = ?").get(attemptId) as SqlRow | undefined;
+      if (!row) {
+        const error = new Error(`execution attempt not found: ${attemptId}`) as Error & { code?: string };
+        error.code = "EXECUTION_ATTEMPT_NOT_FOUND";
+        throw error;
+      }
+      if (row.state !== from) {
+        const error = new Error(`execution attempt ${attemptId} is ${String(row.state)}, expected ${from}`) as Error & { code?: string };
+        error.code = "EXECUTION_ATTEMPT_STATE_CONFLICT";
+        throw error;
+      }
+      const now = new Date().toISOString();
+      const startedAt = to === "running" ? now : row.started_at;
+      const settledAt = TERMINAL_EXECUTION_ATTEMPT_STATES.has(to) ? now : null;
+      const result = db.prepare(`UPDATE execution_attempts
+        SET state = ?, started_at = ?, settled_at = ?, outcome_digest = ?, error_code = ?
+        WHERE id = ? AND state = ?`)
+        .run(to, startedAt ?? null, settledAt, outcomeDigest ?? null, errorCode ?? null, attemptId, from);
+      if (Number(result.changes) !== 1) {
+        const error = new Error(`execution attempt ${attemptId} changed concurrently`) as Error & { code?: string };
+        error.code = "EXECUTION_ATTEMPT_STATE_CONFLICT";
+        throw error;
+      }
+      return {
+        id: attemptId,
+        runId: String(row.run_id),
+        attemptNumber: Number(row.attempt_number),
+        state: to,
+        createdAt: String(row.created_at),
+        startedAt: startedAt === null ? undefined : String(startedAt),
+        settledAt: settledAt === null ? undefined : String(settledAt),
+        outcomeDigest,
+        errorCode
+      };
+    });
+  }
+
+  private hydrateExecutionEnvelope(row: SqlRow) {
+    const envelope = validateExecutionEnvelopeV1(parseJson(row.envelope_json, {}));
+    const actualDigest = digestExecutionEnvelopeV1(envelope);
+    const storedDigest = String(row.envelope_digest);
+    if (actualDigest !== storedDigest) {
+      const error = new Error(`execution envelope integrity check failed for run ${envelope.runId}`) as Error & { code?: string };
+      error.code = "EXECUTION_ENVELOPE_INTEGRITY";
+      throw error;
+    }
+    return { envelope, envelopeDigest: storedDigest, admittedAt: String(row.admitted_at) };
+  }
+
+  private recordExecutionEnvelopeUnsafe(db: DatabaseSync, envelope: ExecutionEnvelopeV1, canonical: string, envelopeDigest: string, admittedAt: string) {
+    const existing = db.prepare(`SELECT run_id, envelope_digest, envelope_json, admitted_at
+      FROM execution_envelopes WHERE principal_id = ? AND idempotency_key = ?`)
+      .get(envelope.principalId, envelope.idempotencyKey) as SqlRow | undefined;
+    if (existing) {
+      const persisted = this.hydrateExecutionEnvelope(existing);
+      if (persisted.envelopeDigest !== envelopeDigest) {
+        const error = new Error(`idempotency key ${envelope.idempotencyKey} was already used for different execution content`) as Error & { code?: string };
+        error.code = "IDEMPOTENCY_CONFLICT";
+        throw error;
+      }
+      return { ...persisted, replay: true };
+    }
+    if (db.prepare("SELECT 1 FROM execution_envelopes WHERE run_id = ?").get(envelope.runId)) {
+      const error = new Error(`run id ${envelope.runId} already has an execution envelope`) as Error & { code?: string };
+      error.code = "EXECUTION_ENVELOPE_CONFLICT";
+      throw error;
+    }
+    if (!db.prepare("SELECT 1 FROM runs WHERE id = ?").get(envelope.runId)) {
+      const error = new Error(`execution envelope run does not exist: ${envelope.runId}`) as Error & { code?: string };
+      error.code = "EXECUTION_RUN_NOT_FOUND";
+      throw error;
+    }
+    db.prepare(`INSERT INTO execution_envelopes
+      (run_id, schema_version, principal_id, idempotency_key, envelope_digest, envelope_json, admitted_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(envelope.runId, envelope.version, envelope.principalId, envelope.idempotencyKey, envelopeDigest, canonical, admittedAt);
+    db.prepare("INSERT INTO cancellation_controls(id, run_id) VALUES (?, ?)")
+      .run(envelope.cancellationControlReference, envelope.runId);
+    return { envelope, envelopeDigest, admittedAt, replay: false };
   }
 
   appendEvent({ runId, type, payload = {}, timestamp = new Date().toISOString() }: { runId: string; type: string; payload?: JsonMap; timestamp?: string }) {
