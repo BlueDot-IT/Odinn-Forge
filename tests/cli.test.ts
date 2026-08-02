@@ -27,6 +27,7 @@ test("CLI advanced help exposes documented safety controls", () => {
     "--duration-ms <ms>",
     "--constraints <json>",
     "--show-token",
+    "gatewatch preview --tool <tool>",
     "improve rollback --improvement <id>",
     "Support: the local single-user workflow is the stable v1 target",
     "docs/v1-compatibility.md"
@@ -35,6 +36,27 @@ test("CLI advanced help exposes documented safety controls", () => {
   }
   assert.equal(help.stdout.match(/^  odinn audit \[--state \.odinn\]$/gmu)?.length, 1);
   assert.doesNotMatch(help.stdout, /--plan-file <plan\.json>.*--plan-file <plan\.json>/u);
+});
+
+test("CLI Gatewatch preview reports a complete non-executing admission decision", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-gatewatch-"));
+  const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
+  const preview = spawnSync("node", [
+    "apps/cli/src/cli.ts", "gatewatch", "preview",
+    "--tool", "browser.open",
+    "--input-json", JSON.stringify({ url: "https://example.com" }),
+    "--parent-capabilities", "browser.read",
+    "--request-capabilities", "browser.read,network.access",
+    "--state", state
+  ], { cwd: root, encoding: "utf8" });
+  assert.equal(preview.status, 0, preview.stderr || preview.stdout);
+  const result = JSON.parse(preview.stdout);
+  assert.equal(result.allowed, false);
+  assert.equal(result.details.code, "CHILD_CAPABILITY_ESCALATION");
+  assert.equal(result.executes, false);
+  assert.deepEqual(result.effectiveCapabilities, []);
+  assert.equal(result.approval.required, false);
 });
 
 test("CLI plural sessions alias forwards list options and explicit subcommands", async () => {
@@ -487,8 +509,10 @@ test("CLI onboarding configures a provider without storing a secret", async () =
   assert.equal(config.providers.openai.models[0], "gpt-test");
   assert.equal(config.providers.openai.apiKeyEnv, "OPENAI_API_KEY");
   assert.equal(config.providers.openai.apiKey, undefined);
-  assert.ok(config.policy.allowedCapabilities.includes("model.chat"));
-  assert.ok(config.policy.allowedCapabilities.includes("agent.run"));
+  assert.ok(config.policy.allowedCapabilities.includes("network.access"));
+  assert.ok(config.policy.allowedCapabilities.includes("agent.delegate"));
+  assert.equal(config.policy.allowedCapabilities.includes("model.chat"), false);
+  assert.equal(config.policy.allowedCapabilities.includes("agent.run"), false);
 });
 
 test("CLI exposes explicit security posture controls", async () => {

@@ -4,8 +4,8 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, runTask as executeTask, SkillPackageStore, SqliteJobStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
-import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
+import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, runTask as executeTask, SkillPackageStore, SqliteJobStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
   ChannelPluginRegistry,
@@ -806,9 +806,14 @@ export async function createGatewayServer({
           toolDetails: Array.from(registry.entries()).map(([name, tool]: any) => ({
             name,
             capability: tool.capability,
+            capabilities: tool.capabilities,
             description: tool.description
           })),
+          capabilityRegistryVersion: CAPABILITY_REGISTRY_VERSION,
+          capabilityRegistry: CAPABILITY_REGISTRY,
+          capabilityMigration: policy.capabilityMigration,
           allowedCapabilities: policy.allowedCapabilities,
+          allowedTools: Array.from(registry.entries()).filter(([name, tool]: any) => evaluateTaskPolicy({ policy, request: { tool: name, input: {} }, tool }).allowed).map(([name]) => name),
           defaultModel: normalizeModelConfig(config).defaultModel,
           models: listConfiguredModels(normalizeModelConfig(config)),
           providers: await summarizeProviders(config, state),
@@ -911,6 +916,23 @@ export async function createGatewayServer({
         const runId = body.runId ?? `policy-${randomBytes(12).toString("hex")}`;
         runtime.ledger.ensureRun({ runId, objective: "policy evaluation" });
         return json(response, 200, runtime.sentinel.evaluate({ runId, stepId: body.stepId, toolName: body.toolName, input: body.input ?? {}, policy: body.policy, workspaceRoot: root }));
+      }
+      if (request.method === "POST" && url.pathname === "/gatewatch/preview") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        try {
+          return json(response, 200, previewExecutionAdmission({
+            task: { tool: body.toolName ?? body.tool, input: body.input ?? {} },
+            policy,
+            registry,
+            workspaceRoot: root,
+            parentCapabilities: body.parentCapabilities,
+            requestedCapabilities: body.requestedCapabilities,
+            skillCapabilities: body.skillCapabilities,
+            mcpCapabilities: body.mcpCapabilities
+          }));
+        } catch (error) {
+          throw new GatewayError(400, error instanceof Error ? error.message : "Gatewatch preview request is invalid");
+        }
       }
       if (request.method === "POST" && url.pathname === "/capabilities/issue") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
@@ -1980,7 +2002,11 @@ function validateGatewayConfig(config: any) {
         }
       }
     }
-    createDefaultPolicy(config.policy);
+    try {
+      createDefaultPolicy(config.policy);
+    } catch (error) {
+      throw new GatewayError(400, error instanceof Error ? error.message : "config.policy capability declarations are invalid");
+    }
   }
 
   if (config.proof !== undefined) {
@@ -4520,6 +4546,18 @@ function renderConsoleHtml(version = "development") {
               <div class="panel browser-page-panel"><div class="panel-head"><h3 id="browser-page-title">No page selected</h3><span class="chip" id="browser-page-url">—</span></div><div id="browser-page-text" class="browser-page-text">Open or select a tab to inspect visible content.</div></div>
             </div>
           </div>
+          <div class="panel stack" id="gatewatch-preview-panel">
+            <div class="panel-head"><div><h2>Gatewatch admission preview</h2><p>Inspect the complete capability, parent-authority, invariant, approval, and safety decision without executing the tool.</p></div><button id="gatewatch-preview-run" type="button">Preview decision</button></div>
+            <div class="grid-2">
+              <div class="field"><label for="gatewatch-preview-tool">Executable tool</label><select id="gatewatch-preview-tool"><option value="text.echo">text.echo</option></select></div>
+              <div class="field"><label for="gatewatch-preview-input">Input JSON</label><textarea id="gatewatch-preview-input" rows="4">{}</textarea></div>
+              <div class="field"><label for="gatewatch-preview-parent">Parent capabilities</label><textarea id="gatewatch-preview-parent" rows="4" placeholder="Leave blank to use current policy authority"></textarea><span class="config-help">One versioned capability identifier per line.</span></div>
+              <div class="field"><label for="gatewatch-preview-requested">Child-requested capabilities</label><textarea id="gatewatch-preview-requested" rows="4" placeholder="Leave blank to request the tool declaration"></textarea><span class="config-help">Requests are intersected with parent, tool, and policy grants.</span></div>
+              <div class="field"><label for="gatewatch-preview-skill">Skill declaration requests</label><textarea id="gatewatch-preview-skill" rows="3" placeholder="Optional; requests authority but never grants it"></textarea></div>
+              <div class="field"><label for="gatewatch-preview-mcp">MCP declaration requests</label><textarea id="gatewatch-preview-mcp" rows="3" placeholder="Optional; requests authority but never grants it"></textarea></div>
+            </div>
+            <pre id="gatewatch-preview-output" class="code-block">No preview yet.</pre>
+          </div>
           <div class="panel stack">
             <div class="panel-head"><div><h2>Actions waiting for you</h2><span class="muted" id="browser-approval-copy">Checking whether a browser action needs your confirmation.</span></div><span class="chip warn">you stay in control</span></div>
             <div id="approval-list" class="list"><div class="empty-state"><strong>Nothing is waiting</strong><span>Ódinn will pause here before changing an external account.</span></div></div>
@@ -4854,9 +4892,9 @@ function renderConsoleHtml(version = "development") {
         technicalName: advancedFeatureBrands.sentinel.name,
         view: "lab-safety-preview",
         summary: "Preview whether a planned action fits your safety rules.",
-        endpoint: "/policy/evaluate",
+        endpoint: "/gatewatch/preview",
         actions: [
-          { id: "evaluate", label: "Preview a decision", method: "POST", path: "/policy/evaluate", description: "See whether a planned action would be allowed without actually running it.", sample: () => ({ runId: "ui-sentinel-" + Date.now(), toolName: "text.echo", input: { text: "safe input" }, policy: { version: 1, invariants: [{ id: "deny-example", type: "command.deny-pattern", values: ["never-match"], enforcement: "block" }] } }) }
+          { id: "evaluate", label: "Preview a decision", method: "POST", path: "/gatewatch/preview", description: "See the complete current admission decision without running the tool.", sample: () => ({ toolName: "text.echo", input: { text: "safe input" } }) }
         ]
       },
       capabilities: {
@@ -5140,8 +5178,8 @@ function renderConsoleHtml(version = "development") {
         refreshBrowser().catch((error) => showOutput(error.message));
       }
       if (name === "sessions") {
-        if (state.status?.allowedCapabilities?.includes("session.read")) refreshSessions().catch((error) => showOutput(error.message));
-        else $("session-list").innerHTML = '<div class="empty-state"><strong>Sessions are disabled by policy</strong><span>Add session.read/session.write to this gateway policy to manage conversations.</span></div>';
+        if (state.status?.allowedTools?.includes("session.list")) refreshSessions().catch((error) => showOutput(error.message));
+        else $("session-list").innerHTML = '<div class="empty-state"><strong>Sessions are disabled by policy</strong><span>Grant the required workspace capabilities to manage conversations.</span></div>';
       }
       if (name === "tasks") refreshTasks().catch((error) => showOutput(error.message));
       if (name === "usage") {
@@ -5207,7 +5245,7 @@ function renderConsoleHtml(version = "development") {
       $("self-improvement-model").textContent = model ? modelDisplayName(model) + " · configured provider" : "Connect a provider";
       $("self-improvement-limit").textContent = String(settings.maxChangesPerCycle || 1) + " maximum per check";
       $("self-improvement-config").querySelector(".detail-card strong").textContent = describeInterval(settings.intervalMs);
-      const canWrite = status?.allowedCapabilities?.includes("improve.write") === true;
+      const canWrite = status?.allowedTools?.includes("improve.propose") === true;
       $("learn-improvements").disabled = !canWrite || !automatic;
     }
 
@@ -5237,7 +5275,7 @@ function renderConsoleHtml(version = "development") {
           '<div class="detail-card"><span>Similar occurrences</span><strong>' + escapeHtml(String((improvement.evidence || []).length)) + '</strong></div>' +
           '<div class="detail-card"><span>Last updated</span><strong>' + escapeHtml(relativeTime(improvement.updatedAt)) + '</strong></div></div>' +
         renderImprovementHistory(improvement);
-      const canWrite = state.status?.allowedCapabilities?.includes("improve.write") === true;
+      const canWrite = state.status?.allowedTools?.includes("improve.decide") === true;
       $("improvement-rollback").disabled = !canWrite || status !== "applied";
     }
 
@@ -5253,7 +5291,7 @@ function renderConsoleHtml(version = "development") {
     }
 
     async function refreshImprovements() {
-      if (state.status?.allowedCapabilities?.includes("improve.read") !== true) {
+      if (state.status?.allowedTools?.includes("improve.list") !== true) {
         state.improvements = [];
         $("improvement-list").innerHTML = '<div class="empty-state"><strong>Improvement history is unavailable</strong><span>This workspace does not allow improvement history to be read.</span></div>';
         renderImprovementDetail();
@@ -5840,7 +5878,7 @@ function renderConsoleHtml(version = "development") {
       const toolRequest = options.tool === "job.healthcheck"
           ? { tool: "job.healthcheck", input: {} }
         : {
-            tool: state.status?.allowedCapabilities?.includes("agent.run") ? "agent.run" : "model.chat",
+            tool: state.status?.allowedTools?.includes("agent.run") ? "agent.run" : "model.chat",
             input: {
               model: state.modelOverride || state.status?.defaultModel,
               sessionId,
@@ -5952,6 +5990,35 @@ function renderConsoleHtml(version = "development") {
         showOutput(result);
       } catch (error) { showOutput(error.message); }
       finally { setBusy($("web-search-run"), false); }
+    }
+
+    async function runGatewatchPreview() {
+      const button = $("gatewatch-preview-run");
+      setBusy(button, true);
+      try {
+        const parentCapabilities = configLines($("gatewatch-preview-parent").value);
+        const requestedCapabilities = configLines($("gatewatch-preview-requested").value);
+        const body = {
+          toolName: $("gatewatch-preview-tool").value,
+          input: JSON.parse($("gatewatch-preview-input").value || "{}"),
+          ...(parentCapabilities.length ? { parentCapabilities } : {}),
+          ...(requestedCapabilities.length ? { requestedCapabilities } : {}),
+          skillCapabilities: configLines($("gatewatch-preview-skill").value),
+          mcpCapabilities: configLines($("gatewatch-preview-mcp").value)
+        };
+        const result = await api("/gatewatch/preview", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        $("gatewatch-preview-output").textContent = JSON.stringify(result, null, 2);
+        showOutput(result);
+      } catch (error) {
+        $("gatewatch-preview-output").textContent = error.message;
+        showOutput(error.message);
+      } finally {
+        setBusy(button, false);
+      }
     }
 
     async function openBrowserUrl() {
@@ -6292,6 +6359,9 @@ function renderConsoleHtml(version = "development") {
       try {
         const status = await api("/status");
         state.status = status;
+        $("gatewatch-preview-tool").innerHTML = (status.toolDetails || []).map((tool) =>
+          '<option value="' + escapeHtml(tool.name) + '">' + escapeHtml(tool.name) + ' · ' + escapeHtml((tool.capabilities || []).join(", ")) + '</option>'
+        ).join("");
         renderExperimentalHome(status);
         $("nav-health").textContent = "online";
         $("status-pill").textContent = "Online";
@@ -6346,15 +6416,15 @@ function renderConsoleHtml(version = "development") {
           : "Browser actions can proceed without console approval under the current policy.";
         $("tool").innerHTML = status.tools.map((tool) => '<option value="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</option>').join("");
         $("cron-tool").innerHTML = status.tools.map((tool) => '<option value="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</option>').join("");
-        $("tool-list").innerHTML = status.toolDetails.map((tool) => renderRecord(tool, tool.name, tool.capability + " | " + tool.description)).join("");
+        $("tool-list").innerHTML = status.toolDetails.map((tool) => renderRecord(tool, tool.name, (tool.capabilities || []).join(", ") + " | " + tool.description)).join("");
         const background = [refreshRuns()];
         background.push((async () => {
-          const canReadSessions = status.allowedCapabilities.includes("session.read");
-          const canReadGoals = status.allowedCapabilities.includes("goal.read");
+          const canReadSessions = status.allowedTools.includes("session.list");
+          const canReadGoals = status.allowedTools.includes("goal.list");
           if (canReadSessions && canReadGoals) await refreshProjects();
           if (canReadSessions) await refreshSessions();
           if (canReadGoals) await refreshGoals();
-          if (status.allowedCapabilities.includes("memory.read")) await refreshMemory();
+          if (status.allowedTools.includes("memory.browse")) await refreshMemory();
         })());
         await Promise.allSettled(background);
         await refreshApprovals();
@@ -7106,6 +7176,7 @@ function renderConsoleHtml(version = "development") {
       }
     });
     $("web-search-run").addEventListener("click", runWebSearch);
+    $("gatewatch-preview-run").addEventListener("click", runGatewatchPreview);
     $("web-search-query").addEventListener("keydown", (event) => {
       if (event.key === "Enter") runWebSearch();
     });

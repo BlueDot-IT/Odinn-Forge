@@ -40,7 +40,8 @@ test("cancelled non-retry-safe effects settle as needs-review", async () => {
   const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
   const controller = new AbortController();
   const registry = new Map<string, unknown>([["fixture.effect", {
-    capability: "fixture.effect",
+    capability: "workspace.mutate",
+    capabilities: ["workspace.mutate"],
     execute: async () => {
       controller.abort(new Error("fixture cancelled after dispatch"));
       throw controller.signal.reason;
@@ -50,7 +51,7 @@ test("cancelled non-retry-safe effects settle as needs-review", async () => {
     await assert.rejects(() => runTask({
       task: { id: "run_uncertain_effect", tool: "fixture.effect", input: {}, actor: "test" },
       auditStore,
-      policy: createDefaultPolicy({ allowedCapabilities: ["fixture.effect"] }),
+      policy: createDefaultPolicy({ allowedCapabilities: ["workspace.mutate"] }),
       registry,
       runLedger: ledger,
       signal: controller.signal
@@ -106,7 +107,8 @@ test("signed audit failure blocks backend dispatch and settles admission as fail
     readRun(id: string) { return durableAudit.readRun(id); }
   };
   const registry = new Map<string, unknown>([["fixture.read", {
-    capability: "fixture.read",
+    capability: "workspace.inspect",
+    capabilities: ["workspace.inspect"],
     execute: async () => {
       executed = true;
       return { ok: true };
@@ -116,7 +118,7 @@ test("signed audit failure blocks backend dispatch and settles admission as fail
     await assert.rejects(() => runTask({
       task: { id: "run_audit_admission_failure", tool: "fixture.read", input: {}, actor: "test" },
       auditStore,
-      policy: createDefaultPolicy({ allowedCapabilities: ["fixture.read"] }),
+      policy: createDefaultPolicy({ allowedCapabilities: ["workspace.inspect"] }),
       registry,
       runLedger: ledger
     }), /fixture audit admission failure/u);
@@ -147,7 +149,8 @@ test("terminal audit failure settles post-dispatch effectful work as needs-revie
     readRun(id: string) { return durableAudit.readRun(id); }
   };
   const registry = new Map<string, unknown>([["fixture.effect.audit", {
-    capability: "fixture.effect",
+    capability: "workspace.mutate",
+    capabilities: ["workspace.mutate"],
     execute: async () => {
       executed = true;
       return { applied: true };
@@ -157,7 +160,7 @@ test("terminal audit failure settles post-dispatch effectful work as needs-revie
     await assert.rejects(() => runTask({
       task: { id: "run_terminal_audit_failure", tool: "fixture.effect.audit", input: {}, actor: "test" },
       auditStore,
-      policy: createDefaultPolicy({ allowedCapabilities: ["fixture.effect"] }),
+      policy: createDefaultPolicy({ allowedCapabilities: ["workspace.mutate"] }),
       registry,
       runLedger: ledger
     }), /fixture terminal audit unavailable/u);
@@ -179,7 +182,8 @@ test("approval-required output leaves the attempt awaiting approval", async () =
   const ledger = createRunLedger({ stateDir, workspaceRoot: root });
   const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
   const registry = new Map<string, unknown>([["browser.click", {
-    capability: "browser.act",
+    capability: "browser.mutate",
+    capabilities: ["browser.mutate", "network.access"],
     execute: async () => ({ type: "approval.required", approvalId: "approval_fixture", summary: "Approve fixture", expiresInSeconds: 300 })
   }]]);
   try {
@@ -234,7 +238,8 @@ test("only trusted recovery creates a fresh attempt for an identical retry-safe 
   const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
   let executions = 0;
   const registry = new Map<string, unknown>([["text.echo", {
-    capability: "core.echo",
+    capability: "workspace.inspect",
+    capabilities: ["workspace.inspect"],
     execute: async () => {
       executions += 1;
       if (executions === 1) throw new Error("retry fixture failed");
@@ -244,7 +249,7 @@ test("only trusted recovery creates a fresh attempt for an identical retry-safe 
   const options = {
     task: { id: "run_retry_safe", tool: "text.echo", input: { text: "same" }, actor: "test" },
     auditStore,
-    policy: createDefaultPolicy({ allowedCapabilities: ["core.echo"] }),
+    policy: createDefaultPolicy({ allowedCapabilities: ["workspace.inspect"] }),
     registry,
     runLedger: ledger
   };
@@ -283,13 +288,14 @@ test("trusted recovery admits a request bound before any envelope was persisted"
     readRun(id: string) { return durableAudit.readRun(id); }
   };
   const registry = new Map<string, unknown>([["fixture.pre-admission", {
-    capability: "fixture.read",
+    capability: "workspace.inspect",
+    capabilities: ["workspace.inspect"],
     execute: async () => { executions += 1; return { recovered: true }; }
   }]]);
   const options = {
     task: { id: "run_pre_admission_crash", tool: "fixture.pre-admission", input: {}, actor: "test" },
     auditStore,
-    policy: createDefaultPolicy({ allowedCapabilities: ["fixture.read"] }),
+    policy: createDefaultPolicy({ allowedCapabilities: ["workspace.inspect"] }),
     registry,
     runLedger: ledger
   };
@@ -325,13 +331,14 @@ test("trusted recovery dispatches an unsafe attempt that never crossed the backe
     readRun(id: string) { return durableAudit.readRun(id); }
   };
   const registry = new Map<string, unknown>([["fixture.effect.queued", {
-    capability: "fixture.effect",
+    capability: "workspace.mutate",
+    capabilities: ["workspace.mutate"],
     execute: async () => { executions += 1; return { applied: true }; }
   }]]);
   const options = {
     task: { id: "run_queued_unsafe", tool: "fixture.effect.queued", input: {}, actor: "test" },
     auditStore,
-    policy: createDefaultPolicy({ allowedCapabilities: ["fixture.effect"] }),
+    policy: createDefaultPolicy({ allowedCapabilities: ["workspace.mutate"] }),
     registry,
     runLedger: ledger
   };

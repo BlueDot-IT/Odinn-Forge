@@ -230,8 +230,8 @@ behavior.
 
 - **Runemark — run verification** checks whether a run met specific acceptance
   rules.
-- **Gatewatch — policy safety** checks commands, file locations, and approval requirements
-  before an operation.
+- **Gatewatch — policy safety** previews capability intersection, commands,
+  file locations, and approval requirements without executing the operation.
 - **Norn Restore — restore points** saves selected local files and previews a
   restore before applying it.
 - **Raven Route — model routing** chooses among configured models using

@@ -39,7 +39,8 @@ test("Discord agent read tools use the configured bot account", async () => {
     assert.deepEqual(output, [{ id: "1", content: "hello" }]);
     assert.equal(calls[0].url, "https://discord.com/api/v10/channels/123/messages?limit=10");
     assert.equal((calls[0].init.headers as Record<string, string>).authorization, "Bot test-token");
-    assert.equal(registry.get("discord.readMessages").capability, "discord.read");
+    assert.equal(registry.get("discord.readMessages").capability, "network.access");
+    assert.deepEqual(registry.get("discord.readMessages").capabilities, ["network.access"]);
   } finally {
     if (original === undefined) delete process.env.ODINN_TEST_DISCORD_TOKEN;
     else process.env.ODINN_TEST_DISCORD_TOKEN = original;
@@ -209,7 +210,7 @@ test("expanded Discord actions preserve read/write gates and native poll payload
   try {
     await registry.get("discord.listPins").execute({ channelId: "123" });
     assert.equal(calls[0].url, "https://discord.com/api/v10/channels/123/pins");
-    assert.equal(registry.get("discord.listPins").capability, "discord.read");
+    assert.equal(registry.get("discord.listPins").capability, "network.access");
     const input = {
       channelId: "123",
       question: "Deploy?",
@@ -227,7 +228,7 @@ test("expanded Discord actions preserve read/write gates and native poll payload
     const payload = JSON.parse(String(calls[1].init.body));
     assert.equal(payload.poll.question.text, "Deploy?");
     assert.deepEqual(payload.poll.answers.map((answer: any) => answer.poll_media.text), ["Yes", "No"]);
-    assert.equal(registry.get("discord.sendPoll").capability, "discord.write");
+    assert.equal(registry.get("discord.sendPoll").capability, "network.access");
   } finally {
     if (original === undefined) delete process.env.ODINN_TEST_DISCORD_TOKEN;
     else process.env.ODINN_TEST_DISCORD_TOKEN = original;

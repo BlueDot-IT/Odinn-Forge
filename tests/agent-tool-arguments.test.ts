@@ -162,13 +162,14 @@ test("supported schema constraints fail closed and valid boundaries dispatch onc
         choices: [{ message: { role: "assistant", content: "", tool_calls: [{ id: `constraint-${index}-${label}`, type: "function", function: { name: "test.constraint", arguments: JSON.stringify(value) } }] } }]
       } : { id: `constraint-done-${index}-${label}`, choices: [{ message: { role: "assistant", content: "done" } }] });
       fx.registry.set("test.constraint", {
-        capability: "browser.read",
+        capability: "workspace.inspect",
+        capabilities: ["workspace.inspect"],
         description: "Constraint test tool.",
         inputSchema: entry.schema,
         execute: async (input: any) => { dispatches += 1; return { input }; }
       });
       try {
-        const result = await runAgent(fx, `constraint-${index}-${label}`, "");
+        const result = await runAgent(fx, `constraint-${index}-${label}`, "", ["agent.run", "model.chat", "workspace.inspect"]);
         assert.equal(result.output.content, "done");
         assert.equal(dispatches, expectedDispatches, `${index}/${label}`);
       } finally {
