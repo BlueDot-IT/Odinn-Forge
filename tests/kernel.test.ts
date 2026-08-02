@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { closeBrowserManagers, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.ts";
+import { executeWorkspaceProcess } from "../packages/kernel/src/workspace-tools.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
 process.env.ODINN_BROWSER_HEADLESS = "1";
@@ -474,6 +475,29 @@ test("process.exec is explicitly gated, shell-free, workspace-cwd-bounded, and o
     registry,
     policy
   }), /path escapes workspace root/);
+});
+
+test("process.exec cannot spawn after cancellation during asynchronous cwd admission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-process-cancellation-"));
+  const marker = join(root, "post-cancellation-marker.json");
+  const controller = new AbortController();
+  const childProgram = [
+    "const fs = require('node:fs');",
+    "fs.writeFileSync(process.argv[1], JSON.stringify({ pid: process.pid }) + '\\n', { flag: 'wx' });"
+  ].join(" ");
+
+  const execution = executeWorkspaceProcess(root, {
+    command: process.execPath,
+    args: ["-e", childProgram, marker],
+    cwd: ".",
+    timeoutMs: 5_000,
+    maxOutputBytes: 1_024
+  }, controller.signal);
+  queueMicrotask(() => controller.abort(new Error("test cancellation")));
+
+  await assert.rejects(execution, (error: any) => error.name === "AbortError");
+  assert.equal(controller.signal.aborted, true);
+  await assert.rejects(readFile(marker), (error: any) => error.code === "ENOENT");
 });
 
 test("self-improvement defaults to automatic observation without a review gate", async () => {
