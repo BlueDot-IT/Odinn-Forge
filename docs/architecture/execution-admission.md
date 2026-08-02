@@ -24,7 +24,7 @@
 | CLI task | `apps/cli/src/cli.ts` -> `runTask` or isolated browser worker | CLI-created policy, ledger, audit | Active through the same service as Gateway. |
 | CLI plan | `apps/cli/src/cli.ts` -> `runPlan` | Parent plan plus admitted task steps | Executable steps are active and parent-correlated; a first-class workflow envelope remains pending. |
 | Cron occurrence | Gateway `CronStore` -> `JobSupervisor` -> isolated task worker | Compatible cron definition plus SQLite occurrence/lease | Every occurrence uses one job/run ID and binds to an admitted envelope and attempt. |
-| Agent tool call | `agent.run` -> `runTool` -> `runTask` | Parent task context and policy | Active with parent-run correlation; capability intersection is Stage 2 work. |
+| Agent tool call | `agent.run` -> `runTool` -> `runTask` | Parent task context and policy | Active with parent-run correlation and parent-child capability intersection. |
 | Browser work | Persistent isolated browser worker | Browser policy plus recovery JSON | Active before browser tool execution; browser recovery remains authoritative for browser uncertainty. |
 | Extension execution | Container extension executor | Extension registry and policy | Reuse as an execution backend behind admission. |
 | Experimental graphs, skills, MCP, automation | Kernel foundations | Default-inert feature flags | Activation must dispatch through admission; no parallel runtime. |
@@ -74,6 +74,21 @@ Policy denial creates no executable envelope. Completed work settles the attempt
 Ledger-less custom callers still pass through the same application service but cannot claim durable admission. Normal Gateway and CLI execution supply the ledger. Gateway runtime jobs and lease history now live in SQLite. Restart reconciliation keeps queued and approval-pending work nonterminal, mirrors already-settled attempts, reuses a queued attempt that never crossed the backend boundary, creates a fresh attempt only for trusted retry-safe recovery, and quarantines interrupted effectful work as `needs-review`. A request bound before its envelope transaction is safely admitted for the first time after restart. Ordinary idempotency replay cannot enter the trusted recovery path.
 
 Job payloads use the shared persistence redactor. The first live dispatch receives the original payload only from supervisor memory. When redaction changes a field, SQLite records that the durable projection is insufficient for replay; if the process restarts before dispatch completes, the job fails closed and must be resubmitted with fresh input. This prevents browser typing values and credential-shaped data from becoming a recovery store.
+
+## Capability admission and preview
+
+Capability registry v1 replaces tool-shaped global grants with precise,
+versioned authority. Every built-in executable tool is finalized from the
+trusted registry. Unknown identifiers and missing or conflicting declarations
+fail closed. Legacy grants migrate to exact tool scopes with a report and no
+automatic widening. Parent/child agent requests are intersected with trusted
+tool declarations before dispatch; Skill and MCP declarations never grant
+authority.
+
+Gatewatch exposes the same capability and invariant decision inputs through
+the CLI, authenticated loopback API, and operator console. Preview is pure and
+returns `executes: false`; it does not create a run, audit event, execution
+envelope, or attempt. Live admission remains authoritative at dispatch time.
 
 Approval execution is correlated back to the originating job and attempt. Claiming an approval atomically moves the original attempt from `awaiting-approval` to `running`; a definitive result settles it, while failure or uncertain interruption becomes `needs-review`. Cancelling before claim revokes the pending approval. Cancelling after claim returns `cancelling` until the in-flight approved action reaches a terminal projection.
 

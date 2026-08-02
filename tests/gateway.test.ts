@@ -46,7 +46,24 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.ok(status.pluginModules.every((plugin: any) => plugin.enabled === false));
     assert.equal(status.security.web.allowPrivateNetwork, false);
     assert.equal(status.security.browser.requireApproval, true);
-    assert.ok(status.toolDetails.some((tool: any) => tool.name === "text.echo" && tool.capability === "text.echo"));
+    assert.equal(status.capabilityRegistryVersion, 1);
+    assert.ok(status.capabilityRegistry.some((capability: any) => capability.id === "process.shell"));
+    assert.ok(status.toolDetails.some((tool: any) => tool.name === "text.echo" && tool.capability === "workspace.inspect" && tool.capabilities.includes("workspace.inspect")));
+    assert.ok(status.allowedTools.includes("agent.run"));
+    assert.equal(status.capabilityMigration.automaticWidening, false);
+
+    const runsBeforePreview = await getJson(`${base}/runs`);
+    const preview = await postJson(`${base}/gatewatch/preview`, {
+      toolName: "browser.open",
+      input: { url: "https://example.com" },
+      parentCapabilities: ["browser.read"],
+      requestedCapabilities: ["browser.read", "network.access"]
+    });
+    assert.equal(preview.allowed, false);
+    assert.equal(preview.details.code, "CHILD_CAPABILITY_ESCALATION");
+    assert.equal(preview.executes, false);
+    assert.deepEqual(preview.effectiveCapabilities, []);
+    assert.deepEqual(await getJson(`${base}/runs`), runsBeforePreview);
 
     await postJson(`${base}/run`, { id: "core-proof-run", tool: "text.echo", input: { text: "proof source" } });
     const coreProof = await fetch(`${base}/proof`, {
@@ -469,7 +486,7 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /Searchable history/);
     assert.doesNotMatch(html, /Skill Workshop/);
     assert.match(html, /modelOverride/);
-    assert.match(html, /allowedCapabilities\?\.includes\("agent\.run"\) \? "agent\.run" : "model\.chat"/);
+    assert.match(html, /allowedTools\?\.includes\("agent\.run"\) \? "agent\.run" : "model\.chat"/);
     assert.match(html, /provider \+ ":" \+ message\.model/);
     assert.match(html, /chat-empty/);
     assert.match(html, /data-chat-prompt/);
@@ -481,6 +498,9 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /memory-namespace/);
     assert.match(html, /Web tools/);
     assert.match(html, /web-search-run/);
+    assert.match(html, /Gatewatch admission preview/);
+    assert.match(html, /gatewatch-preview-run/);
+    assert.match(html, /\/gatewatch\/preview/);
     assert.match(html, /id="browser-approval-mode"[^>]*>\s*Checking safeguards/);
     assert.match(html, /requireApproval/);
     assert.doesNotMatch(html, /catch \(error: any\)/);

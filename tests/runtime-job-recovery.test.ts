@@ -350,7 +350,8 @@ test("correlated retry-safe shutdown resumes after its cancelled attempt", async
   let firstStarted!: () => void;
   const started = new Promise<void>((resolvePromise) => { firstStarted = resolvePromise; });
   const registry = new Map<string, unknown>([["text.echo", {
-    capability: "core.echo",
+    capability: "workspace.inspect",
+    capabilities: ["workspace.inspect"],
     execute: async (_input: unknown, { signal }: { signal: AbortSignal }) => {
       backendStarts += 1;
       if (backendStarts > 1) return { text: "recovered" };
@@ -363,7 +364,7 @@ test("correlated retry-safe shutdown resumes after its cancelled attempt", async
   const execute = (payload: JsonObject, { signal, job }: { signal: AbortSignal; job: { attempts: number } }) => runTask({
     task: payload.task,
     auditStore,
-    policy: createDefaultPolicy({ allowedCapabilities: ["core.echo"] }),
+    policy: createDefaultPolicy({ allowedCapabilities: ["workspace.inspect"] }),
     registry,
     runLedger: ledger,
     signal,

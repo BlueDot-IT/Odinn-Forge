@@ -37,6 +37,7 @@ The stable command groups are:
 | Sessions, goals, and memory | `odinn session ...`, `odinn sessions`, `odinn goal ...`, `odinn memory ...` | JSON records or collections; create/update commands include the resulting event or record identifier |
 | Runs and audit | `odinn run ...`, `odinn runs`, `odinn show`, `odinn audit`, `odinn audit verify` | JSON task results, run events, redacted history, or integrity-verification results |
 | Plans | `odinn plan` | The JSON execution result for the submitted task plan |
+| Admission preview | `odinn gatewatch preview --tool <tool> ...` | The complete current capability, invariant, safety, and approval decision with `executes: false` |
 
 Commands under `odinn experimental` control optional plugin modules. Runemark,
 Gatewatch, Norn Restore, and Raven Route are always-available core advanced
@@ -120,7 +121,7 @@ same OS identity as Odinn and may use available executables or network access.
 Odinn limits the inherited environment and assigns the workspace as child
 `HOME` and `USERPROFILE`, but operators must still use a disposable workspace
 and a suitably restricted host identity. The tool requires both an explicit
-`process.exec` policy capability and the following configuration acknowledgement:
+`process.execute` policy capability and the following configuration acknowledgement:
 
 ```json
 {
@@ -141,9 +142,10 @@ classified as irreversible and non-retry-safe.
 | --- | --- | --- |
 | `GET /config` | No body | `{ ok, config, restartRequired, ... }` with editable configuration and metadata |
 | `PUT /config` | `{ config, fingerprint }`, using the current 64-character fingerprint from `GET /config` | `{ ok, config, fingerprint, restartRequired }`; stale fingerprints return `409` without overwriting newer configuration |
-| `GET /status` | No body | Version, absolute state/workspace paths, configured models/providers, tools, capabilities, security policy, core advanced services, optional plugin flags, and pending approvals |
+| `GET /status` | No body | Version, absolute state/workspace paths, configured models/providers, exact tool capability declarations, capability registry and migration report, allowed tools, security policy, core advanced services, optional plugin flags, and pending approvals |
 | `GET /diagnostics` | No body | A credential-redacted health and configuration report |
 | `GET /channels` | No body | Credential-redacted configured channel lifecycle status |
+| `POST /gatewatch/preview` | `{ toolName, input?, parentCapabilities?, requestedCapabilities?, skillCapabilities?, mcpCapabilities? }` | Complete non-executing Gatewatch decision; invalid or unknown capability sets return `400` |
 
 ### Project, session, and goal routes
 

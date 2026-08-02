@@ -8,8 +8,8 @@ import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
-import { createDefaultPolicy } from "@odinn/policy";
+import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
 import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
@@ -261,6 +261,9 @@ async function main() {
     case "policy":
       await policyCommand(args);
       break;
+    case "gatewatch":
+      await gatewatchCommand(args);
+      break;
     case "capability":
     case "capabilities":
       await capabilityCommand(args);
@@ -413,6 +416,7 @@ function usage() {
   odinn proof contract validate <contract.json|yml>
   odinn policy validate <policy.json|yml>
   odinn policy test <policy.json|yml> --tool <tool> --input-json <json> [--state .odinn]
+  odinn gatewatch preview --tool <tool> [--input-json <json>] [--parent-capabilities <a,b>] [--request-capabilities <a,b>] [--skill-capabilities <a,b>] [--mcp-capabilities <a,b>] [--state .odinn]
   odinn capability issue --run <run-id> --step <step-id> --tool <tool> [--scope a,b] [--constraints <json>] [--expires-ms <ms>] [--max-uses <count>] [--show-token] [--state .odinn]
   odinn capability use --token <token> --run <run-id> --tool <tool> [--resource <json>] [--state .odinn]
   odinn capability list <run-id> [--state .odinn]
@@ -492,6 +496,15 @@ function option(args: any, name: any, fallback: any = undefined) {
 
 function hasFlag(args: any, name: any) {
   return args.includes(name);
+}
+
+function ensureToolCapabilities(policyInput: any, tools: string[]) {
+  const policy = createDefaultPolicy(policyInput);
+  const scoped = new Map(policy.scopedCapabilities.map((grant) => [`${grant.tool}\0${grant.capability}`, grant]));
+  for (const tool of tools) for (const capability of capabilitiesForTool(tool)) {
+    if (!policy.allowedCapabilities.includes(capability)) scoped.set(`${tool}\0${capability}`, { tool, capability });
+  }
+  return { ...policy, scopedCapabilities: [...scoped.values()].sort((left, right) => left.tool.localeCompare(right.tool) || left.capability.localeCompare(right.capability)) };
 }
 
 function invocationRoot() {
@@ -1195,24 +1208,34 @@ async function status(args: any) {
   await recoverInterruptedOnboardingTransactions(state);
   const config = await readConfig(state);
   const models = listConfiguredModels(normalizeModelConfig(config));
-  return {
-    ok: true,
-    state,
-    workspaceRoot: invocationRoot(),
-    auditLog: config.auditLog ?? "audit.jsonl",
-    tools: Array.from(createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }).keys()),
-    allowedCapabilities: config.policy.allowedCapabilities,
-    policy: createDefaultPolicy(config.policy),
-    security: createDefaultPolicy(config.policy).security,
-    experimental: {
-      flags: normalizeExperimentalFlags(config.experimental),
-      warning: experimentalFeatureWarning(config.experimental)
-    },
-    defaultModel: normalizeModelConfig(config).defaultModel,
-    models,
-    providers: await summarizeProviders(config, state),
-    channels: summarizeChannelConfig(config)
-  };
+  const policy = createDefaultPolicy(config.policy);
+  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config });
+  try {
+    return {
+      ok: true,
+      state,
+      workspaceRoot: invocationRoot(),
+      auditLog: config.auditLog ?? "audit.jsonl",
+      tools: Array.from(registry.keys()),
+      toolDetails: Array.from(registry.entries()).map(([name, value]: any) => ({ name, capabilities: value.capabilities, description: value.description })),
+      allowedTools: Array.from(registry.entries()).filter(([name, value]: any) => evaluateTaskPolicy({ policy, request: { tool: name, input: {} }, tool: value }).allowed).map(([name]) => name),
+      allowedCapabilities: policy.allowedCapabilities,
+      capabilityRegistryVersion: policy.capabilityRegistryVersion,
+      capabilityMigration: policy.capabilityMigration,
+      policy,
+      security: policy.security,
+      experimental: {
+        flags: normalizeExperimentalFlags(config.experimental),
+        warning: experimentalFeatureWarning(config.experimental)
+      },
+      defaultModel: normalizeModelConfig(config).defaultModel,
+      models,
+      providers: await summarizeProviders(config, state),
+      channels: summarizeChannelConfig(config)
+    };
+  } finally {
+    registry.close();
+  }
 }
 
 function summarizeChannelConfig(config: any) {
@@ -1328,10 +1351,7 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
   const auditStore = createAuditStore(join(state, "onboarding-verification.jsonl"));
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore });
-  const policy = createDefaultPolicy({
-    ...config.policy,
-    allowedCapabilities: Array.from(new Set([...(config.policy?.allowedCapabilities ?? []), "model.chat"]))
-  });
+  const policy = ensureToolCapabilities(config.policy, ["model.chat"]);
   try {
     const result: any = await runTask({
       task: {
@@ -2148,12 +2168,7 @@ async function addProvider(state: any, args: any, name: any, existingConfig: any
     provider.auth = auth;
   }
   config.providers[name] = provider;
-  config.policy ??= createDefaultPolicy();
-  config.policy.allowedCapabilities = Array.from(new Set([
-    ...(config.policy.allowedCapabilities ?? []),
-    "model.chat",
-    "agent.run"
-  ]));
+  config.policy = ensureToolCapabilities(config.policy, ["model.chat", "agent.run"]);
   if (!config.defaultModel || !listConfiguredModels(normalizeModelConfig(config)).some((entry: any) => entry.id === config.defaultModel)) {
     config.defaultModel = `${name}:${models[0]}`;
   }
@@ -3003,6 +3018,34 @@ async function policyCommand(args: any) {
   if (subcommand === "validate") { await printJson({ valid: true, policy }); return; }
   if (subcommand !== "test") throw new Error("policy requires validate or test");
   const { runtime } = runtimeFor(rest); try { const runId = `policy-test-${randomUUID()}`; runtime.ledger.ensureRun({ runId, objective: "policy test" }); const result = runtime.sentinel.evaluate({ runId, toolName: option(rest, "--tool"), input: JSON.parse(option(rest, "--input-json", "{}")), policy }); await printJson(result); } finally { runtime.ledger.close(); }
+}
+
+async function gatewatchCommand(args: any) {
+  const [subcommand, ...rest] = args;
+  if (subcommand !== "preview") throw new Error("gatewatch requires preview");
+  const toolName = option(rest, "--tool");
+  if (!toolName) throw new Error("gatewatch preview requires --tool");
+  const state = stateDir(rest);
+  const config = await readConfig(state);
+  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config });
+  const optionalCapabilities = (name: string) => {
+    const value = option(rest, name);
+    return value === undefined ? undefined : splitCsv(value);
+  };
+  try {
+    await printJson(previewExecutionAdmission({
+      task: { tool: toolName, input: JSON.parse(option(rest, "--input-json", "{}")) },
+      policy: createDefaultPolicy(config.policy),
+      registry,
+      workspaceRoot: invocationRoot(),
+      parentCapabilities: optionalCapabilities("--parent-capabilities"),
+      requestedCapabilities: optionalCapabilities("--request-capabilities"),
+      skillCapabilities: optionalCapabilities("--skill-capabilities") ?? [],
+      mcpCapabilities: optionalCapabilities("--mcp-capabilities") ?? []
+    }));
+  } finally {
+    registry.close();
+  }
 }
 
 async function capabilityCommand(args: any) {

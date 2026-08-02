@@ -1,4 +1,31 @@
 import { resolve, sep } from "node:path";
+import {
+  CAPABILITY_REGISTRY_VERSION,
+  DEFAULT_ALLOWED_CAPABILITIES,
+  CapabilityRegistryError,
+  assertCapabilityIds,
+  capabilitiesForTool,
+  isCapabilityId,
+  migrateLegacyCapabilityPolicy,
+  type CapabilityGrant,
+  type CapabilityId,
+  type CapabilityMigrationReport
+} from "./capabilities.ts";
+
+export {
+  CAPABILITY_IDS,
+  CAPABILITY_REGISTRY,
+  CAPABILITY_REGISTRY_VERSION,
+  DEFAULT_ALLOWED_CAPABILITIES,
+  TOOL_CAPABILITY_REGISTRY,
+  CapabilityRegistryError,
+  assertCapabilityIds,
+  capabilitiesForTool,
+  intersectChildCapabilities,
+  isCapabilityId,
+  migrateLegacyCapabilityPolicy
+} from "./capabilities.ts";
+export type { CapabilityGrant, CapabilityId, CapabilityMigrationEntry, CapabilityMigrationReport } from "./capabilities.ts";
 
 export type SecuritySurface = {
   enabled: boolean;
@@ -13,13 +40,16 @@ export type SecuritySurface = {
 export interface RuntimePolicy {
   id?: string;
   deniedTools: string[];
-  allowedCapabilities: string[];
+  capabilityRegistryVersion: 1;
+  allowedCapabilities: CapabilityId[];
+  scopedCapabilities: CapabilityGrant[];
+  capabilityMigration: CapabilityMigrationReport;
   maxInputBytes: number;
   security: { web: SecuritySurface; browser: SecuritySurface };
   invariants: PolicyInvariant[];
 }
 
-export interface PolicyTool { capability: string }
+export interface PolicyTool { capability?: string; capabilities?: readonly string[] }
 export interface PolicyRequest { tool: string; input: Record<string, unknown> }
 export type PolicyEnforcement = "log" | "warn" | "pause" | "block" | "rollback" | "terminate";
 export type PolicyInvariantType = "command.deny-pattern" | "tool.requires-approval" | "filesystem.allowed-roots";
@@ -37,10 +67,13 @@ export interface PolicyInvariantEvaluation {
   reason: string;
 }
 export type PolicyDecision =
-  | { allowed: true; decision: "allow"; capability: string }
+  | { allowed: true; decision: "allow"; capability: CapabilityId; capabilities: readonly CapabilityId[] }
   | { allowed: false; decision: "deny"; reason: string; details: Record<string, unknown> };
 
-type PolicyOverrides = Partial<Omit<RuntimePolicy, "security">> & {
+type PolicyOverrides = Partial<Omit<RuntimePolicy, "security" | "allowedCapabilities" | "scopedCapabilities" | "capabilityMigration" | "capabilityRegistryVersion">> & {
+  capabilityRegistryVersion?: 1;
+  allowedCapabilities?: string[];
+  scopedCapabilities?: CapabilityGrant[];
   security?: { web?: Partial<SecuritySurface>; browser?: Partial<SecuritySurface> };
 };
 
@@ -55,34 +88,23 @@ export class PolicyError extends Error {
 }
 
 export function createDefaultPolicy(overrides: PolicyOverrides = {}): RuntimePolicy {
-  const defaultCapabilities = [
-    "job.healthcheck",
-    "text.echo",
-    "workspace.readText",
-    "model.chat",
-    "agent.run",
-    "web.read",
-    "browser.read",
-    "browser.act",
-    "discord.read",
-    "discord.write",
-    "session.read",
-    "session.write",
-    "goal.read",
-    "goal.write",
-    "memory.read",
-    "memory.write",
-    "improve.read",
-    "improve.write"
-  ];
   const configuredCapabilities = Array.isArray(overrides.allowedCapabilities) ? overrides.allowedCapabilities : undefined;
-  const allowedCapabilities = configuredCapabilities ?? defaultCapabilities;
+  if (overrides.capabilityRegistryVersion !== undefined && overrides.capabilityRegistryVersion !== CAPABILITY_REGISTRY_VERSION) {
+    throw new CapabilityRegistryError("INVALID_CAPABILITY_SET", `unsupported capability registry version: ${String(overrides.capabilityRegistryVersion)}`);
+  }
+  const migrated = migrateLegacyCapabilityPolicy(configuredCapabilities ?? DEFAULT_ALLOWED_CAPABILITIES, {
+    versionless: configuredCapabilities !== undefined && overrides.capabilityRegistryVersion === undefined
+  });
+  const scopedCapabilities = mergeScopedCapabilityGrants(migrated.scopedCapabilities, overrides.scopedCapabilities);
   const defaults = {
     deniedTools: [],
     maxInputBytes: 16_384,
     ...overrides,
+    capabilityRegistryVersion: CAPABILITY_REGISTRY_VERSION,
     invariants: normalizePolicyInvariants(overrides.invariants ?? []),
-    allowedCapabilities,
+    allowedCapabilities: [...migrated.allowedCapabilities],
+    scopedCapabilities,
+    capabilityMigration: migrated.report,
     security: {
       ...defaultsSecurity,
       ...(overrides.security ?? {}),
@@ -111,6 +133,63 @@ const defaultsSecurity = {
   }
 };
 
+function mergeScopedCapabilityGrants(migrated: readonly CapabilityGrant[], configured: unknown): CapabilityGrant[] {
+  const grants = new Map<string, CapabilityGrant>(migrated.map((grant) => [`${grant.tool}\0${grant.capability}`, grant]));
+  if (configured !== undefined) {
+    if (!Array.isArray(configured) || configured.length > 512) throw new PolicyError("scopedCapabilities must be an array of at most 512 grants");
+    for (const value of configured) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new PolicyError("scoped capability grants must be objects");
+      const tool = String((value as Record<string, unknown>).tool ?? "").trim();
+      const capabilities = assertCapabilityIds([(value as Record<string, unknown>).capability], "scoped capability grant");
+      if (!tool || !capabilitiesForTool(tool).includes(capabilities[0]!)) throw new PolicyError(`scoped capability grant does not match trusted tool declaration: ${tool}`);
+      const grant = Object.freeze({ tool, capability: capabilities[0]! });
+      grants.set(`${tool}\0${grant.capability}`, grant);
+    }
+  }
+  return [...grants.values()].sort((left, right) => left.tool.localeCompare(right.tool) || left.capability.localeCompare(right.capability));
+}
+
+function resolveToolCapabilities(toolName: string, tool: PolicyTool):
+  | { capabilities: readonly CapabilityId[] }
+  | { error: string; details: Record<string, unknown> } {
+  let registered: readonly CapabilityId[] | undefined;
+  try {
+    registered = capabilitiesForTool(toolName);
+  } catch {
+    registered = undefined;
+  }
+  if (tool.capabilities !== undefined) {
+    let declared: readonly CapabilityId[];
+    try {
+      declared = assertCapabilityIds(tool.capabilities, `tool ${toolName} capabilities`);
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : `tool ${toolName} has invalid capabilities`,
+        details: { code: "UNKNOWN_CAPABILITY", tool: toolName }
+      };
+    }
+    if (!declared.length) return { error: `tool has no declared capabilities: ${toolName}`, details: { code: "CAPABILITY_DECLARATION_MISSING", tool: toolName } };
+    if (registered && (declared.length !== registered.length || declared.some((capability) => !registered!.includes(capability)))) {
+      return {
+        error: `tool capability declaration does not match trusted registry: ${toolName}`,
+        details: { code: "CAPABILITY_DECLARATION_MISMATCH", tool: toolName, declared, registered }
+      };
+    }
+    return { capabilities: registered ?? declared };
+  }
+  if (registered) return { capabilities: registered };
+  if (isCapabilityId(tool.capability)) return { capabilities: Object.freeze([tool.capability]) };
+  return {
+    error: `tool has no trusted capability declaration: ${toolName}`,
+    details: { code: "CAPABILITY_DECLARATION_MISSING", tool: toolName }
+  };
+}
+
+function policyAllowsCapability(policy: RuntimePolicy, tool: string, capability: CapabilityId): boolean {
+  return policy.allowedCapabilities.includes(capability)
+    || policy.scopedCapabilities.some((grant) => grant.tool === tool && grant.capability === capability);
+}
+
 export function evaluateTaskPolicy({ policy = createDefaultPolicy(), request, tool }: { policy?: RuntimePolicy; request: PolicyRequest; tool?: PolicyTool }): PolicyDecision {
   if (!tool) {
     return deny(`unknown tool: ${request.tool}`, { code: "UNKNOWN_TOOL" });
@@ -118,18 +197,112 @@ export function evaluateTaskPolicy({ policy = createDefaultPolicy(), request, to
   if (policy.deniedTools?.includes(request.tool)) {
     return deny(`tool is denied by policy: ${request.tool}`, { code: "TOOL_DENIED" });
   }
-  if (!policy.allowedCapabilities?.includes(tool.capability)) {
-    return deny(`capability is not allowed: ${tool.capability}`, { code: "CAPABILITY_DENIED" });
+  const declared = resolveToolCapabilities(request.tool, tool);
+  if ("error" in declared) return deny(declared.error, declared.details);
+  const missing = declared.capabilities.filter((capability) => !policyAllowsCapability(policy, request.tool, capability));
+  if (missing.length) {
+    return deny(`capability is not allowed: ${missing.join(", ")}`, { code: "CAPABILITY_DENIED", capabilities: missing });
   }
-  if (["web.read", "browser.read", "browser.act"].includes(tool.capability)) {
-    const surface = tool.capability.startsWith("web.") ? policy.security?.web : policy.security?.browser;
-    if (surface?.enabled === false) return deny(`security policy disabled ${tool.capability}`, { code: "SECURITY_SURFACE_DISABLED" });
+  if (request.tool.startsWith("web.") || request.tool.startsWith("browser.")) {
+    const surface = request.tool.startsWith("web.") ? policy.security?.web : policy.security?.browser;
+    if (surface?.enabled === false) return deny(`security policy disabled ${request.tool}`, { code: "SECURITY_SURFACE_DISABLED" });
   }
   const inputBytes = Buffer.byteLength(JSON.stringify(request.input), "utf8");
   if (inputBytes > (policy.maxInputBytes ?? 16_384)) {
     return deny(`input exceeds policy limit: ${inputBytes} bytes`, { code: "INPUT_TOO_LARGE", inputBytes });
   }
-  return { allowed: true, decision: "allow", capability: tool.capability };
+  return { allowed: true, decision: "allow", capability: declared.capabilities[0]!, capabilities: declared.capabilities };
+}
+
+export type GatewatchPreview = Readonly<{
+  schemaVersion: 1;
+  registryVersion: 1;
+  allowed: boolean;
+  decision: "allow" | "deny";
+  reason: string;
+  tool: string;
+  declaredCapabilities: readonly CapabilityId[];
+  policyCapabilities: readonly CapabilityId[];
+  parentCapabilities: readonly CapabilityId[];
+  requestedCapabilities: readonly CapabilityId[];
+  effectiveCapabilities: readonly CapabilityId[];
+  declarationRequests: Readonly<{
+    skill: readonly CapabilityId[];
+    mcp: readonly CapabilityId[];
+    grantsAuthority: false;
+  }>;
+  invariants: readonly PolicyInvariantEvaluation[];
+  migration: CapabilityMigrationReport;
+  details: Readonly<Record<string, unknown>>;
+  executes: false;
+}>;
+
+export function previewGatewatchDecision({
+  policy = createDefaultPolicy(),
+  request,
+  tool,
+  parentCapabilities,
+  requestedCapabilities,
+  skillCapabilities = [],
+  mcpCapabilities = [],
+  workspaceRoot = process.cwd()
+}: {
+  policy?: RuntimePolicy;
+  request: PolicyRequest;
+  tool?: PolicyTool;
+  parentCapabilities?: unknown;
+  requestedCapabilities?: unknown;
+  skillCapabilities?: unknown;
+  mcpCapabilities?: unknown;
+  workspaceRoot?: string;
+}): GatewatchPreview {
+  const base = evaluateTaskPolicy({ policy, request, tool });
+  const resolved = tool ? resolveToolCapabilities(request.tool, tool) : { error: `unknown tool: ${request.tool}`, details: { code: "UNKNOWN_TOOL" } };
+  const declared = "capabilities" in resolved ? resolved.capabilities : [];
+  const policyCapabilities = declared.filter((capability) => policyAllowsCapability(policy, request.tool, capability));
+  const parent = parentCapabilities === undefined ? policyCapabilities : assertCapabilityIds(parentCapabilities, "parentCapabilities");
+  const requested = requestedCapabilities === undefined ? declared : assertCapabilityIds(requestedCapabilities, "requestedCapabilities");
+  const skill = assertCapabilityIds(skillCapabilities, "skillCapabilities");
+  const mcp = assertCapabilityIds(mcpCapabilities, "mcpCapabilities");
+  const outsideParent = requested.filter((capability) => !parent.includes(capability));
+  const outsideTool = requested.filter((capability) => !declared.includes(capability));
+  const missingForTool = declared.filter((capability) => !requested.includes(capability));
+  const missingFromPolicy = declared.filter((capability) => !policyCapabilities.includes(capability));
+  const invariants = evaluatePolicyInvariants({ policy, request, workspaceRoot });
+  const blockingInvariant = invariants.find((item) => ["pause", "block", "rollback", "terminate"].includes(item.decision));
+  const escalation = outsideParent.length > 0 || outsideTool.length > 0 || missingForTool.length > 0;
+  const allowed = base.allowed && !escalation && !blockingInvariant;
+  const reason = !base.allowed ? base.reason
+    : outsideParent.length ? "child capability request exceeds parent grants"
+      : outsideTool.length ? "requested capability exceeds the trusted tool declaration"
+        : missingForTool.length ? "requested capabilities omit authority required by the tool"
+          : blockingInvariant ? blockingInvariant.reason
+            : "Gatewatch would allow this execution";
+  const details = !base.allowed ? base.details : {
+    ...(outsideParent.length ? { code: "CHILD_CAPABILITY_ESCALATION", outsideParent } : {}),
+    ...(outsideTool.length ? { code: "TOOL_CAPABILITY_MISMATCH", outsideTool } : {}),
+    ...(missingForTool.length ? { code: "REQUIRED_CAPABILITY_MISSING", missingForTool } : {}),
+    ...(missingFromPolicy.length ? { missingFromPolicy } : {}),
+    ...(blockingInvariant ? { code: "POLICY_INVARIANT_BLOCKED", invariantId: blockingInvariant.invariantId } : {})
+  };
+  return Object.freeze({
+    schemaVersion: 1,
+    registryVersion: CAPABILITY_REGISTRY_VERSION,
+    allowed,
+    decision: allowed ? "allow" : "deny",
+    reason,
+    tool: request.tool,
+    declaredCapabilities: Object.freeze([...declared]),
+    policyCapabilities: Object.freeze([...policyCapabilities]),
+    parentCapabilities: Object.freeze([...parent]),
+    requestedCapabilities: Object.freeze([...requested]),
+    effectiveCapabilities: Object.freeze(allowed ? declared.filter((capability) => policyCapabilities.includes(capability) && parent.includes(capability) && requested.includes(capability)) : []),
+    declarationRequests: Object.freeze({ skill, mcp, grantsAuthority: false }),
+    invariants: Object.freeze(invariants),
+    migration: policy.capabilityMigration,
+    details: Object.freeze(details),
+    executes: false
+  });
 }
 
 export function normalizePolicyInvariants(value: unknown): PolicyInvariant[] {

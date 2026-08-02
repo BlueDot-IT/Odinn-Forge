@@ -101,7 +101,8 @@ const scenarios = [
   },
   {
     name: "policy-denial-monotonicity",
-    property: fc.property(identifier, identifier, jsonRecord, (tool, capability, generatedInput) => {
+    property: fc.property(identifier, jsonRecord, (tool, generatedInput) => {
+      const capability = "workspace.inspect";
       const decision = evaluateTaskPolicy({
         policy: createDefaultPolicy({
           deniedTools: [tool],
@@ -116,7 +117,7 @@ const scenarios = [
             allowedCapabilities: [capability]
           }
         },
-        tool: { capability }
+        tool: { capability, capabilities: [capability] }
       });
       assert.equal(decision.allowed, false);
       if (decision.allowed) assert.fail("generated input broadened an explicit policy denial");

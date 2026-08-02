@@ -491,7 +491,7 @@ test("agent.run emits ordered privacy-safe progress around browser work", async 
       snapshotId: "snapshot_progress"
     })
   });
-  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "browser.read"] });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "browser.read", "network.access"] });
   const progress: any[] = [];
   try {
     const result = await runTask({
@@ -675,7 +675,7 @@ for (const scenario of [{
         }
       }]
     }));
-    const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", scenario.capability] });
+    const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", scenario.capability, "network.access"] });
     try {
       await assert.rejects(
         execute(fx, `agent_${scenario.tool}_failure`, "agent.run", {

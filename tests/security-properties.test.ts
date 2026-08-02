@@ -188,7 +188,8 @@ test("redaction does not treat secret-like substrings or sensitive siblings as c
 
 test("property: request input cannot broaden an explicit policy denial", () => {
   fc.assert(
-    fc.property(identifierArbitrary, identifierArbitrary, jsonRecordArbitrary, (toolName, capability, generatedInput) => {
+    fc.property(identifierArbitrary, jsonRecordArbitrary, (toolName, generatedInput) => {
+      const capability = "workspace.inspect";
       const input = {
         ...generatedInput,
         allowedCapabilities: [capability],
@@ -205,7 +206,7 @@ test("property: request input cannot broaden an explicit policy denial", () => {
           maxInputBytes: 1_000_000
         }),
         request: { tool: toolName, input },
-        tool: { capability }
+        tool: { capability, capabilities: [capability] }
       });
       assertDenied(explicitlyDenied, "TOOL_DENIED");
 
@@ -216,7 +217,7 @@ test("property: request input cannot broaden an explicit policy denial", () => {
           maxInputBytes: 1_000_000
         }),
         request: { tool: toolName, input },
-        tool: { capability }
+        tool: { capability, capabilities: [capability] }
       });
       assertDenied(capabilityDenied, "CAPABILITY_DENIED");
     }),

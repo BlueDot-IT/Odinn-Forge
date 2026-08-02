@@ -13,7 +13,7 @@ import {
 
 const manifestInput = (maxChildren = 4) => ({
   schemaVersion: 1, id: "worker", revision: 1, registryRef: "registry:worker",
-  requestedTools: ["memory.recall"], requestedCapabilities: ["memory:read"],
+  requestedTools: ["memory.recall"], requestedCapabilities: ["workspace.inspect"],
   maxChildren, defaultTimeoutMs: 30
 });
 const validateManifest = (input: unknown) => validateExecutableAgentManifest(JSON.stringify(input));
@@ -38,7 +38,7 @@ function receipt(request: any, terminalStatus = "completed") {
 
 const runInput = (graph: unknown = graphInput) => ({
   graphRunId: "run-1", principalNamespace: "principal-1", graph: validateGraph(graph),
-  manifests, maxConcurrency: 2, maxRunMs: 100
+  manifests, parentCapabilities: ["workspace.inspect"], maxConcurrency: 2, maxRunMs: 100
 });
 
 test("manifest and graph identities are strict, canonical, and privacy bounded", () => {
@@ -62,6 +62,25 @@ test("audited receipts are content-bound and mismatches become needs-review", as
   const runner = new AgentRunGraphRunner({ dispatch: async (request) => ({ ...receipt(request), auditRef: "audit:secret-token" }) });
   const report = await runner.run(runInput({ ...graphInput, nodes: [node("a")] }));
   assert.equal(report.nodes[0].status, "needs-review");
+});
+
+test("child manifests cannot exceed parent or trusted tool authority", async () => {
+  const runner = new AgentRunGraphRunner({ dispatch: async (request) => receipt(request) });
+  await assert.rejects(() => runner.run({ ...runInput(), parentCapabilities: [] }), /exceeds its parent or trusted tool declarations/u);
+  const widened = validateExecutableAgentManifestCollection(JSON.stringify([{ ...manifestInput(), requestedCapabilities: ["workspace.inspect", "network.access"] }]));
+  const widenedManifest = widened[0]!;
+  const widenedGraph = validateGraph({
+    schemaVersion: 1,
+    id: "widened",
+    nodes: [{ ...node("a"), manifestDigest: widenedManifest.manifestDigest }]
+  });
+  await assert.rejects(() => runner.run({
+    ...runInput(),
+    graphRunId: "run-widened",
+    graph: widenedGraph,
+    manifests: widened,
+    parentCapabilities: ["workspace.inspect", "network.access"]
+  }), /exceeds its parent or trusted tool declarations/u);
 });
 
 test("immutable reports preserve bounded correlation evidence and status precedence", async () => {

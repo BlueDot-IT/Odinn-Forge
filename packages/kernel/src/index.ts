@@ -3,7 +3,7 @@ import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
+import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { captureAncestorIdentities, MAX_BOUNDED_UTF8_BYTES, readUtf8Prefix } from "./skill-packages.ts";
@@ -471,6 +471,15 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
   const discordSchemas = new Map(DISCORD_AGENT_TOOL_SCHEMAS.map((schema: any) => [schema.function.name, schema.function.parameters]));
   for (const [name, tool] of createDiscordAgentTools({ config, approvalStore, fetch: discordFetch })) {
     registry.set(name, { ...tool, inputSchema: discordSchemas.get(name) });
+  }
+  for (const [name, tool] of registry) {
+    const capabilities = capabilitiesForTool(name);
+    registry.set(name, {
+      ...tool,
+      legacyCapability: tool.capability,
+      capability: capabilities[0],
+      capabilities
+    });
   }
   return registry;
 }
@@ -949,7 +958,7 @@ export class ExecutionAdmissionService {
     const runLedger = this.options.runLedger;
     if (!runLedger) return undefined;
     const inputDigest = ledgerStep.inputArtifact.digest;
-    const decisionReference = policyEvent?.id ? `policy-event:${policyEvent.id}` : executionReference("policy", `${request.id}:${tool.capability}`);
+    const decisionReference = policyEvent?.id ? `policy-event:${policyEvent.id}` : executionReference("policy", `${request.id}:${tool.capabilities.join(",")}`);
     const envelope = {
       version: 1,
       runId: request.id,
@@ -959,7 +968,7 @@ export class ExecutionAdmissionService {
       inputDigest,
       inputReference: `artifact:sha256:${ledgerStep.inputArtifact.digest}`,
       capabilityDecisionReferences: [decisionReference],
-      approvalRequirements: safety.requiresApproval ? [{ capability: tool.capability }] : [],
+      approvalRequirements: safety.requiresApproval ? tool.capabilities.map((capability: string) => ({ capability })) : [],
       timeoutMs: executionTimeoutMs(request.input),
       resourceLimits: {
         maxInputBytes: executionInputLimit(this.options.policy),
@@ -999,7 +1008,8 @@ export class ExecutionAdmissionService {
           auditCorrelationId: persisted.envelope.auditCorrelationId,
           cancellationControlReference: persisted.envelope.cancellationControlReference,
           inputDigest,
-          inputReference: persisted.envelope.inputReference
+          inputReference: persisted.envelope.inputReference,
+          capabilities: tool.capabilities
         }
       });
     } catch (error) {
@@ -1044,6 +1054,46 @@ export async function runTask({ task, ...options }: any) {
   return new ExecutionAdmissionService(options).executeTask(task);
 }
 
+export function previewExecutionAdmission({
+  task,
+  policy = createDefaultPolicy(),
+  registry,
+  workspaceRoot = process.cwd(),
+  parentCapabilities,
+  requestedCapabilities,
+  skillCapabilities,
+  mcpCapabilities
+}: any) {
+  if (!registry?.get) throw new Error("previewExecutionAdmission requires a trusted tool registry");
+  const request = {
+    tool: String(task?.tool ?? ""),
+    input: task?.input && typeof task.input === "object" && !Array.isArray(task.input) ? task.input : {}
+  };
+  const tool = registry.get(request.tool);
+  const gatewatch = previewGatewatchDecision({
+    policy,
+    request,
+    tool,
+    parentCapabilities,
+    requestedCapabilities,
+    skillCapabilities,
+    mcpCapabilities,
+    workspaceRoot
+  });
+  const safety = toolSafetyDescriptor(request.tool, tool);
+  const browserApproval = request.tool.startsWith("browser.")
+    && tool?.capabilities?.includes("browser.mutate")
+    && policy.security.browser.requireApproval !== false;
+  return Object.freeze({
+    ...gatewatch,
+    safety: Object.freeze({ ...safety, effects: Object.freeze([...safety.effects]) }),
+    approval: Object.freeze({
+      required: safety.requiresApproval || browserApproval,
+      source: safety.requiresApproval ? "tool-safety" : browserApproval ? "browser-policy" : "none"
+    })
+  });
+}
+
 async function executeTaskThroughAdmission({
   task,
   auditStore,
@@ -1062,7 +1112,16 @@ async function executeTaskThroughAdmission({
   admissionService
 }: any) {
   const request = normalizeTaskRequest(task);
-  const tool = registry.get(request.tool);
+  const registeredTool = registry.get(request.tool);
+  let declaredCapabilities;
+  try {
+    declaredCapabilities = capabilitiesForTool(request.tool);
+  } catch {
+    declaredCapabilities = registeredTool?.capabilities;
+  }
+  const tool = registeredTool && declaredCapabilities
+    ? { ...registeredTool, capability: declaredCapabilities[0], capabilities: declaredCapabilities }
+    : registeredTool;
   const requestDigest = taskRequestDigest(request);
   let runBinding: { replay?: boolean } | undefined;
 
@@ -1093,7 +1152,7 @@ async function executeTaskThroughAdmission({
       throw error;
     }
     const completed = [...prior.events].reverse().find((event: any) => event.type === "task.completed");
-    return { id: request.id, tool: request.tool, capability: tool?.capability, ok: true, replayed: true, output: completed?.data?.output };
+    return { id: request.id, tool: request.tool, capability: tool?.capability, capabilities: tool?.capabilities ?? [], ok: true, replayed: true, output: completed?.data?.output };
   }
   const recoveryReplay = runBinding?.replay === true && trustedRecovery === true;
   if (runBinding?.replay && !recoveryReplay) {
@@ -1119,7 +1178,11 @@ async function executeTaskThroughAdmission({
     capability: tool?.capability,
     decision: decision.decision,
     message: decision.allowed ? "policy allowed task" : decision.reason,
-    data: "details" in decision ? decision.details : undefined
+    data: {
+      ...("details" in decision ? decision.details : {}),
+      declaredCapabilities: tool?.capabilities ?? [],
+      effectiveCapabilities: decision.allowed ? decision.capabilities : []
+    }
   });
 
   const policyEvent = runLedger?.recordPolicy({ runId: request.id, stepId: ledgerStep?.stepId, decision: decision.decision, reason: "reason" in decision ? decision.reason : "policy allowed task", details: "details" in decision ? decision.details : undefined });
@@ -1173,6 +1236,7 @@ async function executeTaskThroughAdmission({
     data: {
       inputDigest: ledgerStep?.inputArtifact.digest,
       requestDigest,
+      capabilities: tool.capabilities,
       attemptId: admission?.attemptId,
       auditCorrelationId: admission?.envelope?.auditCorrelationId,
       input: safeAuditValue(request.input)
@@ -1244,7 +1308,7 @@ async function executeTaskThroughAdmission({
     ledgerFinished = Boolean(runLedger);
     if (awaitingApproval) admissionService.awaitApproval(admission);
     else admissionService.complete(admission, outputArtifact?.digest);
-    return { id: request.id, tool: request.tool, capability: tool.capability, ok: true, output };
+    return { id: request.id, tool: request.tool, capability: tool.capability, capabilities: tool.capabilities, ok: true, output };
   } catch (error) {
     const failure = error instanceof Error ? error : new Error(String(error));
     const cancelled = signal?.aborted === true || failure.name === "AbortError";

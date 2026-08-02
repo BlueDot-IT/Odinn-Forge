@@ -1,4 +1,4 @@
-import { createDefaultPolicy, type RuntimePolicy } from "@odinn/policy";
+import { createDefaultPolicy, type CapabilityGrant, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
 
 export type AccessProfileId = "balanced" | "private" | "chat-only" | "custom";
 
@@ -6,7 +6,8 @@ export type AccessProfile = {
   id: Exclude<AccessProfileId, "custom">;
   label: string;
   hint: string;
-  capabilities: string[];
+  capabilities: CapabilityId[];
+  scopedCapabilities: CapabilityGrant[];
   web: boolean;
   browser: boolean;
 };
@@ -39,6 +40,7 @@ export const ACCESS_PROFILES: AccessProfile[] = [
     label: "Everyday assistant",
     hint: "Memory, local files, and the public web. Browser actions still ask first.",
     capabilities: createDefaultPolicy().allowedCapabilities,
+    scopedCapabilities: createDefaultPolicy().scopedCapabilities,
     web: true,
     browser: true
   },
@@ -46,7 +48,8 @@ export const ACCESS_PROFILES: AccessProfile[] = [
     id: "private",
     label: "Private workspace",
     hint: "Chat, memory, and local files. No web browsing or browser control.",
-    capabilities: PRIVATE_CAPABILITIES,
+    capabilities: createDefaultPolicy({ allowedCapabilities: PRIVATE_CAPABILITIES }).allowedCapabilities,
+    scopedCapabilities: createDefaultPolicy({ allowedCapabilities: PRIVATE_CAPABILITIES }).scopedCapabilities,
     web: false,
     browser: false
   },
@@ -54,7 +57,8 @@ export const ACCESS_PROFILES: AccessProfile[] = [
     id: "chat-only",
     label: "Chat only",
     hint: "Conversation only. No memory, files, web, or browser control.",
-    capabilities: CHAT_ONLY_CAPABILITIES,
+    capabilities: createDefaultPolicy({ allowedCapabilities: CHAT_ONLY_CAPABILITIES }).allowedCapabilities,
+    scopedCapabilities: createDefaultPolicy({ allowedCapabilities: CHAT_ONLY_CAPABILITIES }).scopedCapabilities,
     web: false,
     browser: false
   }
@@ -64,6 +68,7 @@ export function identifyAccessProfile(policyInput: unknown): AccessProfileId {
   const policy = createDefaultPolicy(isRecord(policyInput) ? policyInput : {});
   const match = ACCESS_PROFILES.find((profile) => {
     return sameStrings(policy.allowedCapabilities, profile.capabilities)
+      && sameGrants(policy.scopedCapabilities, profile.scopedCapabilities)
       && policy.security.web.enabled === profile.web
       && policy.security.browser.enabled === profile.browser
       && policy.security.web.allowPrivateNetwork === false
@@ -80,6 +85,7 @@ export function applyAccessProfile(policyInput: unknown, profileId: Exclude<Acce
   return {
     ...policy,
     allowedCapabilities: [...profile.capabilities],
+    scopedCapabilities: [...profile.scopedCapabilities],
     security: {
       web: {
         ...policy.security.web,
@@ -119,6 +125,13 @@ function sameStrings(left: string[], right: string[]): boolean {
   const sortedLeft = [...left].sort();
   const sortedRight = [...right].sort();
   return sortedLeft.every((value, index) => value === sortedRight[index]);
+}
+
+function sameGrants(left: CapabilityGrant[], right: CapabilityGrant[]): boolean {
+  return sameStrings(
+    left.map((grant) => `${grant.tool}\0${grant.capability}`),
+    right.map((grant) => `${grant.tool}\0${grant.capability}`)
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

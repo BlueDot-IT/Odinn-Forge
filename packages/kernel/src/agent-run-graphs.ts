@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { intersectChildCapabilities, type CapabilityId } from "@odinn/policy";
 
 export const EXECUTABLE_AGENT_SCHEMA_VERSION = 1 as const;
 export const AGENT_RUN_GRAPH_SCHEMA_VERSION = 1 as const;
@@ -49,6 +50,7 @@ export type AgentDispatchRequest = {
   requestDigest: string;
   nodeId: string;
   manifest: ExecutableAgentManifest;
+  effectiveCapabilities: readonly CapabilityId[];
   inputRef: string;
   resultRef: string;
   authorized: false;
@@ -394,6 +396,7 @@ export class AgentRunGraphRunner {
     principalNamespace: string;
     graph: AgentRunGraph;
     manifests: ExecutableAgentManifestCollection;
+    parentCapabilities: readonly string[];
     maxConcurrency?: number;
     maxRunMs?: number;
     signal?: AbortSignal;
@@ -408,6 +411,11 @@ export class AgentRunGraphRunner {
     const graph = input.graph;
     const manifests = input.manifests;
     const byManifest = new Map(manifests.map((manifest) => [manifest.id, manifest]));
+    const authorityByManifest = new Map(manifests.map((manifest) => [manifest.id, intersectChildCapabilities({
+      parentCapabilities: input.parentCapabilities,
+      requestedCapabilities: manifest.requestedCapabilities,
+      requestedTools: manifest.requestedTools
+    })]));
     if (byManifest.size !== manifests.length) throw new Error("manifests collection contains duplicate ids");
     for (const node of graph.nodes) {
       const manifest = byManifest.get(node.manifestId);
@@ -444,7 +452,7 @@ export class AgentRunGraphRunner {
       const requestCore = {
         schemaVersion: 1 as const, graphRunId, nodeCallId, principalNamespace,
         graphDigest: graph.graphDigest, manifestDigest: manifest.manifestDigest,
-        nodeId: node.id, manifest, inputRef: node.inputRef, resultRef: node.resultRef,
+        nodeId: node.id, manifest, effectiveCapabilities: authorityByManifest.get(manifest.id)!, inputRef: node.inputRef, resultRef: node.resultRef,
         authorized: false as const, requiresAuditedDispatch: true as const
       };
       const request = deepFreeze({ ...requestCore, requestDigest: hash(requestCore) });

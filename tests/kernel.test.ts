@@ -85,11 +85,11 @@ test("security policy is safe by default and supports explicit posture changes",
     "memory.read", "memory.write", "improve.read", "improve.write"
   ] });
   assert.equal(legacy.allowedCapabilities.includes("browser.read"), false);
-  assert.deepEqual(legacy.allowedCapabilities, [
-    "job.healthcheck", "text.echo", "workspace.readText", "model.chat",
-    "session.read", "session.write", "goal.read", "goal.write",
-    "memory.read", "memory.write", "improve.read", "improve.write"
-  ]);
+  assert.deepEqual(legacy.allowedCapabilities, []);
+  assert.equal(legacy.capabilityMigration.required, true);
+  assert.equal(legacy.capabilityMigration.automaticWidening, false);
+  assert.ok(legacy.scopedCapabilities.some((grant) => grant.tool === "model.chat" && grant.capability === "network.access"));
+  assert.ok(legacy.scopedCapabilities.some((grant) => grant.tool === "memory.recall" && grant.capability === "workspace.inspect"));
 });
 
 test("kernel routes model.chat through an OpenAI-compatible provider", async () => {
@@ -413,12 +413,11 @@ test("workspace.readText is confined to the workspace root", async () => {
 test("workspace.writeText stays unavailable until writes can resist concurrent parent swaps", async () => {
   const { auditStore, registry } = await fixture();
   assert.equal(registry.has("workspace.writeText"), false);
-  const policy = createDefaultPolicy({ allowedCapabilities: [...createDefaultPolicy().allowedCapabilities, "workspace.writeText"] });
   await assert.rejects(runTask({
     task: { id: "run_write_unavailable", tool: "workspace.writeText", input: { path: "result.json", content: "{}\n" }, actor: "test" },
     auditStore,
     registry,
-    policy
+    policy: createDefaultPolicy({ allowedCapabilities: [...createDefaultPolicy().allowedCapabilities, "workspace.patch"] })
   }), /unknown tool/);
 });
 
