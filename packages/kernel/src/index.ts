@@ -25,6 +25,7 @@ import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, list
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
 import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.ts";
+import { executeWorkspaceProcess } from "./workspace-tools.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
@@ -115,6 +116,17 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
           bytesRead: bounded.bytesRead,
           truncated: bounded.truncated
         };
+      }
+    }],
+    ["process.exec", {
+      capability: "process.exec",
+      description: "Execute a bounded argument-array command in a workspace directory without an implicit shell.",
+      inputSchema: { type: "object", properties: { command: { type: "string" }, args: { type: "array", items: { type: "string" }, maxItems: 256 }, cwd: { type: "string" }, timeoutMs: { type: "integer", minimum: 100, maximum: 120_000 }, maxOutputBytes: { type: "integer", minimum: 1_024, maximum: 1_000_000 } }, required: ["command"], additionalProperties: false },
+      execute: async (input: any, context: any) => {
+        if (config.runtime?.allowUnconfinedProcessExec !== true) {
+          throw new Error("process.exec requires runtime.allowUnconfinedProcessExec=true in addition to its explicit policy capability");
+        }
+        return executeWorkspaceProcess(root, input, context.signal);
       }
     }],
     ["web.search", {
@@ -511,7 +523,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   if (memoryStore && canRecallMemory && memoryOptions.autoRecall && latestUserMessage?.content) {
     await onAgentProgress?.({ stage: "memory-recalled", message: "Memory recall completed.", durationMs: Date.now() - recallStartedAt, count: recalled.memories.length });
   }
-  const systemMessage = `${agent.systemPrompt}\n\n## Runtime safety contract\nUse web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.`.trim();
+  const systemMessage = `${agent.systemPrompt}\n\n## Runtime safety contract\nUse workspace tools only inside the current workspace. Use process.exec only for bounded commands, pass arguments separately without shell syntax, and verify file changes with relevant checks before claiming completion. Use web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.`.trim();
   const existingSystem = messages.find((message: any) => message.role === "system");
   if (existingSystem) existingSystem.content = `${systemMessage}\n${existingSystem.content || ""}`.trim();
   else messages.unshift({ role: "system", content: systemMessage });
