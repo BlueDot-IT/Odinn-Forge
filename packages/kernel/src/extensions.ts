@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
 import { redact } from "./run-ledger.ts";
@@ -186,7 +187,52 @@ export class ExtensionExecutor {
       ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
       : { type: "odinn.call", id: `call_${randomUUID()}`, input, capability: requested };
     if (!runtime) throw new Error("extension execution requires the audited runtime boundary");
-    return invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime: { ...runtime, capabilityToken } });
+    const snapshot = await createExtensionExecutionSnapshot(extension, entrypoint, bundleRoot);
+    try {
+      return await invokeThroughRuntime({
+        id,
+        input,
+        requested,
+        extension,
+        entrypoint: snapshot.entrypoint,
+        bundleRoot: snapshot.bundleRoot,
+        request,
+        protocol,
+        timeoutMs,
+        runtime: { ...runtime, capabilityToken }
+      });
+    } finally {
+      await rm(snapshot.directory, { recursive: true, force: true });
+    }
+  }
+}
+
+async function createExtensionExecutionSnapshot(extension: ExtensionManifest, entrypoint: string, bundleRoot: string) {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-extension-exec-"));
+  await chmod(directory, 0o700);
+  const snapshotPath = join(directory, "bundle");
+  try {
+    await cp(bundleRoot, snapshotPath, { recursive: true, dereference: false, errorOnExist: true, force: false });
+    const snapshotRoot = await realpath(snapshotPath);
+    const relativeEntrypoint = relative(bundleRoot, entrypoint);
+    if (!relativeEntrypoint || relativeEntrypoint.startsWith("..") || relativeEntrypoint.includes(`..${sep}`)) {
+      throw new Error("extension entrypoint must remain inside its immutable execution snapshot");
+    }
+    const snapshotEntrypoint = await realpath(resolve(snapshotRoot, relativeEntrypoint));
+    if (snapshotEntrypoint === snapshotRoot || !snapshotEntrypoint.startsWith(`${snapshotRoot}${sep}`)) {
+      throw new Error("extension entrypoint escapes its immutable execution snapshot");
+    }
+    const contentDigest = createHash("sha256").update(await readFile(snapshotEntrypoint)).digest("hex");
+    if (extension.sandbox === "unconfined-process" && extension.contentDigest !== contentDigest) {
+      throw new Error(`extension entrypoint changed while creating its execution snapshot: ${extension.id}`);
+    }
+    if (extension.sandbox === "container" && extension.bundleDigest !== await digestExtensionBundle(snapshotRoot)) {
+      throw new Error(`extension bundle changed while creating its execution snapshot: ${extension.id}`);
+    }
+    return { directory, bundleRoot: snapshotRoot, entrypoint: snapshotEntrypoint };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
   }
 }
 

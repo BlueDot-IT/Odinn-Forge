@@ -8,7 +8,7 @@ import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { captureAncestorIdentities, MAX_BOUNDED_UTF8_BYTES, readUtf8Prefix } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
-export { loadEnvironmentFiles } from "./environment.ts";
+export { loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile } from "./environment.ts";
 export { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
 export type { LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
@@ -121,7 +121,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       capability: "web.read",
       description: "Search the public web and return ranked results with snippets.",
       inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] },
-      execute: async (input: any) => withWebRequestSlot(() => searchWeb(input))
+      execute: async (input: any, context: any) => withWebRequestSlot(() => searchWeb(input, context.policy?.security?.web, resolveNetworkAddresses))
     }],
     ["web.fetch", {
       capability: "web.read",

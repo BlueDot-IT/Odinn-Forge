@@ -154,6 +154,37 @@ test("trusted process extensions execute only with an explicit grant", async () 
   runtime.differentiated.ledger.close();
 });
 
+test("extension execution uses an owner-only snapshot after integrity verification", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-extension-snapshot-"));
+  const bundle = join(root, "bundle");
+  await mkdir(bundle);
+  const entrypointSource = `process.stdin.resume(); setTimeout(async () => { const payload = await import("./payload.ts"); process.stdout.write(JSON.stringify({ result: { value: payload.value } }) + "\\n"); }, 150);\n`;
+  await writeFile(join(bundle, "tool.ts"), entrypointSource);
+  await writeFile(join(bundle, "payload.ts"), 'export const value = "verified";\n');
+  const registry = new ExtensionRegistry(join(root, "extensions.json"));
+  await registry.install({
+    id: "snapshot-tool",
+    version: "1.0.0",
+    type: "tool",
+    entrypoint: "bundle/tool.ts",
+    bundleRoot: "bundle",
+    capabilities: ["text.echo"],
+    sandbox: "unconfined-process",
+    contentDigest: digest(entrypointSource)
+  });
+  await registry.enable("snapshot-tool", { grants: ["text.echo"], trust: true, allowUnsafeSandbox: true });
+  const runtime = auditedExtensionRuntime(root, "snapshot");
+  try {
+    const invocation = new ExtensionExecutor(registry, { workspaceRoot: root, defaultTimeoutMs: 2_000 })
+      .invoke("snapshot-tool", {}, { runtime: runtime.value });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await writeFile(join(bundle, "payload.ts"), 'export const value = "replaced";\n');
+    assert.deepEqual(await invocation, { value: "verified" });
+  } finally {
+    runtime.differentiated.ledger.close();
+  }
+});
+
 test("trusted MCP manifests use the explicit JSONL tools/call adapter", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-mcp-runtime-"));
   const entrypoint = join(root, "mcp.ts");

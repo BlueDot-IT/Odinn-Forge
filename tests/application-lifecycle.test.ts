@@ -8,6 +8,7 @@ import test from "node:test";
 import { STATE_SCHEMA_TARGETS } from "../packages/kernel/src/state/schema-registry.ts";
 import {
   checkForUpdate,
+  resolveGitHubTagCommit,
   rollbackApplication,
   uninstallApplication,
   updateApplication
@@ -15,6 +16,33 @@ import {
 
 const PRIOR_COMMIT = "a".repeat(40);
 const NEXT_COMMIT = "b".repeat(40);
+
+test("remote release tag resolution binds assets to the immutable commit", async () => {
+  const annotatedTag = "c".repeat(40);
+  const responses = [
+    new Response(JSON.stringify({ ref: "refs/tags/v1.0.0", object: { type: "tag", sha: annotatedTag } }), { status: 200 }),
+    new Response(JSON.stringify({ object: { type: "commit", sha: NEXT_COMMIT } }), { status: 200 })
+  ];
+  const requested: string[] = [];
+  const resolved = await resolveGitHubTagCommit("v1.0.0", async (url) => {
+    requested.push(String(url));
+    return responses.shift()!;
+  });
+  assert.equal(resolved, NEXT_COMMIT);
+  assert.match(requested[0]!, /\/git\/ref\/tags\/v1\.0\.0$/u);
+  assert.match(requested[1]!, new RegExp(`/git/tags/${annotatedTag}$`, "u"));
+});
+
+test("remote release tag resolution rejects mismatched and malformed refs", async () => {
+  await assert.rejects(
+    () => resolveGitHubTagCommit("v1.0.0", async () => new Response(JSON.stringify({
+      ref: "refs/tags/v1.0.1",
+      object: { type: "commit", sha: NEXT_COMMIT }
+    }), { status: 200 })),
+    /wrong ref/u
+  );
+  await assert.rejects(() => resolveGitHubTagCommit("../main", async () => new Response()), /tag name is invalid/u);
+});
 
 async function lifecycleFixture() {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-application-lifecycle-"));

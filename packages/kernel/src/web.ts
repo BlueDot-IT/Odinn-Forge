@@ -19,16 +19,15 @@ export async function withWebRequestSlot<T>(operation: () => Promise<T>): Promis
   }
 }
 
-export async function searchWeb(input: any = {}) {
+export async function searchWeb(input: any = {}, security: any = {}, resolveNetworkAddresses: any = dnsLookupAll) {
   const query = cleanRequired(input.query, "web.search requires query");
   const limit = Math.min(normalizeLimit(input.limit, 5), 10);
   const endpoint = process.env.ODINN_SEARCH_ENDPOINT || "https://html.duckduckgo.com/html/";
-  const response = await fetch(`${endpoint}?q=${encodeURIComponent(query)}`, {
-      headers: { "user-agent": "Odinn-Forge/0.1 web-search" },
-    signal: AbortSignal.timeout(WEB_TIMEOUT_MS)
-  });
-  if (!response.ok) throw new Error(`web search returned ${response.status}`);
-  const html = (await readBoundedFetchBody(response, WEB_MAX_BYTES, "web search")).toString("utf8");
+  const separator = endpoint.includes("?") ? "&" : "?";
+  const url = assertPublicWebUrl(`${endpoint}${separator}q=${encodeURIComponent(query)}`, security);
+  const response: any = await fetchPublicUrl(url, security, resolveNetworkAddresses);
+  if (response.status < 200 || response.status >= 300) throw new Error(`web search returned ${response.status}`);
+  const html = response.body.toString("utf8");
   const results = [];
   const pattern = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
   for (const match of html.matchAll(pattern)) {
@@ -143,28 +142,6 @@ async function requestValidatedUrl(value: any, security: any = {}, resolveNetwor
     request.on("error", (error: Error) => finish(error));
     request.end();
   });
-}
-
-async function readBoundedFetchBody(response: any, maxBytes: number, label: string) {
-  if (!response.body) return Buffer.alloc(0);
-  const reader = response.body.getReader();
-  const chunks: Buffer[] = [];
-  let bytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > maxBytes) {
-        await reader.cancel(`${label} response exceeded ${maxBytes} bytes`).catch(() => undefined);
-        throw new Error(`${label} response exceeds ${maxBytes} bytes`);
-      }
-      chunks.push(Buffer.from(value));
-    }
-    return Buffer.concat(chunks);
-  } finally {
-    reader.releaseLock();
-  }
 }
 
 export async function dnsLookupAll(hostnameValue: any) {

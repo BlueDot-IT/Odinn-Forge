@@ -148,10 +148,10 @@ export interface ChannelRouterOptions {
 
 export class ChannelAdmissionError extends Error {
   readonly code = "CHANNEL_CAPACITY_REACHED";
-  readonly scope: "global" | "conversation" | "sender" | "sender-state";
+  readonly scope: "global" | "conversation" | "sender" | "sender-state" | "session-bindings";
   readonly limit: number;
 
-  constructor(scope: "global" | "conversation" | "sender" | "sender-state", limit: number) {
+  constructor(scope: "global" | "conversation" | "sender" | "sender-state" | "session-bindings", limit: number) {
     super(`channel ${scope} admission limit reached (${limit})`);
     this.name = "ChannelAdmissionError";
     this.scope = scope;
@@ -610,8 +610,10 @@ export class ChannelRouter {
 export interface SessionBindingStore {
   get(address: ChannelAddress): Promise<string | undefined>;
   set(address: ChannelAddress, sessionId: string): Promise<void>;
+  assertCanCreate?(address: ChannelAddress): Promise<void>;
 }
 interface BindingState { schemaVersion: 1; bindings: Record<string, string> }
+export const MAX_SESSION_BINDINGS = 10_000;
 
 function parseBindingState(value: unknown): BindingState {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("unsupported channel binding state");
@@ -628,10 +630,12 @@ function parseBindingState(value: unknown): BindingState {
 export class FileSessionBindingStore implements SessionBindingStore {
   readonly #path: string;
   readonly #lockTimeoutMs: number;
+  readonly #maximum: number;
 
-  constructor(path: string, { lockTimeoutMs = 30_000 }: { lockTimeoutMs?: number } = {}) {
+  constructor(path: string, { lockTimeoutMs = 30_000, maximum = MAX_SESSION_BINDINGS }: { lockTimeoutMs?: number; maximum?: number } = {}) {
     this.#path = resolve(path);
     this.#lockTimeoutMs = Math.max(1, lockTimeoutMs);
+    this.#maximum = Math.max(1, maximum);
   }
 
   async get(address: ChannelAddress): Promise<string | undefined> {
@@ -643,6 +647,18 @@ export class FileSessionBindingStore implements SessionBindingStore {
     return state.bindings[channelConversationKey(address)];
   }
 
+  async assertCanCreate(address: ChannelAddress): Promise<void> {
+    const state = await readSecureJsonState(this.#path, {
+      initial: (): BindingState => ({ schemaVersion: 1, bindings: {} }),
+      parse: parseBindingState,
+      lockTimeoutMs: this.#lockTimeoutMs
+    });
+    const key = channelConversationKey(address);
+    if (state.bindings[key] === undefined && Object.keys(state.bindings).length >= this.#maximum) {
+      throw new ChannelAdmissionError("session-bindings", this.#maximum);
+    }
+  }
+
   async set(address: ChannelAddress, sessionId: string): Promise<void> {
     const cleanSessionId = sessionId.trim();
     if (!cleanSessionId) throw new Error("channel session binding requires a session identifier");
@@ -651,7 +667,11 @@ export class FileSessionBindingStore implements SessionBindingStore {
       parse: parseBindingState,
       lockTimeoutMs: this.#lockTimeoutMs,
       mutate: (state) => {
-        state.bindings[channelConversationKey(address)] = cleanSessionId;
+        const key = channelConversationKey(address);
+        if (state.bindings[key] === undefined && Object.keys(state.bindings).length >= this.#maximum) {
+          throw new ChannelAdmissionError("session-bindings", this.#maximum);
+        }
+        state.bindings[key] = cleanSessionId;
       }
     });
   }
@@ -698,6 +718,7 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
   async handle(message: InboundChannelMessage, context: ChannelMessageHandlerContext): Promise<string> {
     let sessionId = await this.#bindings.get(message.address);
     if (!sessionId) {
+      await this.#bindings.assertCanCreate?.(message.address);
       const created = await this.#request("/sessions", {
         title: channelSessionTitle(message), tags: ["channel", message.address.channel], source: `channel:${message.address.channel}`
       }, context.signal);

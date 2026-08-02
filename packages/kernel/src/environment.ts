@@ -9,6 +9,12 @@ export type EnvironmentLoadOptions = {
   protectedKeys?: Iterable<string>;
 };
 
+export const OPERATOR_ONLY_ENVIRONMENT_KEYS = new Set([
+  "ODINN_CHROMIUM_PATH",
+  "ODINN_EXTENSION_CONTAINER_RUNTIME",
+  "ODINN_SEARCH_ENDPOINT"
+]);
+
 export type LoadedEnvironmentFile = {
   path: string;
   keys: string[];
@@ -32,7 +38,7 @@ export function loadEnvironmentFiles({
   const loaded: LoadedEnvironmentFile[] = [];
   const seen = new Set<string>();
 
-  for (const path of [join(root, ".env"), join(state, ".env")]) {
+  for (const [path, source] of [[join(root, ".env"), "workspace"], [join(state, ".env"), "state"]] as const) {
     if (!existsSync(path)) continue;
     const resolvedPath = realpathSync(path);
     if (seen.has(resolvedPath)) continue;
@@ -40,7 +46,11 @@ export function loadEnvironmentFiles({
     if (!statSync(resolvedPath).isFile()) throw new Error(`environment path is not a regular file: ${path}`);
     const values = parseEnv(readFileSync(resolvedPath, "utf8"));
     for (const [key, value] of Object.entries(values)) {
-      if (value !== undefined && !protectedEnvironmentKeys.has(key)) loadedValues.set(key, value);
+      if (
+        value !== undefined
+        && !protectedEnvironmentKeys.has(key)
+        && (source !== "workspace" || !OPERATOR_ONLY_ENVIRONMENT_KEYS.has(key))
+      ) loadedValues.set(key, value);
     }
     loaded.push({ path: resolvedPath, keys: Object.keys(values).sort() });
   }

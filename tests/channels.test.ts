@@ -753,6 +753,25 @@ test("file session bindings isolate channel conversations", async () => {
   assert.equal(persisted.bindings[channelConversationKey(address)], "sess_1");
 });
 
+test("file session bindings reject new conversations at the durable cardinality limit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "odinn-channel-binding-limit-"));
+  const path = join(directory, "bindings.json");
+  const store = new FileSessionBindingStore(path, { maximum: 2 });
+  const address = message().address;
+  await store.set(address, "sess-one");
+  await store.set({ ...address, conversationId: "two" }, "sess-two");
+  await store.set(address, "sess-one-updated");
+  await assert.rejects(
+    () => store.assertCanCreate({ ...address, conversationId: "three" }),
+    /session-bindings.*2/u
+  );
+  await assert.rejects(
+    () => store.set({ ...address, conversationId: "three" }, "sess-three"),
+    /session-bindings.*2/u
+  );
+  assert.equal(Object.keys(JSON.parse(await readFile(path, "utf8")).bindings).length, 2);
+});
+
 test("Telegram updates normalize into the shared channel shape", () => {
   const normalized = normalizeTelegramUpdate({
     update_id: 900,
