@@ -106,6 +106,43 @@ test("backup refuses a corrupt authoritative SQLite audit journal", async () => 
   } finally { await rm(fixture.temporary, { recursive: true, force: true }); }
 });
 
+test("backup refuses while sandbox cleanup recovery is pending", async () => {
+  const fixture = await preparedState();
+  try {
+    await writeFile(join(fixture.state, "sandbox-recovery.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      namespaceId: `sbx_${"a".repeat(36)}`,
+      pending: [{ executionId: `sbxexec_${"b".repeat(32)}` }]
+    })}\n`, { mode: 0o600 });
+    await assert.rejects(createStateBackup(fixture.state, join(fixture.temporary, "blocked-backup")), /sandbox cleanup recovery is pending/u);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("restore and migration refuse pending sandbox recovery even when current backup is skipped", async () => {
+  const fixture = await preparedState();
+  const backup = join(fixture.temporary, "pre-recovery-backup");
+  try {
+    await createStateBackup(fixture.state, backup);
+    await writeFile(join(fixture.state, "sandbox-recovery.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      namespaceId: `sbx_${"a".repeat(36)}`,
+      pending: [{ executionId: `sbxexec_${"b".repeat(32)}` }]
+    })}\n`, { mode: 0o600 });
+    await assert.rejects(
+      restoreStateBackup(backup, fixture.state, { skipCurrentBackup: true }),
+      /restore refused while sandbox cleanup recovery is pending/u
+    );
+    await assert.rejects(
+      ensureStateCompatibility(fixture.state),
+      /migration refused while sandbox cleanup recovery is pending/u
+    );
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
 test("restore verifies into staging, backs up current state, and activates atomically", async () => {
   const fixture = await preparedState();
   const backup = join(fixture.temporary, "backup");

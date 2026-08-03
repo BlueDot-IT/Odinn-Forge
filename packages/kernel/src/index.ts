@@ -24,12 +24,20 @@ import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, list
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
 import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.ts";
-import { executeWorkspaceProcess, readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
+import { readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
-export { ExtensionRegistry, ExtensionExecutor } from "./extensions.ts";
+export { ExtensionRegistry, ExtensionExecutor, resolveConfiguredOciBackend } from "./extensions.ts";
+export { DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, normalizeSandboxConfig, summarizeSandboxRisk, validateSandboxConfig } from "./sandbox-config.ts";
+export type { SandboxConfig, SandboxConfigInput, SandboxRiskSummary } from "./sandbox-config.ts";
+export { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, attestContainerConfiguration, buildNetworkDeniedOciArgs, compileSandboxProfile, detectOciBackend, probeOciBackend, reconcileSandboxRecovery, selectOciBackend, validateDigestPinnedOciImage, validateTrustedOciExecutable } from "./sandbox-backend.ts";
+export type { CompiledSandboxProfile, OciBackendId, OciCapabilityProbe, SandboxBackend, SandboxBackendSelection, SandboxExecutionOptions, SandboxExecutionResult, SandboxProfileInput } from "./sandbox-backend.ts";
+export { materializeSandboxBundle } from "./sandbox-bundle.ts";
+export type { SandboxBundleOptions, SandboxBundleReference } from "./sandbox-bundle.ts";
+export { SandboxRecoveryCoordinator, SandboxRecoveryError, SandboxRecoverySession } from "./sandbox-recovery.ts";
+export type { SandboxRecoveryAdapter, SandboxRecoveryBackend, SandboxRecoveryIdentity, SandboxRecoveryPhase, SandboxRecoveryRecord } from "./sandbox-recovery.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
 export { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
@@ -145,13 +153,10 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     }],
     ["process.exec", {
       capability: "process.exec",
-      description: "Execute a bounded argument-array command in a workspace directory without an implicit shell.",
+      description: "Reserved process surface; refuses execution until a per-run operator approval or enforced sandbox process backend is active.",
       inputSchema: { type: "object", properties: { command: { type: "string" }, args: { type: "array", items: { type: "string" }, maxItems: 256 }, cwd: { type: "string" }, timeoutMs: { type: "integer", minimum: 100, maximum: 120_000 }, maxOutputBytes: { type: "integer", minimum: 1_024, maximum: 1_000_000 } }, required: ["command"], additionalProperties: false },
-      execute: async (input: any, context: any) => {
-        if (config.runtime?.allowUnconfinedProcessExec !== true) {
-          throw new Error("process.exec requires runtime.allowUnconfinedProcessExec=true in addition to its explicit policy capability");
-        }
-        return executeWorkspaceProcess(root, input, context.signal);
+      execute: async () => {
+        throw new Error("process.exec host execution is unavailable until a per-run operator approval or enforced sandbox process backend is active");
       }
     }],
     ["web.search", {

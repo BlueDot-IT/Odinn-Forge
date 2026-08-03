@@ -421,11 +421,10 @@ test("workspace.writeText stays unavailable until writes can resist concurrent p
   }), /unknown tool/);
 });
 
-test("process.exec is explicitly gated, shell-free, workspace-cwd-bounded, and output-bounded", async () => {
+test("process.exec refuses legacy unconfined authorization until per-run approval or sandbox enforcement exists", async () => {
   const { root, auditStore, registry: unacknowledgedRegistry } = await fixture();
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn"), config: { runtime: { allowUnconfinedProcessExec: true } } });
   const policy = createDefaultPolicy({ allowedCapabilities: [...createDefaultPolicy().allowedCapabilities, "process.exec"] });
-  const literal = "literal; shell syntax is data";
 
   await assert.rejects(runTask({
     task: { id: "run_process_default_denied", tool: "process.exec", input: { command: process.execPath }, actor: "test" },
@@ -438,42 +437,14 @@ test("process.exec is explicitly gated, shell-free, workspace-cwd-bounded, and o
     auditStore,
     registry: unacknowledgedRegistry,
     policy
-  }), /allowUnconfinedProcessExec=true/);
-
-  const executed = await runTask({
-    task: { id: "run_process_exec", tool: "process.exec", input: { command: process.execPath, args: ["-e", "process.stdout.write(process.argv[1])", literal] }, actor: "test" },
-    auditStore,
-    registry,
-    policy
-  });
-  assert.equal(executed.output.exitCode, 0);
-  assert.equal(executed.output.stdout, literal);
-  assert.equal(executed.output.cwd, "");
-  assert.equal(executed.output.timedOut, false);
-
-  const home = await runTask({
-    task: { id: "run_process_scoped_home", tool: "process.exec", input: { command: process.execPath, args: ["-e", "process.stdout.write(process.env.HOME || '')"] }, actor: "test" },
-    auditStore,
-    registry,
-    policy
-  });
-  assert.equal(home.output.stdout, root);
-
-  const truncated = await runTask({
-    task: { id: "run_process_output_limit", tool: "process.exec", input: { command: process.execPath, args: ["-e", "process.stdout.write('x'.repeat(4096))"], maxOutputBytes: 1024 }, actor: "test" },
-    auditStore,
-    registry,
-    policy
-  });
-  assert.equal(truncated.output.outputTruncated, true);
-  assert.equal(Buffer.byteLength(truncated.output.stdout), 1024);
+  }), /per-run operator approval or enforced sandbox process backend/);
 
   await assert.rejects(runTask({
-    task: { id: "run_process_escape", tool: "process.exec", input: { command: process.execPath, cwd: ".." }, actor: "test" },
+    task: { id: "run_process_legacy_true", tool: "process.exec", input: { command: process.execPath }, actor: "test" },
     auditStore,
     registry,
     policy
-  }), /path escapes workspace root/);
+  }), /per-run operator approval or enforced sandbox process backend/);
 });
 
 test("process.exec cannot spawn after cancellation during asynchronous cwd admission", async () => {

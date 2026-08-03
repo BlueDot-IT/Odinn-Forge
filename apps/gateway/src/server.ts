@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, runTask as executeTask, SkillPackageStore, SqliteJobStore, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -690,6 +690,10 @@ export async function createGatewayServer({
   await ensureStateCompatibility(state, { applicationVersion: version, applicationCommit: await productCommit() });
   await ensureSecureStateDirectory(state);
   const config = await readConfig(state, { hosted });
+  const startupSandboxConfig = normalizeSandboxConfig(config);
+  if (await access(join(state, "sandbox-recovery.json")).then(() => true).catch(() => false)) {
+    await reconcileSandboxRecovery(state, startupSandboxConfig.backend.enginePaths).catch(() => undefined);
+  }
   await ensureMainAgent(state);
   const featureFlags = normalizeExperimentalFlags(config.experimental);
   const proofOptions = {
@@ -1739,6 +1743,8 @@ function isPrivateHostedProviderUrl(value: string) {
 }
 
 function validateHostedProviderConfig(config: any) {
+  try { assertHostedSandboxConfig(config); }
+  catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "hosted sandbox configuration is invalid"); }
   if (Object.values(config?.channels ?? {}).some((channel: any) => channel?.enabled === true)) {
     throw new GatewayError(400, "multi-user host does not allow messaging channels");
   }
@@ -1787,7 +1793,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
         if (readError?.code !== "ENOENT") throw readError;
       }
       await mkdir(state, { recursive: true });
-      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await chmod(path, 0o600);
       return config;
@@ -1844,6 +1850,8 @@ function validateDiscordGuildConfig(value: any, label: string) {
 
 function validateGatewayConfig(config: any) {
   assertConfigObject(config);
+  try { normalizeSandboxConfig(config); }
+  catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.sandbox is invalid"); }
   if (config.version !== undefined && config.version !== 1) {
     throw new GatewayError(400, "config.version must be 1");
   }
@@ -2087,7 +2095,8 @@ function canonicalConfig(value: any): any {
 }
 
 function configsMatch(left: any, right: any) {
-  return JSON.stringify(canonicalConfig(left)) === JSON.stringify(canonicalConfig(right));
+  const effective = (value: any) => ({ ...value, sandbox: normalizeSandboxConfig(value) });
+  return JSON.stringify(canonicalConfig(effective(left))) === JSON.stringify(canonicalConfig(effective(right)));
 }
 
 async function openEditableConfigFile(path: string) {
@@ -2444,6 +2453,8 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
   const pendingApprovals = approvalStore.list();
   let recovery: any = { status: "clear" };
   try { recovery = JSON.parse(await readFile(join(state, "browser-recovery.json"), "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") recovery = { status: "unavailable" }; }
+  let sandboxRecovery: any = { pending: [] };
+  try { sandboxRecovery = JSON.parse(await readFile(join(state, "sandbox-recovery.json"), "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") sandboxRecovery = { pending: null }; }
   const ownerOnly = await isOwnerOnlyPath(state);
   const normalized = normalizeModelConfig(config);
   let version = "unknown";
@@ -2451,6 +2462,20 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
   let commit = process.env.ODINN_COMMIT ?? "";
   if (!commit) {
     try { commit = JSON.parse(await readFile(INSTALL_METADATA_FILE, "utf8")).commit ?? ""; } catch {}
+  }
+  const sandboxConfig = normalizeSandboxConfig(config);
+  const sandboxBackends = await Promise.all([
+    probeOciBackend("podman", undefined, { executablePaths: sandboxConfig.backend.enginePaths }),
+    probeOciBackend("docker", undefined, { executablePaths: sandboxConfig.backend.enginePaths })
+  ]);
+  let extensionLane: any = { status: sandboxConfig.process.enabled ? "refused" : "disabled", code: sandboxConfig.process.enabled ? "SANDBOX_BACKEND_UNAVAILABLE" : "SANDBOX_PROCESS_DISABLED" };
+  if (sandboxConfig.process.enabled) {
+    try {
+      const selected = await resolveConfiguredOciBackend(sandboxConfig);
+      extensionLane = { status: "eligible", backend: selected.backend, rootless: selected.rootless, controls: "engine-reported; stopped-container attestation required before start" };
+    } catch (error: any) {
+      extensionLane = { status: "refused", code: String(error?.code ?? "SANDBOX_BACKEND_UNAVAILABLE") };
+    }
   }
   return {
     ok: audit.valid,
@@ -2485,6 +2510,21 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
       failed: jobs.filter((job: any) => job.status === "failed").length,
       needsReview: jobs.filter((job: any) => job.status === "needs-review").length,
       completed: jobs.filter((job: any) => job.status === "completed").length
+    },
+    sandbox: {
+      configured: summarizeSandboxRisk(sandboxConfig),
+      recovery: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null },
+      extensionLane,
+      activation: "network-denied immutable extensions are active; general processes, brokered networking, and writable host integration remain unavailable",
+      backends: sandboxBackends.map((backend) => ({
+        backend: backend.backend,
+        available: backend.available,
+        compatible: backend.compatible,
+        rootless: backend.rootless,
+        containerOs: backend.containerOs,
+        controls: backend.controlEvidence.status,
+        resourceControls: backend.resourceControls
+      }))
     },
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: true, secretsExcludedFromDiagnostics: true }
   };
@@ -6194,7 +6234,7 @@ function renderConsoleHtml(version = "development") {
       $("config-channels").innerHTML = Object.entries(value.channels || {}).map(([name, channel]) => renderChannelForm(name, channel)).join("") || '<div class="empty-state"><strong>No messaging channels configured</strong><span>Add Telegram when you want to talk to Ódinn outside this console.</span></div>';
       $("config-invariants").innerHTML = (Array.isArray(policy.invariants) ? policy.invariants : []).map(renderInvariantForm).join("") || '<div class="empty-state"><strong>No Gatewatch rules</strong><span>Add a rule only when you need a policy check beyond the default capability controls.</span></div>';
       $("config-proof-commands").innerHTML = (Array.isArray(value.proof?.allowedCommands) ? value.proof.allowedCommands : []).map(renderProofCommand).join("") || '<div class="empty-state"><strong>No Runemark commands allowed</strong><span>Runemark command checks remain unavailable until you add an exact executable argument vector.</span></div>';
-      $("config-field-count").textContent = "All supported fields shown; unknown settings are preserved.";
+      $("config-field-count").textContent = "Advanced and unknown fields are preserved but are not all shown here.";
     }
 
     function readStructuredConfig() {

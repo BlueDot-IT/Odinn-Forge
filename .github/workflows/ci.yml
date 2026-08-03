@@ -90,6 +90,18 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:integration
+      - name: Real OCI sandbox proof
+        env:
+          ODINN_RUN_OCI_TESTS: "1"
+          ODINN_TEST_OCI_BACKEND: docker
+          ODINN_TEST_OCI_IMAGE: docker.io/library/golang:1.26.5@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647
+          ODINN_TEST_OCI_VOLUME_IMAGE: docker.io/library/postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+          ODINN_TEST_EXTENSION_OCI_IMAGE: docker.io/library/node:24-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3
+        run: |
+          docker pull "$ODINN_TEST_OCI_IMAGE"
+          docker pull "$ODINN_TEST_OCI_VOLUME_IMAGE"
+          docker pull "$ODINN_TEST_EXTENSION_OCI_IMAGE"
+          pnpm test:oci
       - run: pnpm smoke:inference
       - run: pnpm benchmark:ci
       - name: Upload benchmark report

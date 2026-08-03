@@ -20,6 +20,7 @@ const RECOGNIZED_STATE_ENTRIES = new Set([
   "approvals.json",
   "browser-recovery.json",
   "browser-tabs.json",
+  "sandbox-recovery.json",
   "cron-jobs.json",
   "extensions.json",
   "agents.json",
@@ -130,6 +131,7 @@ export async function inspectStateSchemas(stateDir: string): Promise<StateInspec
 
   put(statuses, "approvals", await inspectApprovals(join(stateRoot, "approvals.json")));
   put(statuses, "browserRecovery", await inspectBrowserRecovery(stateRoot));
+  put(statuses, "sandboxRecovery", await inspectVersionedObject(join(stateRoot, "sandbox-recovery.json"), "pending", "array"));
   put(statuses, "cron", await inspectVersionedObject(join(stateRoot, "cron-jobs.json"), "jobs", "array"));
   put(statuses, "extensions", await inspectVersionedObject(join(stateRoot, "extensions.json"), "extensions", "object"));
   put(statuses, "skills", await inspectVersionedObject(join(stateRoot, "skills", "registry.json"), "packages", "array"));
@@ -209,6 +211,7 @@ export async function ensureStateCompatibility(
   const stateRoot = safeStateRoot(stateDir);
   let recoveredInterruptedMigration = false;
   return withStateMutationLock(stateRoot, async () => {
+    await assertNoPendingSandboxRecovery(stateRoot, "migration");
     recoveredInterruptedMigration = await recoverInterruptedStateMigrationUnlocked(stateRoot);
     const plan = await planStateMigrationUnlocked(stateRoot, options);
     if (plan.blockingIncompatibilities.length) throw new Error(plan.blockingIncompatibilities.join("; "));
@@ -226,7 +229,17 @@ export async function applyStateMigrations(
 
 export async function recoverInterruptedStateMigration(stateDir: string): Promise<boolean> {
   const stateRoot = safeStateRoot(stateDir);
-  return withStateMutationLock(stateRoot, () => recoverInterruptedStateMigrationUnlocked(stateRoot));
+  return withStateMutationLock(stateRoot, async () => {
+    await assertNoPendingSandboxRecovery(stateRoot, "migration recovery");
+    return recoverInterruptedStateMigrationUnlocked(stateRoot);
+  });
+}
+
+async function assertNoPendingSandboxRecovery(stateRoot: string, operation: string): Promise<void> {
+  const recovery = await readJson(join(stateRoot, "sandbox-recovery.json"));
+  if (!recovery.present) return;
+  const pending = !Array.isArray(recovery.value) && Array.isArray(recovery.value.pending) ? recovery.value.pending : [];
+  if (pending.length > 0) throw new Error(`state ${operation} refused while sandbox cleanup recovery is pending`);
 }
 
 async function planStateMigrationUnlocked(stateRoot: string, options: StateCompatibilityOptions): Promise<StateMigrationPlan> {
@@ -514,6 +527,10 @@ async function inspectHostMetadata(stateRoot: string, hasState: boolean): Promis
   const storeVersions = value.value.storeVersions;
   if (!storeVersions || typeof storeVersions !== "object" || Array.isArray(storeVersions)) throw new Error(`${MANIFEST_FILENAME} has no storeVersions object`);
   for (const surface of Object.keys(STATE_SCHEMA_TARGETS) as StateSurface[]) {
+    // sandboxRecovery was added as an independently initialized operational
+    // journal after the v1 compatibility manifest shipped. Its absence from an
+    // older manifest means the target v1 surface, not an unknown schema.
+    if (!(surface in storeVersions) && surface === "sandboxRecovery") continue;
     if (!(surface in storeVersions)) throw new Error(`${MANIFEST_FILENAME} is missing ${surface}`);
     const recordedVersion = schemaNumber((storeVersions as Record<string, unknown>)[surface], `${MANIFEST_FILENAME}.${surface}`);
     if (recordedVersion > STATE_SCHEMA_TARGETS[surface]) {
@@ -634,6 +651,7 @@ function schemaTargetForPath(path: string): number {
   if (normalized.endsWith("/extensions.json")) return STATE_SCHEMA_TARGETS.extensions;
   if (normalized.endsWith("/skills/registry.json")) return STATE_SCHEMA_TARGETS.skills;
   if (normalized.endsWith("/agents.json")) return STATE_SCHEMA_TARGETS.agents;
+  if (normalized.endsWith("/sandbox-recovery.json")) return STATE_SCHEMA_TARGETS.sandboxRecovery;
   throw new Error(`no schema target owns ${path}`);
 }
 
