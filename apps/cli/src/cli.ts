@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, providerSupport, ProofVerifier, PROVIDER_PRESETS, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -805,6 +805,7 @@ async function readExistingOnboardingConfig(configPath: any, prompts: any) {
     if (config.version !== 1) throw new Error(`unsupported configuration version: ${config.version ?? "missing"}`);
     createDefaultPolicy(config.policy);
     normalizeModelConfig(config);
+    normalizeSandboxConfig(config);
     return config;
   } catch (error: any) {
     prompts.note(
@@ -1305,12 +1306,27 @@ async function doctor(args: any) {
     completed: jobs.filter((job) => job.status === "completed").length
   };
   const recovery = await readJsonIfPresent(join(state, "browser-recovery.json"), { status: "clear" });
+  const sandboxRecovery = await readJsonIfPresent(join(state, "sandbox-recovery.json"), { pending: [] });
   const ownerOnly = await isOwnerOnlyPath(state);
   let version = "unknown";
   try { version = JSON.parse(readFileSync(PACKAGE_FILE, "utf8")).version ?? version; } catch {}
   let commit = process.env.ODINN_COMMIT ?? "";
   if (!commit) {
     try { commit = JSON.parse(await readFile(INSTALL_METADATA_FILE, "utf8")).commit ?? ""; } catch {}
+  }
+  const sandboxConfig = normalizeSandboxConfig(config);
+  const sandboxBackends = await Promise.all([
+    probeOciBackend("podman", undefined, { executablePaths: sandboxConfig.backend.enginePaths }),
+    probeOciBackend("docker", undefined, { executablePaths: sandboxConfig.backend.enginePaths })
+  ]);
+  let extensionLane: any = { status: sandboxConfig.process.enabled ? "refused" : "disabled", code: sandboxConfig.process.enabled ? "SANDBOX_BACKEND_UNAVAILABLE" : "SANDBOX_PROCESS_DISABLED" };
+  if (sandboxConfig.process.enabled) {
+    try {
+      const selected = await resolveConfiguredOciBackend(sandboxConfig);
+      extensionLane = { status: "eligible", backend: selected.backend, rootless: selected.rootless, controls: "engine-reported; stopped-container attestation required before start" };
+    } catch (error: any) {
+      extensionLane = { status: "refused", code: String(error?.code ?? "SANDBOX_BACKEND_UNAVAILABLE") };
+    }
   }
   return {
     ok: audit.valid,
@@ -1339,6 +1355,21 @@ async function doctor(args: any) {
     approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
     browserRecovery: { status: recovery.status ?? "clear", pending: ["executing", "unknown"].includes(recovery.status), id: recovery.id ?? undefined },
     jobs: { total: jobs.length, ...jobCounts },
+    sandbox: {
+      configured: summarizeSandboxRisk(sandboxConfig),
+      recovery: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null },
+      extensionLane,
+      activation: "network-denied immutable extensions are active; general processes, brokered networking, and writable host integration remain unavailable",
+      backends: sandboxBackends.map((backend) => ({
+        backend: backend.backend,
+        available: backend.available,
+        compatible: backend.compatible,
+        rootless: backend.rootless,
+        containerOs: backend.containerOs,
+        controls: backend.controlEvidence.status,
+        resourceControls: backend.resourceControls
+      }))
+    },
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: true, secretsExcludedFromDiagnostics: true }
   };
 }
@@ -2770,7 +2801,7 @@ async function extensionCommand(args: any) {
       const config = await readConfig(state);
       const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
       const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-      const executor = new ExtensionExecutor(registry, { workspaceRoot: invocationRoot() });
+      const executor = new ExtensionExecutor(registry, { workspaceRoot: invocationRoot(), config });
       try {
         await printJson(await executor.invoke(id, input, {
           capability: option(rest, "--capability", ""),
@@ -2979,8 +3010,14 @@ function runtimeFor(args: any) {
 }
 
 function readConfigSync(state: any) {
-  try { return JSON.parse(readFileSync(join(state, "config.json"), "utf8")); }
-  catch { return { experimental: normalizeExperimentalFlags() }; }
+  try {
+    const config = JSON.parse(readFileSync(join(state, "config.json"), "utf8"));
+    normalizeSandboxConfig(config);
+    return config;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return { experimental: normalizeExperimentalFlags() };
+    throw error;
+  }
 }
 
 async function proof(args: any) {
@@ -3203,11 +3240,12 @@ async function readConfig(state: any) {
   try {
     const raw = await readFile(path, "utf8");
     const config = JSON.parse(raw);
+    normalizeSandboxConfig(config);
     if (config && typeof config === "object") configBaselines.set(config, contentFingerprint(raw));
     return config;
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
-    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
+    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
     configBaselines.set(config, null);
     return config;
   }
@@ -3226,7 +3264,8 @@ async function ensureConfig(state: any) {
       plugins: { entries: {} },
       defaultModel: "",
       experimental: normalizeExperimentalFlags(),
-      selfImprovement: normalizeSelfImprovementConfig()
+      selfImprovement: normalizeSelfImprovementConfig(),
+      sandbox: DEFAULT_SANDBOX_CONFIG
     }, null, 2)}\n`, { flag: "wx", mode: 0o600 }).catch((error: any) => {
       if (error?.code !== "EEXIST") throw error;
     });
@@ -3236,7 +3275,9 @@ async function ensureConfig(state: any) {
 }
 
 async function saveConfig(state: any, config: any) {
+  const sandbox = normalizeSandboxConfig(config);
   const serialized = `${JSON.stringify({
+    ...config,
     version: config.version ?? 1,
     policy: config.policy ?? createDefaultPolicy(),
     auditLog: config.auditLog ?? "audit.jsonl",
@@ -3246,6 +3287,7 @@ async function saveConfig(state: any, config: any) {
     experimental: normalizeExperimentalFlags(config.experimental),
     selfImprovement: normalizeSelfImprovementConfig(config.selfImprovement),
     runtime: config.runtime ?? {},
+    sandbox,
     ...(config.proof ? { proof: config.proof } : {}),
     ...(config.defaultModel ? { defaultModel: config.defaultModel } : {})
   }, null, 2)}\n`;

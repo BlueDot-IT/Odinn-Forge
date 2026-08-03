@@ -102,6 +102,10 @@ async function createStateBackupUnlocked(
   await validatePhysicalTree(stateRoot, "state");
   const inspection = await inspectStateSchemas(stateRoot);
   if (!inspection.healthy) throw new Error("state backup refused because the active state is unhealthy");
+  const sandboxRecovery = await readJsonIfPresent(join(stateRoot, "sandbox-recovery.json"), { pending: [] });
+  if (Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length > 0) {
+    throw new Error("state backup refused while sandbox cleanup recovery is pending");
+  }
   if (await exists(destination)) throw new Error("state backup destination already exists");
 
   const parent = dirname(destination);
@@ -192,6 +196,10 @@ async function restoreStateBackupUnlocked(
 ): Promise<RestoreStateBackupReport> {
   const source = await inspectStateBackup(inputDir);
   const stateRoot = safeRoot(stateDir, "state");
+  const sandboxRecovery = await readJsonIfPresent(join(stateRoot, "sandbox-recovery.json"), { pending: [] });
+  if (Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length > 0) {
+    throw new Error("state restore refused while sandbox cleanup recovery is pending");
+  }
   assertSeparateTrees(stateRoot, source.root);
   const parent = dirname(stateRoot);
   const token = `${Date.now()}-${randomBytes(6).toString("hex")}`;

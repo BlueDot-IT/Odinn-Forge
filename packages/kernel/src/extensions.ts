@@ -1,24 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
 import { redact } from "./run-ledger.ts";
+import { materializeSandboxBundle } from "./sandbox-bundle.ts";
+import { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, compileSandboxProfile, detectOciBackend, validateDigestPinnedOciImage, type OciCapabilityProbe, type SandboxExecutionResult } from "./sandbox-backend.ts";
+import { normalizeSandboxConfig, type SandboxConfig, type SandboxConfigInput } from "./sandbox-config.ts";
 import type { JsonObject } from "@odinn/protocol";
 
 const EXTENSION_SCHEMA_VERSION = 1;
 const EXTENSION_TYPES = new Set(["tool", "skill", "mcp"]);
 const SANDBOXES = new Set(["unconfined-process", "container", "none"]);
 const MAX_EXTENSION_OUTPUT_BYTES = 1_000_000;
-const OCI_PATH_COMPONENT = String.raw`[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*`;
-const OCI_DOMAIN_LABEL = String.raw`[a-z0-9](?:[a-z0-9-]*[a-z0-9])?`;
-const OCI_REGISTRY = String.raw`(?:${OCI_DOMAIN_LABEL}(?:\.${OCI_DOMAIN_LABEL})*|localhost)(?::[0-9]{1,5})?`;
-const OCI_TAG = String.raw`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`;
-const OCI_DIGEST = String.raw`[A-Za-z][A-Za-z0-9]*(?:[+._-][A-Za-z0-9]+)*:[A-Fa-f0-9]{32,}`;
-const OCI_REFERENCE = new RegExp(
-  String.raw`^(?:(?:${OCI_REGISTRY})/)?${OCI_PATH_COMPONENT}(?:/${OCI_PATH_COMPONENT})*(?::${OCI_TAG})?(?:@${OCI_DIGEST})?$`
-);
 
 type ExtensionType = "tool" | "skill" | "mcp";
 type ExtensionSandbox = "unconfined-process" | "container" | "none";
@@ -43,9 +36,10 @@ interface ExtensionRuntime {
   runId?: string; featureFlags?: Record<string, boolean>; workspaceRoot?: string;
   actor?: string; policy?: any; capabilityToken?: string;
 }
-interface InvokeOptions { capability?: string; timeoutMs?: number; runtime?: ExtensionRuntime; capabilityToken?: string }
+interface ExtensionExecutorOptions { workspaceRoot?: string; defaultTimeoutMs?: number; config?: SandboxConfigInput }
+interface InvokeOptions { capability?: string; timeoutMs?: number; runtime?: ExtensionRuntime; capabilityToken?: string; signal?: AbortSignal }
 interface ExtensionRequest extends JsonObject {}
-interface ProcessOptions { cwd: string; timeoutMs: number; protocol: "mcp-jsonl" | "odinn-jsonl" }
+interface ProcessOptions { timeoutMs: number; protocol: "mcp-jsonl" | "odinn-jsonl" }
 interface ProcessResponse extends JsonObject { result?: any; error?: { message?: string } }
 
 export class ExtensionRegistry {
@@ -151,21 +145,29 @@ export class ExtensionExecutor {
   readonly registry: ExtensionRegistry;
   readonly workspaceRoot: string;
   readonly defaultTimeoutMs: number;
+  readonly sandboxConfig: SandboxConfig;
 
-  constructor(registry: ExtensionRegistry, { workspaceRoot = process.cwd(), defaultTimeoutMs = 30_000 }: { workspaceRoot?: string; defaultTimeoutMs?: number } = {}) {
+  constructor(registry: ExtensionRegistry, { workspaceRoot = process.cwd(), defaultTimeoutMs = 30_000, config = {} }: ExtensionExecutorOptions = {}) {
     if (!registry || typeof registry.get !== "function") throw new Error("ExtensionExecutor requires an ExtensionRegistry");
     this.registry = registry;
     this.workspaceRoot = resolve(workspaceRoot);
     this.defaultTimeoutMs = defaultTimeoutMs;
+    this.sandboxConfig = normalizeSandboxConfig(config);
   }
 
-  async invoke(id: string, input: JsonObject = {}, { capability, timeoutMs = this.defaultTimeoutMs, runtime, capabilityToken }: InvokeOptions = {}) {
+  async invoke(id: string, input: JsonObject = {}, { capability, timeoutMs = this.defaultTimeoutMs, runtime, capabilityToken, signal }: InvokeOptions = {}) {
     const extension = await this.registry.get(id);
     if (!extension) throw new Error(`extension not found: ${id}`);
     if (!extension.enabled || !extension.trusted) throw new Error(`extension is not enabled and trusted: ${id}`);
     if (!["unconfined-process", "container"].includes(extension.sandbox)) throw new Error(`extension sandbox is not executable by this adapter: ${extension.sandbox}`);
     const requested = String(capability || extension.capabilities[0] || "").trim();
     if (!requested || !(extension.grants ?? []).includes(requested)) throw new Error(`extension capability is not granted: ${requested || "unspecified"}`);
+    if (extension.sandbox === "container" && !this.sandboxConfig.process.enabled) throw new Error("container extension execution is disabled by config.sandbox.process.enabled");
+    if (extension.sandbox === "unconfined-process") {
+      throw new Error(
+        "unconfined extension execution is unavailable until a host-approved backend can bind the exact command, root, limits, and one-time operator approval into audited execution evidence"
+      );
+    }
     if (!extension.entrypoint || extension.entrypoint.includes("\0")) throw new Error(`extension entrypoint is missing: ${id}`);
     const realRoot = await realpath(this.workspaceRoot);
     const lexicalEntrypoint = resolve(realRoot, extension.entrypoint);
@@ -174,8 +176,6 @@ export class ExtensionExecutor {
     if (!relativeEntrypoint || relativeEntrypoint.startsWith("..") || relativeEntrypoint.includes(`..${sep}`) || !entrypoint.startsWith(`${realRoot}${sep}`)) {
       throw new Error("extension entrypoint must remain inside the configured workspace root");
     }
-    const contentDigest = createHash("sha256").update(await readFile(entrypoint)).digest("hex");
-    if (extension.sandbox === "unconfined-process" && (!/^[a-f0-9]{64}$/.test(extension.contentDigest) || extension.contentDigest !== contentDigest)) throw new Error(`extension entrypoint integrity check failed: ${id}`);
     const bundleRoot = await realpath(resolve(realRoot, extension.bundleRoot || dirname(extension.entrypoint)));
     if (bundleRoot !== realRoot && !bundleRoot.startsWith(`${realRoot}${sep}`)) throw new Error("extension bundle must remain inside the configured workspace root");
     if (extension.sandbox === "container") {
@@ -187,59 +187,38 @@ export class ExtensionExecutor {
       ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
       : { type: "odinn.call", id: `call_${randomUUID()}`, input, capability: requested };
     if (!runtime) throw new Error("extension execution requires the audited runtime boundary");
-    const snapshot = await createExtensionExecutionSnapshot(extension, entrypoint, bundleRoot);
-    try {
-      return await invokeThroughRuntime({
-        id,
-        input,
-        requested,
-        extension,
-        entrypoint: snapshot.entrypoint,
-        bundleRoot: snapshot.bundleRoot,
-        request,
-        protocol,
-        timeoutMs,
-        runtime: { ...runtime, capabilityToken }
-      });
-    } finally {
-      await rm(snapshot.directory, { recursive: true, force: true });
-    }
+    const snapshot = await createExtensionExecutionSnapshot(extension, entrypoint, bundleRoot, runtime.runLedger.stateDir, signal);
+    return invokeThroughRuntime({
+      id,
+      input,
+      requested,
+      extension,
+      entrypoint: snapshot.entrypoint,
+      bundleRoot: snapshot.bundleRoot,
+      request,
+      protocol,
+      timeoutMs,
+      runtime: { ...runtime, capabilityToken },
+      sandboxConfig: this.sandboxConfig,
+      sealedBundleDigest: snapshot.sealedBundleDigest,
+      signal
+    });
   }
 }
 
-async function createExtensionExecutionSnapshot(extension: ExtensionManifest, entrypoint: string, bundleRoot: string) {
-  const directory = await mkdtemp(join(tmpdir(), "odinn-extension-exec-"));
-  await chmod(directory, 0o700);
-  const snapshotPath = join(directory, "bundle");
-  try {
-    if (extension.sandbox === "unconfined-process") await digestExtensionBundle(bundleRoot);
-    await cp(bundleRoot, snapshotPath, { recursive: true, dereference: false, errorOnExist: true, force: false });
-    const snapshotRoot = await realpath(snapshotPath);
-    const snapshotBundleDigest = await digestExtensionBundle(snapshotRoot);
-    const relativeEntrypoint = relative(bundleRoot, entrypoint);
-    if (!relativeEntrypoint || relativeEntrypoint.startsWith("..") || relativeEntrypoint.includes(`..${sep}`)) {
-      throw new Error("extension entrypoint must remain inside its immutable execution snapshot");
-    }
-    const snapshotEntrypoint = await realpath(resolve(snapshotRoot, relativeEntrypoint));
-    if (snapshotEntrypoint === snapshotRoot || !snapshotEntrypoint.startsWith(`${snapshotRoot}${sep}`)) {
-      throw new Error("extension entrypoint escapes its immutable execution snapshot");
-    }
-    const contentDigest = createHash("sha256").update(await readFile(snapshotEntrypoint)).digest("hex");
-    if (extension.sandbox === "unconfined-process" && extension.contentDigest !== contentDigest) {
-      throw new Error(`extension entrypoint changed while creating its execution snapshot: ${extension.id}`);
-    }
-    if (extension.sandbox === "container" && extension.bundleDigest !== snapshotBundleDigest) {
-      throw new Error(`extension bundle changed while creating its execution snapshot: ${extension.id}`);
-    }
-    return { directory, bundleRoot: snapshotRoot, entrypoint: snapshotEntrypoint };
-  } catch (error) {
-    await rm(directory, { recursive: true, force: true });
-    throw error;
-  }
+async function createExtensionExecutionSnapshot(extension: ExtensionManifest, entrypoint: string, bundleRoot: string, stateDir: string, signal?: AbortSignal) {
+  const sealed = await materializeSandboxBundle(bundleRoot, join(resolve(stateDir), "sandbox-bundles"), { signal });
+  const verifiedDigest = await digestExtensionBundle(sealed.path);
+  if (extension.bundleDigest !== verifiedDigest) throw new Error(`extension bundle changed while sealing its execution bundle: ${extension.id}`);
+  const relativeEntrypoint = relative(bundleRoot, entrypoint).replaceAll("\\", "/");
+  if (!relativeEntrypoint || relativeEntrypoint.startsWith("..")) throw new Error("extension entrypoint must remain inside its sealed execution bundle");
+  const sealedEntrypoint = await realpath(resolve(sealed.path, relativeEntrypoint));
+  if (!sealedEntrypoint.startsWith(`${sealed.path}${sep}`)) throw new Error("extension entrypoint escapes its sealed execution bundle");
+  return { bundleRoot: sealed.path, entrypoint: sealedEntrypoint, sealedBundleDigest: sealed.digest };
 }
 
-interface RuntimeInvocation { id: string; input: JsonObject; requested: string; extension: ExtensionManifest; entrypoint: string; bundleRoot: string; request: ExtensionRequest; protocol: "mcp-jsonl" | "odinn-jsonl"; timeoutMs: number; runtime: ExtensionRuntime }
-async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime }: RuntimeInvocation) {
+interface RuntimeInvocation { id: string; input: JsonObject; requested: string; extension: ExtensionManifest; entrypoint: string; bundleRoot: string; request: ExtensionRequest; protocol: "mcp-jsonl" | "odinn-jsonl"; timeoutMs: number; runtime: ExtensionRuntime; sandboxConfig: SandboxConfig; sealedBundleDigest?: string; signal?: AbortSignal }
+async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime, sandboxConfig, sealedBundleDigest, signal }: RuntimeInvocation) {
   const ledger = runtime.runLedger;
   const auditStore = runtime.auditStore;
   if (!ledger || !auditStore) throw new Error("extension runtime enforcement requires runLedger and auditStore");
@@ -261,10 +240,12 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
       claims = new CapabilityBroker(brokerOptions).consume(runtime.capabilityToken ?? "", consumeOptions);
     }
     await append({ type: "task.started", decision: "allow", data: { input: safeInput, capabilityId: claims?.id } });
-    const output = extension.sandbox === "container"
-      ? await runContainerExtension(extension, entrypoint, bundleRoot, request, { timeoutMs, protocol })
-      : await runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });
-    await append({ type: "task.completed", decision: "allow", data: { output: redact(output) } });
+    let sandboxEvidence: JsonObject | undefined;
+    const output = await runContainerExtension(extension, entrypoint, bundleRoot, request, { timeoutMs, protocol, sandboxConfig, signal, stateDir: ledger.stateDir }, async (phase, evidence) => {
+      sandboxEvidence = { ...sandboxEvidence, ...evidence, sealedBundleDigest };
+      await append({ type: `sandbox.${phase}`, decision: "allow", data: { ...evidence, sealedBundleDigest } });
+    });
+    await append({ type: "task.completed", decision: "allow", data: { output: redact(output), ...(sandboxEvidence ? { sandbox: sandboxEvidence } : {}) } });
     ledger.finishTool({ runId, stepId: ledgerStep.stepId, output, status: "succeeded" });
     return output;
   } catch (error) {
@@ -275,115 +256,116 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
   }
 }
 
-function terminateExtensionTree(child: any) {
-  if (!child?.pid) return;
-  if (process.platform === "win32") {
-    const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-    killer.unref();
-    return;
-  }
-  try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
-}
-
-function runExtensionProcess(command: string, args: string[], request: ExtensionRequest, { cwd, timeoutMs, protocol }: ProcessOptions): Promise<unknown> {
-  return new Promise<unknown>((resolveResult, rejectResult) => {
-    const child = spawn(command, args, {
-      cwd,
-      detached: process.platform !== "win32",
-      env: {
-        PATH: process.env.PATH ?? "",
-        ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {})
-      },
-      stdio: ["pipe", "pipe", "ignore"],
-      shell: false,
-      windowsHide: true
-    });
-    let settled = false;
-    let buffer = "";
-    let outputBytes = 0;
-    const finish = (error?: Error, result?: ProcessResponse) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.stdout.removeAllListeners();
-      child.removeAllListeners();
-      if (!child.killed) terminateExtensionTree(child);
-      if (error) rejectResult(error);
-      else resolveResult(protocol === "mcp-jsonl" && result?.result?.content ? result.result : result?.result ?? result);
-    };
-    const timer = setTimeout(() => finish(new Error("extension execution timed out")), timeoutMs);
-    child.once("error", (error) => finish(error));
-    child.once("exit", (code) => {
-      if (!settled) finish(new Error(`extension process exited before returning a result: ${code ?? "unknown"}`));
-    });
-    child.stdout.on("data", (chunk) => {
-      outputBytes += chunk.byteLength;
-      if (outputBytes > MAX_EXTENSION_OUTPUT_BYTES) {
-        finish(new Error(`extension output exceeded ${MAX_EXTENSION_OUTPUT_BYTES} bytes`));
-        return;
-      }
-      buffer += chunk.toString("utf8");
-      let newline;
-      while ((newline = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (!line) continue;
-        try {
-          const response = JSON.parse(line) as ProcessResponse;
-          if (response.error) finish(new Error(response.error.message || "extension returned an error"));
-          else finish(undefined, response);
-        } catch {
-          finish(new Error("extension returned invalid JSON"));
-        }
-      }
-    });
-    child.stdin.end(`${JSON.stringify(request)}\n`);
-  });
-}
-
-async function runContainerExtension(extension: ExtensionManifest, entrypoint: string, bundleRoot: string, request: ExtensionRequest, { timeoutMs, protocol }: Pick<ProcessOptions, "timeoutMs" | "protocol">) {
-  const runtime = process.env.ODINN_EXTENSION_CONTAINER_RUNTIME || "docker";
+async function runContainerExtension(
+  extension: ExtensionManifest,
+  entrypoint: string,
+  bundleRoot: string,
+  request: ExtensionRequest,
+  { timeoutMs, protocol, sandboxConfig, signal, stateDir }: Pick<ProcessOptions, "timeoutMs" | "protocol"> & { sandboxConfig: SandboxConfig; signal?: AbortSignal; stateDir: string },
+  auditSandbox: (phase: "prepared" | "dispatch-authorized" | "settled", evidence: JsonObject) => Promise<void>
+) {
   const relativeEntrypoint = relative(bundleRoot, entrypoint).replaceAll("\\", "/");
   if (!relativeEntrypoint || relativeEntrypoint.startsWith("..")) throw new Error("extension entrypoint must remain inside its immutable bundle");
-  const args = buildContainerExtensionArgs(extension.containerImage, bundleRoot, relativeEntrypoint);
+  if (sandboxConfig.backend.mode === "confined-native") throw new Error("container extensions require an OCI sandbox backend; host execution is not a fallback");
+  const capability = await resolveConfiguredOciBackend(sandboxConfig);
+  const limits = sandboxConfig.process.limits;
+  const profile = compileSandboxProfile({
+    backend: capability.backend,
+    image: extension.containerImage,
+    // Extension bundles request no network authority. A broader operator
+    // ceiling never enlarges the effective per-execution profile.
+    network: "denied",
+    argv: ["node", `/extension/${relativeEntrypoint}`],
+    cwd: "/extension",
+    // Secret and environment brokers are separate enforcement surfaces. Until
+    // they are active, extensions receive no operator environment values.
+    environment: {},
+    mounts: [{ source: bundleRoot, target: "/extension", access: "read-only" }],
+    limits: {
+      timeoutMs: Math.min(timeoutMs, limits.timeoutMs),
+      maxOutputBytes: Math.min(MAX_EXTENSION_OUTPUT_BYTES, limits.outputBytes),
+      memoryBytes: limits.memoryBytes,
+      cpuCount: limits.cpu,
+      processCount: limits.pids,
+      tmpfsBytes: limits.tmpfsBytes
+    }
+  });
+  await auditSandbox("prepared", {
+    schemaVersion: 1,
+    backend: capability.backend,
+    rootless: capability.rootless,
+    containerOs: capability.containerOs,
+    controls: capability.controlEvidence.status,
+    image: profile.image,
+    profileDigest: profile.digest,
+    network: profile.network,
+    mounts: profile.mounts.map((mount) => ({ target: mount.target, access: mount.access })),
+    limits: profile.limits
+  });
+  let execution: SandboxExecutionResult;
   try {
-    return await runExtensionProcess(runtime, args, request, { cwd: bundleRoot, timeoutMs, protocol });
+    execution = await new OciSandboxBackend(capability, undefined, { recoveryStateDir: stateDir }).execute(profile, {
+      signal,
+      stdin: `${JSON.stringify(request)}\n`,
+      onDispatchAuthorized: (evidence) => auditSandbox("dispatch-authorized", evidence)
+    });
   } catch (error) {
-    const failure = error instanceof Error ? error : new Error(String(error));
-    if ((failure as NodeError).code === "ENOENT") throw new Error(`extension container runtime not found: ${runtime}; install Docker/Podman or set ODINN_EXTENSION_CONTAINER_RUNTIME`);
+    if (error instanceof SandboxExecutionError) await auditSandbox("settled", sandboxSettlementEvidence(error.result, error.code));
     throw error;
   }
+  await auditSandbox("settled", sandboxSettlementEvidence(execution));
+  if (execution.cleanupUncertain) throw new Error("sandbox container cleanup could not be proven complete");
+  if (execution.exitCode !== 0) throw new Error(`extension container exited before returning a result: ${execution.exitCode}`);
+  const line = execution.stdout.split(/\r?\n/u).find((value) => value.trim());
+  if (!line) throw new Error("extension container exited before returning a result");
+  let response: ProcessResponse;
+  try { response = JSON.parse(line); } catch { throw new Error("extension returned invalid JSON"); }
+  if (response.error) throw new Error(response.error.message || "extension returned an error");
+  return protocol === "mcp-jsonl" && response.result?.content ? response.result : response.result ?? response;
+}
+
+export async function resolveConfiguredOciBackend(
+  config: SandboxConfig,
+  detector: typeof detectOciBackend = detectOciBackend
+): Promise<OciCapabilityProbe> {
+  const modes = config.backend.mode === "auto" ? config.backend.preference : [config.backend.mode];
+  let lastRefusal: Error | undefined;
+  for (const mode of modes) {
+    if (mode === "confined-native") continue;
+    try {
+      return await detector("auto", undefined, {
+        rootless: mode === "rootless-oci" ? "required" : "any",
+        executablePaths: config.backend.enginePaths
+      });
+    } catch (error) {
+      if (!(error instanceof SandboxBackendRefusalError)) throw error;
+      lastRefusal = error;
+    }
+  }
+  throw lastRefusal ?? new SandboxBackendRefusalError("configured sandbox backend preference has no process-isolating OCI backend", "SANDBOX_BACKEND_UNAVAILABLE");
+}
+
+function sandboxSettlementEvidence(result: SandboxExecutionResult, code = "SANDBOX_SETTLED"): JsonObject {
+  return {
+    schemaVersion: 1,
+    code,
+    backend: result.backend,
+    containerName: result.containerName,
+    profileDigest: result.profileDigest,
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+    cancelled: result.cancelled,
+    outputTruncated: result.outputTruncated,
+    cleanupUncertain: result.cleanupUncertain,
+    controlsAttested: result.controlsAttested,
+    cleanupFailures: result.cleanupDiagnostics.length,
+    durationMs: result.durationMs
+  };
 }
 
 export function validateOciImageReference(input: unknown) {
-  const image = String(input ?? "");
-  if (
-    !image
-    || image !== image.trim()
-    || image.length > 512
-    || /[\s\u0000-\u001f\u007f]/u.test(image)
-    || !OCI_REFERENCE.test(image)
-  ) {
-    throw new Error("extension containerImage must be a strict OCI image reference");
-  }
-  const name = image.split("@", 1)[0].replace(/:[^/]*$/u, "");
-  if (name.length > 255) throw new Error("extension containerImage must be a strict OCI image reference");
-  const first = name.split("/", 1)[0];
-  const port = first.includes(":") ? Number(first.slice(first.lastIndexOf(":") + 1)) : undefined;
-  if (port !== undefined && (port < 1 || port > 65_535)) {
-    throw new Error("extension containerImage must be a strict OCI image reference");
-  }
-  return image;
-}
-
-export function buildContainerExtensionArgs(containerImage: unknown, bundleRoot: string, relativeEntrypoint: string) {
-  const image = validateOciImageReference(containerImage);
-  return [
-    "run", "--rm", "-i", "--network", "none", "--read-only", "--cap-drop", "ALL",
-    "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "256m", "--cpus", "0.5",
-    "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--mount", `type=bind,src=${bundleRoot},dst=/extension,readonly`,
-    "--workdir", "/extension", "--", image, "node", `/extension/${relativeEntrypoint}`
-  ];
+  try { return validateDigestPinnedOciImage(input); }
+  catch { throw new Error("extension containerImage must be a digest-pinned OCI image reference"); }
 }
 
 export async function digestExtensionBundle(root: string) {
@@ -431,7 +413,7 @@ function normalizeManifest(input: unknown, { source, provenance }: Required<Inst
     contentDigest: String(value.contentDigest ?? "").trim().toLowerCase(),
     bundleRoot: String(value.bundleRoot ?? "").trim(),
     bundleDigest: String(value.bundleDigest ?? "").trim().toLowerCase(),
-    containerImage: validateOciImageReference(value.containerImage ?? "node:24-alpine"),
+    containerImage: sandbox === "container" ? validateOciImageReference(value.containerImage) : String(value.containerImage ?? ""),
     integrity: value.bundleDigest ? "bundle-verified" : value.contentDigest ? "content-verified" : "metadata-only",
     permissions: value.permissions && typeof value.permissions === "object" && !Array.isArray(value.permissions) ? value.permissions as JsonObject : {}
   };
