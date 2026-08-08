@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, reconcileProcessRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -519,6 +519,9 @@ function parseJsonOption(args: any, name: any, fallback: any = undefined, requir
 async function runGovernedTool(args: any, tool: any, input: any, runIdOverride?: string) {
   const state = stateDir(args);
   const config = await readConfig(state);
+  if (await access(join(state, "process-recovery.json")).then(() => true).catch(() => false)) {
+    await reconcileProcessRecovery(state).catch(() => undefined);
+  }
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   try {
@@ -1355,6 +1358,9 @@ async function doctor(args: any) {
   };
   const recovery = await readJsonIfPresent(join(state, "browser-recovery.json"), { status: "clear" });
   const sandboxRecovery = await readJsonIfPresent(join(state, "sandbox-recovery.json"), { pending: [] });
+  let processRecovery: any = { pending: [] };
+  try { processRecovery = await readJsonIfPresent(join(state, "process-recovery.json"), { pending: [] }); }
+  catch { processRecovery = { pending: null, invalid: true }; }
   const ownerOnly = await isOwnerOnlyPath(state);
   let version = "unknown";
   try { version = JSON.parse(readFileSync(PACKAGE_FILE, "utf8")).version ?? version; } catch {}
@@ -1417,6 +1423,11 @@ async function doctor(args: any) {
         controls: backend.controlEvidence.status,
         resourceControls: backend.resourceControls
       }))
+    },
+    processRecovery: {
+      pending: Array.isArray(processRecovery.pending) ? processRecovery.pending.length : null,
+      needsReview: Array.isArray(processRecovery.pending) ? processRecovery.pending.filter((entry: any) => entry?.phase === "needs-review").length : null,
+      quarantined: processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0)
     },
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: true, secretsExcludedFromDiagnostics: true }
   };

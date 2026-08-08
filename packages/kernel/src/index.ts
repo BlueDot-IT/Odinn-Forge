@@ -31,6 +31,8 @@ export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, 
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
+export { ProcessSupervisor, ProcessRecoveryError, createProcessExecutionDescriptor, digestProcessValue, reconcileProcessRecovery } from "./process-supervisor.ts";
+export type { ProcessExecutionDescriptor, ProcessExecutionSession, ProcessRecoveryAdapter, ProcessRecoveryPhase, ProcessRecoveryRecord, ProcessPresence, ProcessSupervisorOptions } from "./process-supervisor.ts";
 export { ExtensionRegistry, ExtensionExecutor, resolveConfiguredOciBackend } from "./extensions.ts";
 export { DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, normalizeSandboxConfig, summarizeSandboxRisk, validateSandboxConfig } from "./sandbox-config.ts";
 export type { SandboxConfig, SandboxConfigInput, SandboxRiskSummary } from "./sandbox-config.ts";

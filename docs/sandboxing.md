@@ -204,6 +204,13 @@ external mounts, and general process execution are represented in the strict
 JSON contract but are not silently activated by this cutover. Writable host
 access remains unavailable to normal agent runs until automatic Norn
 checkpoints are active; durable arbitrary processes also require the process
-supervisor. Diagnostics distinguish configured authority from active backend
+supervisor. Stage 6 now provides the first process-supervisor slice: an
+owner-only, atomically replaced `process-recovery.json` reservation journal,
+serialized under the state mutation lock, with bounded digest metadata and
+restart quarantine. A reservation is cleared only after process absence is
+proved; otherwise it remains `needs-review` and blocks further supervised
+dispatch. Diagnostics distinguish configured authority from active backend
 enforcement. This prevents an early shell from bypassing recovery and
-uncertain-outcome guarantees.
+uncertain-outcome guarantees. The model-visible `process.exec` registry surface
+remains unavailable until an enforced process backend, approval semantics, and
+the complete failure-injection and cross-platform gate are in place.

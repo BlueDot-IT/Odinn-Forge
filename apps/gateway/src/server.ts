@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -691,8 +691,12 @@ export async function createGatewayServer({
   await ensureSecureStateDirectory(state);
   const config = await readConfig(state, { hosted });
   const startupSandboxConfig = normalizeSandboxConfig(config);
+  let processRecoveryStartupError = false;
   if (await access(join(state, "sandbox-recovery.json")).then(() => true).catch(() => false)) {
     await reconcileSandboxRecovery(state, startupSandboxConfig.backend.enginePaths).catch(() => undefined);
+  }
+  if (await access(join(state, "process-recovery.json")).then(() => true).catch(() => false)) {
+    await reconcileProcessRecovery(state).catch(() => { processRecoveryStartupError = true; });
   }
   await ensureMainAgent(state);
   const featureFlags = normalizeExperimentalFlags(config.experimental);
@@ -839,7 +843,7 @@ export async function createGatewayServer({
         });
       }
       if (request.method === "GET" && url.pathname === "/diagnostics") {
-        return json(response, 200, await diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor }));
+        return json(response, 200, await diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError }));
       }
       if (request.method === "GET" && url.pathname === "/channels") {
         return json(response, 200, { ok: true, channels: channelSupervisor.status() });
@@ -2569,7 +2573,7 @@ function channelCredentialEnvironments(config: any): string[] {
   ].filter(Boolean);
 }
 
-async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor }: any) {
+async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false }: any) {
   let audit = { valid: true, events: 0, unsigned: 0, failureCount: 0 };
   try {
     const auditPath = join(state, config.auditLog ?? "audit.jsonl");
@@ -2584,6 +2588,8 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
   try { recovery = JSON.parse(await readFile(join(state, "browser-recovery.json"), "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") recovery = { status: "unavailable" }; }
   let sandboxRecovery: any = { pending: [] };
   try { sandboxRecovery = JSON.parse(await readFile(join(state, "sandbox-recovery.json"), "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") sandboxRecovery = { pending: null }; }
+  let processRecovery: any = { pending: [] };
+  try { processRecovery = JSON.parse(await readFile(join(state, "process-recovery.json"), "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") processRecovery = { pending: null, invalid: true }; }
   const ownerOnly = await isOwnerOnlyPath(state);
   const normalized = normalizeModelConfig(config);
   let version = "unknown";
@@ -2654,6 +2660,11 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
         controls: backend.controlEvidence.status,
         resourceControls: backend.resourceControls
       }))
+    },
+    processRecovery: {
+      pending: Array.isArray(processRecovery.pending) ? processRecovery.pending.length : null,
+      needsReview: Array.isArray(processRecovery.pending) ? processRecovery.pending.filter((entry: any) => entry?.phase === "needs-review").length : null,
+      quarantined: processRecoveryStartupError === true || processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0)
     },
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: true, secretsExcludedFromDiagnostics: true }
   };

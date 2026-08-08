@@ -156,6 +156,12 @@ The result reports the normalized `command`, `args`, workspace-relative `cwd`,
 counts, `timedOut`, `outputTruncated`, and `durationMs`. Process execution is
 classified as irreversible and non-retry-safe.
 
+The durable process-supervisor implementation is being introduced before this
+surface is activated. Until an enforced process backend and its approval,
+resource, recovery, and cross-platform gates are complete, the trusted tool
+registry continues to refuse model-visible `process.exec` requests even when
+the legacy unconfined configuration acknowledgement is present.
+
 ### System and configuration routes
 
 | Method and path | Input | Output |
