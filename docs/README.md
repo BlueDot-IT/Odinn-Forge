@@ -57,6 +57,12 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   trigger and schedule primitives.
 - [Cached MCP host foundation](cached-mcp-host.md) — MCP process reuse and
   lifecycle foundations.
+- [Execution admission](architecture/execution-admission.md) — immutable execution
+  envelopes, admission, attempts, cancellation, and recovery boundaries.
+- [Capability registry and Gatewatch preview](capability-gatewatch.md) —
+  operator-owned capability identities and fail-closed preview decisions.
+- [Sandboxing](sandboxing.md) — platform-specific execution isolation and
+  explicit host-execution limits.
 - [Bounded workspace inspection](workspace-inspection.md) — read-only listing,
   metadata, literal search, bounded reads and diffs, sensitive-file policy,
   cursors, and platform limits.
@@ -66,6 +72,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
 These pages describe individual capabilities. Consult the surface matrix and
 v1 compatibility policy before treating any interface as stable.
 
+- [Features index](features/README.md) — status and technical identifiers for
+  the advanced services and optional plugin modules
 - [Gatewatch — policy safety](features/sentinel.md)
 - [Runemark — run verification](features/proof.md)
 - [Norn Restore — restore points](features/rewind.md)
