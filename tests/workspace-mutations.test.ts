@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { link, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -321,4 +321,254 @@ test("fault-injection in limits keeps publication from proceeding and returns co
   assert.equal(limited.status, "conflict");
   assert.equal(limited.conflicts[0]?.code, "BUDGET_EXCEEDED");
   assert.equal(existsSync(join(root, "seed.txt")), false);
+});
+
+test("checkpoint.restore preview captures add/modify/remove and directory actions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-restore-preview-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ workspaceRoot: root, stateDir });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+  const tools = createWorkspaceMutationTools({
+    workspaceRoot: root,
+    runLedger,
+    coordinator,
+    stateDir,
+    runId: "restore-preview-run"
+  });
+
+  try {
+    await writeFile(join(root, "mutable.txt"), "one");
+    await writeFile(join(root, "to-remove.txt"), "to remove");
+    await mkdir(join(root, "restore-dir"));
+    await writeFile(join(root, "restore-dir", "leaf.txt"), "nested");
+
+    const addFile = await tools["workspace.write"].execute({ path: "added.txt", content: "added", apply: true });
+    const addPreview = await tools["checkpoint.restore"].execute({ checkpointId: addFile.checkpointId as string });
+    assert.equal(addPreview.status, "ready");
+    assert.equal(addPreview.preview, true);
+    assert.ok(addPreview.entries.some((entry) => entry.path === "added.txt" && entry.action === "remove"));
+    const addResult = await tools["checkpoint.restore"].execute({ checkpointId: addFile.checkpointId as string, apply: true });
+    assert.equal(addResult.preview, false);
+    assert.equal(addResult.applied, true);
+    assert.equal(addResult.externalEffects, false);
+    assert.equal(existsSync(join(root, "added.txt")), false);
+
+    const modifySeed = await tools["workspace.write"].execute({ path: "mutable.txt", content: "two", apply: true });
+    const modifyPreview = await tools["checkpoint.restore"].execute({ checkpointId: modifySeed.checkpointId as string });
+    assert.equal(modifyPreview.status, "ready");
+    assert.equal(modifyPreview.entries[0]?.action, "modify");
+    const restoreResult = await tools["checkpoint.restore"].execute({ checkpointId: modifySeed.checkpointId as string, apply: true });
+    assert.equal(restoreResult.preview, false);
+    assert.equal(restoreResult.applied, true);
+    assert.equal(await readFile(join(root, "mutable.txt"), "utf8"), "one");
+
+    const removeFile = await tools["workspace.remove"].execute({ path: "to-remove.txt", apply: true });
+    const removePreview = await tools["checkpoint.restore"].execute({ checkpointId: removeFile.checkpointId as string });
+    assert.equal(removePreview.status, "ready");
+    assert.equal(removePreview.entries[0]?.action, "restore");
+    const removeResult = await tools["checkpoint.restore"].execute({ checkpointId: removeFile.checkpointId as string, apply: true });
+    assert.equal(removeResult.applied, true);
+    assert.equal(await readFile(join(root, "to-remove.txt"), "utf8"), "to remove");
+
+    const removeDirectory = await tools["workspace.remove"].execute({ path: "restore-dir", recursive: true, apply: true });
+    const restoreDirectoryPreview = await tools["checkpoint.restore"].execute({ checkpointId: removeDirectory.checkpointId as string });
+    assert.equal(restoreDirectoryPreview.status, "ready");
+    assert.equal(restoreDirectoryPreview.entries.some((entry) => entry.action === "restore-directory"), true);
+    const restoreDirectoryResult = await tools["checkpoint.restore"].execute({
+      checkpointId: removeDirectory.checkpointId as string,
+      apply: true
+    });
+    if (restoreDirectoryResult.applied === true) {
+      assert.equal((await readFile(join(root, "restore-dir", "leaf.txt"), "utf8")), "nested");
+    } else {
+      assert.equal(restoreDirectoryResult.status, "conflict");
+    }
+
+    const addDirectory = await tools["workspace.mkdir"].execute({ path: "created-only-dir", apply: true });
+    const removeDirectoryRestore = await tools["checkpoint.restore"].execute({ checkpointId: addDirectory.checkpointId as string });
+    assert.equal(removeDirectoryRestore.entries[0]?.action, "remove-directory");
+    const addDirectoryResult = await tools["checkpoint.restore"].execute({
+      checkpointId: addDirectory.checkpointId as string,
+      apply: true
+    });
+    assert.equal(addDirectoryResult.applied, true);
+    assert.equal(existsSync(join(root, "created-only-dir")), false);
+  } finally {
+    runLedger.close();
+  }
+});
+
+test("checkpoint.restore rejects stale post-restore targets through conflict checks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-restore-stale-"));
+  const tools = createWorkspaceMutationTools({ workspaceRoot: root });
+  await writeFile(join(root, "seed.txt"), "before");
+
+  const mutation = await tools["workspace.remove"].execute({ path: "seed.txt", apply: true });
+  const firstRestore = await tools["checkpoint.restore"].execute({
+    checkpointId: mutation.checkpointId as string,
+    apply: true
+  });
+  assert.equal(firstRestore.applied, true);
+  assert.equal(await readFile(join(root, "seed.txt"), "utf8"), "before");
+
+  await writeFile(join(root, "seed.txt"), "changed");
+  const staleRestore = await tools["checkpoint.restore"].execute({
+    checkpointId: mutation.checkpointId as string,
+    apply: true
+  });
+  assert.equal(staleRestore.preview, true);
+  assert.equal(staleRestore.applied, false);
+  assert.equal(staleRestore.status, "conflict");
+  assert.equal(staleRestore.conflicts[0]?.code, "STATE_EXISTS");
+  assert.equal(await readFile(join(root, "seed.txt"), "utf8"), "changed");
+});
+
+test("checkpoint.restore reports missing artifact for file restore preview", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-restore-artifact-missing-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ workspaceRoot: root, stateDir });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+  const tools = createWorkspaceMutationTools({ workspaceRoot: root, stateDir, runLedger, coordinator });
+
+  try {
+    await writeFile(join(root, "seed.txt"), "original");
+    const mutation = await tools["workspace.remove"].execute({ path: "seed.txt", apply: true });
+    const description = coordinator.describeCheckpoint(mutation.checkpointId as string);
+    const manifest = description.journal[0]?.manifest as { entries?: Array<{ before?: { artifactDigest?: string } }> };
+    const missingDigest = manifest?.entries?.[0]?.before?.artifactDigest;
+    assert.ok(typeof missingDigest === "string" && missingDigest.length === 64);
+    const artifactPath = join(runLedger.artifacts.root, "sha256", missingDigest.slice(0, 2), missingDigest);
+    await rm(artifactPath);
+
+    const preview = await tools["checkpoint.restore"].execute({ checkpointId: mutation.checkpointId as string });
+    assert.equal(preview.status, "conflict");
+    assert.equal(preview.conflicts.some((entry) => entry.code === "ARTIFACT_MISSING"), true);
+    const applied = await tools["checkpoint.restore"].execute({ checkpointId: mutation.checkpointId as string, apply: true });
+    assert.equal(applied.status, "conflict");
+    assert.equal(applied.applied, false);
+    await assert.rejects(readFile(join(root, "seed.txt"), "utf8"), { code: "ENOENT" });
+  } finally {
+    runLedger.close();
+  }
+});
+
+test("checkpoint.restore reports corrupt artifact for file restore preview", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-restore-artifact-corrupt-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ workspaceRoot: root, stateDir });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+  const tools = createWorkspaceMutationTools({ workspaceRoot: root, stateDir, runLedger, coordinator });
+
+  try {
+    await writeFile(join(root, "seed.txt"), "original");
+    const mutation = await tools["workspace.remove"].execute({ path: "seed.txt", apply: true });
+    const description = coordinator.describeCheckpoint(mutation.checkpointId as string);
+    const manifest = description.journal[0]?.manifest as { entries?: Array<{ before?: { artifactDigest?: string } }> };
+    const corruptDigest = manifest?.entries?.[0]?.before?.artifactDigest;
+    assert.ok(typeof corruptDigest === "string" && corruptDigest.length === 64);
+    const artifactPath = join(runLedger.artifacts.root, "sha256", corruptDigest.slice(0, 2), corruptDigest);
+    await writeFile(artifactPath, "corrupt");
+
+    const preview = await tools["checkpoint.restore"].execute({ checkpointId: mutation.checkpointId as string });
+    assert.equal(preview.status, "conflict");
+    assert.equal(preview.conflicts.some((entry) => entry.code === "ARTIFACT_CORRUPT"), true);
+    const applied = await tools["checkpoint.restore"].execute({ checkpointId: mutation.checkpointId as string, apply: true });
+    assert.equal(applied.status, "conflict");
+    assert.equal(applied.applied, false);
+  } finally {
+    runLedger.close();
+  }
+});
+
+test("checkpoint.restore creates a recovery snapshot before mutation and records the event", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-restore-recovery-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ workspaceRoot: root, stateDir });
+  const tools = createWorkspaceMutationTools({
+    workspaceRoot: root,
+    stateDir,
+    runLedger,
+    runId: "restore-recovery-run"
+  });
+
+  try {
+    await writeFile(join(root, "seed.txt"), "before");
+    const mutation = await tools["workspace.write"].execute({ path: "seed.txt", content: "after", apply: true });
+    const restored = await tools["checkpoint.restore"].execute({ checkpointId: mutation.checkpointId as string, apply: true });
+    assert.equal(restored.preview, false);
+    assert.equal(restored.applied, true);
+    assert.equal(restored.externalEffects, false);
+    assert.ok(typeof restored.recoveryCheckpointId === "string" && restored.recoveryCheckpointId.startsWith("snap_"));
+    const recovery = runLedger.database.db.prepare("SELECT id FROM snapshots WHERE id = ?").get(restored.recoveryCheckpointId as string);
+    assert.ok(recovery !== undefined);
+    const runEvents = runLedger.getRun("restore-recovery-run").events;
+    assert.equal(
+      runEvents.some((event: any) => event.type === "checkpoint-restore" && event.payload?.checkpointId === mutation.checkpointId),
+      true
+    );
+    assert.equal(
+      runEvents.some((event: any) => event.type === "checkpoint-restore" && event.payload?.recoveryCheckpointId === restored.recoveryCheckpointId),
+      true
+    );
+  } finally {
+    runLedger.close();
+  }
+});
+
+test("checkpoint.restore detects covered-path overlap across manifest entries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-restore-covered-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ workspaceRoot: root, stateDir });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+  const toolsRestore = createWorkspaceMutationTools({ workspaceRoot: root, stateDir, runLedger, coordinator });
+
+  try {
+    const boundary = coordinator.startBoundary({ runId: "restore-covered-conflict-run" });
+    coordinator.recordMutationPreview({
+      boundaryId: boundary.boundaryId,
+      operation: "workspace.write",
+      stepId: "covered-1",
+      preview: {
+        preview: true,
+        operation: "workspace.write",
+        status: "ready",
+        coveredPaths: ["seed.txt"],
+        conflicts: [],
+        entries: [{ path: "seed.txt", before: { path: "seed.txt", exists: false, kind: "missing" }, after: { path: "seed.txt", exists: true, kind: "file", bytes: 5 } }],
+        manifest: {
+          operation: "workspace.write",
+          status: "ready",
+          stepId: "covered-1",
+          coveredPaths: ["seed.txt"],
+          entries: [{ path: "seed.txt", before: { path: "seed.txt", exists: false, kind: "missing" }, after: { path: "seed.txt", exists: true, kind: "file", bytes: 5 } }]
+        }
+      }
+    });
+    coordinator.recordMutationPreview({
+      boundaryId: boundary.boundaryId,
+      operation: "workspace.write",
+      stepId: "covered-2",
+      preview: {
+        preview: true,
+        operation: "workspace.write",
+        status: "ready",
+        coveredPaths: ["seed.txt"],
+        conflicts: [],
+        entries: [{ path: "seed.txt", before: { path: "seed.txt", exists: false, kind: "missing" }, after: { path: "seed.txt", exists: true, kind: "file", bytes: 5 } }],
+        manifest: {
+          operation: "workspace.write",
+          status: "ready",
+          stepId: "covered-2",
+          coveredPaths: ["seed.txt"],
+          entries: [{ path: "seed.txt", before: { path: "seed.txt", exists: false, kind: "missing" }, after: { path: "seed.txt", exists: true, kind: "file", bytes: 5 } }]
+        }
+      }
+    });
+    const published = coordinator.publishBoundary(boundary.boundaryId);
+    const restore = await toolsRestore["checkpoint.restore"].execute({ checkpointId: published.checkpointId });
+    assert.equal(restore.status, "conflict");
+    assert.equal(restore.conflicts.some((entry) => entry.code === "COVERED_PATH_CONFLICT"), true);
+  } finally {
+    runLedger.close();
+  }
 });

@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { CheckpointCoordinator } from "./checkpoint-coordinator.ts";
-import { OdinnRuntimeError } from "./differentiated-runtime.ts";
+import { OdinnRuntimeError, SnapshotManager } from "./differentiated-runtime.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
 import { createRunLedger, RunLedger } from "./run-ledger.ts";
 
@@ -37,6 +37,7 @@ interface MutationNodeState {
   bytes?: number;
   mode?: number;
   digest?: string;
+  artifactDigest?: string;
 }
 
 interface ExpectedState {
@@ -105,6 +106,64 @@ type MutationExecutionResult = Omit<MutationPreview, "preview"> & {
   manifestDigest?: string;
   artifactPath?: string;
 };
+
+type RestoreExecutionResult = Omit<MutationPreview, "preview"> & {
+  preview: false;
+  apply: true;
+  applied: boolean;
+  checkpointId: string;
+  manifestDigest?: string;
+  checkpointRunId?: string;
+  boundaryId?: string;
+  recoveryCheckpointId?: string;
+  externalEffects: false;
+};
+
+interface RestorePreviewResult {
+  ok: true;
+  preview: true;
+  operation: string;
+  status: "ready" | "conflict";
+  ceilings: {
+    maxBytes: number;
+    maxFiles: number;
+  };
+  usage: {
+    paths: number;
+    files: number;
+    bytes: number;
+  };
+  coveredPaths: string[];
+  entries: Array<{
+    path: string;
+    before?: MutationNodeState;
+    after?: MutationNodeState;
+    action: RestoreAction["action"];
+    resultDigest?: string;
+  }>;
+  conflicts: MutationConflict[];
+  checkpointId: string;
+  manifestDigest?: string;
+  checkpointRunId?: string;
+  recoveryCheckpointId?: string;
+  apply?: true;
+  applied?: boolean;
+  externalEffects: false;
+}
+
+interface RestoreAction {
+  path: string;
+  action: "restore" | "remove" | "modify" | "restore-directory" | "remove-directory" | "mode";
+  before: MutationNodeState;
+  after: MutationNodeState;
+  reason: "checkpoint-restore-inverse";
+}
+
+interface RestoreManifestEntry {
+  path: string;
+  before?: MutationNodeState;
+  after?: MutationNodeState;
+}
 
 interface MutationToolOptions {
   workspaceRoot?: string;
@@ -789,6 +848,46 @@ function resolveParent(path: string): string | undefined {
   return index <= 0 ? undefined : path.slice(0, index);
 }
 
+function isPortableNode(value: unknown): value is MutationNodeState {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { path?: unknown; exists?: unknown; kind?: unknown };
+  if (typeof candidate.path !== "string" || candidate.path.length === 0) return false;
+  if (typeof candidate.exists !== "boolean") return false;
+  return candidate.kind === "missing" || candidate.kind === "file" || candidate.kind === "directory";
+}
+
+function extractManifestEntries(value: unknown): RestoreManifestEntry[] {
+  if (!value || typeof value !== "object") return [];
+  const candidate = value as { entries?: unknown };
+  if (!Array.isArray(candidate.entries)) return [];
+  const entries = candidate.entries;
+  return entries.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const raw = entry as { path?: unknown; before?: unknown; after?: unknown };
+    if (typeof raw.path !== "string" || raw.path.length === 0) return [];
+    const normalized: RestoreManifestEntry = { path: raw.path };
+    if (raw.before && isPortableNode(raw.before)) {
+      normalized.before = { ...(raw.before as MutationNodeState) };
+    }
+    if (raw.after && isPortableNode(raw.after)) {
+      normalized.after = { ...(raw.after as MutationNodeState) };
+    }
+    return [normalized];
+  });
+}
+
+function resolveTopLevelRoots(paths: string[]) {
+  const sorted = [...new Set(paths)].sort((left, right) => left.length - right.length || left.localeCompare(right));
+  const roots: string[] = [];
+  for (const candidate of sorted) {
+    if (roots.some((root) => candidate === root || candidate.startsWith(`${root}/`))) continue;
+    roots.push(candidate);
+  }
+  return roots;
+}
+
+type RestoreCheckpointRestoreResult = RestorePreviewResult | RestoreExecutionResult;
+
 export function createWorkspaceMutationTools({
   workspaceRoot = process.cwd(),
   safe = true,
@@ -855,11 +954,39 @@ export function createWorkspaceMutationTools({
         runId: selectedRunId
       };
 
+      for (const entry of preview.entries) {
+        if (entry.before && entry.before.kind === "file" && !entry.before.artifactDigest) {
+          try {
+            const beforeFile = resolvePathWithPolicy(entry.before.path).absolute;
+            const beforeBytes = readFileSync(beforeFile);
+            const beforeArtifact = activeRunLedger.artifacts.put(beforeBytes);
+            entry.before.artifactDigest = beforeArtifact.digest;
+            entry.before.digest = hashValue(beforeBytes);
+            entry.before.bytes = beforeBytes.length;
+          } catch {
+            // Keep best-effort metadata if capture fails (e.g., readonly path or missing file).
+          }
+        }
+      }
+
       const recorded = activeCoordinator.recordMutationPreview({
         boundaryId: publication.boundaryId,
         operation: preview.operation,
         stepId,
-        preview
+        preview: {
+          ...preview,
+          manifest: {
+            operation: preview.operation,
+            status: preview.status,
+            stepId,
+            coveredPaths: preview.coveredPaths,
+            entries: preview.entries.map((entry) => ({
+              path: entry.path,
+              before: entry.before ? { ...entry.before } : undefined,
+              after: entry.after ? { ...entry.after } : undefined
+            }))
+          }
+        }
       });
       if (recorded.status === "conflict") {
         return applyMutationResult({
@@ -907,8 +1034,404 @@ export function createWorkspaceMutationTools({
     }
   }
 
+  const restoreEntryMode = (entry: MutationNodeState, defaultMode = 0o600) => entry.mode ?? defaultMode;
+
+  function normalizeManifestDigest(value: unknown) {
+    if (value === undefined) return undefined;
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim().toLowerCase();
+    if (!trimmed || !/^[a-f0-9]{64}$/u.test(trimmed)) return null;
+    return trimmed;
+  }
+
+  function resolveRestoreArtifact(ledger: RunLedger, digest: string) {
+    if (!/^[a-f0-9]{64}$/u.test(digest)) return undefined;
+    const artifactPath = join(ledger.artifacts.root, "sha256", digest.slice(0, 2), digest);
+    try {
+      if (!existsSync(artifactPath) || !lstatSync(artifactPath).isFile()) return undefined;
+      const bytes = readFileSync(artifactPath);
+      const actual = hashValue(bytes);
+      return { bytes, digest: actual, valid: actual === digest };
+    } catch {
+      return undefined;
+    }
+  }
+
+  function invertMutationEntries(entries: RestoreManifestEntry[]): RestoreAction[] {
+    const inverse: RestoreAction[] = [];
+    for (const entry of entries) {
+      const before = entry.before;
+      const after = entry.after;
+      if (!entry.path) continue;
+
+      if (!before && !after) {
+        continue;
+      }
+
+      if ((before?.exists === false || before == null) && (after?.exists === true && (after.kind === "file" || after.kind === "directory"))) {
+        inverse.push({
+          path: entry.path,
+          before: { ...after },
+          after: { path: entry.path, exists: false, kind: "missing" },
+          action: after.kind === "directory" ? "remove-directory" : "remove",
+          reason: "checkpoint-restore-inverse"
+        });
+        continue;
+      }
+
+      if ((after?.exists === false || after == null) && (before?.exists === true && (before.kind === "file" || before.kind === "directory"))) {
+        inverse.push({
+          path: entry.path,
+          before: { path: entry.path, exists: false, kind: "missing" },
+          after: { ...before },
+          action: before.kind === "directory" ? "restore-directory" : "restore",
+          reason: "checkpoint-restore-inverse"
+        });
+        continue;
+      }
+
+      if (before?.kind === "file" && after?.kind === "file") {
+        if (before.digest === after.digest && before.mode === after.mode) {
+          continue;
+        }
+        inverse.push({
+          path: entry.path,
+          before: { ...after },
+          after: { ...before },
+          action: "modify",
+          reason: "checkpoint-restore-inverse"
+        });
+        continue;
+      }
+
+      if (before?.kind === "directory" && after?.kind === "directory") {
+        if (before.mode === after.mode) {
+          continue;
+        }
+        inverse.push({
+          path: entry.path,
+          before: { ...after },
+          after: { ...before },
+          action: "mode",
+          reason: "checkpoint-restore-inverse"
+        });
+      }
+    }
+    return inverse;
+  }
+
+  async function executeCheckpointRestore(
+    input: AnyRecord,
+    checkpointId: string,
+    manifestDigest: string | undefined,
+    baseConflicts: MutationConflict[] = []
+  ): Promise<RestoreCheckpointRestoreResult> {
+    const apply = input.apply === true;
+    const selectedRunId = runId ?? `checkpoint-restore-${checkpointId}`;
+    const normalizedDigest = normalizeManifestDigest(manifestDigest);
+    if (manifestDigest !== undefined && normalizedDigest === null) {
+      error("INPUT_INVALID", "checkpointManifestDigest must be a SHA-256 hex string");
+    }
+
+    const resolvedDigest = normalizedDigest === null ? undefined : normalizedDigest;
+    let localRunLedger: RunLedger | undefined;
+    const activeRunLedger = runLedger ?? coordinator?.runLedger ?? (localRunLedger = createRunLedger({ workspaceRoot: resolvedRoot, stateDir: resolvedStateDir }));
+    const activeCoordinator = coordinator ?? new CheckpointCoordinator({ runLedger: activeRunLedger });
+    const plan = activeCoordinator.planCheckpointRestore(checkpointId, resolvedDigest);
+
+    const manifestEntries: RestoreManifestEntry[] = [];
+    const previewConflicts: MutationConflict[] = [];
+    for (const journalEntry of plan.journal) {
+      const entries = extractManifestEntries(journalEntry.manifest);
+      if (entries.length === 0) {
+        previewConflicts.push({
+          code: "EMPTY_MANIFEST",
+          path: journalEntry.id,
+          message: "restore manifest entry is empty",
+          details: { operation: journalEntry.operation }
+        });
+      }
+      for (const entry of entries) manifestEntries.push(entry);
+    }
+
+    const inverseActions = manifestEntries.slice().reverse().flatMap((entry) => invertMutationEntries([entry]));
+    const inverseByPath = new Map<string, number>();
+    const restorePreviewEntries: RestorePreviewResult["entries"] = [];
+    const usage = { paths: 0, files: 0, bytes: 0 };
+    const planConflicts: MutationConflict[] = [];
+
+    for (const action of inverseActions) {
+      inverseByPath.set(action.path, (inverseByPath.get(action.path) ?? 0) + 1);
+      if (inverseByPath.get(action.path)! > 1) {
+        planConflicts.push({
+          code: "COVERED_PATH_CONFLICT",
+          path: action.path,
+          message: "restore action path appears more than once in inverse plan"
+        });
+      }
+      if (action.after.kind === "file") {
+        usage.files += 1;
+        usage.bytes += action.after.bytes ?? 0;
+      }
+      if (action.after.kind === "file" && action.after.artifactDigest) {
+        const resolved = resolveRestoreArtifact(activeRunLedger, action.after.artifactDigest);
+        if (!resolved) {
+          previewConflicts.push({
+            code: "ARTIFACT_MISSING",
+            message: "restore target artifact is missing",
+            path: action.path,
+            details: { digest: action.after.artifactDigest }
+          });
+        } else if (!resolved.valid) {
+          previewConflicts.push({
+            code: "ARTIFACT_CORRUPT",
+            message: "restore target artifact digest mismatch",
+            path: action.path,
+            details: { digest: action.after.artifactDigest }
+          });
+        }
+      }
+      if (action.after.kind === "file" && action.after.digest === undefined && action.after.artifactDigest) {
+        previewConflicts.push({
+          code: "DIGEST_MISSING",
+          message: "restore target file lacks digest record",
+          path: action.path
+        });
+      }
+
+      if (action.before.kind === action.after.kind && action.before.digest === action.after.digest && action.before.exists === action.after.exists && action.before.mode === action.after.mode) {
+        continue;
+      }
+      restorePreviewEntries.push({
+        path: action.path,
+        before: { ...action.before },
+        after: { ...action.after },
+        action: action.action,
+        resultDigest: action.after.digest
+      });
+    }
+
+    const restorePreview: RestorePreviewResult = {
+      ok: true,
+      preview: true,
+      operation: "checkpoint.restore",
+      status: previewConflicts.length || baseConflicts.length || planConflicts.length || plan.conflicts.length ? "conflict" : "ready",
+      ceilings: { maxBytes: DEFAULT_MUTATION_MAX_BYTES, maxFiles: DEFAULT_MUTATION_MAX_FILES },
+      usage: { paths: restorePreviewEntries.length, files: usage.files, bytes: usage.bytes },
+      coveredPaths: inverseActions.map((action) => action.path),
+      entries: restorePreviewEntries,
+      conflicts: [...baseConflicts, ...previewConflicts, ...plan.conflicts, ...planConflicts],
+      checkpointId,
+      manifestDigest: plan.manifestDigest,
+      checkpointRunId: plan.runId,
+      externalEffects: false
+    };
+
+    if (!apply) return restorePreview;
+    if (restorePreview.status === "conflict") return { ...restorePreview, apply: true, applied: false };
+
+    const staleConflicts = ensureNoStaleState({
+      root: resolvedRoot,
+      entries: restorePreviewEntries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
+      enforceSafety,
+      limits: restorePreview.ceilings
+    });
+    if (staleConflicts.length > 0) {
+      return {
+        ...restorePreview,
+        status: "conflict",
+        conflicts: [...restorePreview.conflicts, ...staleConflicts],
+        apply: true,
+        applied: false
+      };
+    }
+
+    activeRunLedger.ensureRun({ runId: selectedRunId });
+    let publication: MutationPublicationState | undefined;
+    let recoveryCheckpointId: string | undefined;
+    try {
+      const recoveryRoots = resolveTopLevelRoots(inverseActions.map((action) => action.path));
+      const snapshotter = new SnapshotManager({ ledger: activeRunLedger });
+      const recovery = snapshotter.create({
+        runId: selectedRunId,
+        stepId: `checkpoint-restore-recovery-${checkpointId}`,
+        paths: recoveryRoots,
+        label: `Automatic recovery point before restoring ${checkpointId}`,
+        workspaceRoot: resolvedRoot
+      });
+      recoveryCheckpointId = recovery.snapshotId;
+
+      publication = {
+        ...activeCoordinator.startBoundary({
+          runId: selectedRunId,
+          stepId,
+          purpose: "restore",
+          foundation: foundation ?? "agent",
+          metadata: metadata ?? {}
+        }),
+        runId: selectedRunId
+      };
+
+      const restoreMutationPreview: MutationPreview = {
+        ok: true,
+        preview: true,
+        operation: "checkpoint.restore",
+        status: restorePreview.status,
+        ceilings: restorePreview.ceilings,
+        usage: restorePreview.usage,
+        coveredPaths: restorePreview.coveredPaths,
+        entries: restorePreview.entries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
+        conflicts: restorePreview.conflicts
+      };
+      activeCoordinator.recordMutationPreview({
+        boundaryId: publication.boundaryId,
+        operation: "checkpoint.restore",
+        stepId,
+        preview: restoreMutationPreview
+      });
+
+      await withStateMutationLock(resolvedStateDir, async () => {
+        const applyActions = inverseActions.slice().sort((left, right) => {
+          const rank = (action: RestoreAction) => {
+            if (action.action === "restore-directory" || action.action === "restore" || action.action === "modify" || action.action === "mode") return 0;
+            return action.action === "remove" ? 1 : 2;
+          };
+          const leftRank = rank(left);
+          const rightRank = rank(right);
+          if (leftRank !== rightRank) return leftRank - rightRank;
+
+          const leftDepth = left.path.split("/").length;
+          const rightDepth = right.path.split("/").length;
+          if (left.path === right.path) return 0;
+          if (left.action === "remove" || left.action === "remove-directory") {
+            return rightDepth - leftDepth;
+          }
+          return leftDepth - rightDepth;
+        });
+
+        for (const action of applyActions) {
+          const destination = resolveCandidate(resolvedRoot, action.path, enforceSafety).absolute;
+          if (action.action === "restore-directory") {
+            if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
+            mkdirSync(destination, { recursive: true, mode: restoreEntryMode(action.after, action.before.mode) });
+            continue;
+          }
+          if (action.action === "remove-directory") {
+            if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
+            continue;
+          }
+          if (action.action === "mode") {
+            if (action.after.kind === "directory") {
+              if (existsSync(destination)) chmodSync(destination, action.after.mode ?? 0o755);
+              continue;
+            }
+          }
+          if (action.action === "remove") {
+            if (existsSync(destination)) removeAtomically(destination);
+            continue;
+          }
+          if (action.action === "modify" || action.action === "restore") {
+            if (action.after.kind !== "file") continue;
+            const artifact = action.after.artifactDigest ? resolveRestoreArtifact(activeRunLedger, action.after.artifactDigest) : undefined;
+            if (!artifact) throw new Error(`restore artifact unavailable for ${action.path}`);
+            if (existsSync(destination)) removeAtomically(destination);
+            const parent = dirname(destination);
+            if (parent !== resolvedRoot) mkdirSync(parent, { recursive: true });
+            writeAtomically(destination, artifact.bytes, restoreEntryMode(action.after, action.before.mode));
+            continue;
+          }
+        }
+
+        const verification = verifyPostWrite({
+          root: resolvedRoot,
+          preview: {
+            ok: true,
+            preview: true,
+            operation: "checkpoint.restore",
+            status: "ready",
+            ceilings: restorePreview.ceilings,
+            usage: restorePreview.usage,
+            coveredPaths: restorePreview.coveredPaths,
+            entries: restorePreview.entries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
+            conflicts: restorePreview.conflicts
+          },
+          enforceSafety,
+          limits: restorePreview.ceilings
+        });
+        if (verification.length > 0) {
+          throw new OdinnRuntimeError("VERIFICATION_FAILED", "restore verification failed", { issues: verification });
+        }
+      });
+
+      const published = activeCoordinator.publishBoundary(publication.boundaryId);
+      activeRunLedger.appendEvent({
+        runId: selectedRunId,
+        type: "checkpoint-restore",
+        payload: {
+          checkpointId,
+          manifestDigest: plan.manifestDigest,
+          applied: true,
+          recoveryCheckpointId,
+          externalEffects: false
+        }
+      });
+
+      const restoreExecution: RestoreExecutionResult = {
+        ok: true,
+        preview: false,
+        operation: "checkpoint.restore",
+        status: "ready",
+        ceilings: restorePreview.ceilings,
+        usage: restorePreview.usage,
+        coveredPaths: restorePreview.coveredPaths,
+        conflicts: restorePreview.conflicts,
+        entries: restorePreview.entries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
+        apply: true,
+        applied: true,
+        boundaryId: publication.boundaryId,
+        checkpointId: published.checkpointId,
+        manifestDigest: published.manifestDigest ?? plan.manifestDigest,
+        checkpointRunId: restorePreview.checkpointRunId,
+        recoveryCheckpointId,
+        externalEffects: false
+      };
+      return restoreExecution;
+    } catch (cause) {
+      if (publication) {
+        try {
+          activeCoordinator.failBoundary(publication.boundaryId, `checkpoint restore failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        } catch {}
+      }
+      const failed = cause instanceof OdinnRuntimeError ? cause : new Error(cause instanceof Error ? cause.message : String(cause));
+      failed.name = failed.name === "Error" ? "ODINN_CHECKPOINT_RESTORE_FAIL_CLOSED" : failed.name;
+      throw failed;
+    } finally {
+      localRunLedger?.close();
+    }
+  }
+
   return {
-      "workspace.write": {
+    "checkpoint.restore": {
+      capability: "checkpoint.restore",
+      description: "Preview or apply a bounded checkpoint restore with conflict checks and pre-restore recovery snapshotting.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          checkpointId: { type: "string" },
+          checkpointManifestDigest: { type: "string" },
+          apply: { type: "boolean" }
+        },
+        required: ["checkpointId"]
+      },
+      execute: async (input: AnyRecord) => {
+        const checkpointId = typeof input.checkpointId === "string" && input.checkpointId.trim().length > 0
+          ? input.checkpointId.trim()
+          : error("INPUT_INVALID", "checkpointId must be a non-empty string");
+        const checkpointManifestDigest = typeof input.checkpointManifestDigest === "string" ? input.checkpointManifestDigest : undefined;
+        return executeCheckpointRestore(input, checkpointId, checkpointManifestDigest);
+      }
+    },
+    "workspace.write": {
       capability: "workspace.write",
       description: "Preview a bounded write with strict parent and expected-state checks.",
       inputSchema: {

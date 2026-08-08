@@ -20,6 +20,8 @@ interface MutationJournalRecord {
   stepId: string | null;
   coveredPaths: string[];
   conflicts: { code: string; path: string }[];
+  manifest?: JsonMap;
+  payload?: JsonMap;
 }
 
 interface BoundaryInput {
@@ -45,6 +47,31 @@ interface BoundArtifact {
   artifactPath: string;
   mediaType: string;
   sizeBytes: number;
+}
+
+interface RestoreCheckpointResult {
+  checkpointId: string;
+  boundaryId: string;
+  manifestDigest: string;
+  artifactPath: string;
+  journal: MutationJournalRecord[];
+}
+
+interface CheckpointRestoreConflict {
+  code: string;
+  path: string;
+  message: string;
+  details?: JsonMap;
+}
+
+interface CheckpointRestorePlan {
+  checkpointId: string;
+  boundaryId: string;
+  runId: string;
+  manifestDigest: string;
+  status: "ready" | "conflict";
+  conflicts: CheckpointRestoreConflict[];
+  journal: MutationJournalRecord[];
 }
 
 interface BoundaryRecord {
@@ -351,7 +378,9 @@ export class CheckpointCoordinator {
       status: String(journal.status) as MutationJournalRecord["status"],
       stepId: journal.stepId == null ? null : String(journal.stepId),
       coveredPaths: parseJson(journal.covered_paths_json, [] as string[]),
-      conflicts: parseJson(journal.conflicts_json, [] as { code: string; path: string }[])
+      conflicts: parseJson(journal.conflicts_json, [] as { code: string; path: string }[]),
+      manifest: parseJson(journal.manifest_json, {}),
+      payload: parseJson(journal.payload_json, {})
     }));
 
     const artifacts = this.runLedger.database.db.prepare(`
@@ -375,6 +404,109 @@ export class CheckpointCoordinator {
         mediaType: String(artifact.mediaType),
         sizeBytes: Number(artifact.sizeBytes)
       })) as BoundArtifact[]
+    };
+  }
+
+  describeCheckpoint(checkpointId: string) {
+    const checkpoint = this.runLedger.database.db.prepare(`
+      SELECT id, group_id AS boundary_id, run_id, status, created_at, completed_at, error, manifest_digest
+      FROM mutation_checkpoints
+      WHERE id = ?
+    `).get(checkpointId) as SqlRow | undefined;
+    if (!checkpoint) throw new Error(`checkpoint not found: ${checkpointId}`);
+
+    const boundary = this.readBoundary(String(checkpoint.boundary_id));
+    if (!boundary) throw new Error(`checkpoint boundary not found for checkpoint ${checkpointId}`);
+
+    const journal = this.runLedger.database.db.prepare(`
+      SELECT id, operation, status, step_id AS stepId, covered_paths_json, conflicts_json, manifest_json, payload_json
+      FROM mutation_journal_entries
+      WHERE checkpoint_id = ?
+      ORDER BY created_at ASC
+    `).all(checkpointId) as SqlRow[];
+    return {
+      checkpointId: String(checkpoint.id),
+      boundaryId: String(boundary.id),
+      runId: String(checkpoint.run_id),
+      status: String(checkpoint.status),
+      createdAt: String(checkpoint.created_at),
+      completedAt: checkpoint.completed_at == null ? null : String(checkpoint.completed_at),
+      manifestDigest: checkpoint.manifest_digest == null ? null : String(checkpoint.manifest_digest),
+      error: checkpoint.error == null ? null : String(checkpoint.error),
+      journal: journal.map((journalEntry) => ({
+        id: String(journalEntry.id),
+        operation: String(journalEntry.operation),
+        status: String(journalEntry.status) as MutationJournalRecord["status"],
+        stepId: journalEntry.stepId == null ? null : String(journalEntry.stepId),
+        coveredPaths: parseJson(journalEntry.covered_paths_json, [] as string[]),
+        conflicts: parseJson(journalEntry.conflicts_json, [] as { code: string; path: string }[]),
+        manifest: parseJson(journalEntry.manifest_json, {}),
+        payload: parseJson(journalEntry.payload_json, {})
+      }))
+    };
+  }
+
+  planCheckpointRestore(checkpointId: string, manifestDigest?: string): CheckpointRestorePlan {
+    const checkpoint = this.describeCheckpoint(checkpointId);
+    const binding = this.readManifestBinding(checkpointId);
+    if (!binding) {
+      return {
+        checkpointId: checkpoint.checkpointId,
+        boundaryId: checkpoint.boundaryId,
+        runId: checkpoint.runId,
+        manifestDigest: manifestDigest ?? "",
+        status: "conflict",
+        conflicts: [{ code: "MISSING_MANIFEST", path: checkpoint.checkpointId, message: "checkpoint has no manifest artifact", details: {} }],
+        journal: checkpoint.journal
+      };
+    }
+    if (manifestDigest !== undefined && binding.manifestDigest !== manifestDigest) {
+      return {
+        checkpointId: checkpoint.checkpointId,
+        boundaryId: checkpoint.boundaryId,
+        runId: checkpoint.runId,
+        manifestDigest: binding.manifestDigest,
+        status: "conflict",
+        conflicts: [{ code: "TARGET_DIGEST_MISMATCH", path: checkpoint.checkpointId, message: "checkpoint manifest digest does not match target", details: { expected: manifestDigest, actual: binding.manifestDigest } }],
+        journal: checkpoint.journal
+      };
+    }
+    const status = checkpoint.status === "completed" ? "ready" : "conflict";
+    const conflicts: CheckpointRestoreConflict[] = [];
+    if (status !== "ready") {
+      conflicts.push({ code: "CHECKPOINT_NOT_READY", path: checkpoint.checkpointId, message: "checkpoint is not ready", details: { status: String(checkpoint.status) } });
+    }
+    for (const entry of checkpoint.journal) {
+      if (entry.status === "conflict") {
+        conflicts.push({ code: "TARGET_ENTRY_CONFLICT", path: entry.id, message: "checkpoint entry is conflicted", details: { operation: entry.operation } });
+      }
+    }
+    const coveredPathHits = new Map<string, string[]>();
+    for (const entry of checkpoint.journal) {
+      for (const coveredPath of entry.coveredPaths) {
+        const existing = coveredPathHits.get(coveredPath);
+        if (existing) existing.push(entry.id);
+        else coveredPathHits.set(coveredPath, [entry.id]);
+      }
+    }
+    for (const [path, seenBy] of coveredPathHits.entries()) {
+      if (seenBy.length > 1) {
+        conflicts.push({
+          code: "COVERED_PATH_CONFLICT",
+          path,
+          message: "covered-path overlap cannot be safely restored",
+          details: { entries: seenBy.join(",") }
+        });
+      }
+    }
+    return {
+      checkpointId: checkpoint.checkpointId,
+      boundaryId: checkpoint.boundaryId,
+      runId: checkpoint.runId,
+      manifestDigest: binding.manifestDigest,
+      status,
+      conflicts,
+      journal: checkpoint.journal
     };
   }
 
