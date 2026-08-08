@@ -630,7 +630,8 @@ test("gateway governed workspace routes support preview/apply and stale/conflict
     const restoreApply = await postJson(`${base}/governed/restore/apply`, {
       runId: "governed-restore-apply",
       capabilityToken: restoreApplyToken,
-      checkpointId
+      checkpointId,
+      checkpointManifestDigest: restorePreview.output?.manifestDigest
     });
     assert.match(restoreApply.output?.status, /needs-review|conflict/);
     assert.equal(restoreApply.output?.applied, false);
@@ -1165,7 +1166,8 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
   await writeFile(join(workspaceRoot, "fixture.txt"), "before\n");
   await writeFile(join(stateDir, "config.json"), JSON.stringify({
     version: 1,
-    experimental: { capsules: true, capabilities: true, counterfactual: true }
+    experimental: { capsules: true, capabilities: true, counterfactual: true },
+    policy: { allowedCapabilities: ["workspace.inspect", "workspace.mutate", "workspace.patch", "network.access", "browser.read", "browser.mutate", "agent.delegate", "text.echo", "restore.create", "restore.apply"] }
   }));
   const server = await createGatewayServer({ stateDir, workspaceRoot });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
@@ -1214,17 +1216,44 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
     });
     assert.equal(legacyProof.status, 400);
 
+    const checkpointTaskId = "checkpoint-create-gateway-runtime-run";
+    const checkpointCapability = await postJson(`${base}/capabilities/issue`, {
+      runId: checkpointTaskId,
+      stepId: "step-gateway-checkpoint-create",
+      toolName: "snapshot.create"
+    });
     const checkpoint = await postJson(`${base}/checkpoints`, {
       runId: "gateway-runtime-run",
+      taskId: checkpointTaskId,
       stepId: "step-gateway-checkpoint",
       paths: ["fixture.txt"],
       label: "before-change",
-      workspaceRoot: attackerRoot
+      workspaceRoot: attackerRoot,
+      capabilityToken: checkpointCapability.token
     });
     await writeFile(join(workspaceRoot, "fixture.txt"), "after\n");
-    const preview = await postJson(`${base}/rewind/${encodeURIComponent(checkpoint.snapshotId)}`, {});
+    const legacyPreviewToken = (await postJson(`${base}/capabilities/issue`, {
+      runId: "gateway-legacy-rewind-preview",
+      stepId: "gateway-legacy-rewind-preview-step",
+      toolName: "snapshot.restore",
+      resourceConstraints: { snapshotId: checkpoint.snapshotId }
+    })).token;
+    const legacyApplyToken = (await postJson(`${base}/capabilities/issue`, {
+      runId: "gateway-legacy-rewind-apply",
+      stepId: "gateway-legacy-rewind-apply-step",
+      toolName: "snapshot.restore",
+      resourceConstraints: { snapshotId: checkpoint.snapshotId }
+    })).token;
+    const preview = await postJson(`${base}/rewind/${encodeURIComponent(checkpoint.snapshotId)}`, {
+      runId: "gateway-legacy-rewind-preview",
+      capabilityToken: legacyPreviewToken
+    });
     assert.equal(preview.applied, false);
-    const restored = await postJson(`${base}/rewind/${encodeURIComponent(checkpoint.snapshotId)}`, { apply: true });
+    const restored = await postJson(`${base}/rewind/${encodeURIComponent(checkpoint.snapshotId)}`, {
+      runId: "gateway-legacy-rewind-apply",
+      apply: true,
+      capabilityToken: legacyApplyToken
+    });
     assert.equal(restored.applied, true);
     assert.equal(await readFile(join(workspaceRoot, "fixture.txt"), "utf8"), "before\n");
 

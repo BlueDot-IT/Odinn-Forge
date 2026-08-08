@@ -190,6 +190,15 @@ function isWithin(root: string, target: string) {
   return absoluteTarget === base || absoluteTarget.startsWith(`${base}${sep}`);
 }
 
+function lstatIfPresent(path: string) {
+  try {
+    return lstatSync(path);
+  } catch (cause) {
+    if (["ENOENT", "ENOTDIR"].includes((cause as NodeJS.ErrnoException).code ?? "")) return undefined;
+    throw cause;
+  }
+}
+
 function toPosix(value: string) {
   return value.split(sep).join("/");
 }
@@ -394,6 +403,78 @@ function ensureNoStaleState({ root, entries, enforceSafety, limits }: {
   return conflicts;
 }
 
+interface MutationPathIdentity {
+  absolute: string;
+  exists: boolean;
+  dev?: number;
+  ino?: number;
+  directory?: boolean;
+  file?: boolean;
+}
+
+interface MutationIdentities {
+  targets: MutationPathIdentity[];
+  ancestors: MutationPathIdentity[];
+}
+
+function pathIdentity(absolute: string, state: ReturnType<typeof lstatIfPresent>): MutationPathIdentity {
+  if (!state) return { absolute, exists: false };
+  return {
+    absolute,
+    exists: true,
+    dev: Number(state.dev),
+    ino: Number(state.ino),
+    directory: state.isDirectory(),
+    file: state.isFile()
+  };
+}
+
+function captureMutationIdentities(root: string, paths: string[], enforceSafety: boolean): MutationIdentities {
+  const targets = new Map<string, MutationPathIdentity>();
+  const ancestors = new Map<string, MutationPathIdentity>();
+  const workspaceRoot = resolve(root);
+
+  for (const portable of [...new Set(paths)]) {
+    const candidate = resolveCandidate(workspaceRoot, portable || ".", enforceSafety);
+    targets.set(candidate.absolute, pathIdentity(candidate.absolute, lstatIfPresent(candidate.absolute)));
+
+    let cursor = dirname(candidate.absolute);
+    while (isWithin(workspaceRoot, cursor)) {
+      if (!targets.has(cursor)) ancestors.set(cursor, pathIdentity(cursor, lstatIfPresent(cursor)));
+      if (cursor === workspaceRoot) break;
+      cursor = dirname(cursor);
+    }
+  }
+
+  return {
+    targets: [...targets.values()],
+    ancestors: [...ancestors.values()]
+  };
+}
+
+function assertMutationIdentities(root: string, identities: MutationIdentities, { includeTargets = true } = {}) {
+  const workspaceRoot = resolve(root);
+  const check = (identity: MutationPathIdentity) => {
+    const current = lstatIfPresent(identity.absolute);
+    if (identity.exists !== Boolean(current)) {
+      error("PATH_REPLACED", "workspace path changed during the governed mutation", { path: toPosix(relative(workspaceRoot, identity.absolute)) });
+    }
+    if (!identity.exists || !current) return;
+    if (
+      Number(current.dev) !== identity.dev
+      || Number(current.ino) !== identity.ino
+      || current.isDirectory() !== identity.directory
+      || current.isFile() !== identity.file
+      || current.isSymbolicLink()
+    ) {
+      error("PATH_REPLACED", "workspace path identity changed during the governed mutation", { path: toPosix(relative(workspaceRoot, identity.absolute)) });
+    }
+  };
+
+  for (const identity of identities.ancestors) check(identity);
+  if (includeTargets) for (const identity of identities.targets) check(identity);
+}
+
 function verifyPostWrite({ root, preview, enforceSafety, limits }: {
   root: string;
   preview: MutationPreview;
@@ -523,27 +604,25 @@ function resolveCandidate(root: string, portable: string, safe = true): { absolu
   const rootPhysical = resolve(realpathSync(workspaceRoot));
 
   while (cursor !== workspaceRoot) {
-    const cursorReal = existsSync(cursor) ? resolve(realpathSync(cursor)) : cursor;
-    if (cursor !== workspaceRoot && isWithin(cursorReal, workspaceRoot)) {
-      if (safe && existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) {
+    const cursorState = lstatIfPresent(cursor);
+    if (cursorState) {
+      if (safe && cursorState.isSymbolicLink()) {
         error("SYMLINK_FORBIDDEN", "path crosses symbolic link junction", { path: toPosix(relative(workspaceRoot, cursor)) });
       }
-      if (cursor !== workspaceRoot && !existsSync(cursor)) {
-        cursor = dirname(cursor);
-        continue;
-      }
-      if (!lstatSync(cursor).isDirectory()) {
-        error("PARENT_NOT_DIRECTORY", "parent path must be a directory", { path: toPosix(relative(workspaceRoot, cursor)) });
-      }
+      const cursorReal = resolve(realpathSync(cursor));
       if (!isWithin(rootPhysical, cursorReal)) {
         error("PATH_ESCAPE", "path resolves outside the workspace root", { path: toPosix(relative(workspaceRoot, cursor)) });
+      }
+      if (cursor !== absolute && !cursorState.isDirectory()) {
+        error("PARENT_NOT_DIRECTORY", "parent path must be a directory", { path: toPosix(relative(workspaceRoot, cursor)) });
       }
     }
     cursor = dirname(cursor);
   }
 
-  if (safe && existsSync(absolute)) {
-    const state = lstatSync(absolute);
+  const targetState = lstatIfPresent(absolute);
+  if (safe && targetState) {
+    const state = targetState;
     if (state.isSymbolicLink()) {
       error("SYMLINK_FORBIDDEN", "target is a symbolic link", { path: portable });
     }
@@ -553,8 +632,17 @@ function resolveCandidate(root: string, portable: string, safe = true): { absolu
 }
 
 function inspectPath(root: string, portable: string, options: { requireDigest?: boolean; maxBytes?: number } = {}, safe = true): MutationNodeState {
-  const { absolute, relative: relativePath } = resolveCandidate(root, portable);
-  if (!existsSync(absolute)) {
+  let candidate: { absolute: string; relative: string };
+  try {
+    candidate = resolveCandidate(root, portable, safe);
+  } catch (cause) {
+    if (cause instanceof OdinnRuntimeError && cause.code === "PARENT_NOT_DIRECTORY") {
+      return { path: toPosix(relative(resolve(root), resolve(root, portable))), exists: false, kind: "missing" };
+    }
+    throw cause;
+  }
+  const { absolute, relative: relativePath } = candidate;
+  if (!lstatIfPresent(absolute)) {
     return {
       path: relativePath,
       exists: false,
@@ -920,111 +1008,154 @@ export function createWorkspaceMutationTools({
       return applyMutationResult(preview, { applied: false });
     }
 
-    const staleConflicts = ensureNoStaleState({
-      root: resolvedRoot,
-      entries: preview.entries,
-      enforceSafety,
-      limits: preview.ceilings
-    });
-    if (staleConflicts.length > 0) {
-      return applyMutationResult({
-        ...preview,
-        status: "conflict",
-        conflicts: [...preview.conflicts, ...staleConflicts]
-      }, { applied: false });
-    }
-
     const selectedRunId = runId ?? `mutation-${randomUUID()}`;
     let localRunLedger: RunLedger | undefined;
     const activeRunLedger = runLedger ?? coordinator?.runLedger ?? (localRunLedger = createRunLedger({ workspaceRoot: resolvedRoot, stateDir: resolvedStateDir }));
     const activeCoordinator = coordinator ?? new CheckpointCoordinator({ runLedger: activeRunLedger });
     let publication: MutationPublicationState | undefined;
+    let recoverySnapshotId: string | undefined;
+    let mutationStarted = false;
+    let staleResult: MutationExecutionResult | undefined;
+    let completedResult: MutationExecutionResult | undefined;
+    let mutationIdentities: MutationIdentities | undefined;
 
     activeRunLedger.ensureRun({ runId: selectedRunId });
 
     try {
-      publication = {
-        ...activeCoordinator.startBoundary({
-          runId: selectedRunId,
-          stepId,
-          purpose: purpose ?? "mutation-group",
-          foundation: foundation ?? "agent",
-          metadata: metadata ?? {}
-        }),
-        runId: selectedRunId
-      };
-
-      for (const entry of preview.entries) {
-        if (entry.before && entry.before.kind === "file" && !entry.before.artifactDigest) {
-          try {
-            const beforeFile = resolvePathWithPolicy(entry.before.path).absolute;
-            const beforeBytes = readFileSync(beforeFile);
-            const beforeArtifact = activeRunLedger.artifacts.put(beforeBytes);
-            entry.before.artifactDigest = beforeArtifact.digest;
-            entry.before.digest = hashValue(beforeBytes);
-            entry.before.bytes = beforeBytes.length;
-          } catch {
-            // Keep best-effort metadata if capture fails (e.g., readonly path or missing file).
-          }
-        }
-      }
-
-      const recorded = activeCoordinator.recordMutationPreview({
-        boundaryId: publication.boundaryId,
-        operation: preview.operation,
-        stepId,
-        preview: {
-          ...preview,
-          manifest: {
-            operation: preview.operation,
-            status: preview.status,
-            stepId,
-            coveredPaths: preview.coveredPaths,
-            entries: preview.entries.map((entry) => ({
-              path: entry.path,
-              before: entry.before ? { ...entry.before } : undefined,
-              after: entry.after ? { ...entry.after } : undefined
-            }))
-          }
-        }
-      });
-      if (recorded.status === "conflict") {
-        return applyMutationResult({
-          ...preview,
-          status: "conflict",
-          conflicts: [...preview.conflicts]
-        }, { applied: false, boundaryId: publication.boundaryId });
-      }
-
       await withStateMutationLock(resolvedStateDir, async () => {
-        await mutation();
-
-        const verification = verifyPostWrite({
+        activeCoordinator.assertReady();
+        const staleConflicts = ensureNoStaleState({
           root: resolvedRoot,
-          preview,
+          entries: preview.entries,
           enforceSafety,
           limits: preview.ceilings
         });
-        if (verification.length > 0) {
-          const verificationError = new OdinnRuntimeError("VERIFICATION_FAILED", "post-write verification failed", { issues: verification });
-          throw verificationError;
+        if (staleConflicts.length > 0) {
+          staleResult = applyMutationResult({
+            ...preview,
+            status: "conflict",
+            conflicts: [...preview.conflicts, ...staleConflicts]
+          }, { applied: false });
+          return;
+        }
+
+        mutationIdentities = captureMutationIdentities(resolvedRoot, preview.coveredPaths, enforceSafety);
+
+        publication = {
+          ...activeCoordinator.startBoundary({
+            runId: selectedRunId,
+            stepId,
+            purpose: purpose ?? "mutation-group",
+            foundation: foundation ?? "agent",
+            metadata: metadata ?? {}
+          }),
+          runId: selectedRunId
+        };
+
+        try {
+          const recovery = new SnapshotManager({ ledger: activeRunLedger }).create({
+            runId: selectedRunId,
+            stepId: `mutation-recovery-${publication.boundaryId}`,
+            paths: resolveTopLevelRoots(preview.coveredPaths),
+            label: `Automatic recovery point before ${preview.operation}`,
+            workspaceRoot: resolvedRoot
+          });
+          recoverySnapshotId = recovery.snapshotId;
+
+          for (const entry of preview.entries) {
+            if (entry.before && entry.before.kind === "file" && !entry.before.artifactDigest) {
+              try {
+                const beforeFile = resolvePathWithPolicy(entry.before.path).absolute;
+                const beforeBytes = readFileSync(beforeFile);
+                const beforeArtifact = activeRunLedger.artifacts.put(beforeBytes);
+                entry.before.artifactDigest = beforeArtifact.digest;
+                entry.before.digest = hashValue(beforeBytes);
+                entry.before.bytes = beforeBytes.length;
+              } catch (cause) {
+                throw new OdinnRuntimeError("CHECKPOINT_ARTIFACT_CAPTURE_FAILED", "unable to capture pre-mutation artifact; mutation was not attempted", {
+                  path: entry.path,
+                  reason: cause instanceof Error ? cause.message : String(cause)
+                });
+              }
+            }
+          }
+
+          const recorded = activeCoordinator.recordMutationPreview({
+            boundaryId: publication.boundaryId,
+            operation: preview.operation,
+            stepId,
+            preview: {
+              ...preview,
+              manifest: {
+                operation: preview.operation,
+                status: preview.status,
+                stepId,
+                coveredPaths: preview.coveredPaths,
+                entries: preview.entries.map((entry) => ({
+                  path: entry.path,
+                  before: entry.before ? { ...entry.before } : undefined,
+                  after: entry.after ? { ...entry.after } : undefined
+                }))
+              }
+            }
+          });
+          if (recorded.status === "conflict") {
+            staleResult = applyMutationResult({
+              ...preview,
+              status: "conflict",
+              conflicts: [...preview.conflicts]
+            }, { applied: false, boundaryId: publication.boundaryId });
+            return;
+          }
+
+          assertMutationIdentities(resolvedRoot, mutationIdentities);
+          mutationStarted = true;
+          await mutation();
+          assertMutationIdentities(resolvedRoot, mutationIdentities, { includeTargets: false });
+
+          const verification = verifyPostWrite({
+            root: resolvedRoot,
+            preview,
+            enforceSafety,
+            limits: preview.ceilings
+          });
+          if (verification.length > 0) {
+            throw new OdinnRuntimeError("VERIFICATION_FAILED", "post-write verification failed", { issues: verification });
+          }
+
+          const published = activeCoordinator.publishBoundary(publication.boundaryId);
+          completedResult = applyMutationResult(preview, {
+            applied: true,
+            boundaryId: publication.boundaryId,
+            checkpointId: published.checkpointId,
+            manifestDigest: published.manifestDigest,
+            artifactPath: published.artifactPath
+          });
+        } catch (cause) {
+          let failure: unknown = cause;
+          if (mutationStarted && recoverySnapshotId) {
+            try {
+              new SnapshotManager({ ledger: activeRunLedger }).restore(recoverySnapshotId, { apply: true });
+            } catch (rollbackCause) {
+              failure = new OdinnRuntimeError("MUTATION_RECOVERY_FAILED", "mutation failed and automatic recovery could not restore the workspace", {
+                cause: cause instanceof Error ? cause.message : String(cause),
+                recovery: rollbackCause instanceof Error ? rollbackCause.message : String(rollbackCause)
+              });
+            }
+          }
+          if (publication) {
+            try {
+              activeCoordinator.failBoundary(publication.boundaryId, `mutation failed: ${failure instanceof Error ? failure.message : String(failure)}`);
+            } catch {}
+          }
+          throw failure;
         }
       });
 
-      const published = activeCoordinator.publishBoundary(publication.boundaryId);
-      return applyMutationResult(preview, {
-        applied: true,
-        boundaryId: publication.boundaryId,
-        checkpointId: published.checkpointId,
-        manifestDigest: published.manifestDigest,
-        artifactPath: published.artifactPath
-      });
+      if (staleResult) return staleResult;
+      if (completedResult) return completedResult;
+      throw new Error("mutation completed without an execution result");
     } catch (cause) {
-      if (publication) {
-        try {
-          activeCoordinator.failBoundary(publication.boundaryId, `mutation publication failed: ${cause instanceof Error ? cause.message : String(cause)}`);
-        } catch {}
-      }
       if (cause instanceof OdinnRuntimeError && cause.code === "INPUT_INVALID") throw cause;
       const failed = cause instanceof Error ? cause : new Error(String(cause));
       failed.name = "ODINN_MUTATION_FAIL_CLOSED";
@@ -1228,180 +1359,217 @@ export function createWorkspaceMutationTools({
     };
 
     if (!apply) return restorePreview;
-    if (restorePreview.status === "conflict") return { ...restorePreview, apply: true, applied: false };
-
-    const staleConflicts = ensureNoStaleState({
-      root: resolvedRoot,
-      entries: restorePreviewEntries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
-      enforceSafety,
-      limits: restorePreview.ceilings
-    });
-    if (staleConflicts.length > 0) {
-      return {
-        ...restorePreview,
-        status: "conflict",
-        conflicts: [...restorePreview.conflicts, ...staleConflicts],
-        apply: true,
-        applied: false
-      };
+    if (resolvedDigest === undefined) {
+      restorePreview.status = "conflict";
+      restorePreview.conflicts = [...restorePreview.conflicts, {
+        code: "MANIFEST_DIGEST_REQUIRED",
+        path: checkpointId,
+        message: "checkpointManifestDigest is required when applying a restore"
+      }];
     }
-
+    if (restorePreview.status === "conflict") return { ...restorePreview, apply: true, applied: false };
+    activeCoordinator.assertReady();
     activeRunLedger.ensureRun({ runId: selectedRunId });
     let publication: MutationPublicationState | undefined;
     let recoveryCheckpointId: string | undefined;
+    let staleResult: RestoreCheckpointRestoreResult | undefined;
+    let completedResult: RestoreExecutionResult | undefined;
+    let mutationStarted = false;
+    let mutationIdentities: MutationIdentities | undefined;
     try {
-      const recoveryRoots = resolveTopLevelRoots(inverseActions.map((action) => action.path));
-      const snapshotter = new SnapshotManager({ ledger: activeRunLedger });
-      const recovery = snapshotter.create({
-        runId: selectedRunId,
-        stepId: `checkpoint-restore-recovery-${checkpointId}`,
-        paths: recoveryRoots,
-        label: `Automatic recovery point before restoring ${checkpointId}`,
-        workspaceRoot: resolvedRoot
-      });
-      recoveryCheckpointId = recovery.snapshotId;
-
-      publication = {
-        ...activeCoordinator.startBoundary({
-          runId: selectedRunId,
-          stepId,
-          purpose: "restore",
-          foundation: foundation ?? "agent",
-          metadata: metadata ?? {}
-        }),
-        runId: selectedRunId
-      };
-
-      const restoreMutationPreview: MutationPreview = {
-        ok: true,
-        preview: true,
-        operation: "checkpoint.restore",
-        status: restorePreview.status,
-        ceilings: restorePreview.ceilings,
-        usage: restorePreview.usage,
-        coveredPaths: restorePreview.coveredPaths,
-        entries: restorePreview.entries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
-        conflicts: restorePreview.conflicts
-      };
-      activeCoordinator.recordMutationPreview({
-        boundaryId: publication.boundaryId,
-        operation: "checkpoint.restore",
-        stepId,
-        preview: restoreMutationPreview
-      });
-
       await withStateMutationLock(resolvedStateDir, async () => {
-        const applyActions = inverseActions.slice().sort((left, right) => {
-          const rank = (action: RestoreAction) => {
-            if (action.action === "restore-directory" || action.action === "restore" || action.action === "modify" || action.action === "mode") return 0;
-            return action.action === "remove" ? 1 : 2;
-          };
-          const leftRank = rank(left);
-          const rightRank = rank(right);
-          if (leftRank !== rightRank) return leftRank - rightRank;
-
-          const leftDepth = left.path.split("/").length;
-          const rightDepth = right.path.split("/").length;
-          if (left.path === right.path) return 0;
-          if (left.action === "remove" || left.action === "remove-directory") {
-            return rightDepth - leftDepth;
-          }
-          return leftDepth - rightDepth;
+        activeCoordinator.assertReady();
+        const staleConflicts = ensureNoStaleState({
+          root: resolvedRoot,
+          entries: restorePreviewEntries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
+          enforceSafety,
+          limits: restorePreview.ceilings
         });
-
-        for (const action of applyActions) {
-          const destination = resolveCandidate(resolvedRoot, action.path, enforceSafety).absolute;
-          if (action.action === "restore-directory") {
-            if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
-            mkdirSync(destination, { recursive: true, mode: restoreEntryMode(action.after, action.before.mode) });
-            continue;
-          }
-          if (action.action === "remove-directory") {
-            if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
-            continue;
-          }
-          if (action.action === "mode") {
-            if (action.after.kind === "directory") {
-              if (existsSync(destination)) chmodSync(destination, action.after.mode ?? 0o755);
-              continue;
-            }
-          }
-          if (action.action === "remove") {
-            if (existsSync(destination)) removeAtomically(destination);
-            continue;
-          }
-          if (action.action === "modify" || action.action === "restore") {
-            if (action.after.kind !== "file") continue;
-            const artifact = action.after.artifactDigest ? resolveRestoreArtifact(activeRunLedger, action.after.artifactDigest) : undefined;
-            if (!artifact) throw new Error(`restore artifact unavailable for ${action.path}`);
-            if (existsSync(destination)) removeAtomically(destination);
-            const parent = dirname(destination);
-            if (parent !== resolvedRoot) mkdirSync(parent, { recursive: true });
-            writeAtomically(destination, artifact.bytes, restoreEntryMode(action.after, action.before.mode));
-            continue;
-          }
+        if (staleConflicts.length > 0) {
+          staleResult = {
+            ...restorePreview,
+            status: "conflict",
+            conflicts: [...restorePreview.conflicts, ...staleConflicts],
+            apply: true,
+            applied: false
+          };
+          return;
         }
 
-        const verification = verifyPostWrite({
-          root: resolvedRoot,
-          preview: {
+        mutationIdentities = captureMutationIdentities(resolvedRoot, restorePreview.coveredPaths, enforceSafety);
+
+        const recoveryRoots = resolveTopLevelRoots(inverseActions.map((action) => action.path));
+        const snapshotter = new SnapshotManager({ ledger: activeRunLedger });
+        const recovery = snapshotter.create({
+          runId: selectedRunId,
+          stepId: `checkpoint-restore-recovery-${checkpointId}`,
+          paths: recoveryRoots,
+          label: `Automatic recovery point before restoring ${checkpointId}`,
+          workspaceRoot: resolvedRoot
+        });
+        recoveryCheckpointId = recovery.snapshotId;
+
+        publication = {
+          ...activeCoordinator.startBoundary({
+            runId: selectedRunId,
+            stepId,
+            purpose: "restore",
+            foundation: foundation ?? "agent",
+            metadata: metadata ?? {}
+          }),
+          runId: selectedRunId
+        };
+
+        try {
+          const restoreMutationPreview: MutationPreview = {
             ok: true,
             preview: true,
             operation: "checkpoint.restore",
-            status: "ready",
+            status: restorePreview.status,
             ceilings: restorePreview.ceilings,
             usage: restorePreview.usage,
             coveredPaths: restorePreview.coveredPaths,
             entries: restorePreview.entries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
             conflicts: restorePreview.conflicts
-          },
-          enforceSafety,
-          limits: restorePreview.ceilings
-        });
-        if (verification.length > 0) {
-          throw new OdinnRuntimeError("VERIFICATION_FAILED", "restore verification failed", { issues: verification });
+          };
+          activeCoordinator.recordMutationPreview({
+            boundaryId: publication.boundaryId,
+            operation: "checkpoint.restore",
+            stepId,
+            preview: restoreMutationPreview
+          });
+
+          assertMutationIdentities(resolvedRoot, mutationIdentities);
+          mutationStarted = true;
+          const applyActions = inverseActions.slice().sort((left, right) => {
+            const rank = (action: RestoreAction) => {
+              if (action.action === "restore-directory" || action.action === "restore" || action.action === "modify" || action.action === "mode") return 0;
+              return action.action === "remove" ? 1 : 2;
+            };
+            const leftRank = rank(left);
+            const rightRank = rank(right);
+            if (leftRank !== rightRank) return leftRank - rightRank;
+
+            const leftDepth = left.path.split("/").length;
+            const rightDepth = right.path.split("/").length;
+            if (left.path === right.path) return 0;
+            if (left.action === "remove" || left.action === "remove-directory") {
+              return rightDepth - leftDepth;
+            }
+            return leftDepth - rightDepth;
+          });
+
+          for (const action of applyActions) {
+            const destination = resolveCandidate(resolvedRoot, action.path, enforceSafety).absolute;
+            if (action.action === "restore-directory") {
+              if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
+              mkdirSync(destination, { recursive: true, mode: restoreEntryMode(action.after, action.before.mode) });
+              continue;
+            }
+            if (action.action === "remove-directory") {
+              if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
+              continue;
+            }
+            if (action.action === "mode") {
+              if (action.after.kind === "directory") {
+                if (existsSync(destination)) chmodSync(destination, action.after.mode ?? 0o755);
+                continue;
+              }
+            }
+            if (action.action === "remove") {
+              if (existsSync(destination)) removeAtomically(destination);
+              continue;
+            }
+            if (action.action === "modify" || action.action === "restore") {
+              if (action.after.kind !== "file") continue;
+              const artifact = action.after.artifactDigest ? resolveRestoreArtifact(activeRunLedger, action.after.artifactDigest) : undefined;
+              if (!artifact) throw new Error(`restore artifact unavailable for ${action.path}`);
+              if (existsSync(destination)) removeAtomically(destination);
+              const parent = dirname(destination);
+              if (parent !== resolvedRoot) mkdirSync(parent, { recursive: true });
+              writeAtomically(destination, artifact.bytes, restoreEntryMode(action.after, action.before.mode));
+              continue;
+            }
+          }
+
+          assertMutationIdentities(resolvedRoot, mutationIdentities, { includeTargets: false });
+
+          const verification = verifyPostWrite({
+            root: resolvedRoot,
+            preview: {
+              ok: true,
+              preview: true,
+              operation: "checkpoint.restore",
+              status: "ready",
+              ceilings: restorePreview.ceilings,
+              usage: restorePreview.usage,
+              coveredPaths: restorePreview.coveredPaths,
+              entries: restorePreview.entries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
+              conflicts: restorePreview.conflicts
+            },
+            enforceSafety,
+            limits: restorePreview.ceilings
+          });
+          if (verification.length > 0) {
+            throw new OdinnRuntimeError("VERIFICATION_FAILED", "restore verification failed", { issues: verification });
+          }
+
+          const published = activeCoordinator.publishBoundary(publication.boundaryId);
+          activeRunLedger.appendEvent({
+            runId: selectedRunId,
+            type: "checkpoint-restore",
+            payload: {
+              checkpointId,
+              manifestDigest: plan.manifestDigest,
+              applied: true,
+              recoveryCheckpointId,
+              externalEffects: false
+            }
+          });
+
+          completedResult = {
+            ok: true,
+            preview: false,
+            operation: "checkpoint.restore",
+            status: "ready",
+            ceilings: restorePreview.ceilings,
+            usage: restorePreview.usage,
+            coveredPaths: restorePreview.coveredPaths,
+            conflicts: restorePreview.conflicts,
+            entries: restorePreview.entries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
+            apply: true,
+            applied: true,
+            boundaryId: publication.boundaryId,
+            checkpointId: published.checkpointId,
+            manifestDigest: published.manifestDigest ?? plan.manifestDigest,
+            checkpointRunId: restorePreview.checkpointRunId,
+            recoveryCheckpointId,
+            externalEffects: false
+          };
+        } catch (cause) {
+          let failure: unknown = cause;
+          if (mutationStarted && recoveryCheckpointId) {
+            try {
+              snapshotter.restore(recoveryCheckpointId, { apply: true });
+            } catch (rollbackCause) {
+              failure = new OdinnRuntimeError("RESTORE_RECOVERY_FAILED", "restore failed and automatic recovery could not restore the workspace", {
+                cause: cause instanceof Error ? cause.message : String(cause),
+                recovery: rollbackCause instanceof Error ? rollbackCause.message : String(rollbackCause)
+              });
+            }
+          }
+          if (publication) {
+            try {
+              activeCoordinator.failBoundary(publication.boundaryId, `checkpoint restore failed: ${failure instanceof Error ? failure.message : String(failure)}`);
+            } catch {}
+          }
+          throw failure;
         }
       });
-
-      const published = activeCoordinator.publishBoundary(publication.boundaryId);
-      activeRunLedger.appendEvent({
-        runId: selectedRunId,
-        type: "checkpoint-restore",
-        payload: {
-          checkpointId,
-          manifestDigest: plan.manifestDigest,
-          applied: true,
-          recoveryCheckpointId,
-          externalEffects: false
-        }
-      });
-
-      const restoreExecution: RestoreExecutionResult = {
-        ok: true,
-        preview: false,
-        operation: "checkpoint.restore",
-        status: "ready",
-        ceilings: restorePreview.ceilings,
-        usage: restorePreview.usage,
-        coveredPaths: restorePreview.coveredPaths,
-        conflicts: restorePreview.conflicts,
-        entries: restorePreview.entries.map((entry) => ({ path: entry.path, before: entry.before, after: entry.after })),
-        apply: true,
-        applied: true,
-        boundaryId: publication.boundaryId,
-        checkpointId: published.checkpointId,
-        manifestDigest: published.manifestDigest ?? plan.manifestDigest,
-        checkpointRunId: restorePreview.checkpointRunId,
-        recoveryCheckpointId,
-        externalEffects: false
-      };
-      return restoreExecution;
+      if (staleResult) return staleResult;
+      if (completedResult) return completedResult;
+      throw new Error("restore completed without an execution result");
     } catch (cause) {
-      if (publication) {
-        try {
-          activeCoordinator.failBoundary(publication.boundaryId, `checkpoint restore failed: ${cause instanceof Error ? cause.message : String(cause)}`);
-        } catch {}
-      }
       const failed = cause instanceof OdinnRuntimeError ? cause : new Error(cause instanceof Error ? cause.message : String(cause));
       failed.name = failed.name === "Error" ? "ODINN_CHECKPOINT_RESTORE_FAIL_CLOSED" : failed.name;
       throw failed;
@@ -1410,7 +1578,134 @@ export function createWorkspaceMutationTools({
     }
   }
 
+  async function executeLegacySnapshotCreate(input: AnyRecord, requestRunId?: string) {
+    const selectedRunId = typeof input.snapshotRunId === "string" && input.snapshotRunId.trim()
+      ? input.snapshotRunId.trim()
+      : requestRunId ?? runId ?? (typeof input.runId === "string" ? input.runId : `snapshot-${randomUUID()}`);
+    let localRunLedger: RunLedger | undefined;
+    const activeRunLedger = runLedger ?? coordinator?.runLedger ?? (localRunLedger = createRunLedger({ workspaceRoot: resolvedRoot, stateDir: resolvedStateDir }));
+    const activeCoordinator = coordinator ?? new CheckpointCoordinator({ runLedger: activeRunLedger });
+    activeRunLedger.ensureRun({ runId: selectedRunId });
+    try {
+      return await withStateMutationLock(resolvedStateDir, async () => {
+        activeCoordinator.assertReady();
+        return new SnapshotManager({ ledger: activeRunLedger }).create({
+          runId: selectedRunId,
+          stepId: typeof input.stepId === "string" ? input.stepId : undefined,
+          paths: input.paths,
+          label: typeof input.label === "string" ? input.label : undefined,
+          workspaceRoot: resolvedRoot
+        });
+      });
+    } finally {
+      localRunLedger?.close();
+    }
+  }
+
+  async function executeLegacySnapshotRestore(input: AnyRecord, requestRunId?: string) {
+    const snapshotId = typeof input.snapshotId === "string" && input.snapshotId.trim()
+      ? input.snapshotId.trim()
+      : error("INPUT_INVALID", "snapshotId must be a non-empty string");
+    const selectedRunId = requestRunId ?? runId ?? `snapshot-restore-${snapshotId}`;
+    let localRunLedger: RunLedger | undefined;
+    const activeRunLedger = runLedger ?? coordinator?.runLedger ?? (localRunLedger = createRunLedger({ workspaceRoot: resolvedRoot, stateDir: resolvedStateDir }));
+    const activeCoordinator = coordinator ?? new CheckpointCoordinator({ runLedger: activeRunLedger });
+    activeRunLedger.ensureRun({ runId: selectedRunId });
+    try {
+      return await withStateMutationLock(resolvedStateDir, async () => {
+        activeCoordinator.assertReady();
+        const snapshotter = new SnapshotManager({ ledger: activeRunLedger });
+        const plan = snapshotter.plan(snapshotId);
+        const preview = snapshotter.restore(snapshotId, { apply: false });
+        if (input.apply !== true) return preview;
+
+        const coveredPaths = [...new Set([
+          ...plan.roots.map((entry: AnyRecord) => String(entry.path ?? "")),
+          ...plan.entries.map((entry: AnyRecord) => String(entry.path ?? ""))
+        ])];
+        const identities = captureMutationIdentities(resolvedRoot, coveredPaths, enforceSafety);
+        const publication = {
+          ...activeCoordinator.startBoundary({
+            runId: selectedRunId,
+            purpose: "legacy-snapshot-restore",
+            foundation: foundation ?? "operator",
+            metadata: { ...(metadata ?? {}), snapshotId }
+          }),
+          runId: selectedRunId
+        };
+
+        try {
+          activeCoordinator.recordMutationPreview({
+            boundaryId: publication.boundaryId,
+            operation: "snapshot.restore",
+            stepId,
+            preview: {
+              preview: true,
+              operation: "snapshot.restore",
+              status: "ready",
+              coveredPaths,
+              conflicts: [],
+              payload: { snapshotId, apply: true },
+              manifest: {
+                operation: "snapshot.restore",
+                snapshotId,
+                coveredPaths,
+                roots: plan.roots.map((entry: AnyRecord) => ({ path: entry.path, existed: entry.existed, type: entry.type })),
+                entries: plan.entries.map((entry: AnyRecord) => ({ path: entry.path, existed: entry.existed, digest: entry.digest, artifactDigest: entry.artifact_digest }))
+              }
+            }
+          });
+          assertMutationIdentities(resolvedRoot, identities);
+          const result = snapshotter.restore(snapshotId, { apply: true, runId: selectedRunId });
+          assertMutationIdentities(resolvedRoot, identities, { includeTargets: false });
+          const published = activeCoordinator.publishBoundary(publication.boundaryId);
+          return {
+            ...result,
+            boundaryId: publication.boundaryId,
+            checkpointId: published.checkpointId,
+            manifestDigest: published.manifestDigest,
+            artifactPath: published.artifactPath
+          };
+        } catch (cause) {
+          try {
+            activeCoordinator.failBoundary(publication.boundaryId, `legacy snapshot restore failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+          } catch {}
+          throw cause;
+        }
+      });
+    } finally {
+      localRunLedger?.close();
+    }
+  }
+
   return {
+    "snapshot.create": {
+      capability: "restore.create",
+      description: "Create a governed legacy workspace snapshot for later restore.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          paths: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 256 },
+          stepId: { type: "string" },
+          label: { type: "string" }
+        },
+        required: ["paths"]
+      },
+      execute: async (input: AnyRecord, context: AnyRecord = {}) => executeLegacySnapshotCreate(input, typeof (context.request as AnyRecord | undefined)?.id === "string" ? (context.request as AnyRecord).id as string : undefined)
+    },
+    "snapshot.restore": {
+      capability: "restore.apply",
+      description: "Preview or apply a legacy snapshot restore through the governed admission boundary.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          snapshotId: { type: "string" },
+          apply: { type: "boolean" }
+        },
+        required: ["snapshotId"]
+      },
+      execute: async (input: AnyRecord, context: AnyRecord = {}) => executeLegacySnapshotRestore(input, typeof (context.request as AnyRecord | undefined)?.id === "string" ? (context.request as AnyRecord).id as string : undefined)
+    },
     "checkpoint.restore": {
       capability: "checkpoint.restore",
       description: "Preview or apply a bounded checkpoint restore with conflict checks and pre-restore recovery snapshotting.",

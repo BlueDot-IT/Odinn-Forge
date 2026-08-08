@@ -123,6 +123,8 @@ test("CLI workspace mutation and restore command paths are governed and preserve
     "checkpoint",
     "apply",
     checkpointId,
+    "--checkpoint-manifest-digest",
+    preview.manifestDigest,
     "--run",
     "cli-restore-apply-run",
     "--state",

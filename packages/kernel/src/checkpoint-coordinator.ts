@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { resolve, sep } from "node:path";
+import { projectDurableToolOutput } from "@odinn/protocol";
 import { RunLedger } from "@odinn/store-sqlite";
 
 type JsonMap = Record<string, unknown>;
@@ -212,6 +215,9 @@ export class CheckpointCoordinator {
       stepId: stepId ?? boundary.stepId,
       status: preview.status
     };
+    const durablePayload = projectDurableToolOutput("workspace.patch", preview.payload ?? {});
+    const durableManifest = projectDurableToolOutput("workspace.patch", manifest);
+    const durableConflicts = projectDurableToolOutput("workspace.patch", conflicts);
 
     this.runLedger.database.transaction((database) => {
       database.prepare(
@@ -224,10 +230,10 @@ export class CheckpointCoordinator {
         stepId ?? boundary.stepId ?? null,
         safeOperation,
         status,
-        toJson(preview.payload ?? {}, "{}"),
-        toJson(manifest, "{}"),
+        toJson(durablePayload, "{}"),
+        toJson(durableManifest, "{}"),
         toJson(coveredPaths, "[]"),
-        toJson(conflicts, "[]"),
+        toJson(durableConflicts, "[]"),
         nowValue
       );
 
@@ -304,6 +310,9 @@ export class CheckpointCoordinator {
       });
 
       const boundArtifact = this.readManifestBinding(checkpoint.id);
+      if (!boundArtifact || !this.verifyManifestArtifact(boundArtifact)) {
+        throw new Error("published checkpoint manifest artifact failed verification");
+      }
       this.runLedger.database.transaction((database) => {
         database.prepare("UPDATE mutation_checkpoints SET status = ? WHERE id = ?").run("completed", checkpoint.id);
         database.prepare("UPDATE mutation_groups SET status = ?, updated_at = ? WHERE id = ?").run("completed", nowValue, boundaryId);
@@ -352,6 +361,17 @@ export class CheckpointCoordinator {
     return { recovered };
   }
 
+  assertReady() {
+    const row = this.runLedger.database.db.prepare(
+      "SELECT COUNT(1) AS count FROM mutation_groups WHERE status = 'needs-review'"
+    ).get() as SqlCountRow | undefined;
+    if (Number(row?.count ?? 0) > 0) {
+      const blocked = new Error("Odinn has an unresolved mutation checkpoint; inspect and resolve needs-review state before starting another mutation") as Error & { code?: string };
+      blocked.code = "CHECKPOINT_RECOVERY_REQUIRED";
+      throw blocked;
+    }
+  }
+
   failBoundary(boundaryId: string, reason = "failure detected") {
     const boundary = this.readBoundary(boundaryId);
     if (!boundary) throw new Error(`checkpoint boundary not found: ${boundaryId}`);
@@ -367,7 +387,7 @@ export class CheckpointCoordinator {
     if (!checkpoint) throw new Error(`checkpoint boundary missing checkpoint: ${boundaryId}`);
 
     const journals = this.runLedger.database.db.prepare(`
-      SELECT id, operation, status, step_id AS stepId, covered_paths_json, conflicts_json
+      SELECT id, operation, status, step_id AS stepId, covered_paths_json, conflicts_json, manifest_json, payload_json
       FROM mutation_journal_entries
       WHERE group_id = ?
       ORDER BY created_at ASC
@@ -457,6 +477,17 @@ export class CheckpointCoordinator {
         manifestDigest: manifestDigest ?? "",
         status: "conflict",
         conflicts: [{ code: "MISSING_MANIFEST", path: checkpoint.checkpointId, message: "checkpoint has no manifest artifact", details: {} }],
+        journal: checkpoint.journal
+      };
+    }
+    if (!this.verifyManifestArtifact(binding)) {
+      return {
+        checkpointId: checkpoint.checkpointId,
+        boundaryId: checkpoint.boundaryId,
+        runId: checkpoint.runId,
+        manifestDigest: binding.manifestDigest,
+        status: "conflict",
+        conflicts: [{ code: "MANIFEST_ARTIFACT_INVALID", path: checkpoint.checkpointId, message: "checkpoint manifest artifact failed byte verification", details: { digest: binding.manifestDigest } }],
         journal: checkpoint.journal
       };
     }
@@ -592,7 +623,22 @@ export class CheckpointCoordinator {
 
   private hasCheckpointManifest(checkpointId: string): boolean {
     const row = this.readManifestBinding(checkpointId);
-    return Boolean(row);
+    return Boolean(row && this.verifyManifestArtifact(row));
+  }
+
+  private verifyManifestArtifact(binding: BoundArtifact): boolean {
+    const artifactRoot = resolve(this.runLedger.artifacts.root);
+    const artifactPath = resolve(artifactRoot, binding.artifactPath);
+    if (!(artifactPath === artifactRoot || artifactPath.startsWith(`${artifactRoot}${sep}`))) return false;
+    try {
+      if (!existsSync(artifactPath) || !lstatSync(artifactPath).isFile()) return false;
+      const bytes = readFileSync(artifactPath);
+      return bytes.byteLength === binding.sizeBytes
+        && createHash("sha256").update(bytes).digest("hex") === binding.artifactDigest
+        && binding.manifestDigest === binding.artifactDigest;
+    } catch {
+      return false;
+    }
   }
 
   private countCheckpointJournalEntries(checkpointId: string): number {

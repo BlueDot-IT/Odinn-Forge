@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,14 +44,56 @@ test("checkpoint coordinator replays durable journal from persisted mutation pre
     const replay = coordinator.replayBoundary(boundaryId);
     assert.equal(replay.journal.length, 2);
     assert.equal(replay.conflicts, 0);
+    assert.equal(replay.journal[0]?.manifest?.operation, "workspace.write");
+    assert.deepEqual(replay.journal[0]?.payload, {});
     assert.equal(replay.artifacts.length, 1);
     assert.equal(replay.artifacts[0].manifestDigest, published.manifestDigest);
     assert.equal(replay.artifacts[0].artifactPath, published.artifactPath);
 
     const artifactPath = join(stateDir, "artifacts", published.artifactPath);
     await access(artifactPath);
+    const artifact = JSON.parse(await readFile(artifactPath, "utf8"));
+    assert.equal(artifact.journal[0]?.manifest?.operation, "workspace.write");
   } finally {
     coordinator.runLedger.close();
+  }
+});
+
+test("checkpoint journal projects mutation payloads before durable SQLite persistence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-checkpoint-redaction-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+  const contentSecret = "journal-private-content-3d18";
+  const findSecret = "journal-opaque-find-4a72";
+
+  try {
+    const { boundaryId } = coordinator.startBoundary({ runId: "run-checkpoint-redaction" });
+    coordinator.recordMutationPreview({
+      boundaryId,
+      operation: "workspace.patch",
+      stepId: "step-redaction",
+      preview: {
+        preview: true,
+        operation: "workspace.patch",
+        status: "conflict",
+        coveredPaths: ["seed.txt"],
+        payload: { content: contentSecret },
+        manifest: { operation: "workspace.patch", find: findSecret },
+        conflicts: [{ code: "EDIT_AMBIGUOUS", path: "seed.txt", details: { find: findSecret } }]
+      }
+    });
+
+    const row = runLedger.database.db.prepare(
+      "SELECT payload_json, manifest_json, conflicts_json FROM mutation_journal_entries WHERE group_id = ?"
+    ).get(boundaryId) as { payload_json: string; manifest_json: string; conflicts_json: string };
+    const durable = `${row.payload_json}\n${row.manifest_json}\n${row.conflicts_json}`;
+    assert.equal(durable.includes(contentSecret), false);
+    assert.equal(durable.includes(findSecret), false);
+    assert.equal(durable.includes("contentDigest"), true);
+    assert.equal(durable.includes("findDigest"), true);
+  } finally {
+    runLedger.close();
   }
 });
 

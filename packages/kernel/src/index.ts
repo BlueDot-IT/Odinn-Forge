@@ -591,13 +591,43 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
           checkpointId: { type: "string" },
           checkpointManifestDigest: { type: "string" }
         },
-        required: ["checkpointId"]
+        required: ["checkpointId", "checkpointManifestDigest"]
       },
       execute: async (input: any) => mutationTools["checkpoint.restore"].execute({
         checkpointId: input?.checkpointId,
         checkpointManifestDigest: input?.checkpointManifestDigest,
         apply: true
       })
+    }],
+    ["snapshot.create", {
+      capability: "restore.create",
+      description: "Create a governed legacy workspace snapshot for later restore.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          paths: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 256 },
+          stepId: { type: "string" },
+          label: { type: "string" }
+        },
+        required: ["paths"]
+      },
+      execute: async (input: any, context: any) => mutationTools["snapshot.create"].execute(input, context)
+    }],
+    ["snapshot.restore", {
+      capability: "restore.apply",
+      description: "Preview or apply a governed legacy snapshot restore.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          snapshotId: { type: "string" },
+          apply: { type: "boolean" }
+        },
+        required: ["snapshotId"]
+      },
+      execute: async (input: any, context: any) => mutationTools["snapshot.restore"].execute({
+        snapshotId: input?.snapshotId,
+        apply: input?.apply === true
+      }, context)
     }]
   ]) as BuiltInRegistry;
   let closed = false;
@@ -1050,6 +1080,27 @@ function taskRequestDigest(request: any): string {
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input: request.input ?? {}, actor: request.actor ?? "unknown" })).digest("hex");
 }
 
+function executionResourceForRequest(toolName: string, input: AnyRecord = {}) {
+  const pick = (entries: Array<[string, unknown]>) => Object.fromEntries(entries.filter(([, value]) => value !== undefined));
+  if (toolName === "workspace.mutate") {
+    return pick([["operation", input.operation], ["path", input.path], ["from", input.from], ["to", input.to]]);
+  }
+  if (toolName === "workspace.patch") {
+    return pick([["operation", input.operation], ["path", input.path]]);
+  }
+  if (toolName === "restore.create" || toolName === "restore.apply") {
+    return pick([["checkpointId", input.checkpointId], ["checkpointManifestDigest", input.checkpointManifestDigest]]);
+  }
+  if (toolName === "snapshot.create") {
+    const paths = Array.isArray(input.paths) ? [...new Set(input.paths.filter((value: unknown): value is string => typeof value === "string"))].sort() : [];
+    return { pathsDigest: createHash("sha256").update(stableTaskValue(paths), "utf8").digest("hex") };
+  }
+  if (toolName === "snapshot.restore") {
+    return pick([["snapshotId", input.snapshotId]]);
+  }
+  return input.resource && typeof input.resource === "object" && !Array.isArray(input.resource) ? input.resource : {};
+}
+
 function executionReference(namespace: string, value: unknown): string {
   return `${namespace}:sha256:${createHash("sha256").update(String(value), "utf8").digest("hex")}`;
 }
@@ -1372,7 +1423,11 @@ async function executeTaskThroughAdmission({
         error.code = "CAPABILITY_DENIED";
         throw error;
       }
-      capabilityClaims = new CapabilityBroker({ ledger: runLedger, stateDir: runLedger.stateDir, featureFlags: runLedger.featureFlags }).consume(token, { runId: request.id, toolName: request.tool, resource: request.input?.resource ?? {} });
+      capabilityClaims = new CapabilityBroker({ ledger: runLedger, stateDir: runLedger.stateDir, featureFlags: runLedger.featureFlags }).consume(token, {
+        runId: request.id,
+        toolName: request.tool,
+        resource: executionResourceForRequest(request.tool, request.input)
+      });
     }
   } catch (error) {
     const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError;

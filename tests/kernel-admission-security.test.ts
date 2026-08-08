@@ -21,6 +21,8 @@ test("governed mutation and restore tools are registered; legacy workspace.write
   assert.equal(registry.has("workspace.patch"), true);
   assert.equal(registry.has("restore.create"), true);
   assert.equal(registry.has("restore.apply"), true);
+  assert.equal(registry.has("snapshot.create"), true);
+  assert.equal(registry.has("snapshot.restore"), true);
   assert.equal(registry.has("workspace.writeText"), false);
 });
 
@@ -81,6 +83,111 @@ test("workspace.mutate requires capability/policy admission and rejects model-de
   }
 });
 
+test("capability resource constraints bind to the canonical workspace mutation target", async () => {
+  const root = await withTempRoot();
+  const state = join(root, ".odinn");
+  const auditStore = createAuditStore(join(state, "audit.jsonl"));
+  const runtime = createDifferentiatedRuntime({ workspaceRoot: root, stateDir: state, featureFlags: { capabilities: true, counterfactual: false, capsules: false } });
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, auditStore, config: { runLedger: runtime.ledger } });
+
+  try {
+    const runId = "mutation-resource-mismatch";
+    runtime.ledger.ensureRun({ runId, objective: "reject a mismatched mutation target" });
+    const issued = runtime.capabilities.issue({
+      runId,
+      stepId: "mutation-step",
+      toolName: "workspace.mutate",
+      resourceConstraints: { path: "safe.txt" }
+    });
+    await assert.rejects(
+      runTask({
+        task: {
+          id: runId,
+          tool: "workspace.mutate",
+          input: { operation: "write", path: "evil.txt", content: "must not publish", capabilityToken: issued.token }
+        },
+        auditStore,
+        policy: createDefaultPolicy({ allowedCapabilities: ["workspace.mutate"] }),
+        registry,
+        runLedger: runtime.ledger
+      }),
+      (error: any) => error.code === "CAPABILITY_SCOPE_MISMATCH"
+    );
+    assert.equal(existsSync(join(root, "evil.txt")), false);
+  } finally {
+    registry.close();
+    auditStore.close();
+    runtime.ledger.close();
+    await rm(state, { recursive: true, force: true });
+  }
+});
+
+test("mutation payloads are projected before durable audit and execution artifacts", async () => {
+  const root = await withTempRoot();
+  const state = join(root, ".odinn");
+  const auditStore = createAuditStore(join(state, "audit.jsonl"));
+  const runtime = createDifferentiatedRuntime({ workspaceRoot: root, stateDir: state, featureFlags: { capabilities: true, counterfactual: false, capsules: false } });
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, auditStore, config: { runLedger: runtime.ledger } });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["workspace.mutate", "workspace.patch"] });
+  const contentSecret = "private-mutation-content-7f43";
+  const findSecret = "opaque-find-value-2c91";
+  const replaceSecret = "opaque-replace-value-8a06";
+
+  try {
+    await writeFile(join(root, "seed.txt"), `${findSecret} ${findSecret}`);
+    const mutationRunId = "mutation-durable-redaction";
+    runtime.ledger.ensureRun({ runId: mutationRunId, objective: "project mutation content" });
+    const mutationToken = runtime.capabilities.issue({ runId: mutationRunId, stepId: "mutation-step", toolName: "workspace.mutate" });
+    await runTask({
+      task: {
+        id: mutationRunId,
+        tool: "workspace.mutate",
+        input: { operation: "write", path: "new.txt", content: contentSecret, capabilityToken: mutationToken.token }
+      },
+      auditStore,
+      policy,
+      registry,
+      runLedger: runtime.ledger
+    });
+
+    const patchRunId = "patch-durable-redaction";
+    runtime.ledger.ensureRun({ runId: patchRunId, objective: "project patch content" });
+    const patchToken = runtime.capabilities.issue({ runId: patchRunId, stepId: "patch-step", toolName: "workspace.patch" });
+    await runTask({
+      task: {
+        id: patchRunId,
+        tool: "workspace.patch",
+        input: { operation: "edit", path: "seed.txt", find: findSecret, replace: replaceSecret, capabilityToken: patchToken.token }
+      },
+      auditStore,
+      policy,
+      registry,
+      runLedger: runtime.ledger
+    });
+
+    const audit = JSON.stringify(await auditStore.readAll());
+    const rows = runtime.ledger.database.db.prepare(
+      "SELECT input_digest, output_digest FROM run_steps WHERE run_id IN (?, ?)"
+    ).all(mutationRunId, patchRunId) as Array<{ input_digest: string | null; output_digest: string | null }>;
+    const durableArtifacts = await Promise.all(rows.flatMap((row) => [row.input_digest, row.output_digest].filter((digest): digest is string => Boolean(digest))).map(async (digest) => {
+      const artifact = runtime.ledger.database.db.prepare("SELECT path FROM artifacts WHERE digest = ?").get(digest) as { path: string };
+      return readFile(join(runtime.ledger.artifacts.root, artifact.path), "utf8");
+    }));
+    const durableText = `${audit}\n${durableArtifacts.join("\n")}`;
+    assert.equal(durableText.includes(contentSecret), false);
+    assert.equal(durableText.includes(findSecret), false);
+    assert.equal(durableText.includes(replaceSecret), false);
+    assert.equal(durableText.includes("contentDigest"), true);
+    assert.equal(durableText.includes("findDigest"), true);
+    assert.equal(durableText.includes("replaceDigest"), true);
+  } finally {
+    registry.close();
+    auditStore.close();
+    runtime.ledger.close();
+    await rm(state, { recursive: true, force: true });
+  }
+});
+
 test("registry workspace.mutate and restore wrappers preserve stale-state failure gates", async () => {
   const root = await withTempRoot();
   const state = join(root, ".odinn");
@@ -110,11 +217,22 @@ test("registry workspace.mutate and restore wrappers preserve stale-state failur
     assert.equal(mutate.output.status, "ready");
 
     await writeFile(join(root, "seed.txt"), "changed after first mutation");
+    const restorePreview = await runTask({
+      task: {
+        id: "restore-preview",
+        tool: "restore.create",
+        input: { checkpointId }
+      },
+      auditStore,
+      policy,
+      registry,
+      runLedger
+    });
     const staleRestore = await runTask({
       task: {
         id: "restore-stale",
         tool: "restore.apply",
-        input: { checkpointId }
+        input: { checkpointId, checkpointManifestDigest: restorePreview.output.manifestDigest }
       },
       auditStore,
       policy,

@@ -81,6 +81,8 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
   tool("workspace.patch", ["workspace.patch"], []),
   tool("restore.create", ["restore.create"], []),
   tool("restore.apply", ["restore.apply"], []),
+  tool("snapshot.create", ["restore.create"], []),
+  tool("snapshot.restore", ["restore.apply"], []),
   tool("process.exec", ["process.execute"], ["process.exec"]),
   tool("web.search", ["network.access"], ["web.read"]),
   tool("web.fetch", ["network.access"], ["web.read"]),

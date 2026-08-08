@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -427,10 +427,10 @@ function usage() {
   odinn capability list <run-id> [--state .odinn]
   odinn capability revoke <capability-id> [--state .odinn]
   odinn timeline <run-id> [--state .odinn]
-  odinn checkpoint create <run-id> --path <path[,path]> [--label <label>] [--state .odinn]
+  odinn checkpoint create <run-id> --path <path[,path]> [--label <label>] [--task-run <run-id>] --capability-token <token> [--state .odinn]
   odinn checkpoint preview <snapshot-id> [--run <run-id>] [--checkpoint-manifest-digest <digest>] [--capability-token <token>] [--state .odinn]
   odinn checkpoint apply <snapshot-id> --run <run-id> [--checkpoint-manifest-digest <digest>] [--capability-token <token>] [--state .odinn]
-  odinn rewind <snapshot-id> [--apply] [--state .odinn]
+  odinn rewind <snapshot-id> [--run <run-id>] [--apply] --capability-token <token> [--checkpoint-manifest-digest <digest>] [--state .odinn]
   odinn workspace mutate --run <run-id> --operation write|mkdir|remove|move --path <path> [--from <path>] [--to <path>] [--content <text>] [--recursive true|false] [--mode <mode>] [--expected <json>] [--max-bytes <bytes>] [--max-files <files>] [--apply] [--capability-token <token>] [--state .odinn]
   odinn workspace patch --run <run-id> --operation edit|applyPatch --path <path> [--find <text>] [--replace <text>] [--replace-all true|false] [--patches <json-array>] [--expected <json>] [--max-bytes <bytes>] [--max-files <files>] [--apply] [--capability-token <token>] [--state .odinn]
   odinn branch <run-id> --from <step-id> --plan-file <plan.json> [--state .odinn]
@@ -516,13 +516,14 @@ function parseJsonOption(args: any, name: any, fallback: any = undefined, requir
   }
 }
 
-async function runGovernedTool(args: any, tool: any, input: any) {
+async function runGovernedTool(args: any, tool: any, input: any, runIdOverride?: string) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   try {
-    const runId = option(args, "--run", randomUUID());
+    new CheckpointCoordinator({ runLedger }).recover();
+    const runId = runIdOverride ?? option(args, "--run", randomUUID());
     const result = await runTask({
       task: {
         id: runId,
@@ -532,7 +533,7 @@ async function runGovernedTool(args: any, tool: any, input: any) {
       },
       auditStore,
       policy: createDefaultPolicy(config.policy),
-      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore }),
+      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config: { ...config, runLedger }, auditStore }),
       runLedger
     });
     await printJson(result.output);
@@ -3135,7 +3136,7 @@ async function gatewatchCommand(args: any) {
 async function capabilityCommand(args: any) {
   const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest);
   try {
-    if (subcommand === "issue") { const result = runtime.capabilities.issue({ runId: option(rest, "--run"), stepId: option(rest, "--step"), toolName: option(rest, "--tool"), scopes: splitCsv(option(rest, "--scope", "")), resourceConstraints: JSON.parse(option(rest, "--constraints", "{}")), expiresInMs: Number(option(rest, "--expires-ms", "60000")), maxUses: Number(option(rest, "--max-uses", "1")) }); await printJson(hasFlag(rest, "--show-token") ? result : { claims: result.claims, token: "[hidden; use --show-token only for a one-time local test]" }); return; }
+    if (subcommand === "issue") { const runId = option(rest, "--run"); runtime.ledger.ensureRun({ runId, objective: `capability: ${option(rest, "--tool")}` }); const result = runtime.capabilities.issue({ runId, stepId: option(rest, "--step"), toolName: option(rest, "--tool"), scopes: splitCsv(option(rest, "--scope", "")), resourceConstraints: JSON.parse(option(rest, "--constraints", "{}")), expiresInMs: Number(option(rest, "--expires-ms", "60000")), maxUses: Number(option(rest, "--max-uses", "1")) }); await printJson(hasFlag(rest, "--show-token") ? result : { claims: result.claims, token: "[hidden; use --show-token only for a one-time local test]" }); return; }
     if (subcommand === "use") { await printJson(runtime.capabilities.consume(option(rest, "--token"), { runId: option(rest, "--run"), toolName: option(rest, "--tool"), resource: JSON.parse(option(rest, "--resource", "{}")) })); return; }
     if (subcommand === "list") { await printJson(runtime.capabilities.list(rest.find((value: any) => !value.startsWith("--")))); return; }
     if (subcommand === "revoke") { await printJson(runtime.capabilities.revoke(rest.find((value: any) => !value.startsWith("--")))); return; }
@@ -3158,21 +3159,14 @@ async function checkpointCommand(args: any) {
   const state = stateDir(args);
   if (subcommand === "create") {
     const runId = rest[0] && !rest[0].startsWith("--") ? rest[0] : option(rest, "--run");
-    const runtime = createDifferentiatedRuntime({
-      stateDir: state,
-      workspaceRoot: invocationRoot(),
-      featureFlags: normalizeExperimentalFlags((await readConfig(state)).experimental)
-    });
-    try {
-      await printJson(runtime.snapshots.create({
-        runId,
-        paths: splitCsv(option(rest, "--path", "")),
-        label: option(rest, "--label", "checkpoint"),
-        workspaceRoot: invocationRoot()
-      }));
-    } finally {
-      runtime.ledger.close();
-    }
+    const governedArgs = rest.includes("--run") || !runId ? rest : [...rest, "--run", runId];
+    await runGovernedTool(governedArgs, "snapshot.create", {
+      paths: splitCsv(option(rest, "--path", "")),
+      stepId: option(rest, "--step"),
+      label: option(rest, "--label", "checkpoint"),
+      snapshotRunId: runId,
+      capabilityToken: option(rest, "--capability-token", undefined)
+    }, option(rest, "--task-run", `checkpoint-create-${runId ?? randomUUID()}`));
     return;
   }
   if (subcommand === "preview" || subcommand === "apply") {
@@ -3207,18 +3201,11 @@ async function rewindCommand(args: any) {
 }
 
 async function runLegacySnapshotRewind(args: any, snapshotId: string) {
-  const state = stateDir(args);
-  const config = await readConfig(state);
-  const runtime = createDifferentiatedRuntime({
-    stateDir: state,
-    workspaceRoot: invocationRoot(),
-    featureFlags: normalizeExperimentalFlags(config.experimental)
+  await runGovernedTool(args, "snapshot.restore", {
+    snapshotId,
+    apply: hasFlag(args, "--apply"),
+    capabilityToken: option(args, "--capability-token", undefined)
   });
-  try {
-    await printJson(runtime.snapshots.restore(snapshotId, { apply: hasFlag(args, "--apply") }));
-  } finally {
-    runtime.ledger.close();
-  }
 }
 
 function isLegacyRewindSnapshot(snapshotId: string) {

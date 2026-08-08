@@ -80,6 +80,7 @@ export function redactDurableValue(value: unknown, context: DurableRedactionCont
 }
 
 const WORKSPACE_CONTENT_TOOLS = new Set(["workspace.readText", "workspace.read", "workspace.search", "workspace.diff"]);
+const WORKSPACE_MUTATION_TOOLS = new Set(["workspace.mutate", "workspace.patch"]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -91,6 +92,7 @@ export function isWorkspaceContentTool(toolName: unknown): boolean {
  * may cross audit, ledger, or runtime-job persistence boundaries.
  */
 export function projectDurableToolInput(toolName: string, input: unknown): unknown {
+  if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
   if (typeof projected.before === "string") {
@@ -108,6 +110,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
 
 /** Project workspace results to bounded metadata before durable persistence. */
 export function projectDurableToolOutput(toolName: string, output: unknown): unknown {
+  if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(output);
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
   const record = output as JsonObject;
   if (toolName === "workspace.read" || toolName === "workspace.readText") {
@@ -140,6 +143,23 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
 
 function sha256Reference(value: string) {
   return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+const MUTATION_PAYLOAD_FIELDS = new Set(["content", "find", "replace"]);
+
+function projectMutationPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => projectMutationPayload(item));
+  if (!value || typeof value !== "object") return value;
+  const projected: JsonObject = {};
+  for (const [key, item] of Object.entries(value as JsonObject)) {
+    if (MUTATION_PAYLOAD_FIELDS.has(key) && typeof item === "string") {
+      projected[`${key}Digest`] = sha256Reference(item);
+      projected[`${key}Bytes`] = Buffer.byteLength(item, "utf8");
+    } else {
+      projected[key] = projectMutationPayload(item);
+    }
+  }
+  return projected;
 }
 
 function pickWorkspaceMetadata(value: JsonObject, keys: readonly string[]) {

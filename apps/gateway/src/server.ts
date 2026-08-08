@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -701,6 +701,7 @@ export async function createGatewayServer({
     includeRawEvidence: config.proof?.includeRawEvidence === true
   };
   const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags, proofOptions });
+  new CheckpointCoordinator({ runLedger: runtime.ledger }).recover();
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
@@ -959,12 +960,43 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/checkpoints") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        runtime.ledger.ensureRun({ runId: body.runId, objective: body.objective ?? "checkpoint" });
-        return json(response, 200, runtime.snapshots.create({ ...body, workspaceRoot: root }));
+        const snapshotRunId = body.runId;
+        const runId = body.taskId || body.id || request.headers["idempotency-key"] || (snapshotRunId ? `checkpoint-create-${snapshotRunId}` : randomUUID());
+        const result = await runGovernedTask({
+          task: {
+            id: runId,
+            actor: body.actor || "gateway",
+            tool: "snapshot.create",
+            input: {
+              paths: body.paths,
+              stepId: body.stepId,
+              label: body.label,
+              snapshotRunId,
+              capabilityToken: body.capabilityToken
+            },
+            reason: body.reason ?? "checkpoint create"
+          }
+        });
+        return json(response, 200, result.output ?? result);
       }
       if (request.method === "POST" && url.pathname.startsWith("/rewind/")) {
         const snapshotId = decodeURIComponent(url.pathname.slice("/rewind/".length));
-        return json(response, 200, runtime.snapshots.restore(snapshotId, { apply: (await readJson(request, { maxBytes: requestMaxBytes })).apply === true }));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
+        const result = await runGovernedTask({
+          task: {
+            id: runId,
+            actor: body.actor || "gateway",
+            tool: "snapshot.restore",
+            input: {
+              snapshotId,
+              apply: body.apply === true,
+              capabilityToken: body.capabilityToken
+            },
+            reason: body.reason
+          }
+        });
+        return json(response, 200, result.output ?? result);
       }
       if (request.method === "POST" && url.pathname === "/governed/workspace/mutate") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
