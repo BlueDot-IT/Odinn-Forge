@@ -1,7 +1,10 @@
-import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, realpathSync, readFileSync, statSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { CheckpointCoordinator } from "./checkpoint-coordinator.ts";
 import { OdinnRuntimeError } from "./differentiated-runtime.ts";
+import { withStateMutationLock } from "./state-mutation.ts";
+import { createRunLedger, RunLedger } from "./run-ledger.ts";
 
 type AnyRecord = Record<string, unknown>;
 
@@ -91,6 +94,35 @@ export interface MutationPreview {
     resultDigest?: string;
   }>;
   conflicts: MutationConflict[];
+}
+
+type MutationExecutionResult = Omit<MutationPreview, "preview"> & {
+  preview: false;
+  apply: true;
+  applied: boolean;
+  boundaryId?: string;
+  checkpointId?: string;
+  manifestDigest?: string;
+  artifactPath?: string;
+};
+
+interface MutationToolOptions {
+  workspaceRoot?: string;
+  safe?: boolean;
+  runLedger?: RunLedger;
+  coordinator?: CheckpointCoordinator;
+  stateDir?: string;
+  runId?: string;
+  stepId?: string;
+  purpose?: string;
+  foundation?: string;
+  metadata?: AnyRecord;
+}
+
+interface MutationPublicationState {
+  runId: string;
+  boundaryId: string;
+  stepId?: string;
 }
 
 function isWithin(root: string, target: string) {
@@ -221,6 +253,169 @@ function finalizePreview(
     entries: stableEntries,
     conflicts: stableConflicts
   };
+}
+
+function applyMutationResult(preview: MutationPreview, fields: {
+  applied: boolean;
+  boundaryId?: string;
+  checkpointId?: string;
+  manifestDigest?: string;
+  artifactPath?: string;
+}) {
+  const result: MutationExecutionResult = {
+    ...preview,
+    preview: false,
+    apply: true,
+    ...fields
+  };
+  return result;
+}
+
+function expectedFromNode(node: MutationNodeState): ExpectedState {
+  if (!node.exists) return { exists: false };
+  const expected: ExpectedState = {
+    exists: true,
+    type: node.kind === "missing" ? undefined : node.kind
+  };
+  if (node.bytes !== undefined) expected.bytes = node.bytes;
+  if (node.mode !== undefined) expected.mode = node.mode;
+  if (node.digest !== undefined) expected.digest = node.digest;
+  return expected;
+}
+
+function verifyParentChains(root: string, entries: MutationPreview["entries"], limits: MutationLimits, enforceSafety: boolean, conflicts: MutationConflict[]) {
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const parent = resolveParent(entry.path);
+    if (!parent) continue;
+    if (seen.has(parent)) continue;
+    seen.add(parent);
+    try {
+      const state = inspectPath(root, parent, { maxBytes: limits.maxBytes }, enforceSafety);
+      if (!state.exists || state.kind !== "directory") {
+        pushConflict(conflicts, entry.path, "PARENT_INVALID", "parent directory missing or not a directory", { parent });
+      }
+    } catch (cause) {
+      if (cause instanceof OdinnRuntimeError) {
+        pushConflict(conflicts, entry.path, cause.code, cause.message, cause.details);
+      } else {
+        throw cause;
+      }
+    }
+  }
+}
+
+function ensureNoStaleState({ root, entries, enforceSafety, limits }: {
+  root: string;
+  entries: MutationPreview["entries"];
+  enforceSafety: boolean;
+  limits: MutationLimits;
+}): MutationConflict[] {
+  const conflicts: MutationConflict[] = [];
+  for (const entry of entries) {
+    const expectedBefore = expectedFromNode(entry.before ?? { path: entry.path, exists: false, kind: "missing" });
+    try {
+      const current = inspectPath(
+        root,
+        entry.path,
+        { requireDigest: entry.before?.kind === "file" && entry.before.digest !== undefined, maxBytes: limits.maxBytes },
+        enforceSafety
+      );
+      addExpectedConflicts(entry.path, current, expectedBefore, conflicts);
+    } catch (cause) {
+      if (cause instanceof OdinnRuntimeError) {
+        pushConflict(conflicts, entry.path, cause.code, cause.message, cause.details);
+      } else {
+        throw cause;
+      }
+    }
+  }
+
+  verifyParentChains(root, entries, limits, enforceSafety, conflicts);
+  return conflicts;
+}
+
+function verifyPostWrite({ root, preview, enforceSafety, limits }: {
+  root: string;
+  preview: MutationPreview;
+  enforceSafety: boolean;
+  limits: MutationLimits;
+}) {
+  const conflicts: MutationConflict[] = [];
+  for (const entry of preview.entries) {
+    if (!entry.after) continue;
+    const expected = expectedFromNode(entry.after);
+    try {
+      const actual = inspectPath(
+        root,
+        entry.path,
+        {
+          requireDigest: entry.after.kind === "file",
+          maxBytes: limits.maxBytes
+        },
+        enforceSafety
+      );
+      addExpectedConflicts(entry.path, actual, expected, conflicts);
+    } catch (cause) {
+      if (cause instanceof OdinnRuntimeError) {
+        pushConflict(conflicts, entry.path, cause.code, cause.message, cause.details);
+      } else {
+        throw cause;
+      }
+    }
+  }
+  return conflicts;
+}
+
+function writeAtomically(absolute: string, bytes: Buffer, mode: number) {
+  const temporary = `${absolute}.odinn-write-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, bytes, { mode });
+    renameSync(temporary, absolute);
+  } catch (error) {
+    try {
+      rmSync(temporary, { recursive: true, force: true });
+    } catch {}
+    throw error;
+  }
+}
+
+function removeAtomically(absolute: string) {
+  const backup = `${absolute}.odinn-remove-${process.pid}-${randomUUID()}`;
+  renameSync(absolute, backup);
+  try {
+    rmSync(backup, { recursive: true, force: true });
+  } catch (error) {
+    try {
+      renameSync(backup, absolute);
+    } catch {}
+    throw error;
+  }
+}
+
+function moveAtomically(source: string, destination: string, overwrite: boolean) {
+  const backup = `${destination}.odinn-overwrite-${process.pid}-${randomUUID()}`;
+  const destinationExisted = existsSync(destination);
+  let backedUp = false;
+  try {
+    if (destinationExisted) {
+      if (!overwrite) throw new Error("destination exists");
+      renameSync(destination, backup);
+      backedUp = true;
+    }
+    renameSync(source, destination);
+    if (backedUp) {
+      rmSync(backup, { recursive: true, force: true });
+    }
+  } catch (error) {
+    if (backedUp) {
+      try {
+        if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
+        renameSync(backup, destination);
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 function normalizePortablePath(label: string, value: unknown): string {
@@ -594,12 +789,124 @@ function resolveParent(path: string): string | undefined {
   return index <= 0 ? undefined : path.slice(0, index);
 }
 
-export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), safe = true }: { workspaceRoot?: string; safe?: boolean } = {}) {
+export function createWorkspaceMutationTools({
+  workspaceRoot = process.cwd(),
+  safe = true,
+  runLedger,
+  coordinator,
+  stateDir,
+  runId,
+  stepId,
+  purpose,
+  foundation,
+  metadata
+}: MutationToolOptions = {}) {
   const enforceSafety = safe !== false;
-  const inspectPathWithPolicy = (portable: string, options: { requireDigest?: boolean; maxBytes?: number } = {}) => inspectPath(workspaceRoot, portable, options, enforceSafety);
-  const resolvePathWithPolicy = (portable: string) => resolveCandidate(workspaceRoot, portable, enforceSafety);
+  const resolvedRoot = resolve(workspaceRoot);
+  const resolvedStateDir = resolve(stateDir ?? join(resolvedRoot, ".odinn"));
+  const inspectPathWithPolicy = (portable: string, options: { requireDigest?: boolean; maxBytes?: number } = {}) =>
+    inspectPath(resolvedRoot, portable, options, enforceSafety);
+  const resolvePathWithPolicy = (portable: string) => resolveCandidate(resolvedRoot, portable, enforceSafety);
   const collectTreeWithPolicy = (portable: string, limits: MutationLimits, conflicts: MutationConflict[]) =>
-    collectDirectoryTree(workspaceRoot, portable, limits, enforceSafety, conflicts);
+    collectDirectoryTree(resolvedRoot, portable, limits, enforceSafety, conflicts);
+
+  async function executeMutation(
+    input: AnyRecord,
+    preview: MutationPreview,
+    mutation: () => Promise<void> | void
+  ): Promise<MutationPreview | MutationExecutionResult> {
+    const apply = input.apply === true;
+    if (!apply || preview.status === "conflict") {
+      if (!apply) return preview;
+      return applyMutationResult(preview, { applied: false });
+    }
+
+    const staleConflicts = ensureNoStaleState({
+      root: resolvedRoot,
+      entries: preview.entries,
+      enforceSafety,
+      limits: preview.ceilings
+    });
+    if (staleConflicts.length > 0) {
+      return applyMutationResult({
+        ...preview,
+        status: "conflict",
+        conflicts: [...preview.conflicts, ...staleConflicts]
+      }, { applied: false });
+    }
+
+    const selectedRunId = runId ?? `mutation-${randomUUID()}`;
+    let localRunLedger: RunLedger | undefined;
+    const activeRunLedger = runLedger ?? coordinator?.runLedger ?? (localRunLedger = createRunLedger({ workspaceRoot: resolvedRoot, stateDir: resolvedStateDir }));
+    const activeCoordinator = coordinator ?? new CheckpointCoordinator({ runLedger: activeRunLedger });
+    let publication: MutationPublicationState | undefined;
+
+    activeRunLedger.ensureRun({ runId: selectedRunId });
+
+    try {
+      publication = {
+        ...activeCoordinator.startBoundary({
+          runId: selectedRunId,
+          stepId,
+          purpose: purpose ?? "mutation-group",
+          foundation: foundation ?? "agent",
+          metadata: metadata ?? {}
+        }),
+        runId: selectedRunId
+      };
+
+      const recorded = activeCoordinator.recordMutationPreview({
+        boundaryId: publication.boundaryId,
+        operation: preview.operation,
+        stepId,
+        preview
+      });
+      if (recorded.status === "conflict") {
+        return applyMutationResult({
+          ...preview,
+          status: "conflict",
+          conflicts: [...preview.conflicts]
+        }, { applied: false, boundaryId: publication.boundaryId });
+      }
+
+      await withStateMutationLock(resolvedStateDir, async () => {
+        await mutation();
+
+        const verification = verifyPostWrite({
+          root: resolvedRoot,
+          preview,
+          enforceSafety,
+          limits: preview.ceilings
+        });
+        if (verification.length > 0) {
+          const verificationError = new OdinnRuntimeError("VERIFICATION_FAILED", "post-write verification failed", { issues: verification });
+          throw verificationError;
+        }
+      });
+
+      const published = activeCoordinator.publishBoundary(publication.boundaryId);
+      return applyMutationResult(preview, {
+        applied: true,
+        boundaryId: publication.boundaryId,
+        checkpointId: published.checkpointId,
+        manifestDigest: published.manifestDigest,
+        artifactPath: published.artifactPath
+      });
+    } catch (cause) {
+      if (publication) {
+        try {
+          activeCoordinator.failBoundary(publication.boundaryId, `mutation publication failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        } catch {}
+      }
+      if (cause instanceof OdinnRuntimeError && cause.code === "INPUT_INVALID") throw cause;
+      const failed = cause instanceof Error ? cause : new Error(String(cause));
+      failed.name = "ODINN_MUTATION_FAIL_CLOSED";
+      throw failed;
+    } finally {
+      localRunLedger?.close();
+    }
+  }
+
   return {
       "workspace.write": {
       capability: "workspace.write",
@@ -611,6 +918,7 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           content: { type: "string" },
           mode: { type: "integer" },
           expected: { type: "object" },
+          apply: { type: "boolean" },
           maxBytes: { type: "integer" },
           maxFiles: { type: "integer" }
         },
@@ -654,9 +962,13 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           digest: hashValue(Buffer.from(content, "utf8"))
         };
 
-        return finalizePreview("workspace.write", limits, [{ path, before, after, expected, resultDigest: after.digest }], conflicts);
-      }
-    },
+      const preview = finalizePreview("workspace.write", limits, [{ path, before, after, expected, resultDigest: after.digest }], conflicts);
+      return executeMutation(input, preview, () => {
+        const { absolute } = resolvePathWithPolicy(path);
+        writeAtomically(absolute, Buffer.from(content, "utf8"), mode);
+      });
+    }
+  },
     "workspace.edit": {
       capability: "workspace.edit",
       description: "Preview a bounded in-file find-and-replace edit with deterministic conflicts.",
@@ -668,6 +980,7 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           replace: { type: "string" },
           replaceAll: { type: "boolean" },
           expected: { type: "object" },
+          apply: { type: "boolean" },
           maxBytes: { type: "integer" },
           maxFiles: { type: "integer" }
         },
@@ -694,13 +1007,14 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
         }
         addExpectedConflicts(path, before, expected, conflicts);
 
+        let sourceText = "";
         let afterText = "";
         let after: MutationNodeState = before;
 
         if (before.exists && before.kind === "file") {
           const { absolute } = resolvePathWithPolicy(path);
-          const source = readTextFileIfFits(absolute, limits.maxBytes, conflicts, path);
-          const occurrences = source.split(input.find as string).length - 1;
+          sourceText = readTextFileIfFits(absolute, limits.maxBytes, conflicts, path);
+          const occurrences = sourceText.split(input.find as string).length - 1;
           if (occurrences === 0) {
             pushConflict(conflicts, path, "EDIT_NOT_FOUND", "find text not present", { find: input.find });
           } else if (!replaceAll && occurrences > 1) {
@@ -709,8 +1023,8 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
 
           if (occurrences > 0) {
             afterText = replaceAll
-              ? source.split(input.find as string).join(input.replace as string)
-              : source.replace(input.find as string, input.replace as string);
+              ? sourceText.split(input.find as string).join(input.replace as string)
+              : sourceText.replace(input.find as string, input.replace as string);
             if (Buffer.byteLength(afterText, "utf8") !== before.bytes) {
               after = {
                 path,
@@ -737,7 +1051,14 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           pushConflict(conflicts, path, "BUDGET_EXCEEDED", "result exceeds byte ceiling", { bytes: after.bytes, maxBytes: limits.maxBytes });
         }
 
-        return finalizePreview("workspace.edit", limits, [{ path, before, after, expected, resultDigest: after.digest }], conflicts);
+        const preview = finalizePreview("workspace.edit", limits, [{ path, before, after, expected, resultDigest: after.digest }], conflicts);
+        return executeMutation(input, preview, () => {
+          if (after.kind !== "file") {
+            error("TYPE_MISMATCH", "edit target is not a file", { path });
+          }
+          const { absolute } = resolvePathWithPolicy(path);
+          writeAtomically(absolute, Buffer.from(afterText, "utf8"), before.mode ?? 0o600);
+        });
       }
     },
     "workspace.applyPatch": {
@@ -749,6 +1070,7 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           path: { type: "string" },
           patches: { type: "array", minItems: 1, maxItems: MAX_PATCH_COUNT },
           expected: { type: "object" },
+          apply: { type: "boolean" },
           maxBytes: { type: "integer" },
           maxFiles: { type: "integer" }
         },
@@ -790,7 +1112,14 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           pushConflict(conflicts, path, "BUDGET_EXCEEDED", "result exceeds byte ceiling", { bytes: afterBytes, maxBytes: limits.maxBytes });
         }
 
-        return finalizePreview("workspace.applyPatch", limits, [{ path, before, after, expected, resultDigest: after.digest }], conflicts);
+        const preview = finalizePreview("workspace.applyPatch", limits, [{ path, before, after, expected, resultDigest: after.digest }], conflicts);
+        return executeMutation(input, preview, () => {
+          const { absolute } = resolvePathWithPolicy(path);
+          if (after.kind !== "file") {
+            error("TYPE_MISMATCH", "patch target is not a file", { path });
+          }
+          writeAtomically(absolute, Buffer.from(patched, "utf8"), before.mode ?? 0o600);
+        });
       }
     },
     "workspace.mkdir": {
@@ -802,6 +1131,7 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           path: { type: "string" },
           mode: { type: "integer" },
           expected: { type: "object" },
+          apply: { type: "boolean" },
           maxBytes: { type: "integer" },
           maxFiles: { type: "integer" }
         },
@@ -837,7 +1167,11 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           mode
         };
 
-        return finalizePreview("workspace.mkdir", limits, [{ path, before, after, expected }], conflicts);
+        const preview = finalizePreview("workspace.mkdir", limits, [{ path, before, after, expected }], conflicts);
+        return executeMutation(input, preview, () => {
+          const { absolute } = resolvePathWithPolicy(path);
+          mkdirSync(absolute, { mode, recursive: false });
+        });
       }
     },
     "workspace.remove": {
@@ -849,6 +1183,7 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           path: { type: "string" },
           recursive: { type: "boolean" },
           expected: { type: "object" },
+          apply: { type: "boolean" },
           maxBytes: { type: "integer" },
           maxFiles: { type: "integer" }
         },
@@ -882,7 +1217,10 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           }
         }
 
-        return finalizePreview("workspace.remove", limits, entries, conflicts);
+        const preview = finalizePreview("workspace.remove", limits, entries, conflicts);
+        return executeMutation(input, preview, () => {
+          if (before.exists) removeAtomically(resolvePathWithPolicy(path).absolute);
+        });
       }
     },
     "workspace.move": {
@@ -896,6 +1234,7 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           overwrite: { type: "boolean" },
           expectedSource: { type: "object" },
           expectedDestination: { type: "object" },
+          apply: { type: "boolean" },
           maxBytes: { type: "integer" },
           maxFiles: { type: "integer" }
         },
@@ -971,7 +1310,13 @@ export function createWorkspaceMutationTools({ workspaceRoot = process.cwd(), sa
           }
         }
 
-        return finalizePreview("workspace.move", limits, entries, conflicts);
+        const preview = finalizePreview("workspace.move", limits, entries, conflicts);
+        return executeMutation(input, preview, () => {
+          if (!sourceState.exists) return;
+          const { absolute: source } = resolvePathWithPolicy(sourcePath);
+          const { absolute: destination } = resolvePathWithPolicy(destinationPath);
+          moveAtomically(source, destination, overwrite);
+        });
       }
     }
   };

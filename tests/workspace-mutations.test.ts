@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createBuiltInRegistry } from "../packages/kernel/src/index.ts";
+import { CheckpointCoordinator, createRunLedger } from "../packages/kernel/src/index.ts";
 import { createWorkspaceMutationTools } from "../packages/kernel/src/workspace-mutations.ts";
 
 test("workspace mutation tools stay unavailable in default registry", async () => {
@@ -163,3 +164,161 @@ if (process.platform !== "win32") {
     );
   });
 }
+
+test("apply mode creates publication artifacts for write, edit, patch, mkdir, remove, and move", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-apply-all-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ workspaceRoot: root, stateDir });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+  const tools = createWorkspaceMutationTools({ workspaceRoot: root, runLedger, coordinator, stateDir });
+
+  try {
+    await writeFile(join(root, "seed.txt"), "alpha");
+    const writeResult = await tools["workspace.write"].execute({
+      path: "seed.txt",
+      content: "beta",
+      apply: true
+    });
+    assert.equal(writeResult.preview, false);
+    assert.equal(writeResult.applied, true);
+    assert.equal((await readFile(join(root, "seed.txt"), "utf8")), "beta");
+    assert.equal(existsSync(join(root, "seed.txt")), true);
+
+    const editDigest = createHash("sha256").update("beta").digest("hex");
+    const editResult = await tools["workspace.edit"].execute({
+      path: "seed.txt",
+      find: "be",
+      replace: "g",
+      expected: { digest: editDigest },
+      apply: true
+    });
+    assert.equal(editResult.preview, false);
+    assert.equal(editResult.applied, true);
+    assert.equal(await readFile(join(root, "seed.txt"), "utf8"), "gta");
+
+    const patchResult = await tools["workspace.applyPatch"].execute({
+      path: "seed.txt",
+      patches: [{ find: "gta", replace: "omega" }],
+      apply: true
+    });
+    assert.equal(patchResult.preview, false);
+    assert.equal(patchResult.applied, true);
+    assert.equal((await readFile(join(root, "seed.txt"), "utf8")), "omega");
+
+    const mkdirResult = await tools["workspace.mkdir"].execute({
+      path: "folder",
+      apply: true
+    });
+    assert.equal(mkdirResult.preview, false);
+    assert.equal(mkdirResult.applied, true);
+    assert.equal(existsSync(join(root, "folder")), true);
+
+    const removeResult = await tools["workspace.remove"].execute({ path: "folder", apply: true });
+    assert.equal(removeResult.preview, false);
+    assert.equal(removeResult.applied, true);
+    assert.equal(existsSync(join(root, "folder")), false);
+
+    await writeFile(join(root, "move-from.txt"), "to-move");
+    const moveResult = await tools["workspace.move"].execute({
+      from: "move-from.txt",
+      to: "moved.txt",
+      apply: true
+    });
+    assert.equal(moveResult.preview, false);
+    assert.equal(moveResult.applied, true);
+    assert.equal(existsSync(join(root, "move-from.txt")), false);
+    assert.equal(existsSync(join(root, "moved.txt")), true);
+
+    const boundaryStatus = runLedger.database.db.prepare(
+      "SELECT status, step_id FROM mutation_groups ORDER BY created_at DESC LIMIT 1"
+    ).get() as { status: string; step_id: string | null } | undefined;
+    assert.equal(boundaryStatus?.status, "completed");
+  } finally {
+    runLedger.close();
+  }
+});
+
+test("stale-write refusal rejects apply when expected-current digest no longer matches", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-apply-stale-"));
+  await writeFile(join(root, "seed.txt"), "one");
+  const original = await readFile(join(root, "seed.txt"));
+  const expectedDigest = createHash("sha256").update(original).digest("hex");
+  const tools = createWorkspaceMutationTools({ workspaceRoot: root });
+
+  await writeFile(join(root, "seed.txt"), "stale");
+  const staleResult = await tools["workspace.write"].execute({
+    path: "seed.txt",
+    content: "new-content",
+    expected: { digest: expectedDigest },
+    apply: true
+  });
+  assert.equal(staleResult.preview, false);
+  assert.equal(staleResult.applied, false);
+  assert.equal(staleResult.status, "conflict");
+  assert.equal(staleResult.conflicts[0]?.code, "DIGEST_MISMATCH");
+});
+
+test("parent-swap and identity defenses reject apply when ancestors become unsafe", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-parent-swap-"));
+  const safeDir = join(root, "safe");
+  await mkdir(safeDir);
+  const target = join(root, "target-dir");
+  await mkdir(target);
+  await writeFile(join(root, "seed.txt"), "value");
+  const tools = createWorkspaceMutationTools({ workspaceRoot: root });
+  await writeFile(join(safeDir, "seed.txt"), "value");
+  await symlink(target, join(root, "link-safe"), "dir");
+  await assert.rejects(
+    () => tools["workspace.write"].execute({ path: "link-safe/seed.txt", content: "changed", apply: true }),
+    (error: any) => error.code === "SYMLINK_FORBIDDEN" || error.code === "PARENT_INVALID"
+  );
+});
+
+test("mutations fail-closed when publication fails after execution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-publication-failclosed-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ workspaceRoot: root, stateDir });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+  const originalPublish = coordinator.publishBoundary.bind(coordinator);
+  const tools = createWorkspaceMutationTools({ workspaceRoot: root, runLedger, coordinator, stateDir });
+  coordinator.publishBoundary = ((boundaryId: string) => {
+    throw new Error(`injected publish failure for ${boundaryId}`);
+  }) as typeof coordinator.publishBoundary;
+  try {
+    await assert.rejects(
+      () => tools["workspace.write"].execute({
+        path: "seed.txt",
+        content: "alpha",
+        apply: true
+      }),
+      (error: any) => error.name === "ODINN_MUTATION_FAIL_CLOSED"
+    );
+
+    const boundary = runLedger.database.db.prepare("SELECT id, status FROM mutation_groups ORDER BY created_at DESC LIMIT 1").get() as {
+      id: string;
+      status: string;
+    } | undefined;
+    assert.equal(boundary?.status, "needs-review");
+    assert.equal(existsSync(join(root, "seed.txt")), true);
+  } finally {
+    coordinator.publishBoundary = originalPublish;
+    runLedger.close();
+  }
+});
+
+test("fault-injection in limits keeps publication from proceeding and returns conflict", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-stage5-apply-limit-"));
+  const tools = createWorkspaceMutationTools({ workspaceRoot: root });
+
+  const limited = await tools["workspace.write"].execute({
+    path: "seed.txt",
+    content: "x".repeat(2_500),
+    maxBytes: 1_000,
+    apply: true
+  });
+  assert.equal(limited.preview, false);
+  assert.equal(limited.applied, false);
+  assert.equal(limited.status, "conflict");
+  assert.equal(limited.conflicts[0]?.code, "BUDGET_EXCEEDED");
+  assert.equal(existsSync(join(root, "seed.txt")), false);
+});

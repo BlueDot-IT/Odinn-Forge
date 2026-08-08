@@ -299,7 +299,7 @@ export class CheckpointCoordinator {
       };
     } catch (cause) {
       const message = toErrorMessage(cause);
-      this.failBoundary(boundaryId, checkpoint.id, `publish failed: ${message}`);
+      this.setNeedsReview(boundaryId, checkpoint.id, `publish failed: ${message}`);
       const error = cause instanceof Error ? cause : new Error(message);
       error.name = "ODINN_CHECKPOINT_FAIL_CLOSED";
       throw error;
@@ -311,10 +311,18 @@ export class CheckpointCoordinator {
       "SELECT id, group_id FROM mutation_checkpoints WHERE status IN ('created', 'checkpointing', 'publishing', 'verifying', 'ready')"
     ).all() as SqlRow[];
     const recovered = unstable.map((row) => {
-      this.failBoundary(String(row.group_id), String(row.id), "recovered after interruption");
+      this.setNeedsReview(String(row.group_id), String(row.id), "recovered after interruption");
       return String(row.id);
     });
     return { recovered };
+  }
+
+  failBoundary(boundaryId: string, reason = "failure detected") {
+    const boundary = this.readBoundary(boundaryId);
+    if (!boundary) throw new Error(`checkpoint boundary not found: ${boundaryId}`);
+    const checkpoint = this.currentCheckpoint(boundaryId);
+    if (!checkpoint) throw new Error(`checkpoint boundary missing checkpoint: ${boundaryId}`);
+    this.setNeedsReview(boundary.id, checkpoint.id, reason);
   }
 
   replayBoundary(boundaryId: string) {
@@ -362,7 +370,7 @@ export class CheckpointCoordinator {
     };
   }
 
-  private failBoundary(groupId: string, checkpointId: string, reason: string) {
+  private setNeedsReview(groupId: string, checkpointId: string, reason: string) {
     const nowValue = this.now();
     this.runLedger.database.transaction((database) => {
       database.prepare(
