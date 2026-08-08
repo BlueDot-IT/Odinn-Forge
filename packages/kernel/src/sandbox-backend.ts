@@ -299,6 +299,7 @@ export function buildNetworkDeniedOciArgs(
     "--label", "odinn.managed=true",
     ...(identity ? ["--label", `odinn.namespace-id=${identity.namespaceId}`, "--label", `odinn.execution-id=${identity.executionId}`] : []),
     "--label", `odinn.profile-digest=${profile.digest}`,
+    "--label", `odinn.image-ref=${profile.image}`,
     "--label", `odinn.timeout-ms=${profile.limits.timeoutMs}`,
     "--label", `odinn.max-output-bytes=${profile.limits.maxOutputBytes}`
   ];
@@ -1049,6 +1050,7 @@ export function attestContainerConfiguration(profile: CompiledSandboxProfile, re
   const noNewPrivilegesSelectors = security.filter((value) => value === "no-new-privileges" || value.startsWith("no-new-privileges="));
   const noNewPrivilegesMatches = noNewPrivilegesSelectors.length === 1
     && ["no-new-privileges", "no-new-privileges=true"].includes(noNewPrivilegesSelectors[0]!);
+  const securityOptionsSafe = security.every((value) => value === "no-new-privileges" || value === "no-new-privileges=true" || value === "seccomp=builtin");
   const dropped: string[] = Array.isArray(host.CapDrop) ? host.CapDrop.map((value: unknown) => String(value).toUpperCase()) : [];
   const tmpfs = host.Tmpfs && typeof host.Tmpfs === "object" ? host.Tmpfs : {};
   const tmpfsTokens = typeof tmpfs["/tmp"] === "string" ? String(tmpfs["/tmp"]).split(",").map((value) => value.trim()).filter(Boolean) : [];
@@ -1064,6 +1066,11 @@ export function attestContainerConfiguration(profile: CompiledSandboxProfile, re
       && typeof actual.ReadOnly === "boolean"
       && actual.ReadOnly === (mount.access === "read-only")
   ));
+  const forbiddenPrivilegeSurfaces = host.Privileged === true
+    || (Array.isArray(host.Devices) && host.Devices.length > 0)
+    || (Array.isArray(host.DeviceRequests) && host.DeviceRequests.length > 0)
+    || (Array.isArray(host.Binds) && host.Binds.length > 0)
+    || ["PidMode", "IpcMode", "UTSMode", "UsernsMode"].some((key) => typeof host[key] === "string" && host[key] !== "");
   const controlsMatch = String(host.NetworkMode ?? "") === "none"
     && state.Running === false
     && state.Paused === false
@@ -1073,6 +1080,8 @@ export function attestContainerConfiguration(profile: CompiledSandboxProfile, re
     && String(configuration.User ?? "") === "65532:65532"
     && dropped.includes("ALL")
     && noNewPrivilegesMatches
+    && securityOptionsSafe
+    && !forbiddenPrivilegeSurfaces
     && (profile.backend !== "docker" || seccompSelectors.length === 1 && seccompSelectors[0] === "seccomp=builtin")
     && typeof host.PidsLimit === "number" && Number.isSafeInteger(host.PidsLimit) && host.PidsLimit === profile.limits.processCount
     && typeof host.Memory === "number" && Number.isSafeInteger(host.Memory) && host.Memory === profile.limits.memoryBytes
@@ -1084,7 +1093,8 @@ export function attestContainerConfiguration(profile: CompiledSandboxProfile, re
   const identityMatches = !identity || labels["odinn.managed"] === "true"
     && labels["odinn.namespace-id"] === identity.namespaceId
     && labels["odinn.execution-id"] === identity.executionId
-    && labels["odinn.profile-digest"] === profile.digest;
+    && labels["odinn.profile-digest"] === profile.digest
+    && labels["odinn.image-ref"] === profile.image;
   if (!controlsMatch || !identityMatches) {
     throw new SandboxBackendRefusalError("sandbox runtime did not preserve the compiled isolation controls", "SANDBOX_CONTROL_ATTESTATION_FAILED");
   }

@@ -264,3 +264,16 @@ test("sandbox bundle sources must be absolute canonical real directories and sep
     await assert.rejects(() => materializeSandboxBundle(alias, paths.state), /real directory/u);
   }
 });
+
+test("sandbox bundles can omit a trusted nested runtime state root", async () => {
+  const paths = await fixture("nested-state");
+  const nestedState = join(paths.source, ".odinn");
+  await mkdir(nestedState, { mode: 0o700 });
+  await writeFile(join(paths.source, "workspace.txt"), "workspace");
+  await writeFile(join(nestedState, "approval-secret"), "must-not-enter-bundle");
+  await assert.rejects(() => materializeSandboxBundle(paths.source, nestedState), /must not overlap/u);
+
+  const reference = await materializeSandboxBundle(paths.source, nestedState, { excludeStateRoot: true });
+  assert.equal(await readFile(join(reference.path, "workspace.txt"), "utf8"), "workspace");
+  await assert.rejects(() => access(join(reference.path, ".odinn")), { code: "ENOENT" });
+});

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   createStateBackup,
+  createApprovalStore,
   ensureStateCompatibility,
   inspectStateBackup,
   restoreStateBackup,
@@ -50,6 +51,14 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     await writeFile(join(fixture.state, "browser-profile", "Cookies"), "do-not-copy\n");
     await writeFile(join(fixture.state, "gateway.token"), "do-not-copy\n");
     await writeFile(join(fixture.state, "capability-signing.key"), "do-not-copy\n");
+    const approvalSecret = "do-not-copy-process-command";
+    createApprovalStore({ path: join(fixture.state, "approvals.json") }).create({
+      tool: "process.exec",
+      runId: "backup-secret",
+      input: { command: approvalSecret, args: ["private-argument"] }
+    });
+    await mkdir(join(fixture.state, "bundles", "sha256", "bundle"), { recursive: true });
+    await writeFile(join(fixture.state, "bundles", "sha256", "bundle", "workspace-secret.txt"), "workspace-secret-must-not-copy\n");
     await mkdir(join(fixture.state, "db"), { recursive: true });
     for (const sidecar of ["custom-audit.sqlite-wal", "custom-audit.sqlite-shm", "custom-audit.sqlite.notify"]) {
       await writeFile(join(fixture.state, "db", sidecar), "ephemeral\n");
@@ -62,12 +71,15 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     assert.equal(created.manifest.includesSensitiveState, false);
     assert.ok(created.manifest.files.some((file) => file.path === "records.jsonl"));
     assert.ok(created.manifest.files.some((file) => file.path === "audit.jsonl.keys.json"));
-    for (const forbidden of ["oauth/openai.json", "credentials/custom-oauth.json", "browser-profile/Cookies", "gateway.token", "capability-signing.key"]) {
+    for (const forbidden of ["oauth/openai.json", "credentials/custom-oauth.json", "browser-profile/Cookies", "gateway.token", "capability-signing.key", "approvals.json", "approvals.json.key", "bundles/sha256/bundle/workspace-secret.txt"]) {
       assert.equal(created.manifest.files.some((file) => file.path === forbidden), false);
     }
     assert.equal(created.manifest.files.some((file) => /^db\/custom-audit\.sqlite(?:-(?:wal|shm)|\.notify)$/u.test(file.path)), false);
     assert.ok(created.manifest.excluded.includes("credentials/custom-oauth.json"));
-    assert.doesNotMatch(JSON.stringify(created), /do-not-copy/u);
+    assert.ok(created.manifest.excluded.includes("approvals.json"));
+    assert.ok(created.manifest.excluded.includes("approvals.json.key"));
+    assert.ok(created.manifest.excluded.includes("bundles/"));
+    assert.doesNotMatch(JSON.stringify(created), /do-not-copy|workspace-secret-must-not-copy|private-argument/u);
     const inspected = await inspectStateBackup(backup);
     assert.equal(inspected.valid, true);
     assert.equal(inspected.manifest.sourceApplication.version, "1.0.0");
@@ -93,6 +105,27 @@ test("backup tampering and future schemas fail before restore", async () => {
     manifest.stateSchemas.config = 999;
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
     await assert.rejects(() => inspectStateBackup(backup), /future config schema/u);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("backup inspection rejects protected approval and bundle payloads", async () => {
+  const fixture = await preparedState();
+  const backup = join(fixture.temporary, "protected-state-backup");
+  try {
+    await createStateBackup(fixture.state, backup);
+    const protectedContent = `${JSON.stringify({ schemaVersion: 1, approvals: [] })}\n`;
+    await writeFile(join(backup, "approvals.json"), protectedContent);
+    const manifestPath = join(backup, "backup-manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.files.push({
+      path: "approvals.json",
+      bytes: Buffer.byteLength(protectedContent),
+      sha256: createHash("sha256").update(protectedContent).digest("hex")
+    });
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await assert.rejects(() => inspectStateBackup(backup), /protected ephemeral state/u);
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
   }

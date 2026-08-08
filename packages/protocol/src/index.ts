@@ -276,7 +276,10 @@ function redactDurableNode(value: unknown, state: DurableRedactionContext & { de
     .map(([key, item]) => {
       const isInput = state.input || key === "input";
       const browserTypeValue = toolName === "browser.type" && isInput && key === "value";
-      if (browserTypeValue || (markedSensitive && key === "value")) return [key, REDACTED];
+      const processCommandValue = toolName === "process.exec" && isInput && key === "command";
+      const processArgumentValue = toolName === "process.exec" && isInput && key === "args";
+      if (browserTypeValue || processCommandValue || (markedSensitive && key === "value")) return [key, REDACTED];
+      if (processArgumentValue) return [key, [REDACTED]];
       return [key, redactDurableNode(item, {
         toolName,
         input: isInput,

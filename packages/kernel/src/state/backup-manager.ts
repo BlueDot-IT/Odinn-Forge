@@ -20,6 +20,11 @@ const DEFAULT_EXCLUSIONS = Object.freeze([
   "users.json",
   "login-attempts.json"
 ]);
+const ALWAYS_EXCLUDED = Object.freeze([
+  "approvals.json",
+  "approvals.json.key",
+  "bundles/"
+]);
 const EPHEMERAL_STATE_FILES = Object.freeze([
   "db/odinn.sqlite-shm",
   "db/odinn.sqlite-wal",
@@ -115,7 +120,7 @@ async function createStateBackupUnlocked(
   await mkdir(staging, { mode: 0o700 });
   const includeSensitiveState = options.includeSensitiveState === true;
   const sensitiveExclusions = includeSensitiveState ? [] : await configuredSensitiveStatePaths(stateRoot);
-  const files = await payloadFiles(stateRoot, includeSensitiveState, sensitiveExclusions);
+  const files = await payloadFiles(stateRoot, includeSensitiveState, sensitiveExclusions, { excludeProtected: true });
   try {
     for (const file of files) {
       const source = join(stateRoot, file);
@@ -137,9 +142,12 @@ async function createStateBackupUnlocked(
       },
       stateSchemas: inspection.currentVersions,
       includesSensitiveState: includeSensitiveState,
-      excluded: includeSensitiveState
-        ? [...EPHEMERAL_STATE_FILES]
-        : [...new Set([...DEFAULT_EXCLUSIONS, ...sensitiveExclusions, ...EPHEMERAL_STATE_FILES])],
+      excluded: [...new Set([
+        ...ALWAYS_EXCLUDED,
+        ...(includeSensitiveState ? [] : DEFAULT_EXCLUSIONS),
+        ...sensitiveExclusions,
+        ...EPHEMERAL_STATE_FILES
+      ])],
       files: await Promise.all(files.map(async (file) => fileRecord(staging, file)))
     };
     await writeFile(join(staging, BACKUP_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600, flag: "wx" });
@@ -158,7 +166,7 @@ export async function inspectStateBackup(inputDir: string): Promise<InspectedSta
   await validatePhysicalTree(root, "state backup");
   const raw = JSON.parse(await readFile(join(root, BACKUP_MANIFEST), "utf8"));
   const manifest = validateManifest(raw);
-  const actualFiles = (await payloadFiles(root, true)).filter((path) => path !== BACKUP_MANIFEST);
+  const actualFiles = (await payloadFiles(root, true, [], { excludeProtected: false })).filter((path) => path !== BACKUP_MANIFEST);
   const expected = new Map(manifest.files.map((file) => [file.path, file]));
   if (expected.size !== manifest.files.length) throw new Error("backup manifest contains duplicate file paths");
   if (actualFiles.length !== expected.size || actualFiles.some((path) => !expected.has(path))) {
@@ -432,6 +440,7 @@ function validateManifest(value: unknown): StateBackupManifest {
       || !Number.isInteger(file.bytes) || file.bytes < 0 || !/^[a-f0-9]{64}$/u.test(file.sha256)) {
       throw new Error("backup manifest contains an invalid file record");
     }
+    if (isAlwaysExcludedPath(file.path)) throw new Error("backup manifest contains protected ephemeral state");
   }
   return manifest as StateBackupManifest;
 }
@@ -485,14 +494,14 @@ async function appendLifecycleAudit(stateRoot: string, type: string, message: st
   if ("close" in store) store.close();
 }
 
-async function payloadFiles(root: string, includeSensitiveState: boolean, sensitiveExclusions: string[] = []): Promise<string[]> {
+async function payloadFiles(root: string, includeSensitiveState: boolean, sensitiveExclusions: string[] = [], { excludeProtected = false }: { excludeProtected?: boolean } = {}): Promise<string[]> {
   const files: string[] = [];
   const walk = async (directory: string): Promise<void> => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       const name = relative(root, path).replaceAll("\\", "/");
       if (isEphemeralStateFile(name)) continue;
-      if (!includeSensitiveState && excludedFromNormalBackup(name, entry.isDirectory(), sensitiveExclusions)) continue;
+      if (excludeProtected && excludedFromBackup(name, entry.isDirectory(), includeSensitiveState, sensitiveExclusions)) continue;
       const metadata = await lstat(path);
       if (metadata.isSymbolicLink()) throw new Error(`state contains a symbolic link: ${name}`);
       if (metadata.isDirectory()) await walk(path);
@@ -507,11 +516,20 @@ async function payloadFiles(root: string, includeSensitiveState: boolean, sensit
   return files.sort();
 }
 
-function excludedFromNormalBackup(path: string, directory: boolean, sensitiveExclusions: string[]): boolean {
+function excludedFromBackup(path: string, directory: boolean, includeSensitiveState: boolean, sensitiveExclusions: string[]): boolean {
   const normalized = directory ? `${path}/` : path;
-  return [...DEFAULT_EXCLUSIONS, ...sensitiveExclusions].some((excluded) =>
+  const exclusions = [
+    ...ALWAYS_EXCLUDED,
+    ...(includeSensitiveState ? [] : DEFAULT_EXCLUSIONS),
+    ...sensitiveExclusions
+  ];
+  return exclusions.some((excluded) =>
     excluded.endsWith("/") ? normalized === excluded || normalized.startsWith(excluded) : normalized === excluded
   );
+}
+
+function isAlwaysExcludedPath(path: string): boolean {
+  return ALWAYS_EXCLUDED.some((excluded) => excluded.endsWith("/") ? path === excluded.slice(0, -1) || path.startsWith(excluded) : path === excluded);
 }
 
 async function configuredSensitiveStatePaths(stateRoot: string): Promise<string[]> {
@@ -553,7 +571,7 @@ async function copySqliteSnapshot(source: string, destination: string): Promise<
 async function validatePhysicalTree(root: string, label: string): Promise<void> {
   const metadata = await lstat(root);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`${label} root must be a physical directory`);
-  await payloadFiles(root, true);
+  await payloadFiles(root, true, [], { excludeProtected: false });
 }
 
 async function secureTree(root: string): Promise<void> {

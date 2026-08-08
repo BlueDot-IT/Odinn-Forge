@@ -28,6 +28,7 @@ import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
 import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.ts";
 import { readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
+import type { SandboxProcessInput } from "./sandbox-process.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
@@ -40,6 +41,8 @@ export { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, a
 export type { CompiledSandboxProfile, OciBackendId, OciCapabilityProbe, SandboxBackend, SandboxBackendSelection, SandboxExecutionOptions, SandboxExecutionResult, SandboxProfileInput } from "./sandbox-backend.ts";
 export { materializeSandboxBundle } from "./sandbox-bundle.ts";
 export type { SandboxBundleOptions, SandboxBundleReference } from "./sandbox-bundle.ts";
+export { SANDBOX_PROCESS_PROFILE, SandboxProcessRefusalError, compileProcessProfile, createSandboxProcessExecutor, executeSandboxProcess, resolveConfiguredProcessBackend } from "./sandbox-process.ts";
+export type { SandboxProcessBackendResolver, SandboxProcessBundleMaterializer, SandboxProcessExecutionContext, SandboxProcessExecutorOptions, SandboxProcessInput, SandboxProcessResult } from "./sandbox-process.ts";
 export { SandboxRecoveryCoordinator, SandboxRecoveryError, SandboxRecoverySession } from "./sandbox-recovery.ts";
 export type { SandboxRecoveryAdapter, SandboxRecoveryBackend, SandboxRecoveryIdentity, SandboxRecoveryPhase, SandboxRecoveryRecord } from "./sandbox-recovery.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
@@ -94,7 +97,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch, processExecutor }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -162,10 +165,55 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     }],
     ["process.exec", {
       capability: "process.exec",
-      description: "Reserved process surface; refuses execution until a per-run operator approval or enforced sandbox process backend is active.",
+      description: "Execute one bounded argument-array command inside the durable Linux OCI process sandbox.",
       inputSchema: { type: "object", properties: { command: { type: "string" }, args: { type: "array", items: { type: "string" }, maxItems: 256 }, cwd: { type: "string" }, timeoutMs: { type: "integer", minimum: 100, maximum: 120_000 }, maxOutputBytes: { type: "integer", minimum: 1_024, maximum: 1_000_000 } }, required: ["command"], additionalProperties: false },
-      execute: async () => {
-        throw new Error("process.exec host execution is unavailable until a per-run operator approval or enforced sandbox process backend is active");
+      execute: async (input: SandboxProcessInput, context: any) => {
+        if (context?.durableExecution !== true) {
+          throw new Error("process.exec direct execution remains refused; a per-run operator approval or enforced sandbox process backend is available only through the durable /jobs execution surface");
+        }
+        if (typeof processExecutor !== "function") {
+          throw new Error("process.exec has no enforced sandbox backend; host execution is not a fallback");
+        }
+        const normalizedInput: Record<string, unknown> = { ...(input ?? {}) };
+        delete normalizedInput.approvalId;
+        if (!context.trustedApprovalId) {
+          const summary = "Run one approved command inside the isolated process sandbox";
+          const approvalId = approvalStore.create({
+            type: "approval.required",
+            tool: "process.exec",
+            runId: context.request?.id,
+            summary,
+            input: normalizedInput
+          });
+          return { type: "approval.required", approvalId, tool: "process.exec", summary, expiresInSeconds: 300 };
+        }
+        const approved = approvalStore.consume(context.trustedApprovalId, {
+          tool: "process.exec",
+          runId: context.trustedApprovalRunId ?? context.request?.id,
+          input: normalizedInput
+        });
+        if (!approved) throw new Error("process execution approval is missing, expired, already used, or does not match this action");
+        return processExecutor(approved.input ?? normalizedInput, {
+          signal: context.signal,
+          requestId: context.request?.id,
+          onDispatchAuthorized: async (evidence: any) => {
+            await auditStore?.append({
+              at: new Date().toISOString(),
+              runId: context.request?.id,
+              type: "sandbox.dispatch-authorized",
+              actor: context.request?.actor ?? "process-sandbox",
+              tool: "process.exec",
+              capability: "process.execute",
+              decision: "allow",
+              data: {
+                backend: evidence.backend,
+                containerName: evidence.containerName,
+                profileDigest: evidence.profileDigest,
+                controlsAttested: evidence.controlsAttested
+              }
+            });
+          }
+        });
       }
     }],
     ["web.search", {
@@ -1087,6 +1135,15 @@ function taskRequestDigest(request: any): string {
 
 function executionResourceForRequest(toolName: string, input: AnyRecord = {}) {
   const pick = (entries: Array<[string, unknown]>) => Object.fromEntries(entries.filter(([, value]) => value !== undefined));
+  if (toolName === "process.exec") {
+    return pick([
+      ["commandDigest", createHash("sha256").update(String(input.command ?? ""), "utf8").digest("hex")],
+      ["argsDigest", createHash("sha256").update(stableTaskValue(Array.isArray(input.args) ? input.args : []), "utf8").digest("hex")],
+      ["cwd", input.cwd ?? "."],
+      ["timeoutMs", input.timeoutMs],
+      ["maxOutputBytes", input.maxOutputBytes]
+    ]);
+  }
   if (toolName === "workspace.mutate") {
     return pick([["operation", input.operation], ["path", input.path], ["from", input.from], ["to", input.to]]);
   }
@@ -1129,7 +1186,7 @@ function executionInputLimit(policy: any): number {
 }
 
 function executionSandboxProfile(safety: ReturnType<typeof toolSafetyDescriptor>): string {
-  if (safety.effects.includes("process")) return "host-approved";
+  if (safety.effects.includes("process")) return "sandbox.process.v1";
   if (safety.effects.includes("external-state")) return "network-allowlisted";
   if (safety.effects.includes("filesystem-write")) return "workspace-write";
   if (safety.effects.includes("network")) return "network-allowlisted";
@@ -1313,6 +1370,7 @@ async function executeTaskThroughAdmission({
   trustedApprovalId,
   trustedApprovalRunId,
   trustedRecovery = false,
+  durableExecution = false,
   parentRunId,
   admissionService
 }: any) {
@@ -1491,6 +1549,7 @@ async function executeTaskThroughAdmission({
       capability: capabilityClaims,
       trustedApprovalId,
       trustedApprovalRunId,
+      durableExecution,
       runTool: (nestedTask: any) => runTask({
         task: { ...nestedTask, actor: nestedTask.actor ?? request.actor },
         auditStore,
@@ -1502,7 +1561,8 @@ async function executeTaskThroughAdmission({
         parentRunId: request.id,
         onModelDelta,
         onProviderAttempt,
-        onAgentProgress
+        onAgentProgress,
+        durableExecution
       })
     });
     backendReturned = true;
@@ -1559,7 +1619,9 @@ export async function runPlan({
   registry = createBuiltInRegistry(),
   actor = "local",
   now = () => new Date().toISOString(),
-  runLedger
+  runLedger,
+  signal,
+  durableExecution = false
 }: any) {
   const normalized = normalizePlan(plan, actor);
   if (!auditStore) throw new Error("runPlan requires an auditStore");
@@ -1594,7 +1656,9 @@ export async function runPlan({
         registry,
         now,
         runLedger,
-        parentRunId: normalized.id
+        parentRunId: normalized.id,
+        signal,
+        durableExecution
       });
       steps.push({ id: step.id, ok: true, result });
     }

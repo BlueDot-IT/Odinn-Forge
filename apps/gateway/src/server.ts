@@ -692,8 +692,9 @@ export async function createGatewayServer({
   const config = await readConfig(state, { hosted });
   const startupSandboxConfig = normalizeSandboxConfig(config);
   let processRecoveryStartupError = false;
+  let sandboxRecoveryStartupError = false;
   if (await access(join(state, "sandbox-recovery.json")).then(() => true).catch(() => false)) {
-    await reconcileSandboxRecovery(state, startupSandboxConfig.backend.enginePaths).catch(() => undefined);
+    await reconcileSandboxRecovery(state, startupSandboxConfig.backend.enginePaths).catch(() => { sandboxRecoveryStartupError = true; });
   }
   if (await access(join(state, "process-recovery.json")).then(() => true).catch(() => false)) {
     await reconcileProcessRecovery(state).catch(() => { processRecoveryStartupError = true; });
@@ -843,7 +844,7 @@ export async function createGatewayServer({
         });
       }
       if (request.method === "GET" && url.pathname === "/diagnostics") {
-        return json(response, 200, await diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError }));
+        return json(response, 200, await diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError, sandboxRecoveryStartupError }));
       }
       if (request.method === "GET" && url.pathname === "/channels") {
         return json(response, 200, { ok: true, channels: channelSupervisor.status() });
@@ -1216,9 +1217,15 @@ export async function createGatewayServer({
         }
         const task = body.task && typeof body.task === "object" ? body.task : body;
         const safety = toolSafetyDescriptor(task.tool, registry.get(task.tool));
+        const durableExecution = task.tool === "process.exec";
+        const sandboxProcessConfig = durableExecution ? normalizeSandboxConfig(config).process : undefined;
+        const requestedTimeout = Number.isSafeInteger(task.input?.timeoutMs) ? Number(task.input.timeoutMs) : sandboxProcessConfig?.limits.timeoutMs;
+        const effectiveTimeout = durableExecution
+          ? Math.min(requestedTimeout ?? 120_000, sandboxProcessConfig?.limits.timeoutMs ?? 120_000) + 30_000
+          : body.timeoutMs;
         const job = await supervisor.submit(
-          { task: { ...task, ...(id ? { id: String(id) } : {}) } },
-          { id: id ? String(id) : undefined, requestHash, timeoutMs: body.timeoutMs, retrySafe: safety.retrySafe === true }
+          { durableExecution, task: { ...task, ...(id ? { id: String(id) } : {}) } },
+          { id: id ? String(id) : undefined, requestHash, timeoutMs: effectiveTimeout, retrySafe: safety.retrySafe === true }
         );
         return json(response, 202, { ok: true, job });
       }
@@ -1338,6 +1345,7 @@ export async function createGatewayServer({
           const result = await isolatedTaskExecutor({
             approvalId: id,
             approvalRunId: pending.runId,
+            durableExecution: pending.tool === "process.exec",
             task: { id: `${pending.runId}:approval:${randomUUID()}`, tool: pending.tool, input: pending.input, actor: "approval-executor", reason: "explicit user approval" },
           });
           if (linkedJob) await supervisor.settleApproval(linkedJob.id, { result });
@@ -2573,7 +2581,7 @@ function channelCredentialEnvironments(config: any): string[] {
   ].filter(Boolean);
 }
 
-async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false }: any) {
+async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false, sandboxRecoveryStartupError = false }: any) {
   let audit = { valid: true, events: 0, unsigned: 0, failureCount: 0 };
   try {
     const auditPath = join(state, config.auditLog ?? "audit.jsonl");
@@ -2648,9 +2656,9 @@ async function diagnostics({ state, config, featureFlags, auditStore, approvalSt
     },
     sandbox: {
       configured: summarizeSandboxRisk(sandboxConfig),
-      recovery: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null },
+      recovery: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null, quarantined: sandboxRecoveryStartupError === true || sandboxRecovery.pending === null },
       extensionLane,
-      activation: "network-denied immutable extensions are active; general processes, brokered networking, and writable host integration remain unavailable",
+      activation: "durable process jobs require an operator approval and a configured digest-pinned Linux OCI image; direct runs, shell access, network access, and writable host integration remain unavailable",
       backends: sandboxBackends.map((backend) => ({
         backend: backend.backend,
         available: backend.available,

@@ -57,6 +57,7 @@ cannot silently disappear.
     "process": {
       "enabled": true,
       "shell": true,
+      "image": "docker.io/library/odinn-process@sha256:<64 lowercase hex characters>",
       "limits": {
         "timeoutMs": 120000,
         "cpu": 2,
@@ -199,18 +200,15 @@ so changing daemon bindings cannot clear an older container as absent. If the ru
 quarantines further sandbox dispatch until reconciliation succeeds; there is no
 force-clear path.
 
-Persistent homes, brokered process networking, secret injection, writable
-external mounts, and general process execution are represented in the strict
-JSON contract but are not silently activated by this cutover. Writable host
-access remains unavailable to normal agent runs until automatic Norn
-checkpoints are active; durable arbitrary processes also require the process
-supervisor. Stage 6 now provides the first process-supervisor slice: an
-owner-only, atomically replaced `process-recovery.json` reservation journal,
-serialized under the state mutation lock, with bounded digest metadata and
-restart quarantine. A reservation is cleared only after process absence is
-proved; otherwise it remains `needs-review` and blocks further supervised
-dispatch. Diagnostics distinguish configured authority from active backend
-enforcement. This prevents an early shell from bypassing recovery and
-uncertain-outcome guarantees. The model-visible `process.exec` registry surface
-remains unavailable until an enforced process backend, approval semantics, and
-the complete failure-injection and cross-platform gate are in place.
+Persistent homes, brokered process networking, secret injection, and writable
+external mounts remain unavailable. Stage 6 adds the durable process supervisor
+and the first public process slice: only `POST /jobs` may submit `process.exec`,
+and only after explicit approval does it dispatch to a Linux OCI runtime. The
+operator must configure `sandbox.process.image` as an exact `@sha256:` image
+reference. The runtime receives a sealed read-only workspace bundle, denied
+networking, no shell, no host mounts, and bounded resource controls. Direct run
+routes and CLI execution continue to refuse the tool. The owner-only,
+atomically replaced `process-recovery.json` journal remains available for the
+host-supervised compatibility path, while OCI executions use the matching
+durable `sandbox-recovery.json` container journal. Either journal quarantines
+further dispatch when cleanup or absence cannot be proved.
