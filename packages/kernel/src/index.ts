@@ -14,6 +14,7 @@ export type { LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from ".
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, DarwinRouter, OdinnRuntimeError, Sentinel } from "./differentiated-runtime.ts";
+import { CheckpointCoordinator } from "./checkpoint-coordinator.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
 import { appendSessionMessage, assignSessionProject, createGoal, createProject, createSession, DEFAULT_PROJECT_ID, deleteSession, listGoals, listProjects, listSessions, readSession, renameSession, resolveSession, updateGoal, updateProject, updateSession } from "./workspace-records.ts";
 import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, formatMemoryContext, learnFromConversation, listMemoryCandidates, normalizeMemoryOptions, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
@@ -40,6 +41,7 @@ export { SandboxRecoveryCoordinator, SandboxRecoveryError, SandboxRecoverySessio
 export type { SandboxRecoveryAdapter, SandboxRecoveryBackend, SandboxRecoveryIdentity, SandboxRecoveryPhase, SandboxRecoveryRecord } from "./sandbox-recovery.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
+export { CheckpointCoordinator };
 export { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
 export type { AdvancedFeature } from "./features.ts";
 export { withStateMutationLock } from "./state-mutation.ts";

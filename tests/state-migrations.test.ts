@@ -84,11 +84,11 @@ test("release-candidate SQLite state migrates transactionally and preserves its 
     } }, null, 2)}\n`;
     await writeFile(join(candidate.state, "jobs.json"), legacyJobs);
     const plan = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4", "runtime-database-v4-to-v5"]);
+    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4", "runtime-database-v4-to-v5", "runtime-database-v5-to-v6"]);
     assert.equal(plan.rollbackCompatible, false);
     const report = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(report?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 5);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 6);
     assert.equal(inspectExistingSqliteSchema(join(report.backupLocation!, "db", "odinn.sqlite")), 2);
     const migratedDatabase = new DatabaseSync(databasePath, { readOnly: true });
     assert.equal((migratedDatabase.prepare("SELECT status FROM runtime_jobs WHERE id = 'migrated_job'").get() as { status: string }).status, "queued");
@@ -97,7 +97,31 @@ test("release-candidate SQLite state migrates transactionally and preserves its 
     const manifest = JSON.parse(await readFile(join(candidate.state, "state-schema.json"), "utf8"));
     assert.equal(manifest.minimumApplicationVersion, "1.0.0");
     assert.equal(manifest.applicationVersion, "1.0.0");
-    assert.equal(manifest.storeVersions.runtimeDatabase, 5);
+    assert.equal(manifest.storeVersions.runtimeDatabase, 6);
+  } finally {
+    await rm(candidate.temporary, { recursive: true, force: true });
+  }
+});
+
+test("release-candidate migration from runtime schema 5 persists checkpoint journal tables", async () => {
+  const candidate = await fixture("release-candidate");
+  const databasePath = join(candidate.state, "db", "odinn.sqlite");
+  try {
+    await mkdir(dirname(databasePath), { recursive: true });
+    const database = new SqliteStore(databasePath, { targetVersion: 5 });
+    database.close();
+    const report = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
+    assert.deepEqual(report.steps.map((step) => step.id), ["runtime-database-v5-to-v6"]);
+    const migration = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
+    assert.ok(migration?.backupLocation);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 6);
+    const sqlite = new DatabaseSync(databasePath);
+    try {
+      const tables = (sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('mutation_groups','mutation_checkpoints','mutation_journal_entries','checkpoint_manifest_artifacts')").all() as Array<{ name: string }>).map((row) => row.name).sort();
+      assert.deepEqual(tables, ["checkpoint_manifest_artifacts", "mutation_checkpoints", "mutation_groups", "mutation_journal_entries"]);
+    } finally {
+      sqlite.close();
+    }
   } finally {
     await rm(candidate.temporary, { recursive: true, force: true });
   }

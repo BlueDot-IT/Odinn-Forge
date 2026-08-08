@@ -14,7 +14,7 @@ import {
 export { SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
 export type { AuditPage } from "./audit.ts";
 
-export const SQLITE_SCHEMA_VERSION = 5;
+export const SQLITE_SCHEMA_VERSION = 6;
 export type SqliteStoreOptions = { targetVersion?: number };
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
@@ -391,6 +391,62 @@ const MIGRATIONS = [
   CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status ON runtime_jobs(status, created_at);
   CREATE INDEX IF NOT EXISTS idx_runtime_jobs_execution ON runtime_jobs(execution_run_id, execution_attempt_id);
   CREATE INDEX IF NOT EXISTS idx_runtime_job_leases_job ON runtime_job_leases(job_id, acquired_at);`
+  ,
+  `CREATE TABLE IF NOT EXISTS mutation_groups (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    purpose TEXT NOT NULL,
+    step_id TEXT,
+    foundation TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS mutation_checkpoints (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    group_id TEXT NOT NULL REFERENCES mutation_groups(id),
+    status TEXT NOT NULL,
+    label TEXT,
+    manifest_json TEXT,
+    manifest_digest TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    error TEXT,
+    UNIQUE(group_id, id)
+  );
+  CREATE TABLE IF NOT EXISTS mutation_journal_entries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    group_id TEXT NOT NULL REFERENCES mutation_groups(id),
+    checkpoint_id TEXT NOT NULL REFERENCES mutation_checkpoints(id),
+    step_id TEXT,
+    operation TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    covered_paths_json TEXT NOT NULL,
+    conflicts_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS checkpoint_manifest_artifacts (
+    id TEXT PRIMARY KEY,
+    checkpoint_id TEXT NOT NULL REFERENCES mutation_checkpoints(id),
+    manifest_digest TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL REFERENCES artifacts(digest),
+    artifact_path TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(checkpoint_id, manifest_digest)
+  );
+  CREATE INDEX IF NOT EXISTS idx_mutation_groups_run ON mutation_groups(run_id, status);
+  CREATE INDEX IF NOT EXISTS idx_mutation_checkpoints_group ON mutation_checkpoints(group_id, status);
+  CREATE INDEX IF NOT EXISTS idx_mutation_checkpoints_run ON mutation_checkpoints(run_id, status);
+  CREATE INDEX IF NOT EXISTS idx_mutation_journal_group ON mutation_journal_entries(group_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_mutation_journal_checkpoint ON mutation_journal_entries(checkpoint_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_checkpoint_manifest_artifacts_checkpoint ON checkpoint_manifest_artifacts(checkpoint_id, manifest_digest);`
 ];
 
 export class SqliteStore {
