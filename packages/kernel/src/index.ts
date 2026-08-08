@@ -16,6 +16,7 @@ import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, DarwinRouter, OdinnRuntimeError, Sentinel } from "./differentiated-runtime.ts";
 import { CheckpointCoordinator } from "./checkpoint-coordinator.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
+import { createWorkspaceMutationTools } from "./workspace-mutations.ts";
 import { appendSessionMessage, assignSessionProject, createGoal, createProject, createSession, DEFAULT_PROJECT_ID, deleteSession, listGoals, listProjects, listSessions, readSession, renameSession, resolveSession, updateGoal, updateProject, updateSession } from "./workspace-records.ts";
 import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, formatMemoryContext, learnFromConversation, listMemoryCandidates, normalizeMemoryOptions, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
 import { createApprovalStore } from "./approvals.ts";
@@ -100,6 +101,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
   if (existsSync(legacyRecordPath) && !migration?.complete) migrateLegacyRecordsToSqlite({ legacyPath: legacyRecordPath, databasePath: recordDatabasePath });
   const recordStore = new SqliteRecordStore(recordDatabasePath);
   const modelConfig = normalizeModelConfig(config);
+  const mutationTools = createWorkspaceMutationTools({ workspaceRoot: root, stateDir, runLedger: config?.runLedger });
   const registry = new Map([
     ["job.healthcheck", {
       capability: "job.healthcheck",
@@ -489,6 +491,113 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       capability: "improve.write",
       description: "Rollback an autonomously applied improvement to its captured configuration snapshot.",
       execute: async (input: any) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config })
+    }],
+    ["workspace.mutate", {
+      capability: "workspace.mutate",
+      description: "Preview or apply a governed workspace write/mkdir/remove/move mutation.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["write", "mkdir", "remove", "move"] },
+          path: { type: "string" },
+          content: { type: "string" },
+          mode: { type: "integer" },
+          expected: { type: "object" },
+          from: { type: "string" },
+          to: { type: "string" },
+          recursive: { type: "boolean" },
+          apply: { type: "boolean" },
+          maxBytes: { type: "integer" },
+          maxFiles: { type: "integer" }
+        },
+        required: ["operation", "path"]
+      },
+      execute: async (input: any) => {
+        const operation = String(input?.operation || "");
+        if (!["write", "mkdir", "remove", "move"].includes(operation)) {
+          throw new Error(`workspace.mutate operation must be one of write, mkdir, remove, move`);
+        }
+        if (operation === "write") {
+          const { path, content, mode, expected, apply, maxBytes, maxFiles } = input;
+          return mutationTools["workspace.write"].execute({ path, content, mode, expected, apply, maxBytes, maxFiles });
+        }
+        if (operation === "mkdir") {
+          const { path, mode, apply, maxBytes, maxFiles } = input;
+          return mutationTools["workspace.mkdir"].execute({ path, mode, apply, maxBytes, maxFiles });
+        }
+        if (operation === "remove") {
+          const { path, recursive, apply, maxBytes, maxFiles, expected } = input;
+          return mutationTools["workspace.remove"].execute({ path, recursive, apply, maxBytes, maxFiles, expected });
+        }
+        const { from, to, apply, maxBytes, maxFiles } = input;
+        return mutationTools["workspace.move"].execute({ from, to, apply, maxBytes, maxFiles });
+      }
+    }],
+    ["workspace.patch", {
+      capability: "workspace.patch",
+      description: "Preview or apply a governed workspace text patch mutation.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["edit", "applyPatch"] },
+          path: { type: "string" },
+          find: { type: "string" },
+          replace: { type: "string" },
+          patches: { type: "array", items: { type: "object" } },
+          replaceAll: { type: "boolean" },
+          expected: { type: "object" },
+          apply: { type: "boolean" },
+          maxBytes: { type: "integer" },
+          maxFiles: { type: "integer" }
+        },
+        required: ["operation", "path"]
+      },
+      execute: async (input: any) => {
+        const operation = String(input?.operation || "");
+        if (!["edit", "applyPatch"].includes(operation)) {
+          throw new Error(`workspace.patch operation must be one of edit, applyPatch`);
+        }
+        if (operation === "edit") {
+          const { path, find, replace, replaceAll, expected, apply, maxBytes, maxFiles } = input;
+          return mutationTools["workspace.edit"].execute({ path, find, replace, replaceAll, expected, apply, maxBytes, maxFiles });
+        }
+        const { path, patches, expected, apply, maxBytes, maxFiles } = input;
+        return mutationTools["workspace.applyPatch"].execute({ path, patches, expected, apply, maxBytes, maxFiles });
+      }
+    }],
+    ["restore.create", {
+      capability: "restore.create",
+      description: "Create a governed checkpoint-restore plan without applying changes.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          checkpointId: { type: "string" },
+          checkpointManifestDigest: { type: "string" }
+        },
+        required: ["checkpointId"]
+      },
+      execute: async (input: any) => mutationTools["checkpoint.restore"].execute({
+        checkpointId: input?.checkpointId,
+        checkpointManifestDigest: input?.checkpointManifestDigest,
+        apply: false
+      })
+    }],
+    ["restore.apply", {
+      capability: "restore.apply",
+      description: "Apply a governed checkpoint restore from a created plan.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          checkpointId: { type: "string" },
+          checkpointManifestDigest: { type: "string" }
+        },
+        required: ["checkpointId"]
+      },
+      execute: async (input: any) => mutationTools["checkpoint.restore"].execute({
+        checkpointId: input?.checkpointId,
+        checkpointManifestDigest: input?.checkpointManifestDigest,
+        apply: true
+      })
     }]
   ]) as BuiltInRegistry;
   let closed = false;
@@ -929,6 +1038,14 @@ function stableTaskValue(value: any): string {
   return JSON.stringify(value) ?? "null";
 }
 
+function sanitizeExecutionRequest(task: any) {
+  if (!task || typeof task !== "object") return task;
+  if (!("capability" in task)) return task;
+  const sanitized = { ...task };
+  delete sanitized.capability;
+  return sanitized;
+}
+
 function taskRequestDigest(request: any): string {
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input: request.input ?? {}, actor: request.actor ?? "unknown" })).digest("hex");
 }
@@ -1205,10 +1322,38 @@ async function executeTaskThroughAdmission({
   throwIfAborted(signal);
   const safety = toolSafetyDescriptor(request.tool, tool);
   let ledgerStep;
+  const admission = new ExecutionAdmissionService({ featureFlags: runLedger?.featureFlags ?? {} });
   if (runLedger) {
     ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: projectDurableToolInput(request.tool, request.input), safety, metadata: { actor: request.actor } });
   }
-  const decision = evaluateTaskPolicy({ policy, request, tool });
+  let decision;
+  let capabilityClaims;
+  try {
+    ({ policyDecision: decision, capabilityClaims } = await admission.authorize({
+      request,
+      policy,
+      tool,
+      safety,
+      runLedger,
+      ledgerStepId: ledgerStep?.stepId,
+      now
+    }));
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    await auditStore.append({
+      at: now(),
+      runId: request.id,
+      type: "task.blocked",
+      actor: request.actor,
+      tool: request.tool,
+      capability: tool?.capability,
+      decision: "deny",
+      message: failure.message,
+      data: { code: (failure as NodeError).code ?? "POLICY_VIOLATION" }
+    });
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "blocked", error: failure.message });
+    throw failure;
+  }
 
   await auditStore.append({
     at: now(),
@@ -1227,7 +1372,6 @@ async function executeTaskThroughAdmission({
   });
 
   const policyEvent = runLedger?.recordPolicy({ runId: request.id, stepId: ledgerStep?.stepId, decision: decision.decision, reason: "reason" in decision ? decision.reason : "policy allowed task", details: "details" in decision ? decision.details : undefined });
-
   try {
     assertAllowed(decision);
   } catch (error) {
