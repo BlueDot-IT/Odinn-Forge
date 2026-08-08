@@ -6,6 +6,7 @@ settings:
 
 overrides:
   uuid@<11.1.1: 11.1.1
+  brace-expansion@<5.0.9: 5.0.9
 
 importers:
 
@@ -23,12 +24,12 @@ importers:
       eslint:
         specifier: 10.7.0
         version: 10.7.0
-      fflate:
-        specifier: 0.8.2
-        version: 0.8.2
       fast-check:
         specifier: 4.9.0
         version: 4.9.0
+      fflate:
+        specifier: 0.8.2
+        version: 0.8.2
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -714,8 +715,8 @@ packages:
   botframework-streaming@4.23.3:
     resolution: {integrity: sha512-GMtciQGfZXtAW6syUqFpFJQ2vDyVbpxL3T1DqFzq/GmmkAu7KTZ1zvo7PTww6+IT1kMW0lmL/XZJVq3Rhg4PQA==}
 
-  brace-expansion@5.0.8:
-    resolution: {integrity: sha512-JZyDyq3D4AUifKTPOB7DELf6XsB3WdPuNxCtob1vFXPsSXhdAiHBWJ/tJ8HAc9aH84BK+5JFZLNkJKx3G9kzQg==}
+  brace-expansion@5.0.9:
+    resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
     engines: {node: 20 || >=22}
 
   buffer-equal-constant-time@1.0.1:
@@ -2191,7 +2192,7 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  brace-expansion@5.0.8:
+  brace-expansion@5.0.9:
     dependencies:
       balanced-match: 4.0.4
 
@@ -2753,7 +2754,7 @@ snapshots:
 
   minimatch@10.2.5:
     dependencies:
-      brace-expansion: 5.0.8
+      brace-expansion: 5.0.9
 
   ms@2.1.3: {}
 
