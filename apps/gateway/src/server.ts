@@ -705,6 +705,7 @@ export async function createGatewayServer({
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore });
+  const governedRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore });
   const gatewayToken = await loadGatewayToken(state);
   const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
@@ -713,6 +714,7 @@ export async function createGatewayServer({
     execute: isolatedTaskExecutor
   });
   const runIsolatedTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
+  const runGovernedTask = (request: any): Promise<any> => executeTask({ ...request, auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
   const quotaGate = createQuotaGate(quotas);
   const cronStore = new CronStore(join(state, "cron-jobs.json"));
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
@@ -963,6 +965,100 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname.startsWith("/rewind/")) {
         const snapshotId = decodeURIComponent(url.pathname.slice("/rewind/".length));
         return json(response, 200, runtime.snapshots.restore(snapshotId, { apply: (await readJson(request, { maxBytes: requestMaxBytes })).apply === true }));
+      }
+      if (request.method === "POST" && url.pathname === "/governed/workspace/mutate") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
+        if (!runId || typeof runId !== "string") return json(response, 400, { ok: false, error: "runId is required for governed mutation" });
+        const result = await runGovernedTask({
+          task: {
+            id: runId,
+            actor: body.actor || "gateway",
+            tool: "workspace.mutate",
+            input: {
+              operation: body.operation,
+              path: body.path,
+              content: body.content,
+              mode: body.mode,
+              expected: body.expected,
+              from: body.from,
+              to: body.to,
+              recursive: body.recursive,
+              apply: body.apply === true,
+              maxBytes: body.maxBytes,
+              maxFiles: body.maxFiles,
+              capabilityToken: body.capabilityToken
+            },
+            reason: body.reason
+          }
+        });
+        return json(response, 200, result);
+      }
+      if (request.method === "POST" && url.pathname === "/governed/workspace/patch") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
+        if (!runId || typeof runId !== "string") return json(response, 400, { ok: false, error: "runId is required for governed mutation" });
+        const result = await runGovernedTask({
+          task: {
+            id: runId,
+            actor: body.actor || "gateway",
+            tool: "workspace.patch",
+            input: {
+              operation: body.operation,
+              path: body.path,
+              find: body.find,
+              replace: body.replace,
+              replaceAll: body.replaceAll,
+              patches: body.patches,
+              expected: body.expected,
+              apply: body.apply === true,
+              maxBytes: body.maxBytes,
+              maxFiles: body.maxFiles,
+              capabilityToken: body.capabilityToken
+            },
+            reason: body.reason
+          }
+        });
+        return json(response, 200, result);
+      }
+      if (request.method === "POST" && url.pathname === "/governed/restore/create") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
+        if (!runId || typeof runId !== "string") return json(response, 400, { ok: false, error: "runId is required for governed restore" });
+        const result = await runGovernedTask({
+          task: {
+            id: runId,
+            actor: body.actor || "gateway",
+            tool: "restore.create",
+            input: {
+              checkpointId: body.checkpointId,
+              checkpointManifestDigest: body.checkpointManifestDigest,
+              capabilityToken: body.capabilityToken
+            },
+            reason: body.reason
+          }
+        });
+        return json(response, 200, result);
+      }
+      if (request.method === "POST" && url.pathname === "/governed/restore/apply") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
+        if (!runId || typeof runId !== "string") return json(response, 400, { ok: false, error: "runId is required for governed restore" });
+        const result = await runGovernedTask({
+          task: {
+            id: runId,
+            actor: body.actor || "gateway",
+            tool: "restore.apply",
+            input: {
+              checkpointId: body.checkpointId,
+              checkpointManifestDigest: body.checkpointManifestDigest,
+              apply: true,
+              capabilityToken: body.capabilityToken
+            },
+            reason: body.reason
+          }
+        });
+        return json(response, 200, result);
       }
       if (request.method === "POST" && url.pathname === "/capsules/export") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
