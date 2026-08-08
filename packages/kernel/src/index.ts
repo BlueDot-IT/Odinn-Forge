@@ -97,8 +97,11 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
   const recordDatabasePath = join(stateRoot, "db", "records.sqlite");
-  const migration = legacyRecordMigrationStatus({ legacyPath: legacyRecordPath, databasePath: recordDatabasePath });
-  if (existsSync(legacyRecordPath) && !migration?.complete) migrateLegacyRecordsToSqlite({ legacyPath: legacyRecordPath, databasePath: recordDatabasePath });
+  const legacyRecordExists = existsSync(legacyRecordPath);
+  const migration = legacyRecordExists
+    ? legacyRecordMigrationStatus({ legacyPath: legacyRecordPath, databasePath: recordDatabasePath })
+    : undefined;
+  if (legacyRecordExists && !migration?.complete) migrateLegacyRecordsToSqlite({ legacyPath: legacyRecordPath, databasePath: recordDatabasePath });
   const recordStore = new SqliteRecordStore(recordDatabasePath);
   const modelConfig = normalizeModelConfig(config);
   const mutationTools = createWorkspaceMutationTools({ workspaceRoot: root, stateDir, runLedger: config?.runLedger });
