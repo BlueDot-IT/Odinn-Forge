@@ -2701,6 +2701,16 @@ const ADVANCED_CONSOLE_PAGES = [
     steps: ["Create a restore point", "Preview what would change", "Restore only when ready"]
   },
   {
+    key: "governance",
+    core: true,
+    view: "lab-governed-workspace",
+    title: "Controlled Workspace Governance",
+    technicalName: "Norn Governance",
+    summary: "Run bounded workspace mutations and restore operations through preview/apply governed routes.",
+    benefit: "Use this to stage file-level changes, review expected digests, and apply only when conflicts are clear.",
+    steps: ["Choose mutate, patch, or restore", "Run a governed preview", "Apply only after reviewing results"]
+  },
+  {
     key: "capsules",
     view: "lab-portable-runs",
     title: "Portable Runs",
@@ -5059,6 +5069,22 @@ function renderConsoleHtml(version = "development") {
           { id: "apply", label: "Restore files", method: "POST", path: "/rewind/{target}", target: "Snapshot ID", description: "Return the saved files to their earlier state.", dangerous: true, sample: () => ({ apply: true }) }
         ]
       },
+      governance: {
+        core: true,
+        title: "Controlled Workspace Governance",
+        technicalName: "Norn Governance",
+        view: "lab-governed-workspace",
+        summary: "Use governed preview/apply for workspace mutation and restore operations.",
+        endpoint: "/governed/workspace/mutate · /governed/workspace/patch · /governed/restore/create · /governed/restore/apply",
+        actions: [
+          { id: "mutate-preview", label: "Preview write/mkdir/remove/move", method: "POST", path: "/governed/workspace/mutate", description: "Preview a bounded change before anything is applied.", sample: () => ({ runId: "ui-governance-" + Date.now(), operation: "write", path: "README.md", content: "governed content" }) },
+          { id: "mutate-apply", label: "Apply workspace mutation", method: "POST", path: "/governed/workspace/mutate", description: "Apply a prepared workspace mutation after reviewing the preview.", dangerous: true, requiresConfirmation: true, confirmationLabel: "Apply mutation", sample: () => ({ runId: "ui-governance-" + Date.now(), operation: "write", path: "README.md", content: "governed content", apply: true }) },
+          { id: "patch-preview", label: "Preview patch edit", method: "POST", path: "/governed/workspace/patch", description: "Preview a bounded text replacement before applying it.", sample: () => ({ runId: "ui-governance-" + Date.now(), operation: "edit", path: "README.md", find: "old", replace: "governed", apply: false }) },
+          { id: "patch-apply", label: "Apply patch edit", method: "POST", path: "/governed/workspace/patch", description: "Apply a bounded text replacement after reviewing preview output.", dangerous: true, requiresConfirmation: true, confirmationLabel: "Apply patch", sample: () => ({ runId: "ui-governance-" + Date.now(), operation: "edit", path: "README.md", find: "old", replace: "governed", apply: true }) },
+          { id: "restore-preview", label: "Prepare restore plan", method: "POST", path: "/governed/restore/create", target: "Checkpoint ID", description: "Create a governed restore plan and show what would be changed.", sample: () => ({ runId: "ui-governance-" + Date.now(), checkpointId: "replace-with-checkpoint-id" }) },
+          { id: "restore-apply", label: "Apply governed restore", method: "POST", path: "/governed/restore/apply", target: "Checkpoint ID", description: "Apply a governed restore only after validating the preview.", dangerous: true, requiresConfirmation: true, confirmationLabel: "Apply restore", sample: () => ({ runId: "ui-governance-" + Date.now(), checkpointId: "replace-with-checkpoint-id" }) }
+        ]
+      },
       capsules: {
         title: "Portable Runs",
         technicalName: advancedFeatureBrands.capsules.name,
@@ -5526,22 +5552,23 @@ function renderConsoleHtml(version = "development") {
       if (feature?.core !== true && state.status?.experimental?.[featureKey] !== true && action.availableWhenDisabled !== true) throw new Error("This plugin is currently off. Enable it in Odinn settings and restart before using this action.");
       const target = page.querySelector('[data-role="target"]').value.trim();
       const path = experimentalPath(action, target, true);
-      if (action.dangerous && !window.confirm('Continue with “' + action.label + '”? ' + action.description + " A preview is recommended whenever one is available.")) return;
+      if (action.dangerous && action.requiresConfirmation !== true && !window.confirm('Continue with “' + action.label + '”? ' + action.description + " A preview is recommended whenever one is available.")) return;
       const options = { method: action.method };
+      let payload;
       if (action.method !== "GET") {
-        let payload;
         try { payload = JSON.parse(page.querySelector('[data-role="payload"]').value || "{}"); }
         catch { throw new Error("The advanced options are not valid. Reset them or correct the formatting."); }
         options.headers = { "content-type": "application/json" };
         options.body = JSON.stringify(payload);
       }
+      if (action.requiresConfirmation && !window.confirm('Apply only after review: ' + (action.confirmationLabel || action.label) + ". This cannot be undone if external effects are not fully reversible.")) return;
       const button = page.querySelector('[data-role="run"]');
       const resultArea = page.querySelector('[data-role="result"]');
       setBusy(button, true);
       resultArea.innerHTML = '<div class="empty-state"><strong>Working…</strong><span>Ódinn is completing ' + escapeHtml(action.label.toLowerCase()) + '.</span></div>';
       try {
         const result = await api(path, options);
-        renderFriendlyResult(resultArea, result, featureKey, action);
+        renderFriendlyResult(resultArea, result, featureKey, action, payload);
         showOutput(action.label + " completed.");
       } catch (error) {
         resultArea.innerHTML = '<div class="result-summary error"><strong>That did not work</strong><p>' + escapeHtml(error.message) + '</p></div>';
@@ -5718,8 +5745,45 @@ function renderConsoleHtml(version = "development") {
       }).join("") + '</ul></div>';
     }
 
-    function renderFriendlyResult(target, result, featureKey, action) {
+    function renderGovernanceProposal(payload, action) {
+      const operation = payload?.operation;
+      if (operation) {
+        const details = [payload.path ? "path: " + payload.path : "", payload.checkpointId ? "checkpoint: " + payload.checkpointId : "", payload.find ? "find: “" + payload.find + "”" : "", payload.replace ? "replace: “" + payload.replace + "”" : ""].filter(Boolean);
+        return operation + (details.length ? " • " + details.join(" • ") : "");
+      }
+      if (action?.id === "restore-preview" || action?.id === "restore-apply") {
+        return payload?.checkpointId ? "restore checkpoint: " + payload.checkpointId : "restore request";
+      }
+      if (payload?.runId) return "run " + payload.runId;
+      return action?.label;
+    }
+
+    function renderGovernanceSummary(result, action, payload) {
+      const output = (result && typeof result === "object" && "output" in result) ? result.output : result;
+      if (!output || typeof output !== "object") return "";
+      const conflicts = Array.isArray(output.conflicts) ? output.conflicts : [];
+      const entries = Array.isArray(output.entries) ? output.entries : [];
+      const needsReview = output.status === "needs-review" || output.status === "conflict" || conflicts.length > 0;
+      const digestFacts = entries.map((entry) => {
+        const expectedDigest = String((entry.expected || {}).digest || entry.before?.digest || "not specified");
+        const currentDigest = String(entry.before?.digest || "not present");
+        const resultingDigest = String(entry.after?.digest || entry.resultDigest || "not computed");
+        return '<div class="result-fact"><small>Path</small><strong>' + escapeHtml(String(entry.path || "(root)")) + '</strong></div>' +
+          '<div class="result-fact"><small>Expected digest</small><strong>' + escapeHtml(expectedDigest) + '</strong></div>' +
+          '<div class="result-fact"><small>Current digest</small><strong>' + escapeHtml(currentDigest) + '</strong></div>' +
+          '<div class="result-fact"><small>Resulting digest</small><strong>' + escapeHtml(resultingDigest) + '</strong></div>';
+      }).join("");
+      const conflictRows = conflicts.map((conflict, index) => '<li><strong>' + escapeHtml(friendlyStatus(conflict.code || "Needs review")) + '</strong><span>' + escapeHtml((conflict.path || "") + (conflict.message ? ": " + conflict.message : "")) + '</span></li>').join("");
+      const digestSection = digestFacts ? '<section class="agent-section"><strong>Digest report</strong><div class="result-grid">' + digestFacts + '</div></section>' : "";
+      const conflictSection = conflicts.length ? '<section class="agent-section"><strong>Conflicts</strong><ul class="human-list">' + conflictRows + '</ul></section>' : "";
+      const status = output.status || (output.applied === true ? "applied" : output.applied === false ? "needs-review" : "ready");
+      const statusText = needsReview ? "needs-review" : status;
+      return '<section class="agent-section"><strong>Proposed operation</strong><p>' + escapeHtml(renderGovernanceProposal(payload, action)) + '</p><div class="result-grid"><div class="result-fact"><small>Apply</small><strong>' + escapeHtml(output.applied === true ? "Applied" : output.applied === false ? "Not applied" : "Preview") + '</strong></div><div class="result-fact"><small>Status</small><strong>' + escapeHtml(friendlyStatus(statusText)) + '</strong></div><div class="result-fact"><small>Needs review</small><strong>' + escapeHtml(needsReview ? "Yes" : "No") + '</strong></div><div class="result-fact"><small>Action</small><strong>' + escapeHtml(String(output.operation || action?.id || "")) + '</strong></div></div></section>' + digestSection + conflictSection;
+    }
+
+    function renderFriendlyResult(target, result, featureKey, action, requestPayload) {
       if (featureKey === "capabilities" && typeof result?.token === "string") state.lastCapabilityToken = result.token;
+      const output = featureKey === "governance" && result && typeof result === "object" && "output" in result ? result.output : result;
       const facts = [];
       const labels = {
         status: "Status",
@@ -5736,7 +5800,7 @@ function renderConsoleHtml(version = "development") {
         candidates: "Approaches",
         records: "Records"
       };
-      for (const [key, value] of Object.entries(result || {})) {
+      for (const [key, value] of Object.entries(output || {})) {
         if (!labels[key] || value === undefined || value === null) continue;
         const display = typeof value === "boolean"
           ? value ? "Yes" : "No"
@@ -5746,7 +5810,7 @@ function renderConsoleHtml(version = "development") {
                 : typeof value === "object" ? Object.keys(value).length + " items" : friendlyStatus(value);
         facts.push('<div class="result-fact"><small>' + escapeHtml(labels[key]) + '</small><strong>' + escapeHtml(display) + '</strong></div>');
       }
-      const message = result?.message || result?.summary || action.label + " completed successfully.";
+      const message = output?.message || output?.summary || action.label + " completed successfully.";
       const tokenNotice = state.lastCapabilityToken && featureKey === "capabilities" && action.id === "issue"
         ? '<div class="agent-section"><strong>Your access pass is ready</strong><p>For safety, it is not displayed on this page. Copy it now and store it only where it is needed.</p><button class="secondary" data-copy-access-pass type="button">Copy access pass</button></div>'
         : "";
@@ -5754,8 +5818,9 @@ function renderConsoleHtml(version = "development") {
         ? '<ul class="human-list">' + result.assertions.map((item) => '<li><strong>' + escapeHtml(item.passed === false ? "Needs attention" : "Passed") + '</strong><div class="muted">' + escapeHtml(item.message || item.id || "Check completed") + '</div></li>').join("") + '</ul>'
         : "";
       const safeDetails = redactTechnicalResult(result);
+      const governanceSection = featureKey === "governance" ? renderGovernanceSummary(output, action, requestPayload || {}) : "";
       target.innerHTML = '<div class="result-summary success"><div><strong>' + escapeHtml(action.label + " complete") + '</strong><p>' + escapeHtml(message) + '</p></div>' +
-        (facts.length ? '<div class="result-grid">' + facts.join("") + '</div>' : "") + tokenNotice + list +
+        (facts.length ? '<div class="result-grid">' + facts.join("") + '</div>' : "") + governanceSection + tokenNotice + list +
         '<details class="activity-details technical-details"><summary>Developer details</summary><pre>' + escapeHtml(JSON.stringify(safeDetails, null, 2)) + '</pre></details></div>';
     }
 

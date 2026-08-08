@@ -201,12 +201,13 @@ because source code or TypeScript exports are visible.
 
 ### Advanced services and experimental modules
 
-Runemark, Gatewatch, Norn Restore, and Raven Route are core advanced runtime
-services and do not require feature flags. The existing Proof, Sentinel,
-Rewind, and Darwin technical identifiers remain compatible. Their documented
-CLI and gateway surfaces remain experimental interfaces unless another row in
-this policy explicitly marks them stable; core placement is an implementation
-and availability decision, not a public-SDK compatibility promise.
+Runemark, Gatewatch, Norn Restore, Norn Governance, and Raven Route are core
+advanced runtime services and do not require feature flags. The existing Proof,
+Sentinel, Rewind, and Darwin technical identifiers remain compatible. Their
+documented CLI and gateway surfaces remain experimental interfaces unless another
+row in this policy explicitly marks them stable; core placement is an
+implementation and availability decision, not a public-SDK compatibility
+promise.
 
 Saga Archive, Rune Key, Worldtree Paths, Agent SDK packages, Skill SDK
 packages, third-party extensions, MCP packages, multi-user hosting, and

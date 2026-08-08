@@ -37,10 +37,14 @@ raw state directory.
 ## Advanced
 
 Advanced is a collapsible navigation group, not a landing page. Run Checks,
-Safety Preview, Restore Points, and Smart Routing are core capabilities.
-Temporary Access, Portable Runs, and Compare Approaches are optional plugin
-modules. Each has a dedicated guided workflow, while developer input and raw
-endpoint details stay collapsed under Advanced options.
+Safety Preview, Restore Points, Controlled Workspace Governance, and Smart Routing
+are core capabilities. Controlled Workspace Governance introduces bounded
+workspace mutate, patch, and restore workflows that separate preview and apply so
+apply stays intentionally behind an explicit review step. The page shows digest
+and conflict summaries, including needs-review signals, when returned. Temporary
+Access, Portable Runs, and Compare Approaches are optional plugin modules. Each
+has a dedicated guided workflow, while developer input and raw endpoint details
+stay collapsed under Advanced options.
 
 The three plugin-module flags remain off by default. A disabled plugin stays
 locked. Destructive operations remain explicit, and restore or comparison
