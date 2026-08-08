@@ -22,7 +22,7 @@
     "@odinn/protocol": "workspace:*",
     "@odinn/store-file": "workspace:*",
     "@odinn/store-sqlite": "workspace:*",
-    "fflate": "0.8.2",
+    "fflate": "0.8.3",
     "playwright-core": "1.61.1"
   }
 }
