@@ -295,6 +295,8 @@ benchmark procedures are documented in [Audit storage operations](docs/audit-sto
 - [Benchmark evidence and limitations](docs/benchmarks.md) — enforced gates,
   observational and synthetic measurements, reproduction, and publication
   caveats
+- [Features index](docs/features/README.md) — core advanced services and
+  optional plugin modules
 - [Report a bug or request a feature](https://github.com/BlueDot-IT/Odinn-Forge/issues/new/choose)
 - [Contributing guide](CONTRIBUTING.md) — development setup, pull requests,
   validation, and releases
