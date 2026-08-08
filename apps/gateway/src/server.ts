@@ -1675,6 +1675,7 @@ export async function createGatewayServer({
       .then(() => {
         let registryError: unknown;
         try { registry.close(); } catch (error) { registryError = error; }
+        try { governedRegistry.close(); } catch (error) { registryError ??= error; }
         try { auditStore.close?.(); } catch (error) { registryError ??= error; }
         close((serverError: unknown) => callback?.(serverError ?? registryError));
       })
