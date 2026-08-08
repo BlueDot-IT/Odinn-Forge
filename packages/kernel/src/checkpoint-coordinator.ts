@@ -308,11 +308,19 @@ export class CheckpointCoordinator {
 
   recover() {
     const unstable = this.runLedger.database.db.prepare(
-      "SELECT id, group_id FROM mutation_checkpoints WHERE status IN ('created', 'checkpointing', 'publishing', 'verifying', 'ready')"
+      "SELECT id, group_id, status FROM mutation_checkpoints WHERE status IN ('created', 'checkpointing', 'publishing', 'verifying', 'ready')"
     ).all() as SqlRow[];
     const recovered = unstable.map((row) => {
-      this.setNeedsReview(String(row.group_id), String(row.id), "recovered after interruption");
-      return String(row.id);
+      const checkpointId = String(row.id);
+      const boundaryId = String(row.group_id);
+      const checkpointStatus = String(row.status);
+      const recovery = this.classifyRecoveredCheckpoint(checkpointId, checkpointStatus);
+      if (recovery.kind === "complete") {
+        this.setCompleted(boundaryId, checkpointId, recovery.completedAt);
+      } else {
+        this.setNeedsReview(boundaryId, checkpointId, "recovered after interruption");
+      }
+      return checkpointId;
     });
     return { recovered };
   }
@@ -448,5 +456,42 @@ export class CheckpointCoordinator {
   private readCount(statement: string, boundaryId: string): number {
     const row = this.runLedger.database.db.prepare(statement).get(boundaryId) as SqlCountRow | undefined;
     return Number(row?.count ?? 0);
+  }
+
+  private hasCheckpointManifest(checkpointId: string): boolean {
+    const row = this.readManifestBinding(checkpointId);
+    return Boolean(row);
+  }
+
+  private countCheckpointJournalEntries(checkpointId: string): number {
+    const row = this.runLedger.database.db.prepare(
+      "SELECT COUNT(1) AS count FROM mutation_journal_entries WHERE checkpoint_id = ?"
+    ).get(checkpointId) as SqlCountRow | undefined;
+    return Number(row?.count ?? 0);
+  }
+
+  private classifyRecoveredCheckpoint(checkpointId: string, status: string):
+    { kind: "complete"; completedAt: string } | { kind: "needs-review" } {
+    if (!ACTIVE_STATUSES.has(status)) return { kind: "needs-review" };
+    if (status === "verifying") {
+      if (this.hasCheckpointManifest(checkpointId)) {
+        return { kind: "complete", completedAt: this.now() };
+      }
+      return { kind: "needs-review" };
+    }
+    const mutationCount = this.countCheckpointJournalEntries(checkpointId);
+    if (status === "created" && mutationCount === 0) {
+      return { kind: "complete", completedAt: this.now() };
+    }
+    return { kind: "needs-review" };
+  }
+
+  private setCompleted(groupId: string, checkpointId: string, completedAt: string) {
+    this.runLedger.database.transaction((database) => {
+      database.prepare(
+        "UPDATE mutation_checkpoints SET status = ?, completed_at = COALESCE(completed_at, ?), error = NULL WHERE id = ?"
+      ).run("completed", completedAt, checkpointId);
+      database.prepare("UPDATE mutation_groups SET status = ?, updated_at = ? WHERE id = ?").run("completed", completedAt, groupId);
+    });
   }
 }

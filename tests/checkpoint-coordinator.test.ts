@@ -105,6 +105,84 @@ test("checkpoint coordinator recovers crash-state boundaries into needs-review",
   }
 });
 
+test("checkpoint coordinator completes empty created boundary on startup reconciliation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-checkpoint-recover-empty-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+
+  try {
+    const { boundaryId } = coordinator.startBoundary({ runId: "run-checkpoint-empty-boundary" });
+    const checkpointRow = runLedger.database.db.prepare("SELECT id FROM mutation_checkpoints WHERE group_id = ? ORDER BY created_at DESC LIMIT 1").get(boundaryId) as { id: string };
+    runLedger.database.db.prepare("UPDATE mutation_checkpoints SET status = 'created' WHERE id = ?").run(checkpointRow.id);
+
+    const recovered = coordinator.recover();
+    assert.equal(recovered.recovered.length, 1);
+    assert.equal(recovered.recovered[0], checkpointRow.id);
+
+    const boundaryRow = runLedger.database.db.prepare("SELECT status FROM mutation_groups WHERE id = ?").get(boundaryId) as { status: string };
+    const recoveredCheckpointRow = runLedger.database.db.prepare("SELECT status FROM mutation_checkpoints WHERE id = ?").get(checkpointRow.id) as { status: string };
+    assert.equal(boundaryRow.status, "completed");
+    assert.equal(recoveredCheckpointRow.status, "completed");
+  } finally {
+    coordinator.runLedger.close();
+  }
+});
+
+test("checkpoint coordinator reconciles publishing crash state into needs-review", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-checkpoint-recover-publishing-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+
+  try {
+    const { boundaryId } = coordinator.startBoundary({ runId: "run-checkpoint-recover-publishing" });
+    const mutationTools = createWorkspaceMutationTools({ workspaceRoot: root });
+    const preview = await mutationTools["workspace.write"].execute({ path: "safe.txt", content: "value" });
+    coordinator.recordMutationPreview({ boundaryId, operation: preview.operation, stepId: "step-1", preview });
+
+    const checkpointRow = runLedger.database.db.prepare("SELECT id FROM mutation_checkpoints WHERE group_id = ? ORDER BY created_at DESC LIMIT 1").get(boundaryId) as { id: string };
+    runLedger.database.db.prepare("UPDATE mutation_checkpoints SET status = 'publishing' WHERE id = ?").run(checkpointRow.id);
+
+    const recovered = coordinator.recover();
+    assert.equal(recovered.recovered.length, 1);
+    assert.equal(recovered.recovered[0], checkpointRow.id);
+
+    const boundary = runLedger.database.db.prepare("SELECT status FROM mutation_groups WHERE id = ?").get(boundaryId) as { status: string };
+    const checkpoint = runLedger.database.db.prepare("SELECT status FROM mutation_checkpoints WHERE id = ?").get(checkpointRow.id) as { status: string };
+    assert.equal(boundary.status, "needs-review");
+    assert.equal(checkpoint.status, "needs-review");
+  } finally {
+    coordinator.runLedger.close();
+  }
+});
+
+test("checkpoint coordinator reconciles verifying crash state with manifest as completed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-checkpoint-recover-verifying-"));
+  const stateDir = join(root, ".odinn");
+  const runLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const coordinator = new CheckpointCoordinator({ runLedger });
+  const mutationTools = createWorkspaceMutationTools({ workspaceRoot: root });
+
+  try {
+    const { boundaryId } = coordinator.startBoundary({ runId: "run-checkpoint-recover-verifying" });
+    const preview = await mutationTools["workspace.write"].execute({ path: "safe.txt", content: "value" });
+    coordinator.recordMutationPreview({ boundaryId, operation: preview.operation, stepId: "step-1", preview });
+    coordinator.publishBoundary(boundaryId);
+    const checkpointRow = runLedger.database.db.prepare("SELECT id FROM mutation_checkpoints WHERE group_id = ? ORDER BY created_at DESC LIMIT 1").get(boundaryId) as { id: string };
+    runLedger.database.db.prepare("UPDATE mutation_checkpoints SET status = 'verifying' WHERE id = ?").run(checkpointRow.id);
+
+    const recovered = coordinator.recover();
+    assert.equal(recovered.recovered.length, 1);
+    const boundary = runLedger.database.db.prepare("SELECT status FROM mutation_groups WHERE id = ?").get(boundaryId) as { status: string };
+    const checkpoint = runLedger.database.db.prepare("SELECT status FROM mutation_checkpoints WHERE id = ?").get(checkpointRow.id) as { status: string };
+    assert.equal(boundary.status, "completed");
+    assert.equal(checkpoint.status, "completed");
+  } finally {
+    coordinator.runLedger.close();
+  }
+});
+
 test("checkpoint journal records mutation budgets and deterministic conflicts", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-checkpoint-budget-"));
   const stateDir = join(root, ".odinn");
