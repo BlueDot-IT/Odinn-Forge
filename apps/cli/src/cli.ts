@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -519,6 +519,13 @@ function parseJsonOption(args: any, name: any, fallback: any = undefined, requir
 async function runGovernedTool(args: any, tool: any, input: any, runIdOverride?: string) {
   const state = stateDir(args);
   const config = await readConfig(state);
+  if (await access(join(state, "sandbox-recovery.json")).then(() => true).catch(() => false) && tool === "process.exec") {
+    await reconcileSandboxRecovery(state, normalizeSandboxConfig(config).backend.enginePaths);
+  }
+  if (await access(join(state, "process-recovery.json")).then(() => true).catch(() => false)) {
+    if (tool === "process.exec") await reconcileProcessRecovery(state);
+    else await reconcileProcessRecovery(state).catch(() => undefined);
+  }
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   try {
@@ -1331,6 +1338,10 @@ async function doctor(args: any) {
   const state = stateDir(args);
   await recoverInterruptedOnboardingTransactions(state);
   const config = await readConfig(state);
+  let sandboxRecoveryStartupError = false;
+  if (await access(join(state, "sandbox-recovery.json")).then(() => true).catch(() => false)) {
+    await reconcileSandboxRecovery(state, normalizeSandboxConfig(config).backend.enginePaths).catch(() => { sandboxRecoveryStartupError = true; });
+  }
   const normalizedModels = normalizeModelConfig(config);
   const auditPath = join(state, config.auditLog ?? "audit.jsonl");
   const auditStore = createAuditStore(auditPath);
@@ -1355,6 +1366,9 @@ async function doctor(args: any) {
   };
   const recovery = await readJsonIfPresent(join(state, "browser-recovery.json"), { status: "clear" });
   const sandboxRecovery = await readJsonIfPresent(join(state, "sandbox-recovery.json"), { pending: [] });
+  let processRecovery: any = { pending: [] };
+  try { processRecovery = await readJsonIfPresent(join(state, "process-recovery.json"), { pending: [] }); }
+  catch { processRecovery = { pending: null, invalid: true }; }
   const ownerOnly = await isOwnerOnlyPath(state);
   let version = "unknown";
   try { version = JSON.parse(readFileSync(PACKAGE_FILE, "utf8")).version ?? version; } catch {}
@@ -1405,9 +1419,9 @@ async function doctor(args: any) {
     jobs: { total: jobs.length, ...jobCounts },
     sandbox: {
       configured: summarizeSandboxRisk(sandboxConfig),
-      recovery: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null },
+      recovery: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null, quarantined: sandboxRecoveryStartupError || sandboxRecovery.pending === null },
       extensionLane,
-      activation: "network-denied immutable extensions are active; general processes, brokered networking, and writable host integration remain unavailable",
+      activation: "durable process jobs require explicit approval and a digest-pinned Linux OCI image; direct CLI runs, shell access, network access, and writable host integration remain unavailable",
       backends: sandboxBackends.map((backend) => ({
         backend: backend.backend,
         available: backend.available,
@@ -1417,6 +1431,11 @@ async function doctor(args: any) {
         controls: backend.controlEvidence.status,
         resourceControls: backend.resourceControls
       }))
+    },
+    processRecovery: {
+      pending: Array.isArray(processRecovery.pending) ? processRecovery.pending.length : null,
+      needsReview: Array.isArray(processRecovery.pending) ? processRecovery.pending.filter((entry: any) => entry?.phase === "needs-review").length : null,
+      quarantined: processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0)
     },
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: true, secretsExcludedFromDiagnostics: true }
   };

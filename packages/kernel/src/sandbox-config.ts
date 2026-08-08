@@ -1,5 +1,6 @@
 import { isIP } from "node:net";
 import { isAbsolute, posix, win32 } from "node:path";
+import { validateDigestPinnedOciImage } from "./sandbox-backend.ts";
 
 const BACKENDS = ["rootless-oci", "oci", "confined-native"] as const;
 const BACKEND_MODES = ["auto", ...BACKENDS] as const;
@@ -69,6 +70,7 @@ export interface SandboxConfig {
   readonly process: {
     readonly enabled: boolean;
     readonly shell: boolean;
+    readonly image?: string;
     readonly limits: {
       readonly timeoutMs: number;
       readonly cpu: number;
@@ -308,15 +310,19 @@ function parseNetwork(value: Record<string, unknown>): SandboxConfig["network"] 
 }
 
 function parseProcess(value: Record<string, unknown>): SandboxConfig["process"] {
-  exactKeys(value, ["enabled", "shell", "limits"], "config.sandbox.process");
+  exactKeys(value, ["enabled", "shell", "image", "limits"], "config.sandbox.process");
   const limits = optionalRecord(value.limits, "config.sandbox.process.limits");
   exactKeys(limits, ["timeoutMs", "cpu", "memoryBytes", "pids", "tmpfsBytes", "outputBytes"], "config.sandbox.process.limits");
   const enabled = boolean(value.enabled ?? true, "config.sandbox.process.enabled");
   const shell = boolean(value.shell ?? true, "config.sandbox.process.shell");
   if (!enabled && shell) throw new Error("config.sandbox.process.shell cannot be enabled when process execution is disabled");
+  const image = value.image === undefined
+    ? undefined
+    : validateDigestPinnedOciImage(value.image);
   return {
     enabled,
     shell,
+    ...(image ? { image } : {}),
     limits: {
       timeoutMs: integer(limits.timeoutMs ?? DEFAULT_SANDBOX_CONFIG.process.limits.timeoutMs, 100, 3_600_000, "config.sandbox.process.limits.timeoutMs"),
       cpu: boundedNumber(limits.cpu ?? DEFAULT_SANDBOX_CONFIG.process.limits.cpu, 0.1, 64, "config.sandbox.process.limits.cpu"),

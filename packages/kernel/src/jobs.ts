@@ -60,6 +60,7 @@ interface ActiveJob {
 }
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
+const PROCESS_WORKER_ABORT_GRACE_MS = 30_000;
 
 export class JobSupervisor {
   readonly store: JobStore;
@@ -394,9 +395,11 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
       const child = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
       children.add(child);
       let settled = false;
+      let abortGraceTimer: NodeJS.Timeout | undefined;
       const finish = (error?: Error, result?: unknown) => {
         if (settled) return;
         settled = true;
+        if (abortGraceTimer) clearTimeout(abortGraceTimer);
         children.delete(child);
         signal?.removeEventListener("abort", abort);
         child.removeAllListeners();
@@ -405,8 +408,24 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
         else resolve(result);
       };
       const abort = () => {
+        const reason = signal?.reason instanceof Error ? signal.reason : new Error("isolated task aborted");
+        if (payload.task?.tool === "process.exec") {
+          try {
+            if (child.connected) child.send({ type: "abort" });
+          } catch {
+            child.kill();
+            finish(reason);
+            return;
+          }
+          abortGraceTimer = setTimeout(() => {
+            child.kill();
+            finish(reason);
+          }, PROCESS_WORKER_ABORT_GRACE_MS);
+          abortGraceTimer.unref?.();
+          return;
+        }
         child.kill();
-        finish(signal?.reason instanceof Error ? signal.reason : new Error("isolated task aborted"));
+        finish(reason);
       };
       child.on("message", (message) => {
         if (!isWorkerResponse(message)) return finish(new Error("isolated task returned an invalid response"));
@@ -418,7 +437,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
         if (!settled) finish(new Error(`forked task worker exited unexpectedly: ${code ?? exitSignal}`));
       });
       signal?.addEventListener("abort", abort, { once: true });
-      child.send({ payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy, trustedRecovery });
+      child.send({ type: "task", payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy, trustedRecovery });
     });
   }) as TaskExecutor;
   execute.shutdown = async () => {

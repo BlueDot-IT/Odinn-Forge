@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep, win32 } from "node:path";
+import { ProcessRecoveryError, createProcessExecutionDescriptor, type ProcessExecutionSession, type ProcessSupervisor } from "./process-supervisor.ts";
 
 const DEFAULT_MAX_FILE_BYTES = 1_000_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 128_000;
@@ -731,7 +732,7 @@ function throwIfCancelled(signal: AbortSignal | undefined, label: string) {
   throw error;
 }
 
-export async function executeWorkspaceProcess(workspaceRoot: string, input: any = {}, signal?: AbortSignal) {
+export async function executeWorkspaceProcess(workspaceRoot: string, input: any = {}, signal?: AbortSignal, { supervisor, requestId }: { supervisor?: ProcessSupervisor; requestId?: string } = {}) {
   if (signal?.aborted) throw processCancellationError();
   const command = cleanCommand(input.command);
   const args = cleanArguments(input.args);
@@ -743,9 +744,12 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
   const cwd = await resolveWorkspacePath(workspaceRoot, compatibleCwd, "process.exec", { allowRoot: true, expected: "directory", security: { deniedPatterns: [] } });
   const timeoutMs = boundedInteger(input.timeoutMs, 100, 120_000, DEFAULT_TIMEOUT_MS);
   const maxOutputBytes = boundedInteger(input.maxOutputBytes, 1_024, 1_000_000, DEFAULT_MAX_OUTPUT_BYTES);
+  const descriptor = supervisor
+    ? createProcessExecutionDescriptor({ workspaceRoot: root, command, args, cwd: cwd.path || ".", timeoutMs, maxOutputBytes, requestId })
+    : undefined;
   const startedAt = Date.now();
 
-  return await new Promise((resolveProcess, rejectProcess) => {
+  const execute = async (session?: ProcessExecutionSession) => await new Promise((resolveProcess, rejectProcess) => {
     let child: ReturnType<typeof spawn> | undefined;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -755,21 +759,43 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
     let timedOut = false;
     let outputTruncated = false;
     let settled = false;
+    let launchFailed = false;
+    let cancellationRequested = false;
+    let lifecycleError: unknown;
+    let runningRecord: Promise<void> | undefined;
+    let terminationRecord: Promise<void> | undefined;
+    let launchAbortRecord: Promise<void> | undefined;
+    let terminationStarted = false;
+    let closed = false;
 
     const terminate = () => {
       const activeChild = child;
       if (!activeChild?.pid) return;
+      if (!terminationStarted) {
+        terminationStarted = true;
+        terminationRecord = Promise.all([
+          session?.markTerminating() ?? Promise.resolve(),
+          process.platform === "win32" ? terminateWindowsProcess(activeChild.pid) : Promise.resolve()
+        ]).then(() => undefined).catch((error) => {
+          lifecycleError ??= error;
+        });
+      }
       if (process.platform === "win32") {
-        spawn("taskkill", ["/pid", String(activeChild.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).unref();
+        return;
       } else {
         try { process.kill(-activeChild.pid, "SIGKILL"); } catch { activeChild.kill("SIGKILL"); }
       }
     };
-    const abort = () => terminate();
+    const abort = () => {
+      cancellationRequested = true;
+      terminate();
+    };
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) {
       signal.removeEventListener("abort", abort);
-      rejectProcess(processCancellationError());
+      launchAbortRecord = session?.abortBeforeLaunch();
+      if (launchAbortRecord) void launchAbortRecord.then(() => rejectProcess(processCancellationError())).catch(rejectProcess);
+      else rejectProcess(processCancellationError());
       return;
     }
     try {
@@ -783,7 +809,10 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
       });
     } catch (error) {
       signal?.removeEventListener("abort", abort);
-      rejectProcess(error);
+      launchFailed = true;
+      launchAbortRecord = session?.abortBeforeLaunch();
+      const launchError = processLaunchFailure();
+      void (launchAbortRecord ? launchAbortRecord.then(() => rejectProcess(launchError)).catch(rejectProcess) : Promise.resolve(rejectProcess(launchError)));
       return;
     }
     const activeChild = child!;
@@ -802,47 +831,92 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
     activeChild.stdout!.on("data", (chunk: Buffer) => collect(stdout, chunk, "stdout"));
     activeChild.stderr!.on("data", (chunk: Buffer) => collect(stderr, chunk, "stderr"));
     activeChild.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", abort);
-      rejectProcess(error);
+      lifecycleError ??= processLaunchFailure();
+      if (!activeChild.pid) {
+        launchFailed = true;
+        launchAbortRecord = session?.abortBeforeLaunch().catch((failure) => { lifecycleError ??= failure; });
+      } else terminate();
     });
     const timer = setTimeout(() => {
+      if (closed || settled) return;
       timedOut = true;
       terminate();
     }, timeoutMs);
-    activeChild.once("close", (exitCode, childSignal) => {
-      if (settled) return;
-      settled = true;
+    activeChild.once("exit", () => {
+      closed = true;
       clearTimeout(timer);
-      signal?.removeEventListener("abort", abort);
-      if (signal?.aborted) {
-        rejectProcess(processCancellationError());
-        return;
-      }
-      resolveProcess({
-        command,
-        args,
-        cwd: cwd.path === "." ? "" : cwd.path,
-        exitCode: exitCode ?? 1,
-        signal: childSignal,
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8"),
-        stdoutBytes,
-        stderrBytes,
-        timedOut,
-        outputTruncated,
-        durationMs: Date.now() - startedAt
-      });
     });
+    activeChild.once("close", (exitCode, childSignal) => {
+      void (async () => {
+        if (settled) return;
+        closed = true;
+        clearTimeout(timer);
+        await launchAbortRecord;
+        await runningRecord;
+        await terminationRecord;
+        if (session && !launchFailed) {
+          try { await session.settle(); }
+          catch (error) { lifecycleError ??= error; }
+        }
+        settled = true;
+        signal?.removeEventListener("abort", abort);
+        if (cancellationRequested || signal?.aborted) {
+          rejectProcess(processCancellationError());
+          return;
+        }
+        if (lifecycleError) {
+          rejectProcess(lifecycleError);
+          return;
+        }
+        resolveProcess({
+          command,
+          args,
+          cwd: cwd.path === "." ? "" : cwd.path,
+          exitCode: exitCode ?? 1,
+          signal: childSignal,
+          stdout: Buffer.concat(stdout).toString("utf8"),
+          stderr: Buffer.concat(stderr).toString("utf8"),
+          stdoutBytes,
+          stderrBytes,
+          timedOut,
+          outputTruncated,
+          durationMs: Date.now() - startedAt
+        });
+      })().catch(rejectProcess);
+    });
+    if (session && activeChild.pid) {
+      runningRecord = session.markRunning(activeChild.pid).then(() => undefined).catch((error) => {
+        lifecycleError ??= error;
+        terminate();
+      });
+    }
   });
+
+  return supervisor && descriptor ? supervisor.execute(descriptor, (session) => execute(session)) : execute();
 }
 
 function processCancellationError() {
   const error = new Error("process.exec cancelled");
   error.name = "AbortError";
   return error;
+}
+
+function processLaunchFailure() {
+  return new ProcessRecoveryError("process execution could not be started", "PROCESS_LAUNCH_FAILED");
+}
+
+function terminateWindowsProcess(pid: number): Promise<void> {
+  return new Promise((resolveTermination) => {
+    let killer: ReturnType<typeof spawn>;
+    try {
+      killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    } catch {
+      resolveTermination();
+      return;
+    }
+    killer.once("error", () => resolveTermination());
+    killer.once("close", () => resolveTermination());
+  });
 }
 
 function cleanCommand(value: unknown) {

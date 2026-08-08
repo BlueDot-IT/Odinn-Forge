@@ -1,5 +1,5 @@
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createCipheriv, createDecipheriv, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { redactDurableValue } from "@odinn/protocol";
 
@@ -7,6 +7,14 @@ type NodeError = Error & { code?: string };
 
 type StoredApprovalAction = ApprovalAction & {
   bindingTag?: string;
+  sealedInput?: SealedApprovalInput;
+};
+
+type SealedApprovalInput = {
+  version: 1;
+  iv: string;
+  data: string;
+  authTag: string;
 };
 
 const durableApprovalKeys = new Map<string, Buffer>();
@@ -38,7 +46,7 @@ export interface ApprovalStore {
 export function createApprovalStore({ path }: { path?: string } = {}): ApprovalStore {
   const pending = new Map<string, StoredApprovalAction>();
   const storeKey = path ?? `memory:${randomUUID()}`;
-  const bindingKey = durableApprovalKeys.get(storeKey) ?? randomBytes(32);
+  const bindingKey = durableApprovalKeys.get(storeKey) ?? (path ? loadDurableApprovalKey(path) : randomBytes(32));
   durableApprovalKeys.set(storeKey, bindingKey);
   const volatile = volatileApprovalActions.get(storeKey) ?? new Map<string, ApprovalAction>();
   volatileApprovalActions.set(storeKey, volatile);
@@ -129,6 +137,7 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
           id,
           ...sanitized,
           bindingTag,
+          ...(path ? { sealedInput: sealApprovalInput(bindingKey, id, normalized.input ?? {}) } : {}),
           status: "pending",
           createdAt: new Date().toISOString(),
           expiresAt: Date.now() + 300_000
@@ -170,7 +179,7 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
           return undefined;
         }
         const normalized = normalizeApprovalAction(expected);
-        const exact = volatile.get(key);
+        const exact = volatile.get(key) ?? recoverSealedApprovalAction(bindingKey, key, action);
         if (!exact || !action.bindingTag || !safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, exact))) return undefined;
         const exactMatch = safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, normalized));
         const redactedMatch = stableApprovalValue(normalizeApprovalAction(action)) === stableApprovalValue(normalized);
@@ -202,7 +211,7 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         persist();
         return Array.from(pending.values())
           .filter((action) => action.status === "pending")
-          .map(({ input, bindingTag: _bindingTag, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
+          .map(({ input, bindingTag: _bindingTag, sealedInput: _sealedInput, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
       });
     }
   };
@@ -264,8 +273,72 @@ function approvalBindingTag(key: Buffer, action: ApprovalAction): string {
 }
 
 function publicApprovalAction(action: StoredApprovalAction): ApprovalAction {
-  const { bindingTag: _bindingTag, ...publicAction } = action;
+  const { bindingTag: _bindingTag, sealedInput: _sealedInput, ...publicAction } = action;
   return publicAction;
+}
+
+function loadDurableApprovalKey(path: string): Buffer {
+  const keyPath = `${path}.key`;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    const key = readFileSync(keyPath);
+    if (key.byteLength !== 32) throw new Error("approval store key is invalid; refusing to recover durable approvals");
+    chmodSync(keyPath, 0o600);
+    return key;
+  } catch (error) {
+    if ((error as NodeError).code !== "ENOENT") throw error;
+  }
+  const key = randomBytes(32);
+  try {
+    const descriptor = openSync(keyPath, "wx", 0o600);
+    try {
+      writeFileSync(descriptor, key);
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    chmodSync(keyPath, 0o600);
+    return key;
+  } catch (error) {
+    if ((error as NodeError).code !== "EEXIST") throw error;
+    const existing = readFileSync(keyPath);
+    if (existing.byteLength !== 32) throw new Error("approval store key is invalid; refusing to recover durable approvals");
+    chmodSync(keyPath, 0o600);
+    return existing;
+  }
+}
+
+function sealApprovalInput(key: Buffer, approvalId: string, input: Record<string, unknown>): SealedApprovalInput {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(`odinn-approval-input-v1:${approvalId}`, "utf8"));
+  const data = Buffer.concat([cipher.update(Buffer.from(JSON.stringify(input), "utf8")), cipher.final()]);
+  return {
+    version: 1,
+    iv: iv.toString("base64url"),
+    data: data.toString("base64url"),
+    authTag: cipher.getAuthTag().toString("base64url")
+  };
+}
+
+function recoverSealedApprovalAction(key: Buffer, approvalId: string, action: StoredApprovalAction): ApprovalAction | undefined {
+  const sealed = action.sealedInput;
+  if (!sealed || sealed.version !== 1 || typeof sealed.iv !== "string" || typeof sealed.data !== "string" || typeof sealed.authTag !== "string") return undefined;
+  try {
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(sealed.iv, "base64url"));
+    decipher.setAAD(Buffer.from(`odinn-approval-input-v1:${approvalId}`, "utf8"));
+    decipher.setAuthTag(Buffer.from(sealed.authTag, "base64url"));
+    const input = JSON.parse(Buffer.concat([decipher.update(Buffer.from(sealed.data, "base64url")), decipher.final()]).toString("utf8"));
+    if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+    return normalizeApprovalAction({
+      tool: action.tool,
+      runId: action.runId,
+      accountId: action.accountId,
+      input: input as Record<string, unknown>
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 function safeEqualTag(left: string, right: string): boolean {

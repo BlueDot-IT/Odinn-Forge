@@ -130,31 +130,30 @@ confinement, race-detection, and cancellation implementation as
 ### `process.exec` tool contract
 
 `process.exec` starts one executable directly with a separate argument array;
-it never invokes a shell. Its working directory must resolve beneath the
-assigned workspace. `timeoutMs` is bounded from 100 to 120,000 milliseconds and
-defaults to 30,000. Combined captured output is bounded from 1,024 to 1,000,000
-bytes and defaults to 128,000; exceeding the limit terminates the process tree
-and sets `outputTruncated`.
+it never invokes a shell. Public execution is accepted only through durable
+`POST /jobs`; direct `/run`, `/run/stream`, `/plan`, replay, and CLI execution
+remain refused. Its working directory must resolve beneath the assigned
+workspace. `timeoutMs` and combined captured output are bounded by the
+configured process limits; exceeding either limit terminates the container and
+sets `outputTruncated` or `timedOut`.
 
-This is intentionally not an operating-system sandbox. A child runs under the
-same OS identity as Odinn and may use available executables or network access.
-Odinn limits the inherited environment and assigns the workspace as child
-`HOME` and `USERPROFILE`, but operators must still use a disposable workspace
-and a suitably restricted host identity. The tool requires both an explicit
-`process.execute` policy capability and the following configuration acknowledgement:
-
-```json
-{
-  "runtime": {
-    "allowUnconfinedProcessExec": true
-  }
-}
-```
+The active backend is a Linux OCI runtime selected from the operator's trusted
+configuration. It requires an exact digest-pinned image, `--pull=never`, denied
+networking, a sealed read-only workspace bundle, an empty supplied environment,
+no shell, no devices, no writable host mounts, and bounded CPU, memory, PID,
+tmpfs, and output limits. There is no host-spawn fallback. A per-run operator
+approval is required before container start and binds the command, arguments,
+cwd, limits, and run identity. Cancellation, timeout, worker loss, and cleanup
+uncertainty use the durable sandbox recovery journal; uncertain outcomes
+quarantine further process dispatch.
 
 The result reports the normalized `command`, `args`, workspace-relative `cwd`,
 `exitCode`, terminating `signal`, bounded `stdout` and `stderr`, captured byte
 counts, `timedOut`, `outputTruncated`, and `durationMs`. Process execution is
 classified as irreversible and non-retry-safe.
+
+The legacy `runtime.allowUnconfinedProcessExec` acknowledgement never activates
+this surface and host execution remains unavailable.
 
 ### System and configuration routes
 

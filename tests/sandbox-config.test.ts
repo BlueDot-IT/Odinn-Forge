@@ -58,6 +58,7 @@ test("sandbox accepts explicit broad filesystem, network, device, process, and h
       process: {
         enabled: true,
         shell: true,
+        image: "docker.io/library/odinn-process@sha256:" + "a".repeat(64),
         limits: { timeoutMs: 600_000, cpu: 4.5, memoryBytes: 4 * 1024 ** 3, pids: 512, tmpfsBytes: 1024 ** 3, outputBytes: 8 * 1024 ** 2 }
       },
       environment: {
@@ -72,6 +73,7 @@ test("sandbox accepts explicit broad filesystem, network, device, process, and h
   assert.equal(config.filesystem.grants[0].access, "read-write");
   assert.equal(config.network.mode, "unrestricted");
   assert.equal(config.process.limits.cpu, 4.5);
+  assert.match(config.process.image ?? "", /@sha256:[a-f0-9]{64}$/u);
   assert.equal(config.devices.grants.length, 1);
   assert.equal(config.hostExecution.scope, "all");
 });
@@ -138,6 +140,7 @@ test("network rules are exact bounded host and port objects", () => {
 });
 
 test("numeric, array, string, and semantic bounds fail closed", () => {
+  assert.throws(() => normalizeSandboxConfig({ sandbox: { process: { image: "docker.io/library/odinn-process:latest" } } }), /pinned/u);
   assert.throws(() => normalizeSandboxConfig({ sandbox: { process: { limits: { pids: 4097 } } } }), /pids must be an integer/u);
   assert.throws(() => normalizeSandboxConfig({ sandbox: { process: { enabled: false } } }), /shell cannot be enabled/u);
   assert.doesNotThrow(() => normalizeSandboxConfig({ sandbox: { process: { enabled: false, shell: false } } }));

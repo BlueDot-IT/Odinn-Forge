@@ -81,6 +81,7 @@ export function redactDurableValue(value: unknown, context: DurableRedactionCont
 
 const WORKSPACE_CONTENT_TOOLS = new Set(["workspace.readText", "workspace.read", "workspace.search", "workspace.diff"]);
 const WORKSPACE_MUTATION_TOOLS = new Set(["workspace.mutate", "workspace.patch"]);
+const PROCESS_TOOLS = new Set(["process.exec"]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -93,6 +94,7 @@ export function isWorkspaceContentTool(toolName: unknown): boolean {
  */
 export function projectDurableToolInput(toolName: string, input: unknown): unknown {
   if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(input);
+  if (PROCESS_TOOLS.has(toolName)) return projectProcessInput(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
   if (typeof projected.before === "string") {
@@ -111,6 +113,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
 /** Project workspace results to bounded metadata before durable persistence. */
 export function projectDurableToolOutput(toolName: string, output: unknown): unknown {
   if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(output);
+  if (PROCESS_TOOLS.has(toolName)) return projectProcessOutput(output);
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
   const record = output as JsonObject;
   if (toolName === "workspace.read" || toolName === "workspace.readText") {
@@ -143,6 +146,85 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
 
 function sha256Reference(value: string) {
   return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function projectProcessInput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const input = value as JsonObject;
+  const projected: JsonObject = {};
+  const command = boundedProcessString(input.command, 4_096);
+  if (command !== undefined) {
+    projected.commandDigest = sha256Reference(command);
+    projected.commandBytes = Buffer.byteLength(command, "utf8");
+  }
+  const args = boundedProcessArgs(input.args);
+  if (args !== undefined) {
+    projected.argsDigest = sha256Reference(JSON.stringify(args));
+    projected.argsCount = args.length;
+    projected.argsBytes = args.reduce((total, arg) => total + Buffer.byteLength(arg, "utf8"), 0);
+  }
+  const cwd = boundedProcessString(input.cwd, 4_096);
+  if (cwd !== undefined) projected.cwd = cwd;
+  const timeoutMs = boundedProcessInteger(input.timeoutMs, 1, 86_400_000);
+  if (timeoutMs !== undefined) projected.timeoutMs = timeoutMs;
+  const maxOutputBytes = boundedProcessInteger(input.maxOutputBytes, 1, 16 * 1024 * 1024);
+  if (maxOutputBytes !== undefined) projected.maxOutputBytes = maxOutputBytes;
+  return projected;
+}
+
+function projectProcessOutput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const output = value as JsonObject;
+  const projected: JsonObject = {};
+  const command = boundedProcessString(output.command, 4_096);
+  if (command !== undefined) {
+    projected.commandDigest = sha256Reference(command);
+    projected.commandBytes = Buffer.byteLength(command, "utf8");
+  }
+  const args = boundedProcessArgs(output.args);
+  if (args !== undefined) {
+    projected.argsDigest = sha256Reference(JSON.stringify(args));
+    projected.argsCount = args.length;
+  }
+  const cwd = boundedProcessString(output.cwd, 4_096);
+  if (cwd !== undefined) projected.cwd = cwd;
+  const exitCode = boundedProcessInteger(output.exitCode, -32_768, 32_768);
+  if (exitCode !== undefined) projected.exitCode = exitCode;
+  const signal = boundedProcessString(output.signal, 64);
+  if (signal !== undefined) projected.signal = signal;
+  for (const key of ["stdoutBytes", "stderrBytes"] as const) {
+    const bytes = boundedProcessInteger(output[key], 0, 16 * 1024 * 1024);
+    if (bytes !== undefined) projected[key] = bytes;
+  }
+  for (const key of ["timedOut", "outputTruncated"] as const) {
+    if (typeof output[key] === "boolean") projected[key] = output[key];
+  }
+  const durationMs = boundedProcessInteger(output.durationMs, 0, 86_400_000);
+  if (durationMs !== undefined) projected.durationMs = durationMs;
+  for (const key of ["stdout", "stderr"] as const) {
+    const text = boundedProcessString(output[key], 16 * 1024 * 1024);
+    if (text !== undefined) {
+      projected[`${key}Digest`] = sha256Reference(text);
+      projected[`${key}Bytes`] = Buffer.byteLength(text, "utf8");
+    }
+  }
+  return projected;
+}
+
+function boundedProcessString(value: unknown, maxBytes: number): string | undefined {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= maxBytes && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? value
+    : undefined;
+}
+
+function boundedProcessArgs(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length > 256 || value.some((arg) => boundedProcessString(arg, 64 * 1024) === undefined)) return undefined;
+  const args = value as string[];
+  return args.reduce((total, arg) => total + Buffer.byteLength(arg, "utf8"), 0) <= 16 * 1024 * 1024 ? args : undefined;
+}
+
+function boundedProcessInteger(value: unknown, minimum: number, maximum: number): number | undefined {
+  return Number.isSafeInteger(value) && Number(value) >= minimum && Number(value) <= maximum ? Number(value) : undefined;
 }
 
 const MUTATION_PAYLOAD_FIELDS = new Set(["content", "find", "replace"]);
@@ -194,7 +276,10 @@ function redactDurableNode(value: unknown, state: DurableRedactionContext & { de
     .map(([key, item]) => {
       const isInput = state.input || key === "input";
       const browserTypeValue = toolName === "browser.type" && isInput && key === "value";
-      if (browserTypeValue || (markedSensitive && key === "value")) return [key, REDACTED];
+      const processCommandValue = toolName === "process.exec" && isInput && key === "command";
+      const processArgumentValue = toolName === "process.exec" && isInput && key === "args";
+      if (browserTypeValue || processCommandValue || (markedSensitive && key === "value")) return [key, REDACTED];
+      if (processArgumentValue) return [key, [REDACTED]];
       return [key, redactDurableNode(item, {
         toolName,
         input: isInput,

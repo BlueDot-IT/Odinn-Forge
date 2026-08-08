@@ -58,6 +58,8 @@ export type SandboxBundleOptions = Readonly<{
   maxBytes?: number;
   maxPathBytes?: number;
   signal?: AbortSignal;
+  /** Trusted runtime state may live beneath the source root; omit that state tree from the bundle. */
+  excludeStateRoot?: boolean;
   /** Deterministic security-test hooks. Production callers must not supply these. */
   hooks?: SandboxBundleTestHooks;
 }>;
@@ -81,6 +83,7 @@ type BundleScan = Readonly<{
 type MaterializationContext = {
   sourceRoot: string;
   stagingRoot: string;
+  excludedSourceDirectory?: string;
   limits: MaterializationLimits;
   signal?: AbortSignal;
   hooks?: SandboxBundleTestHooks;
@@ -103,14 +106,22 @@ export async function materializeSandboxBundle(
   const limits = normalizeLimits(options);
   throwIfCancelled(options.signal);
   const sourceRoot = await requireAbsoluteRealDirectory(sourceDirectory, "sandbox bundle source");
-  const sourceRootIdentity = await captureDirectoryIdentity(sourceRoot, "sandbox bundle source");
   const requestedStateRoot = resolveStateRootInput(stateRoot);
-  if (overlaps(sourceRoot, requestedStateRoot)) {
+  const stateOverlapsSource = overlaps(sourceRoot, requestedStateRoot);
+  if (stateOverlapsSource && (!options.excludeStateRoot || requestedStateRoot === sourceRoot || !contained(sourceRoot, requestedStateRoot))) {
     throw new Error("sandbox bundle source and state root must not overlap");
   }
   const store = await prepareBundleStore(stateRoot);
-  if (overlaps(sourceRoot, store.stateRoot)) {
+  if (overlaps(sourceRoot, store.stateRoot) && (!options.excludeStateRoot || store.stateRoot === sourceRoot || !contained(sourceRoot, store.stateRoot))) {
     throw new Error("sandbox bundle source and state root must not overlap");
+  }
+  const sourceRootIdentity = await captureDirectoryIdentity(sourceRoot, "sandbox bundle source");
+  const excludedSourceDirectory = stateOverlapsSource ? store.stateRoot : undefined;
+  if (excludedSourceDirectory) {
+    const excludedMetadata = await lstat(excludedSourceDirectory, { bigint: true });
+    if (excludedMetadata.isSymbolicLink() || !excludedMetadata.isDirectory()) {
+      throw new Error("sandbox bundle state root must remain a physical directory when excluded from the source");
+    }
   }
   await options.hooks?.afterSourceValidation?.();
   throwIfCancelled(options.signal);
@@ -126,6 +137,7 @@ export async function materializeSandboxBundle(
     const context: MaterializationContext = {
       sourceRoot,
       stagingRoot,
+      excludedSourceDirectory,
       limits,
       signal: options.signal,
       hooks: options.hooks,
@@ -221,6 +233,11 @@ async function copyDirectory(
     const sourcePath = join(sourceDirectory, name);
     const destinationPath = join(destinationDirectory, name);
     await assertDirectoryChain(context.sourceDirectories, "sandbox bundle source");
+    if (context.excludedSourceDirectory && resolve(sourcePath) === context.excludedSourceDirectory) {
+      const excluded = await lstat(sourcePath, { bigint: true });
+      if (excluded.isSymbolicLink() || !excluded.isDirectory()) throw new Error(`sandbox bundle excluded state root changed into an unsafe entry: ${relativePath}`);
+      continue;
+    }
     const before = await lstat(sourcePath, { bigint: true });
     await context.hooks?.afterEntryLstat?.(relativePath);
     throwIfCancelled(context.signal);

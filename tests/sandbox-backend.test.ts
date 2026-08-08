@@ -213,10 +213,13 @@ test("stopped-container attestation rejects missing, coerced, or changed control
       "odinn.managed": "true",
       "odinn.namespace-id": identity.namespaceId,
       "odinn.execution-id": identity.executionId,
-      "odinn.profile-digest": compiled.digest
+      "odinn.profile-digest": compiled.digest,
+      "odinn.image-ref": compiled.image
     } },
     HostConfig: {
       NetworkMode: "none",
+      IpcMode: "private",
+      CgroupnsMode: "private",
       ReadonlyRootfs: true,
       CapDrop: ["ALL"],
       SecurityOpt: ["no-new-privileges"],
@@ -283,6 +286,11 @@ test("stopped-container attestation rejects missing, coerced, or changed control
   ]) {
     dockerInspection.HostConfig.SecurityOpt = selectors;
     assert.throws(() => attestContainerConfiguration(dockerProfile, dockerInspection, { ...identity, backend: "docker" }), SandboxBackendRefusalError);
+  }
+  for (const field of ["Privileged", "Devices", "DeviceRequests", "Binds", "PidMode", "IpcMode", "UTSMode", "UsernsMode"]) {
+    const changed = structuredClone(inspection) as any;
+    changed.HostConfig[field] = ["Devices", "DeviceRequests", "Binds"].includes(field) ? [{}] : field.endsWith("Mode") ? "host" : true;
+    assert.throws(() => attestContainerConfiguration(compiled, changed, identity), SandboxBackendRefusalError, field);
   }
 });
 

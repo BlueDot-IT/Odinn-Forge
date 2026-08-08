@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { createApprovalStore, isOwnerOnlyPath } from "../packages/kernel/src/index.ts";
@@ -148,6 +150,34 @@ test("approval records survive restart and consume exactly once for the bound ac
   });
   assert.equal(consumed?.id, id);
   assert.equal(createApprovalStore({ path }).consume(id, action), undefined);
+  assert.deepEqual(createApprovalStore({ path }).list(), []);
+});
+
+test("process approval bindings survive a worker restart without persisting command contents", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-worker-restart-"));
+  const path = join(stateDir, "approvals.json");
+  const command = "opaque-worker-command";
+  const argument = "opaque-worker-argument";
+  const id = createApprovalStore({ path }).create({
+    tool: "process.exec",
+    runId: "run-process-worker-restart",
+    input: { command, args: [argument], cwd: "." }
+  });
+  createApprovalStore({ path }).claim(id);
+  const persisted = await readFile(path, "utf8");
+  assert.doesNotMatch(persisted, new RegExp(command));
+  assert.doesNotMatch(persisted, new RegExp(argument));
+  if (process.platform !== "win32") assert.equal((await stat(`${path}.key`)).mode & 0o777, 0o600);
+
+  const moduleUrl = pathToFileURL(join(process.cwd(), "packages/kernel/src/approvals.ts")).href;
+  const childCode = [
+    `import { createApprovalStore } from ${JSON.stringify(moduleUrl)};`,
+    `const store = createApprovalStore({ path: ${JSON.stringify(path)} });`,
+    `const result = store.consume(${JSON.stringify(id)}, { tool: "process.exec", runId: "run-process-worker-restart", input: { command: "[redacted]", args: ["[redacted]"], cwd: "." } });`,
+    `if (!result || result.input?.command !== ${JSON.stringify(command)} || result.input?.args?.[0] !== ${JSON.stringify(argument)}) process.exit(2);`
+  ].join("\n");
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], { encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
   assert.deepEqual(createApprovalStore({ path }).list(), []);
 });
 
