@@ -179,6 +179,17 @@ test("CLI preview/apply preserve stale-conflict and external-effects semantics",
   assert.equal(stale.applied, false);
   assert.equal(stale.conflicts.length > 0, true);
 
+  const rewindMissingToken = invoke(workspace, [
+    "rewind",
+    checkpointId,
+    "--run",
+    "cli-rewind-preview-run-without-token",
+    "--state",
+    state
+  ]);
+  assert.equal(rewindMissingToken.status, 1);
+  assert.match(rewindMissingToken.stderr, /capability token required|CAPABILITY_DENIED|capability is not allowed: restore\.create/);
+
   const rewindPreview = ensureSuccess(invoke(workspace, [
     "rewind",
     checkpointId,

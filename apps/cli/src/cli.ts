@@ -3194,12 +3194,35 @@ async function checkpointCommand(args: any) {
 async function rewindCommand(args: any) {
   const snapshotId = args.find((value: any) => !value.startsWith("--"));
   if (!snapshotId) throw new Error("rewind requires <snapshot-id>");
+  if (isLegacyRewindSnapshot(snapshotId)) {
+    await runLegacySnapshotRewind(args, snapshotId);
+    return;
+  }
   await runGovernedTool(args, hasFlag(args, "--apply") ? "restore.apply" : "restore.create", {
     checkpointId: snapshotId,
     checkpointManifestDigest: option(args, "--checkpoint-manifest-digest", undefined),
     capabilityToken: option(args, "--capability-token", undefined),
     apply: hasFlag(args, "--apply")
   });
+}
+
+async function runLegacySnapshotRewind(args: any, snapshotId: string) {
+  const state = stateDir(args);
+  const config = await readConfig(state);
+  const runtime = createDifferentiatedRuntime({
+    stateDir: state,
+    workspaceRoot: invocationRoot(),
+    featureFlags: normalizeExperimentalFlags(config.experimental)
+  });
+  try {
+    await printJson(runtime.snapshots.restore(snapshotId, { apply: hasFlag(args, "--apply") }));
+  } finally {
+    runtime.ledger.close();
+  }
+}
+
+function isLegacyRewindSnapshot(snapshotId: string) {
+  return /^snap_[0-9a-f-]+$/i.test(snapshotId);
 }
 
 async function workspaceCommand(args: any) {

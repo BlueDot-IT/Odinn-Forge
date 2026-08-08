@@ -135,6 +135,7 @@ test("experimental CLI routes every system to its real runtime implementation", 
   const checkpoint = expectOk(invoke(workspace, [
     "checkpoint", "create", run.id, "--path", "seed.txt", "--state", state
   ]));
+  assert.equal(checkpoint.snapshotId.startsWith("snap_"), true);
   const preview = expectOk(invoke(workspace, ["rewind", checkpoint.snapshotId, "--state", state]));
   assert.equal(preview.applied, false);
   assert.equal(preview.actions[0].action, "restore");
