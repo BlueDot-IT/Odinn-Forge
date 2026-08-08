@@ -64,7 +64,7 @@ test("checkpoint coordinator marks unresolved boundary as needs-review on publis
   try {
     const { boundaryId } = coordinator.startBoundary({ runId: "run-checkpoint-empty" });
 
-    await assert.rejects(() => coordinator.publishBoundary(boundaryId), (error: any) => {
+    await assert.rejects(async () => coordinator.publishBoundary(boundaryId), (error: any) => {
       return error instanceof Error && error.name === "ODINN_CHECKPOINT_FAIL_CLOSED";
     });
 

@@ -67,7 +67,7 @@ interface CheckpointRecord {
   error: string | null;
 }
 
-interface CountRow { count: number; }
+type SqlCountRow = { count?: unknown };
 
 const ACTIVE_STATUSES = new Set(["created", "checkpointing", "ready", "publishing", "verifying"]);
 
@@ -112,19 +112,18 @@ export class CheckpointCoordinator {
     const boundary = this.readBoundary(boundaryId);
     if (!boundary) return undefined;
     const checkpoint = this.currentCheckpoint(boundaryId);
-    const journalRow = this.runLedger.database.db.prepare(
-      "SELECT COUNT(1) AS count FROM mutation_journal_entries WHERE group_id = ?"
-    ).get(boundaryId) as CountRow;
-    const conflictRow = this.runLedger.database.db.prepare(
-      "SELECT COUNT(1) AS count FROM mutation_journal_entries WHERE group_id = ? AND status = 'conflict'"
-    ).get(boundaryId) as CountRow;
+    const journalCount = this.readCount("SELECT COUNT(1) AS count FROM mutation_journal_entries WHERE group_id = ?", boundaryId);
+    const conflictCount = this.readCount(
+      "SELECT COUNT(1) AS count FROM mutation_journal_entries WHERE group_id = ? AND status = 'conflict'",
+      boundaryId
+    );
     return {
       boundaryId,
       boundaryStatus: boundary.status,
       checkpointId: checkpoint?.id,
       checkpointStatus: checkpoint?.status ?? "unknown",
-      journalCount: Number(journalRow.count ?? 0),
-      conflictCount: Number(conflictRow.count ?? 0)
+      journalCount,
+      conflictCount
     };
   }
 
@@ -266,6 +265,9 @@ export class CheckpointCoordinator {
       const bindingId = `manifest_${randomUUID()}`;
 
       this.runLedger.database.transaction((database) => {
+        database.prepare(
+          "INSERT OR IGNORE INTO artifacts(digest, path, media_type, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)"
+        ).run(manifestArtifact.digest, manifestArtifact.path, manifestArtifact.mediaType, manifestArtifact.sizeBytes, nowValue);
         database.prepare(
           "UPDATE mutation_checkpoints SET status = ?, completed_at = ?, manifest_json = ?, manifest_digest = ? WHERE id = ?"
         ).run("verifying", nowValue, toJson(manifest, "{}"), manifestArtifact.digest, checkpoint.id);
@@ -434,5 +436,9 @@ export class CheckpointCoordinator {
       mediaType: String(row.mediaType),
       sizeBytes: Number(row.sizeBytes)
     };
+  }
+  private readCount(statement: string, boundaryId: string): number {
+    const row = this.runLedger.database.db.prepare(statement).get(boundaryId) as SqlCountRow | undefined;
+    return Number(row?.count ?? 0);
   }
 }
