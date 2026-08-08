@@ -1066,11 +1066,26 @@ export function attestContainerConfiguration(profile: CompiledSandboxProfile, re
       && typeof actual.ReadOnly === "boolean"
       && actual.ReadOnly === (mount.access === "read-only")
   ));
+  // Docker reports its default IPC namespace as `private` even when no
+  // namespace flag was supplied. Empty/private are isolated container
+  // namespaces; host, container, and arbitrary namespace joins are not.
+  const isolatedNamespaceMode = (value: unknown): boolean => {
+    const mode = typeof value === "string" ? value.toLowerCase() : "";
+    return mode === "" || mode === "private";
+  };
+  const userNamespaceModeSafe = (value: unknown): boolean => {
+    const mode = typeof value === "string" ? value.toLowerCase() : "";
+    return mode === "";
+  };
   const forbiddenPrivilegeSurfaces = host.Privileged === true
     || (Array.isArray(host.Devices) && host.Devices.length > 0)
     || (Array.isArray(host.DeviceRequests) && host.DeviceRequests.length > 0)
     || (Array.isArray(host.Binds) && host.Binds.length > 0)
-    || ["PidMode", "IpcMode", "UTSMode", "UsernsMode"].some((key) => typeof host[key] === "string" && host[key] !== "");
+    || !isolatedNamespaceMode(host.PidMode)
+    || !isolatedNamespaceMode(host.IpcMode)
+    || !isolatedNamespaceMode(host.UTSMode)
+    || !userNamespaceModeSafe(host.UsernsMode)
+    || !isolatedNamespaceMode(host.CgroupnsMode);
   const controlsMatch = String(host.NetworkMode ?? "") === "none"
     && state.Running === false
     && state.Paused === false

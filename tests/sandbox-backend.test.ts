@@ -218,6 +218,8 @@ test("stopped-container attestation rejects missing, coerced, or changed control
     } },
     HostConfig: {
       NetworkMode: "none",
+      IpcMode: "private",
+      CgroupnsMode: "private",
       ReadonlyRootfs: true,
       CapDrop: ["ALL"],
       SecurityOpt: ["no-new-privileges"],
