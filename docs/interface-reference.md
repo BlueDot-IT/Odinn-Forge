@@ -202,6 +202,12 @@ classified as irreversible and non-retry-safe.
 | Method and path | Input | Output |
 | --- | --- | --- |
 | `POST /run` | `{ tool, input, id?, actor?, reason? }` | The completed audited task result |
+| `POST /checkpoints` | `{ runId, taskId?, paths, stepId?, label?, capabilityToken? }` | Governed legacy snapshot creation; the workspace root is server-bound and `restore.create` admission is required |
+| `POST /rewind/:snapshotId` | `{ runId, apply?, capabilityToken? }` | Governed legacy snapshot preview or restore; apply records a checkpoint boundary and requires `restore.apply` admission |
+| `POST /governed/workspace/mutate` | `{ runId, operation, path, content?, mode?, expected?, from?, to?, recursive?, apply?, maxBytes?, maxFiles?, capabilityToken? }` | Governed workspace write/mkdir/remove/move preview or apply result |
+| `POST /governed/workspace/patch` | `{ runId, operation, path, find?, replace?, replaceAll?, patches?, expected?, apply?, maxBytes?, maxFiles?, capabilityToken? }` | Governed workspace edit/applyPatch preview or apply result |
+| `POST /governed/restore/create` | `{ runId, checkpointId, checkpointManifestDigest?, capabilityToken? }` | Create governed checkpoint-restore preview |
+| `POST /governed/restore/apply` | `{ runId, checkpointId, checkpointManifestDigest, capabilityToken? }` | Apply governed checkpoint restore preview or restore; the exact digest returned by preview is required |
 | `POST /plan` | A plan with ordered task steps and optional identifier | The isolated plan result |
 | `GET /runs` | No body | Recorded run summaries |
 | `GET /runs/:id` | Run identifier in the path | The run and its recorded events |

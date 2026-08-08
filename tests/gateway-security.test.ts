@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
 import { mkdtemp, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -270,6 +271,259 @@ test("configuration reads refuse symbolic-link swaps", { skip: process.platform 
     assert.match((await response.json()).error, /symbolic link/);
     assert.equal(await readFile(outside, "utf8"), outsideContents);
     assert.equal((await stat(outside)).mode & 0o777, outsideMode);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("governed workspace mutation endpoints require authenticated session and same-origin controls", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-governed-auth-"));
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({ version: 1, experimental: { capabilities: true } })}\n`);
+  const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const payload = JSON.stringify({ runId: "missing-auth", operation: "write", path: "seed.txt", content: "without-cookie" });
+  try {
+    const noAuth = await fetch(`${base}/governed/workspace/mutate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: payload
+    });
+    assert.equal(noAuth.status, 401);
+
+    const bootstrap = await fetch(`${base}/`);
+    const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
+    assert.ok(cookie);
+    const crossOrigin = await fetch(`${base}/governed/workspace/mutate`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        cookie,
+        origin: "https://evil.example"
+      },
+      body: payload
+    });
+    assert.equal(crossOrigin.status, 403);
+    const sameOrigin = await fetch(`${base}/governed/workspace/mutate`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        cookie,
+        origin: base,
+        "sec-fetch-site": "same-origin"
+      },
+      body: payload
+    });
+    assert.equal(sameOrigin.status, 400);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("governed mutation endpoints enforce capability gates and ignore nested request payload tokens", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-governed-capability-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-governed-capability-workspace-"));
+  const tokenConfig = {
+    version: 1,
+    experimental: { capabilities: true },
+    policy: {
+      allowedCapabilities: [
+        "job.healthcheck",
+        "text.echo",
+        "workspace.readText",
+        "workspace.mutate",
+        "workspace.patch",
+        "restore.create",
+        "restore.apply",
+        "model.chat",
+        "agent.run",
+        "web.read",
+        "browser.read",
+        "browser.act",
+        "discord.read",
+        "discord.write",
+        "session.read",
+        "session.write",
+        "goal.read",
+        "goal.write",
+        "memory.read",
+        "memory.write",
+        "improve.read",
+        "improve.write"
+      ]
+    }
+  };
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify(tokenConfig)}\n`);
+  const server = await createGatewayServer({ stateDir, workspaceRoot });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const bootstrap = await fetch(`${base}/`);
+  const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
+  assert.ok(cookie);
+  try {
+    const mutateRequestBody = {
+      runId: "governed-mutate-denied",
+      operation: "write",
+      path: "seed.txt",
+      content: "before"
+    };
+    const denied = await fetch(`${base}/governed/workspace/mutate`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({ ...mutateRequestBody, runId: "governed-mutate-denied" })
+    });
+    assert.equal(denied.status, 400);
+    const deniedBody = await denied.json();
+    assert.equal(deniedBody.ok, false);
+    assert.equal(typeof deniedBody.error, "string");
+
+    const payloadOnly = await fetch(`${base}/governed/workspace/mutate`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({ ...mutateRequestBody, runId: "governed-mutate-payload-only", input: { capabilityToken: "forged" } })
+    });
+    assert.equal(payloadOnly.status, 400);
+    const payloadOnlyBody = await payloadOnly.json();
+    assert.equal(payloadOnlyBody.ok, false);
+    assert.equal(typeof payloadOnlyBody.error, "string");
+
+    const issued = await (await fetch(`${base}/capabilities/issue`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({
+        runId: "governed-mutate-allowed",
+        stepId: "governed-mutate-step",
+        toolName: "workspace.mutate",
+        scopes: ["workspace:mutate"]
+      })
+    })).json();
+    const allowed = await fetch(`${base}/governed/workspace/mutate`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({ ...mutateRequestBody, runId: "governed-mutate-allowed", capabilityToken: issued.token })
+    });
+    assert.equal(allowed.status, 200);
+    const allowedBody = await allowed.json();
+    assert.equal(allowedBody.output?.preview, true);
+    assert.equal(existsSync(join(workspaceRoot, "seed.txt")), false);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("governed restore create/apply preserves restore conflict semantics", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-governed-restore-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-governed-restore-workspace-"));
+  const tokenConfig = {
+    version: 1,
+    experimental: { capabilities: true },
+    policy: {
+      allowedCapabilities: [
+        "job.healthcheck",
+        "text.echo",
+        "workspace.readText",
+        "workspace.mutate",
+        "workspace.patch",
+        "restore.create",
+        "restore.apply",
+        "model.chat",
+        "agent.run",
+        "web.read",
+        "browser.read",
+        "browser.act",
+        "discord.read",
+        "discord.write",
+        "session.read",
+        "session.write",
+        "goal.read",
+        "goal.write",
+        "memory.read",
+        "memory.write",
+        "improve.read",
+        "improve.write"
+      ]
+    }
+  };
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify(tokenConfig)}\n`);
+  const server = await createGatewayServer({ stateDir, workspaceRoot });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const bootstrap = await fetch(`${base}/`);
+  const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
+  assert.ok(cookie);
+  try {
+    const issuedMutateToken = (await (await fetch(`${base}/capabilities/issue`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({
+        runId: "governed-restore-source",
+        stepId: "governed-restore-step",
+        toolName: "workspace.mutate",
+        scopes: ["workspace:mutate"]
+      })
+    })).json()).token;
+    const issuedCreateToken = (await (await fetch(`${base}/capabilities/issue`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({
+        runId: "governed-restore-create",
+        stepId: "governed-restore-step",
+        toolName: "restore.create",
+        scopes: ["restore:create"]
+      })
+    })).json()).token;
+    const issuedApplyToken = (await (await fetch(`${base}/capabilities/issue`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({
+        runId: "governed-restore-apply",
+        stepId: "governed-restore-step",
+        toolName: "restore.apply",
+        scopes: ["restore:apply"]
+      })
+    })).json()).token;
+
+    await writeFile(join(workspaceRoot, "seed.txt"), "restored baseline");
+    const mutateTicket = {
+      runId: "governed-restore-source",
+      operation: "remove",
+      path: "seed.txt",
+      apply: true,
+      capabilityToken: issuedMutateToken
+    };
+    const mutate = await fetch(`${base}/governed/workspace/mutate`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify(mutateTicket)
+    });
+    assert.equal(mutate.status, 200);
+    const mutation = await mutate.json();
+    const checkpointId = mutation.output?.checkpointId;
+    assert.equal(typeof checkpointId, "string");
+    const create = await fetch(`${base}/governed/restore/create`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({ runId: "governed-restore-create", checkpointId, capabilityToken: issuedCreateToken })
+    });
+    assert.equal(create.status, 200);
+    const createBody = await create.json();
+    assert.equal(createBody.output?.preview, true);
+    assert.equal(createBody.output?.status, "ready");
+
+    await writeFile(join(workspaceRoot, "seed.txt"), "externally-changed");
+    const apply = await fetch(`${base}/governed/restore/apply`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({ runId: "governed-restore-apply", checkpointId, capabilityToken: issuedApplyToken })
+    });
+    assert.equal(apply.status, 200);
+    const applyBody = await apply.json();
+    assert.equal(applyBody.output?.status, "conflict");
+    assert.equal(applyBody.output?.applied, false);
+    assert.equal(applyBody.output?.preview, true);
+    assert.equal(applyBody.output?.conflicts?.some((conflict: any) => typeof conflict.code === "string"), true);
+    await writeFile(join(workspaceRoot, "seed.txt"), "externally-changed");
+    assert.equal(await readFile(join(workspaceRoot, "seed.txt"), "utf8"), "externally-changed");
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

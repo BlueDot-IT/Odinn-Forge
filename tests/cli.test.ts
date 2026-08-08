@@ -28,6 +28,10 @@ test("CLI advanced help exposes documented safety controls", () => {
     "--constraints <json>",
     "--show-token",
     "gatewatch preview --tool <tool>",
+    "checkpoint preview <snapshot-id>",
+    "checkpoint apply <snapshot-id>",
+    "workspace mutate",
+    "--apply",
     "improve rollback --improvement <id>",
     "Support: the local single-user workflow is the stable v1 target",
     "docs/v1-compatibility.md"

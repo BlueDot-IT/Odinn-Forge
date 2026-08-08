@@ -37,10 +37,26 @@ raw state directory.
 ## Advanced
 
 Advanced is a collapsible navigation group, not a landing page. Run Checks,
-Safety Preview, Restore Points, and Smart Routing are core capabilities.
-Temporary Access, Portable Runs, and Compare Approaches are optional plugin
-modules. Each has a dedicated guided workflow, while developer input and raw
-endpoint details stay collapsed under Advanced options.
+Safety Preview, Restore Points, Controlled Workspace Governance, and Smart Routing
+are core capabilities. Controlled Workspace Governance introduces bounded
+workspace mutate, patch, and restore workflows that separate preview and apply so
+apply stays intentionally behind an explicit review step. The page shows digest
+and conflict summaries, including needs-review signals, when returned. Temporary
+Access, Portable Runs, and Compare Approaches are optional plugin modules. Each
+has a dedicated guided workflow, while developer input and raw endpoint details
+stay collapsed under Advanced options.
+
+Restore apply is bound to the exact manifest digest returned by its preview;
+missing or mismatched digests are rejected. Legacy `rewind` routes use the same
+governed admission, capability, audit, locking, and recovery path. Startup
+reconciliation verifies checkpoint manifest bytes and blocks new governed
+mutations while an unresolved `needs-review` boundary remains.
+
+Legacy `/checkpoints` creation and `odinn checkpoint create` also enter the
+governed admission path and require an explicit `restore.create` capability;
+the gateway always binds capture to its configured workspace root. A legacy
+snapshot apply records a durable mutation boundary so interruption becomes
+`needs-review` rather than silently publishing an uncertain restore.
 
 The three plugin-module flags remain off by default. A disabled plugin stays
 locked. Destructive operations remain explicit, and restore or comparison

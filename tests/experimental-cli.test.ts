@@ -116,6 +116,10 @@ test("experimental CLI routes every system to its real runtime implementation", 
     const toggled = expectOk(invoke(workspace, ["experimental", "enable", feature, "--confirm-impact", "--state", state]));
     assert.equal(toggled.enabled, true);
   }
+  const configPath = join(state, "config.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.policy = { ...(config.policy ?? {}), allowedCapabilities: [...new Set([...(config.policy?.allowedCapabilities ?? []), "restore.create", "restore.apply"])] };
+  await writeFile(configPath, `${JSON.stringify(config)}\n`);
 
   const sentinel = expectOk(invoke(workspace, [
     "policy", "test", policyPath,
@@ -132,10 +136,20 @@ test("experimental CLI routes every system to its real runtime implementation", 
   const capabilities = expectOk(invoke(workspace, ["experimental", "capabilities", "list", run.id, "--state", state]));
   assert.ok(capabilities.some((capability: any) => capability.id === issued.claims.id));
 
+  const checkpointTaskId = `checkpoint-create-${run.id}`;
+  const checkpointCapability = expectOk(invoke(workspace, [
+    "capability", "issue", "--run", checkpointTaskId, "--step", "checkpoint-create-step", "--tool", "snapshot.create", "--show-token", "--state", state
+  ]));
   const checkpoint = expectOk(invoke(workspace, [
     "checkpoint", "create", run.id, "--path", "seed.txt", "--state", state
+    , "--task-run", checkpointTaskId, "--capability-token", checkpointCapability.token
   ]));
-  const preview = expectOk(invoke(workspace, ["rewind", checkpoint.snapshotId, "--state", state]));
+  assert.equal(checkpoint.snapshotId.startsWith("snap_"), true);
+  const previewToken = expectOk(invoke(workspace, [
+    "capability", "issue", "--run", "cli-legacy-rewind-preview", "--step", "legacy-rewind-preview-step", "--tool", "snapshot.restore",
+    "--constraints", JSON.stringify({ snapshotId: checkpoint.snapshotId }), "--show-token", "--state", state
+  ]));
+  const preview = expectOk(invoke(workspace, ["rewind", checkpoint.snapshotId, "--run", "cli-legacy-rewind-preview", "--capability-token", previewToken.token, "--state", state]));
   assert.equal(preview.applied, false);
   assert.equal(preview.actions[0].action, "restore");
 

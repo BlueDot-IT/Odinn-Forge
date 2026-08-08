@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -272,8 +272,13 @@ async function main() {
       await timeline(args);
       break;
     case "checkpoint":
+      await checkpointCommand(args);
+      break;
     case "rewind":
-      await rewindCommand(command, args);
+      await rewindCommand(args);
+      break;
+    case "workspace":
+      await workspaceCommand(args);
       break;
     case "branch":
     case "compare":
@@ -422,8 +427,12 @@ function usage() {
   odinn capability list <run-id> [--state .odinn]
   odinn capability revoke <capability-id> [--state .odinn]
   odinn timeline <run-id> [--state .odinn]
-  odinn checkpoint create <run-id> --path <path[,path]> [--label <label>] [--state .odinn]
-  odinn rewind <snapshot-id> [--apply] [--state .odinn]
+  odinn checkpoint create <run-id> --path <path[,path]> [--label <label>] [--task-run <run-id>] --capability-token <token> [--state .odinn]
+  odinn checkpoint preview <snapshot-id> [--run <run-id>] [--checkpoint-manifest-digest <digest>] [--capability-token <token>] [--state .odinn]
+  odinn checkpoint apply <snapshot-id> --run <run-id> [--checkpoint-manifest-digest <digest>] [--capability-token <token>] [--state .odinn]
+  odinn rewind <snapshot-id> [--run <run-id>] [--apply] --capability-token <token> [--checkpoint-manifest-digest <digest>] [--state .odinn]
+  odinn workspace mutate --run <run-id> --operation write|mkdir|remove|move --path <path> [--from <path>] [--to <path>] [--content <text>] [--recursive true|false] [--mode <mode>] [--expected <json>] [--max-bytes <bytes>] [--max-files <files>] [--apply] [--capability-token <token>] [--state .odinn]
+  odinn workspace patch --run <run-id> --operation edit|applyPatch --path <path> [--find <text>] [--replace <text>] [--replace-all true|false] [--patches <json-array>] [--expected <json>] [--max-bytes <bytes>] [--max-files <files>] [--apply] [--capability-token <token>] [--state .odinn]
   odinn branch <run-id> --from <step-id> --plan-file <plan.json> [--state .odinn]
   odinn compare <group-id> [--state .odinn]
   odinn capsule export <run-id> --output <run.odinn> [--state .odinn]
@@ -492,6 +501,45 @@ function option(args: any, name: any, fallback: any = undefined) {
   const index = args.indexOf(name);
   if (index === -1) return fallback;
   return args[index + 1] ?? fallback;
+}
+
+function parseJsonOption(args: any, name: any, fallback: any = undefined, required = false) {
+  const value = option(args, name);
+  if (value === undefined) {
+    if (required) throw new Error(`${name} requires JSON input`);
+    return fallback;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new Error(`${name} must be valid JSON`);
+  }
+}
+
+async function runGovernedTool(args: any, tool: any, input: any, runIdOverride?: string) {
+  const state = stateDir(args);
+  const config = await readConfig(state);
+  const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+  try {
+    new CheckpointCoordinator({ runLedger }).recover();
+    const runId = runIdOverride ?? option(args, "--run", randomUUID());
+    const result = await runTask({
+      task: {
+        id: runId,
+        tool,
+        input,
+        actor: "cli"
+      },
+      auditStore,
+      policy: createDefaultPolicy(config.policy),
+      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config: { ...config, runLedger }, auditStore }),
+      runLedger
+    });
+    await printJson(result.output);
+  } finally {
+    runLedger.close();
+  }
 }
 
 function hasFlag(args: any, name: any) {
@@ -3088,7 +3136,7 @@ async function gatewatchCommand(args: any) {
 async function capabilityCommand(args: any) {
   const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest);
   try {
-    if (subcommand === "issue") { const result = runtime.capabilities.issue({ runId: option(rest, "--run"), stepId: option(rest, "--step"), toolName: option(rest, "--tool"), scopes: splitCsv(option(rest, "--scope", "")), resourceConstraints: JSON.parse(option(rest, "--constraints", "{}")), expiresInMs: Number(option(rest, "--expires-ms", "60000")), maxUses: Number(option(rest, "--max-uses", "1")) }); await printJson(hasFlag(rest, "--show-token") ? result : { claims: result.claims, token: "[hidden; use --show-token only for a one-time local test]" }); return; }
+    if (subcommand === "issue") { const runId = option(rest, "--run"); runtime.ledger.ensureRun({ runId, objective: `capability: ${option(rest, "--tool")}` }); const result = runtime.capabilities.issue({ runId, stepId: option(rest, "--step"), toolName: option(rest, "--tool"), scopes: splitCsv(option(rest, "--scope", "")), resourceConstraints: JSON.parse(option(rest, "--constraints", "{}")), expiresInMs: Number(option(rest, "--expires-ms", "60000")), maxUses: Number(option(rest, "--max-uses", "1")) }); await printJson(hasFlag(rest, "--show-token") ? result : { claims: result.claims, token: "[hidden; use --show-token only for a one-time local test]" }); return; }
     if (subcommand === "use") { await printJson(runtime.capabilities.consume(option(rest, "--token"), { runId: option(rest, "--run"), toolName: option(rest, "--tool"), resource: JSON.parse(option(rest, "--resource", "{}")) })); return; }
     if (subcommand === "list") { await printJson(runtime.capabilities.list(rest.find((value: any) => !value.startsWith("--")))); return; }
     if (subcommand === "revoke") { await printJson(runtime.capabilities.revoke(rest.find((value: any) => !value.startsWith("--")))); return; }
@@ -3106,11 +3154,154 @@ async function timeline(args: any) {
   } finally { runtime.ledger.close(); }
 }
 
-async function rewindCommand(command: any, args: any) {
-  const { runtime } = runtimeFor(args); try {
-    if (command === "checkpoint") { if (args[0] !== "create") throw new Error("checkpoint requires create"); const runId = args[1] && !args[1].startsWith("--") ? args[1] : option(args, "--run"); await printJson(runtime.snapshots.create({ runId, paths: splitCsv(option(args, "--path", "")), label: option(args, "--label", "checkpoint"), workspaceRoot: invocationRoot() })); return; }
-    const snapshotId = args.find((value: any) => !value.startsWith("--")); if (!snapshotId) throw new Error("rewind requires <snapshot-id>"); await printJson(runtime.snapshots.restore(snapshotId, { apply: hasFlag(args, "--apply") }));
-  } finally { runtime.ledger.close(); }
+async function checkpointCommand(args: any) {
+  const [subcommand, ...rest] = args;
+  const state = stateDir(args);
+  if (subcommand === "create") {
+    const runId = rest[0] && !rest[0].startsWith("--") ? rest[0] : option(rest, "--run");
+    const governedArgs = rest.includes("--run") || !runId ? rest : [...rest, "--run", runId];
+    await runGovernedTool(governedArgs, "snapshot.create", {
+      paths: splitCsv(option(rest, "--path", "")),
+      stepId: option(rest, "--step"),
+      label: option(rest, "--label", "checkpoint"),
+      snapshotRunId: runId,
+      capabilityToken: option(rest, "--capability-token", undefined)
+    }, option(rest, "--task-run", `checkpoint-create-${runId ?? randomUUID()}`));
+    return;
+  }
+  if (subcommand === "preview" || subcommand === "apply") {
+    const checkpointId = rest.find((value: any) => !value.startsWith("--"));
+    if (!checkpointId) throw new Error(`checkpoint ${subcommand} requires <snapshot-id>`);
+    const runId = option(rest, "--run", randomUUID());
+    await runGovernedTool(rest, subcommand === "apply" ? "restore.apply" : "restore.create", {
+      runId,
+      checkpointId,
+      checkpointManifestDigest: option(rest, "--checkpoint-manifest-digest", undefined),
+      capabilityToken: option(rest, "--capability-token", undefined),
+      apply: subcommand === "apply"
+    });
+    return;
+  }
+  throw new Error("checkpoint requires create, preview, or apply");
+}
+
+async function rewindCommand(args: any) {
+  const snapshotId = args.find((value: any) => !value.startsWith("--"));
+  if (!snapshotId) throw new Error("rewind requires <snapshot-id>");
+  if (isLegacyRewindSnapshot(snapshotId)) {
+    await runLegacySnapshotRewind(args, snapshotId);
+    return;
+  }
+  await runGovernedTool(args, hasFlag(args, "--apply") ? "restore.apply" : "restore.create", {
+    checkpointId: snapshotId,
+    checkpointManifestDigest: option(args, "--checkpoint-manifest-digest", undefined),
+    capabilityToken: option(args, "--capability-token", undefined),
+    apply: hasFlag(args, "--apply")
+  });
+}
+
+async function runLegacySnapshotRewind(args: any, snapshotId: string) {
+  await runGovernedTool(args, "snapshot.restore", {
+    snapshotId,
+    apply: hasFlag(args, "--apply"),
+    capabilityToken: option(args, "--capability-token", undefined)
+  });
+}
+
+function isLegacyRewindSnapshot(snapshotId: string) {
+  return /^snap_[0-9a-f-]+$/i.test(snapshotId);
+}
+
+async function workspaceCommand(args: any) {
+  const [subcommand, ...rest] = args;
+  if (subcommand === "mutate") {
+    const operation = option(rest, "--operation");
+    if (!operation) throw new Error("workspace mutate requires --operation");
+    if (operation === "move" && (!option(rest, "--from") || !option(rest, "--to"))) {
+      throw new Error("workspace mutate move requires --from and --to");
+    }
+
+    const input: any = {
+      operation,
+      apply: hasFlag(rest, "--apply"),
+      path: option(rest, "--path", ""),
+      from: option(rest, "--from", ""),
+      to: option(rest, "--to", ""),
+      content: option(rest, "--content", ""),
+      mode: Number.parseInt(option(rest, "--mode", "0"), 10),
+      expected: parseJsonOption(rest, "--expected", undefined),
+      recursive: option(rest, "--recursive") ? parseBoolean(option(rest, "--recursive"), "--recursive") : undefined,
+      maxBytes: Number.parseInt(option(rest, "--max-bytes", "0"), 10),
+      maxFiles: Number.parseInt(option(rest, "--max-files", "0"), 10),
+      capabilityToken: option(rest, "--capability-token", undefined)
+    };
+
+    if (operation === "write") {
+      if (!input.path) throw new Error("workspace mutate write requires --path");
+      if (option(rest, "--content") === undefined) throw new Error("workspace mutate write requires --content");
+      delete input.from;
+      delete input.to;
+      delete input.mode;
+    }
+    if (operation === "mkdir" || operation === "remove") {
+      if (!input.path) throw new Error(`workspace mutate ${operation} requires --path`);
+      delete input.from;
+      delete input.to;
+      delete input.content;
+    }
+    if (operation === "move") {
+      delete input.content;
+      delete input.mode;
+      delete input.expected;
+      delete input.recursive;
+    }
+    if (Number.isNaN(input.mode)) delete input.mode;
+    if (input.maxBytes <= 0) delete input.maxBytes;
+    if (input.maxFiles <= 0) delete input.maxFiles;
+    if (input.expected === undefined) delete input.expected;
+    if (input.recursive === undefined) delete input.recursive;
+    if (!input.path && operation !== "move") {
+      throw new Error("workspace mutate requires --path");
+    }
+    if (!input.from && !input.to) delete input.from;
+    if (!input.to && !input.from) delete input.to;
+    await runGovernedTool(rest, "workspace.mutate", input);
+    return;
+  }
+  if (subcommand === "patch") {
+    const operation = option(rest, "--operation");
+    if (!operation) throw new Error("workspace patch requires --operation");
+    const path = option(rest, "--path", "");
+    if (!path) throw new Error("workspace patch requires --path");
+
+    const input: any = {
+      operation,
+      path,
+      apply: hasFlag(rest, "--apply"),
+      expected: parseJsonOption(rest, "--expected", undefined),
+      maxBytes: Number.parseInt(option(rest, "--max-bytes", "0"), 10),
+      maxFiles: Number.parseInt(option(rest, "--max-files", "0"), 10),
+      capabilityToken: option(rest, "--capability-token", undefined)
+    };
+    if (operation === "edit") {
+      const find = option(rest, "--find");
+      const replace = option(rest, "--replace");
+      if (find === undefined || replace === undefined) throw new Error("workspace patch edit requires --find and --replace");
+      input.find = find;
+      input.replace = replace;
+      input.replaceAll = hasFlag(rest, "--replace-all");
+    } else if (operation === "applyPatch") {
+      input.patches = parseJsonOption(rest, "--patches", undefined, true);
+    } else {
+      throw new Error("workspace patch operation must be edit or applyPatch");
+    }
+    if (input.maxBytes <= 0) delete input.maxBytes;
+    if (input.maxFiles <= 0) delete input.maxFiles;
+    if (input.expected === undefined) delete input.expected;
+    await runGovernedTool(rest, "workspace.patch", input);
+    return;
+  }
+  throw new Error("workspace requires mutate or patch");
 }
 
 async function branchCommand(command: any, args: any) {

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Unzip, UnzipInflate, zipSync } from "fflate";
@@ -145,7 +145,21 @@ function safeExistingPath(root: string, candidate: string) {
   const base = resolve(root);
   const target = safePath(base, candidate);
   let cursor = target;
-  while (cursor !== base && !existsSync(cursor)) cursor = dirname(cursor);
+  while (cursor !== base) {
+    try {
+      lstatSync(cursor);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      cursor = dirname(cursor);
+    }
+  }
+  try {
+    if (lstatSync(target).isSymbolicLink()) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "symlinks are not snapshot-safe", { path: candidate });
+  } catch (error) {
+    if (error instanceof OdinnRuntimeError) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const real = resolve(realpathSync(cursor));
   const physicalBase = resolve(realpathSync(base));
   if (real !== physicalBase && !real.startsWith(`${physicalBase}${sep}`)) throw new OdinnRuntimeError("POLICY_VIOLATION", "symlink escapes allowed root", { path: candidate });
@@ -436,7 +450,12 @@ function rejectSymbolicPath(root: string, target: string) {
   const base = resolve(root);
   let cursor = resolve(target);
   while (cursor !== base && isWithin(base, cursor)) {
-    if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "symlinks are not snapshot-safe", { path: relative(base, cursor) });
+    try {
+      if (lstatSync(cursor).isSymbolicLink()) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "symlinks are not snapshot-safe", { path: relative(base, cursor) });
+    } catch (error) {
+      if (error instanceof OdinnRuntimeError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     cursor = dirname(cursor);
   }
 }
@@ -489,7 +508,7 @@ export class SnapshotManager {
     const createdAt = now(); this.ledger.database.transaction((db: any) => { db.prepare("INSERT INTO snapshots(id, run_id, step_id, label, workspace_root, manifest_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(snapshotId, runId, stepId ?? null, label ?? null, resolve(workspaceRoot), json({ roots, totalBytes, entries: entries.map((entry) => ({ path: entry.path, existed: entry.existed, digest: entry.digest, artifactDigest: entry.artifactDigest })) }), createdAt); for (const entry of entries) db.prepare("INSERT INTO snapshot_entries(id, snapshot_id, path, existed, mode, digest, artifact_digest) VALUES (?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), snapshotId, entry.path, entry.existed ? 1 : 0, entry.mode ?? null, entry.digest ?? null, entry.artifactDigest ?? null); }); this.ledger.appendEvent({ runId, type: "snapshot", payload: { snapshotId, label, entries: entries.length, totalBytes } }); return { snapshotId, entries, roots, totalBytes };
   }
   plan(snapshotId: string): AnyRecord { const snapshot = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord | undefined; if (!snapshot) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot not found"); const manifest = parse(snapshot.manifest_json, {}); return { snapshotId, workspaceRoot: snapshot.workspace_root, roots: Array.isArray(manifest.roots) ? manifest.roots : [], entries: this.ledger.database.db.prepare("SELECT * FROM snapshot_entries WHERE snapshot_id = ? ORDER BY path").all(snapshotId) }; }
-  restore(snapshotId: string, { apply = false }: AnyRecord = {}) {
+  restore(snapshotId: string, { apply = false, runId }: AnyRecord = {}) {
     const plan = this.plan(snapshotId);
     const prepared = plan.entries.map((entry: AnyRecord) => {
       const target = safeExistingPath(plan.workspaceRoot, entry.path);
@@ -506,36 +525,77 @@ export class SnapshotManager {
     const actions: AnyRecord[] = [];
     const snapshotRow = this.ledger.database.db.prepare("SELECT run_id FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord;
     let recoverySnapshotId;
-    if (apply) {
+    if (!apply) {
+      for (const item of prepared) actions.push({ path: item.entry.path, action: item.entry.existed ? "restore" : "remove" });
+    } else {
       const recoveryPaths = plan.roots.length ? plan.roots.map((root: AnyRecord) => root.path) : plan.entries.map((entry: AnyRecord) => entry.path);
       const recovery = this.create({
-        runId: snapshotRow.run_id,
+        runId: runId ?? snapshotRow.run_id,
         stepId: `recovery:${snapshotId}`,
         paths: recoveryPaths,
         label: `Automatic recovery point before restoring ${snapshotId}`,
         workspaceRoot: plan.workspaceRoot
       });
       recoverySnapshotId = recovery.snapshotId;
-      for (const root of plan.roots) {
-        const target = safeExistingPath(plan.workspaceRoot, root.path);
-        rejectSymbolicPath(plan.workspaceRoot, target);
-        if (existsSync(target)) rmSync(target, { recursive: true, force: true });
-        if (root.existed && root.type === "directory") mkdirSync(target, { recursive: true, mode: root.mode ?? 0o700 });
+
+      const present = (path: string) => {
+        try { lstatSync(path); return true; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+      };
+      const staged: Array<{ target: string; stage?: string; backup: string; existed: boolean }> = [];
+      try {
+        for (const root of plan.roots) {
+          const target = safeExistingPath(plan.workspaceRoot, root.path);
+          rejectSymbolicPath(plan.workspaceRoot, target);
+          const existed = present(target);
+          const backup = `${target}.odinn-restore-backup-${process.pid}-${randomUUID()}`;
+          const item = { target, backup, existed } as { target: string; stage?: string; backup: string; existed: boolean };
+          if (root.existed) {
+            const stage = `${target}.odinn-restore-stage-${process.pid}-${randomUUID()}`;
+            item.stage = stage;
+            if (root.type === "directory") {
+              mkdirSync(stage, { recursive: false, mode: root.mode ?? 0o700 });
+              for (const preparedItem of prepared) {
+                const entry = preparedItem.entry;
+                const rootPrefix = root.path ? `${root.path}${sep}` : "";
+                if (!entry.existed || (entry.path !== root.path && !entry.path.startsWith(rootPrefix))) continue;
+                const stagedPath = entry.path === root.path ? stage : join(stage, relative(root.path, entry.path));
+                mkdirSync(dirname(stagedPath), { recursive: true });
+                writeFileSync(stagedPath, preparedItem.bytes, { mode: entry.mode ?? 0o600 });
+              }
+            } else if (root.type === "file") {
+              const preparedItem = prepared.find((candidate: AnyRecord) => candidate.entry.path === root.path && candidate.entry.existed);
+              if (!preparedItem) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot file root is missing its artifact", { path: root.path });
+              writeFileSync(stage, preparedItem.bytes, { mode: preparedItem.entry.mode ?? 0o600 });
+            } else {
+              item.stage = undefined;
+            }
+          }
+          staged.push(item);
+        }
+
+        for (const item of staged) {
+          if (item.existed) renameSync(item.target, item.backup);
+          if (item.stage) renameSync(item.stage, item.target);
+        }
+      } catch (cause) {
+        for (const item of [...staged].reverse()) {
+          try {
+            if (present(item.target)) rmSync(item.target, { recursive: true, force: true });
+            if (present(item.backup)) renameSync(item.backup, item.target);
+            if (item.stage && present(item.stage)) rmSync(item.stage, { recursive: true, force: true });
+          } catch {}
+        }
+        throw cause;
       }
-    }
-    for (const item of prepared) {
-      const { entry, target, bytes } = item;
-      if (!apply) { actions.push({ path: entry.path, action: entry.existed ? "restore" : "remove" }); continue; }
-      if (entry.existed) {
-        mkdirSync(dirname(target), { recursive: true });
-        writeFileSync(target, bytes, { mode: entry.mode ?? 0o600 });
-        actions.push({ path: entry.path, action: "restored" });
-      } else if (existsSync(target)) {
-        rmSync(target, { recursive: true, force: true });
-        actions.push({ path: entry.path, action: "removed" });
+
+      for (const item of staged) {
+        try { if (present(item.backup)) rmSync(item.backup, { recursive: true, force: true }); } catch {}
       }
+
+      for (const item of prepared) actions.push({ path: item.entry.path, action: item.entry.existed ? "restored" : "removed" });
     }
-    this.ledger.appendEvent({ runId: snapshotRow.run_id, type: "rollback", payload: { snapshotId, applied: apply, recoverySnapshotId, actions } });
+    this.ledger.appendEvent({ runId: runId ?? snapshotRow.run_id, type: "rollback", payload: { snapshotId, applied: apply, recoverySnapshotId, actions } });
     return { snapshotId, applied: apply, recoverySnapshotId, actions };
   }
 }
