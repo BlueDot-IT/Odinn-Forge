@@ -68,6 +68,7 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     const inlineScripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/giu)].map((match) => match[1]);
     assert.equal(inlineScripts.length, 1);
     assert.doesNotThrow(() => new Script(inlineScripts[0], { filename: "odinn-console.js" }));
+    const script = inlineScripts[0];
 
     const navigation = section(html, /<nav class="nav"[^>]*>/, /<\/nav>/);
     assert.match(navigation, /data-view="overview"[\s\S]*data-view="sessions"/, "Sessions must sit directly below Chat");
@@ -87,7 +88,7 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     const navigationMatches = [...navigation.matchAll(/\bdata-view=["']([^"']+)["']/giu)].map((match) => match[1]);
     const views = [...new Set(viewMatches)];
     const navigationTargets = [...new Set(navigationMatches)];
-    assert.equal(views.length, 20, "the console must expose the product surface plus seven dedicated Advanced pages");
+    assert.equal(views.length, 21, "the console must expose the product surface plus eight dedicated Advanced pages");
     assert.equal(viewMatches.length, views.length, "console view ids must be unique");
     assert.equal(navigationMatches.length, navigationTargets.length, "console navigation targets must be unique");
     assert.deepEqual(
@@ -219,19 +220,33 @@ test("console presents the human-first product surfaces and dedicated Advanced p
       "view-lab-safety-preview",
       "view-lab-temporary-access",
       "view-lab-restore-points",
+      "view-lab-governed-workspace",
       "view-lab-portable-runs",
       "view-lab-scenario-compare",
       "view-lab-model-routing"
     ]);
-    assert.equal(experiments.match(/data-experimental-page=/g)?.length ?? 0, 7);
+    assert.equal(experiments.match(/data-experimental-page=/g)?.length ?? 0, 8);
     assert.match(experiments, /Runs quietly in the background/);
     assert.match(experiments, /Core capability/);
     assert.match(experiments, /Optional plugin module/);
-    for (const brand of ["Runemark", "Gatewatch", "Norn Restore", "Raven Route", "Rune Key", "Saga Archive", "Worldtree Paths"]) {
+    for (const brand of ["Runemark", "Gatewatch", "Norn Restore", "Norn Governance", "Raven Route", "Rune Key", "Saga Archive", "Worldtree Paths"]) {
       assert.match(experiments, new RegExp(brand));
     }
     assert.doesNotMatch(experiments, /release blocker|release-blocker|review queue|content-addressed artifact store/i);
     assert.doesNotMatch(html, /id="view-experiments"/);
+    assert.match(script, /governance/);
+    assert.match(script, /\bgovernance\b/);
+    assert.match(script, /run-governed-workspace|lab-governed-workspace/);
+    assert.match(script, /governed\/workspace\/mutate/);
+    assert.match(script, /governed\/workspace\/patch/);
+    assert.match(script, /governed\/restore\/create/);
+    assert.match(script, /governed\/restore\/apply/);
+    assert.match(script, /requiresConfirmation/);
+    assert.match(script, /Apply only after review/);
+    assert.match(script, /function renderGovernanceSummary/);
+    assert.match(script, /Needs review/);
+    assert.match(script, /Proposed operation/);
+    assert.doesNotMatch(script, /workspace\\.writeText/);
 
     const globalFeedback = openingTagById(html, "toast-region");
     assert.match(globalFeedback, /\baria-live=["'](?:polite|assertive)["']/iu);
@@ -247,7 +262,6 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     assert.doesNotMatch(mobileStyles, /\.content\s*\{[^}]*overflow:\s*hidden/isu);
     assert.match(styles, /\.(?:table-panel|table-scroll)\s*\{[^}]*overflow-x:\s*auto/isu, "wide data tables need a containing horizontal scroll viewport");
 
-    const script = inlineScripts[0];
     assert.match(script, /location\.hash/u, "view selection must be reflected in the URL hash");
     assert.match(script, /addEventListener\(["']hashchange["']/u, "browser Back and direct hashes must restore the selected view");
     assert.match(script, /api\(["']\/config["']\)/u, "the configuration page must load config.json");

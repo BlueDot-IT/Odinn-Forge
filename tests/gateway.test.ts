@@ -516,6 +516,156 @@ test("gateway serves the local console shell", async () => {
   }
 });
 
+test("gateway governed workspace routes support preview/apply and stale/conflict handling", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-governed-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-governed-workspace-"));
+  await writeFile(join(stateDir, "config.json"), JSON.stringify({
+    version: 1,
+    experimental: { capabilities: true },
+    policy: {
+      allowedCapabilities: [
+        "job.healthcheck",
+        "text.echo",
+        "workspace.readText",
+        "workspace.mutate",
+        "workspace.patch",
+        "restore.create",
+        "restore.apply",
+        "model.chat",
+        "agent.run",
+        "web.read",
+        "browser.read",
+        "browser.act",
+        "discord.read",
+        "discord.write",
+        "session.read",
+        "session.write",
+        "goal.read",
+        "goal.write",
+        "memory.read",
+        "memory.write",
+        "improve.read",
+        "improve.write"
+      ]
+    }
+  }, null, 2));
+  await writeFile(join(workspaceRoot, "seed.txt"), "baseline");
+  const server = await createGatewayServer({ stateDir, workspaceRoot });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const status = await getJson(`${base}/status`);
+    assert.equal(status.tools.includes("workspace.mutate"), true);
+    assert.equal(status.tools.includes("workspace.writeText"), false);
+    const mutatePreviewToken = (await postJson(`${base}/capabilities/issue`, {
+      runId: "governed-mutate-preview",
+      stepId: "governed-mutate-preview-step",
+      toolName: "workspace.mutate",
+      scopes: ["workspace:mutate"]
+    })).token;
+    const mutateApplyToken = (await postJson(`${base}/capabilities/issue`, {
+      runId: "governed-mutate-apply",
+      stepId: "governed-mutate-apply-step",
+      toolName: "workspace.mutate",
+      scopes: ["workspace:mutate"]
+    })).token;
+    const restorePreviewToken = (await postJson(`${base}/capabilities/issue`, {
+      runId: "governed-restore-preview",
+      stepId: "governed-restore-preview-step",
+      toolName: "restore.create",
+      scopes: ["restore:create"]
+    })).token;
+    const restoreApplyToken = (await postJson(`${base}/capabilities/issue`, {
+      runId: "governed-restore-apply",
+      stepId: "governed-restore-apply-step",
+      toolName: "restore.apply",
+      scopes: ["restore:apply"]
+    })).token;
+    const patchPreviewToken = (await postJson(`${base}/capabilities/issue`, {
+      runId: "governed-patch-preview",
+      stepId: "governed-patch-preview-step",
+      toolName: "workspace.patch",
+      scopes: ["workspace:patch"]
+    })).token;
+    const patchApplyToken = (await postJson(`${base}/capabilities/issue`, {
+      runId: "governed-patch-apply",
+      stepId: "governed-patch-apply-step",
+      toolName: "workspace.patch",
+      scopes: ["workspace:patch"]
+    })).token;
+
+    const mutatePreview = await postJson(`${base}/governed/workspace/mutate`, {
+      runId: "governed-mutate-preview",
+      capabilityToken: mutatePreviewToken,
+      operation: "write",
+      path: "seed.txt",
+      content: "candidate-preview"
+    });
+    assert.equal(mutatePreview.output?.preview, true);
+    assert.equal(mutatePreview.output?.status, "ready");
+    assert.notEqual(mutatePreview.output?.applied, true);
+
+    const mutateApply = await postJson(`${base}/governed/workspace/mutate`, {
+      runId: "governed-mutate-apply",
+      capabilityToken: mutateApplyToken,
+      operation: "write",
+      path: "seed.txt",
+      content: "candidate-applied",
+      apply: true
+    });
+    assert.equal(mutateApply.output?.applied, true);
+    assert.equal(mutateApply.output?.preview, false);
+    const checkpointId = mutateApply.output?.checkpointId;
+    assert.equal(typeof checkpointId, "string");
+
+    const restorePreview = await postJson(`${base}/governed/restore/create`, {
+      runId: "governed-restore-preview",
+      capabilityToken: restorePreviewToken,
+      checkpointId
+    });
+    assert.equal(restorePreview.output?.preview, true);
+    assert.equal(restorePreview.output?.status, "ready");
+
+    await writeFile(join(workspaceRoot, "seed.txt"), "externally changed");
+    const restoreApply = await postJson(`${base}/governed/restore/apply`, {
+      runId: "governed-restore-apply",
+      capabilityToken: restoreApplyToken,
+      checkpointId
+    });
+    assert.match(restoreApply.output?.status, /needs-review|conflict/);
+    assert.equal(restoreApply.output?.applied, false);
+    assert.equal(restoreApply.output?.preview, true);
+    assert.equal(Array.isArray(restoreApply.output?.conflicts), true);
+    assert.equal(restoreApply.output?.conflicts.length > 0, true);
+
+    const patchPreview = await postJson(`${base}/governed/workspace/patch`, {
+      runId: "governed-patch-preview",
+      capabilityToken: patchPreviewToken,
+      operation: "edit",
+      path: "seed.txt",
+      find: "externally",
+      replace: "restored",
+      apply: false
+    });
+    assert.equal(patchPreview.output?.preview, true);
+    assert.equal(patchPreview.output?.status, "ready");
+
+    const patchApply = await postJson(`${base}/governed/workspace/patch`, {
+      runId: "governed-patch-apply",
+      capabilityToken: patchApplyToken,
+      operation: "edit",
+      path: "seed.txt",
+      find: "externally",
+      replace: "restored",
+      apply: true
+    });
+    assert.equal(patchApply.output?.preview, false);
+    assert.equal(patchApply.output?.applied, true);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
 test("assistant Markdown images remain inert for every network-capable URL form", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-markdown-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
