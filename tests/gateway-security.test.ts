@@ -278,6 +278,7 @@ test("configuration reads refuse symbolic-link swaps", { skip: process.platform 
 
 test("governed workspace mutation endpoints require authenticated session and same-origin controls", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-governed-auth-"));
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({ version: 1, experimental: { capabilities: true } })}\n`);
   const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;

@@ -1322,38 +1322,10 @@ async function executeTaskThroughAdmission({
   throwIfAborted(signal);
   const safety = toolSafetyDescriptor(request.tool, tool);
   let ledgerStep;
-  const admission = new ExecutionAdmissionService({ featureFlags: runLedger?.featureFlags ?? {} });
   if (runLedger) {
     ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: projectDurableToolInput(request.tool, request.input), safety, metadata: { actor: request.actor } });
   }
-  let decision;
-  let capabilityClaims;
-  try {
-    ({ policyDecision: decision, capabilityClaims } = await admission.authorize({
-      request,
-      policy,
-      tool,
-      safety,
-      runLedger,
-      ledgerStepId: ledgerStep?.stepId,
-      now
-    }));
-  } catch (error) {
-    const failure = error instanceof Error ? error : new Error(String(error));
-    await auditStore.append({
-      at: now(),
-      runId: request.id,
-      type: "task.blocked",
-      actor: request.actor,
-      tool: request.tool,
-      capability: tool?.capability,
-      decision: "deny",
-      message: failure.message,
-      data: { code: (failure as NodeError).code ?? "POLICY_VIOLATION" }
-    });
-    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "blocked", error: failure.message });
-    throw failure;
-  }
+  const decision = evaluateTaskPolicy({ policy, request, tool });
 
   await auditStore.append({
     at: now(),

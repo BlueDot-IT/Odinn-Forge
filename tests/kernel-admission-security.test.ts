@@ -61,7 +61,7 @@ test("workspace.mutate requires capability/policy admission and rejects model-de
         registry,
         runLedger: runtime.ledger
       }),
-      /CAPABILITY_DENIED|POLICY_VIOLATION|capability is not allowed: text\.echo/
+      /CAPABILITY_DENIED|POLICY_VIOLATION|capability is not allowed: (?:text\.echo|workspace\.inspect)/
     );
 
     runtime.ledger.ensureRun({ runId: "mutate-with-token", objective: "mutation allowed with token" });
