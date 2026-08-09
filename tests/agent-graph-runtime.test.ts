@@ -647,3 +647,45 @@ test("valid graph principals are digest-only across durable projections", () => 
   assert.match(output.principalNamespace, /^sha256:[a-f0-9]{64}$/u);
   assert.doesNotMatch(JSON.stringify({ input, output }), /operator/u);
 });
+
+test("live child dispatch keeps principals digest-only", async () => {
+  const manifestInput = manifest();
+  const manifestDigest = digest({
+    schemaVersion: 1,
+    id: manifestInput.id,
+    revision: manifestInput.revision,
+    registryRef: manifestInput.registryRef,
+    requestedTools: [...manifestInput.requestedTools].sort(),
+    requestedCapabilities: [...manifestInput.requestedCapabilities].sort(),
+    maxChildren: manifestInput.maxChildren,
+    defaultTimeoutMs: manifestInput.defaultTimeoutMs
+  });
+  const executable = { ...manifestInput, manifestDigest };
+  const graphInput = {
+    graph: JSON.stringify(graph(manifestDigest)),
+    manifests: JSON.stringify([executable]),
+    principalNamespace: "PRIVATE_LIVE_PRINCIPAL",
+    inputs: { "input:first": { prompt: "safe" } }
+  } as any;
+  const dispatches: any[] = [];
+  const report = await executeAgentGraph(graphInput, {
+    registry: new Map([
+      ["agent.run", { execute: async () => undefined }],
+      ["text.echo", { execute: async () => undefined }]
+    ]),
+    policy: createDefaultPolicy(),
+    parentCapabilities: ["agent.delegate", "network.access", "workspace.inspect"],
+    runId: "parent-live-principal",
+    runChild: async (task: any) => {
+      dispatches.push(task);
+      return { ok: true, output: { text: "done" } };
+    },
+    appendAuditEvent: async () => undefined,
+    readAuditRun: async () => ({ events: [{ type: "task.completed" }] })
+  });
+  const serialized = JSON.stringify({ report, dispatches });
+  assert.doesNotMatch(serialized, /PRIVATE_LIVE_PRINCIPAL/u);
+  assert.match(report.principalNamespace, /^sha256:[a-f0-9]{64}$/u);
+  assert.match(dispatches[0].actor, /^child-agent:sha256:[a-f0-9]{64}$/u);
+  assert.equal(dispatches[0].actor.includes("PRIVATE_LIVE_PRINCIPAL"), false);
+});
