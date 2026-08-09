@@ -14,6 +14,22 @@ Projects group related sessions and goals through `/projects`. Sessions default 
 
 The Activity page combines the usage overview and searchable history in two tabs over the same signed audit journal. It reports distinct run IDs, completed `model.chat`/`agent.run` executions, recorded token counts, and semantic failed-or-denied outcomes. The overview shows only the four latest model conversations. Activity is operational telemetry, not a provider invoice.
 
+## Operator page and shared control plane
+
+The **Operator** page is the web-console adapter for the same bounded contract
+used by `odinn operator snapshot`, `odinn inspect`, and the terminal TUI. It
+combines runtime surfaces, durable work, approvals, automation, context,
+recovery, audit verification, and the other available operator surfaces in one
+redacted projection. The JSON source is `GET /operator/snapshot`; use `page`,
+`pageSize`, `q`, and `status` to keep inspection bounded.
+
+Operator mutations use `POST /operator/actions` and retain the gateway's
+authentication and origin checks. Cancel job, approve, cancel/resume workflow,
+and verify-audit actions route through the existing supervisor, approval,
+workflow, and audit paths. The page does not expose raw prompts, credentials,
+headers, tool input, or tool results. Pending or uncertain work remains visible
+as attention rather than being treated as completed.
+
 ## Cron Jobs
 
 Cron Jobs are stored in `.odinn/cron-jobs.json` and evaluated by the running gateway every 30 seconds. `/cron` creates and lists jobs; `/cron/<id>` updates or deletes them; `/cron/<id>/run` starts one immediately. Each scheduled occurrence is durably keyed as `cron:<job-id>:<scheduled ISO timestamp>` before dispatch. A second gateway process, a polling race, or a restart reuses that key rather than creating a second occurrence. A dispatch lease expires only after the bounded recovery window; an expired lease is reconciled against the same occurrence key.

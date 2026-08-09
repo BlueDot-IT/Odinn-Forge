@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -849,6 +849,181 @@ export async function createGatewayServer({
     : undefined;
   improvementTimer?.unref?.();
 
+  const approveGatewayApproval = async (id: string) => {
+    const preview = approvalStore.list().find((approval: any) => approval.id === id);
+    let linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
+    if (linkedJob && linkedJob.status !== "awaiting-approval") {
+      approvalStore.revoke(id);
+      throw new GatewayError(409, "the originating job is no longer awaiting approval");
+    }
+    if (linkedJob) {
+      try {
+        linkedJob = await supervisor.beginApproval(linkedJob.id);
+      } catch {
+        approvalStore.revoke(id);
+        throw new GatewayError(409, "the originating job approval was already claimed or cancelled");
+      }
+    }
+    const pending = approvalStore.claim(id);
+    if (!pending) {
+      if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
+      throw new GatewayError(404, "approval not found or expired");
+    }
+    if (pending.type === "skill-lifecycle") {
+      return { approvalId: id, result: await skillLifecycle.applyApproved(id, pending) };
+    }
+    const recoveredMcp = pending.tool === "mcp.invoke" ? approvalStore.recover(id) : undefined;
+    if (pending.tool === "mcp.invoke" && (!recoveredMcp?.input || !pending.runId)) {
+      approvalStore.revoke(id);
+      if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approved MCP execution input could not be recovered") }).catch(() => undefined);
+      throw new GatewayError(409, "approved MCP execution input could not be recovered; refusing dispatch");
+    }
+    const linkedTask = linkedJob?.payload?.task && typeof linkedJob.payload.task === "object" && !Array.isArray(linkedJob.payload.task)
+      ? linkedJob.payload.task as Record<string, unknown>
+      : undefined;
+    const continuation = pending.tool === "mcp.invoke";
+    const pendingRunId = String(pending.runId ?? "");
+    const taskId = continuation ? pendingRunId : `${pendingRunId}:approval:${randomUUID()}`;
+    try {
+      const result = await isolatedTaskExecutor({
+        approvalId: id,
+        approvalRunId: pending.runId,
+        trustedRecovery: continuation,
+        durableExecution: pending.tool === "process.exec" || continuation,
+        task: {
+          id: taskId,
+          tool: pending.tool,
+          input: continuation ? recoveredMcp!.input : pending.input,
+          actor: continuation
+            ? (typeof linkedTask?.actor === "string" && linkedTask.actor.trim() ? linkedTask.actor : pending.actor || "approval-executor")
+            : "approval-executor",
+          reason: "explicit user approval"
+        }
+      });
+      if (linkedJob) await supervisor.settleApproval(linkedJob.id, { result });
+      return { approvalId: id, result };
+    } catch (error) {
+      if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error }).catch(() => undefined);
+      throw error;
+    }
+  };
+
+  const readOperatorFile = async (name: string, fallback: any) => {
+    try { return JSON.parse(await readFile(join(state, name), "utf8")); }
+    catch (error: any) { return error?.code === "ENOENT" ? fallback : { ...fallback, invalid: true }; }
+  };
+
+  const operatorSnapshot = async (surface: any = "http", page = 1, pageSize = 10, query = "", statusFilter = "") => {
+    const [jobs, runs, events, cronJobs, auditVerification, browserRecovery, sandboxRecovery, processRecovery] = await Promise.all([
+      supervisor.list(),
+      auditStore.readRuns(),
+      auditStore.readAll(),
+      cronStore.list(),
+      auditStore.verifyIntegrity({ allowUnsigned: true }).catch(() => ({ valid: false, events: 0, unsigned: 0, failures: [{ reason: "audit verification unavailable" }] })),
+      readOperatorFile("browser-recovery.json", { status: "clear" }),
+      readOperatorFile("sandbox-recovery.json", { pending: [] }),
+      readOperatorFile("process-recovery.json", { pending: [] })
+    ]);
+    const queryText = String(query || "").trim().toLowerCase();
+    const matches = (item: any) => (!queryText || [item.id, item.label, item.status, item.summary, item.kind].some((value) => String(value ?? "").toLowerCase().includes(queryText)))
+      && (!statusFilter || statusFilter === "all" || item.status === statusFilter);
+    const filter = (items: any[]) => items.filter(matches);
+    const jobsItems = filter(jobs.map((job: any) => {
+      const task = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task) ? job.payload.task : {};
+      const tool = String(task.tool || "job");
+      const attention = ["failed", "needs-review"].includes(job.status);
+      return {
+        id: job.id,
+        kind: "job",
+        label: tool,
+        status: job.status,
+        summary: attention ? "Execution needs operator attention." : `${job.attempts ?? 0} attempt(s) · ${job.retrySafe ? "retry-safe" : "effectful"}`,
+        updatedAt: job.updatedAt || job.completedAt || job.createdAt,
+        attention,
+        controls: ["queued", "running", "cancelling", "awaiting-approval"].includes(job.status) ? ["cancel-job"] : [],
+        details: {
+          attempts: Number(job.attempts || 0),
+          retrySafe: job.retrySafe === true,
+          ...(job.executionRunId ? { executionRunId: job.executionRunId } : {}),
+          ...(job.envelopeDigest ? { envelopeDigest: job.envelopeDigest } : {}),
+          ...(job.auditCorrelationId ? { auditCorrelationId: job.auditCorrelationId } : {})
+        }
+      };
+    }));
+    const runItems = filter(runs.slice(0, 200).map((run: any) => ({
+      id: String(run.id),
+      kind: "run",
+      label: String(run.tool || "run"),
+      status: String(run.status || "unknown"),
+      summary: String(run.message || "Audited run"),
+      updatedAt: run.lastEventAt || run.completedAt || run.startedAt,
+      attention: ["failed", "blocked", "needs-review"].includes(String(run.status || "")),
+      details: { eventCount: Number(run.eventCount || 0), actor: String(run.actor || "local") }
+    })));
+    const approvals = filter(approvalStore.list().map((approval: any) => ({
+      id: String(approval.id),
+      kind: "approval",
+      label: String(approval.tool || approval.type || "approval"),
+      status: String(approval.status || "pending"),
+      summary: "Waiting for an explicit operator decision.",
+      updatedAt: approval.createdAt,
+      attention: true,
+      controls: ["approve"],
+      details: {
+        ...(approval.runId ? { runId: approval.runId } : {}),
+        ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {})
+      }
+    })));
+    const workflowItems = workflowRuntime
+      ? filter(workflowRuntime.list(100).map((run: any) => ({
+        id: String(run.runId), kind: "workflow", label: String(run.definitionDigest || "workflow"), status: String(run.status),
+        summary: "Durable workflow run", updatedAt: run.updatedAt,
+        attention: ["failed", "needs-review", "awaiting-approval"].includes(String(run.status)),
+        controls: ["running", "queued", "awaiting-approval"].includes(String(run.status)) ? ["cancel-workflow"] : ["needs-review"].includes(String(run.status)) ? ["resume-workflow"] : []
+      })))
+      : [];
+    const watchItems = eventIngress
+      ? eventIngress.listWatches().map((watch: any) => ({ id: watch.watchId, kind: "event-watch", label: "Event watch", status: watch.enabled ? "enabled" : "disabled", summary: "Durable event ingress declaration", updatedAt: watch.updatedAt, details: { enabled: watch.enabled === true } }))
+      : [];
+    const cronItems = filter(cronJobs.map((job: any) => ({ id: job.id, kind: "schedule", label: job.name, status: job.enabled ? "enabled" : "disabled", summary: job.lastStatus ? `Last run: ${job.lastStatus}` : "Scheduled automation", updatedAt: job.updatedAt, details: { nextRunAt: job.nextRunAt ?? null } })));
+    const recoveryItems = filter([
+      { id: "browser-recovery", kind: "recovery", label: "Browser recovery", status: String(browserRecovery.status || "clear"), summary: browserRecovery.status === "clear" ? "No browser action is awaiting resolution." : "Browser action recovery is required.", attention: ["executing", "unknown"].includes(String(browserRecovery.status)), details: { pending: ["executing", "unknown"].includes(String(browserRecovery.status)) } },
+      { id: "sandbox-recovery", kind: "recovery", label: "Sandbox recovery", status: Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length ? "needs-review" : "clear", summary: "Sandbox process recovery state", attention: Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length > 0, details: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null } },
+      { id: "process-recovery", kind: "recovery", label: "Process recovery", status: processRecovery.invalid === true ? "needs-review" : Array.isArray(processRecovery.pending) && processRecovery.pending.length ? "needs-review" : "clear", summary: "Durable process recovery state", attention: processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0), details: { pending: Array.isArray(processRecovery.pending) ? processRecovery.pending.length : null } }
+    ]);
+    const auditSummary = summarizeAuditEvents(events);
+    const auditItem = {
+      id: "audit-journal", kind: "audit", label: "Audit journal", status: auditVerification.valid === false ? "needs-review" : "verified", summary: auditVerification.valid === false ? "Audit integrity needs attention." : "Hash-chain verification passed.", attention: auditVerification.valid === false,
+      details: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0), unsigned: Number(auditVerification.unsigned || 0), failures: Array.isArray(auditVerification.failures) ? auditVerification.failures.length : 0 }
+    };
+    const runtimeItems = [
+      { id: "gateway", kind: "runtime", label: "Gateway", status: "running", summary: "Authenticated local control plane" },
+      { id: "mcp", kind: "runtime", label: "MCP", status: mcpRuntime ? "enabled" : "disabled", summary: mcpRuntime ? "Governed MCP activation" : "Disabled by default" },
+      { id: "workflows", kind: "runtime", label: "Durable workflows", status: workflowRuntime ? "enabled" : "disabled", summary: workflowRuntime ? "Durable workflow runtime" : "Disabled by default" },
+      { id: "event-ingress", kind: "runtime", label: "Event ingress", status: eventIngress ? "enabled" : "disabled", summary: eventIngress ? "Authenticated event and heartbeat ingress" : "Disabled by default" },
+      { id: "project-context", kind: "runtime", label: "Project context", status: projectContext ? "enabled" : "disabled", summary: projectContext ? "Bounded context retrieval" : "Disabled by default" }
+    ];
+    const surfaces = ["CLI", "TUI", "HTTP JSON", "Web console"].map((label) => ({ id: label.toLowerCase().replace(/\s+/gu, "-"), kind: "surface", label, status: "available", summary: "Uses the shared operator contract" }));
+    const attentionCount = jobsItems.filter((item: any) => item.attention).length + runItems.filter((item: any) => item.attention).length + approvals.length + recoveryItems.filter((item: any) => item.attention).length + (auditItem.attention ? 1 : 0);
+    return buildOperatorSnapshot({
+      surface,
+      identity: { state, workspaceRoot: root, version, commit: await productCommit() },
+      health: { status: attentionCount ? "attention" : "healthy", ok: attentionCount === 0, attention: attentionCount, summary: attentionCount ? `${attentionCount} item(s) need operator attention.` : "All governed surfaces are operating normally." },
+      page,
+      pageSize,
+      sections: {
+        runtime: { items: runtimeItems },
+        work: { items: [...jobsItems, ...runItems], counts: { jobs: jobsItems.length, runs: runItems.length } },
+        approvals: { items: approvals, counts: { pending: approvals.length } },
+        automation: { items: [...workflowItems, ...watchItems, ...cronItems], counts: { workflows: workflowItems.length, watches: watchItems.length, schedules: cronItems.length } },
+        context: { items: [{ id: "project-context", kind: "context", label: "Project context", status: projectContext ? "enabled" : "disabled", summary: projectContext ? "Context retrieval is available through the governed context surface." : "Project context is disabled by default." }] },
+        recovery: { items: recoveryItems },
+        audit: { items: [auditItem], counts: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0) } },
+        surfaces: { items: surfaces }
+      }
+    });
+  };
+
   const server: any = createServer(async (request: any, response: any) => {
     const requestId = String(request.headers["x-odinn-request-id"] || randomUUID());
     response.setHeader("x-odinn-request-id", requestId);
@@ -937,6 +1112,40 @@ export async function createGatewayServer({
       }
       if (request.method === "GET" && url.pathname === "/diagnostics") {
         return json(response, 200, await diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError, sandboxRecoveryStartupError }));
+      }
+      if (request.method === "GET" && (url.pathname === "/operator" || url.pathname === "/operator/snapshot")) {
+        const requestedSurface = String(url.searchParams.get("surface") || "http");
+        const surface = ["cli", "tui", "http", "console"].includes(requestedSurface) ? requestedSurface : "http";
+        const page = Number.parseInt(url.searchParams.get("page") || "1", 10) || 1;
+        const pageSize = Number.parseInt(url.searchParams.get("pageSize") || "10", 10) || 10;
+        const snapshot = await operatorSnapshot(surface, page, pageSize, url.searchParams.get("q") || "", url.searchParams.get("status") || "");
+        return json(response, 200, { ok: true, ...snapshot });
+      }
+      if (request.method === "POST" && url.pathname === "/operator/actions") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const action = String(body.action || "").trim();
+        if (!operatorActionNames().includes(action as any)) throw new GatewayError(400, "operator action is unsupported");
+        if (action !== "verify-audit" && body.confirm !== true) throw new GatewayError(400, "operator action requires confirm=true");
+        const targetId = String(body.targetId || "").trim();
+        if (action !== "verify-audit" && (!targetId || targetId.length > 512)) throw new GatewayError(400, "operator action targetId is required");
+        let result: any;
+        if (action === "cancel-job") {
+          for (const approval of approvalStore.list()) if (approval.runId === targetId && approval.id) approvalStore.revoke(approval.id);
+          result = await supervisor.cancel(targetId);
+        } else if (action === "approve") {
+          result = await approveGatewayApproval(targetId);
+        } else if (action === "cancel-workflow") {
+          if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled");
+          result = await workflowRuntime.cancel(targetId);
+        } else if (action === "resume-workflow") {
+          if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled");
+          result = await workflowRuntime.resume(targetId);
+        } else {
+          result = await auditStore.verifyIntegrity({ allowUnsigned: true });
+        }
+        const surface = String(body.surface || "http");
+        const snapshot = await operatorSnapshot(["cli", "tui", "http", "console"].includes(surface) ? surface : "http");
+        return json(response, 200, { ok: true, action, ...(targetId ? { targetId } : {}), result, snapshot });
       }
       if (request.method === "GET" && url.pathname === "/channels") {
         return json(response, 200, { ok: true, channels: channelSupervisor.status() });
@@ -4879,6 +5088,7 @@ function renderConsoleHtml(version = "development") {
       </div>
       <nav class="nav" aria-label="Console views">
         <button class="active" data-view="overview" data-title="Chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-chat"></use></svg></span><span class="nav-label">Chat</span><span class="badge ok" id="nav-health">...</span></button>
+        <button data-view="operator" data-title="Operator" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-monitor"></use></svg></span><span class="nav-label">Operator</span><span class="badge" id="nav-operator-attention">0</span></button>
         <button data-view="sessions" data-title="Sessions" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-session"></use></svg></span><span class="nav-label">Sessions</span></button>
         <div class="menu-chats">
           <button class="secondary" id="new-chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-plus"></use></svg></span><span class="nav-label">New session</span></button>
@@ -4940,6 +5150,15 @@ function renderConsoleHtml(version = "development") {
     </header>
 
     <main class="content">
+      <section id="view-operator" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Shared control plane</div><h1>Operator</h1><p>One bounded view of runtime health, durable work, approvals, recovery, audit, and every available operator surface.</p></div><div class="row"><span class="chip" id="operator-health">Loading</span><button class="secondary" id="refresh-operator" type="button">Refresh</button></div></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="operator-attention">0</strong><span>need attention</span></div><div class="stat-card"><strong id="operator-work-count">0</strong><span>work items</span></div><div class="stat-card"><strong id="operator-approval-count">0</strong><span>approvals</span></div><div class="stat-card"><strong id="operator-audit-status">—</strong><span>audit</span></div></div>
+          <div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Runtime</h2><span class="muted" id="operator-generated">—</span></div><div id="operator-runtime" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Attention</h2><span class="muted">Bounded, redacted summaries</span></div><div id="operator-attention-list" class="list"></div></div></div>
+          <div class="panel stack"><div class="panel-head"><h2>Recent work</h2><span class="muted" id="operator-work-page">—</span></div><div id="operator-work" class="list"></div></div>
+          <details class="panel stack"><summary>Contract payload</summary><pre id="operator-payload" class="output">Loading…</pre></details>
+        </div>
+      </section>
       <section id="view-overview" class="view active">
         <div class="chat-shell">
           <div class="chat-column">
@@ -5605,6 +5824,41 @@ function renderConsoleHtml(version = "development") {
       $("sidebar-toggle").setAttribute("aria-expanded", String(!mobile && !collapsed));
     }
 
+    function renderOperatorItem(item) {
+      const controls = (item.controls || []).map((action) => '<button class="secondary" data-operator-action="' + escapeHtml(action) + '" data-operator-target="' + escapeHtml(item.id) + '" type="button">' + escapeHtml(friendlyStatus(action)) + '</button>').join("");
+      return '<div class="item"><div class="item-line"><strong>' + escapeHtml(item.label || item.kind) + '</strong><span class="chip ' + (item.attention ? "danger" : item.status === "enabled" || item.status === "running" || item.status === "verified" || item.status === "available" ? "ok" : "warn") + '">' + escapeHtml(friendlyStatus(item.status)) + '</span></div><div>' + escapeHtml(item.summary || "") + '</div><div class="muted">' + escapeHtml(item.id || "") + (item.updatedAt ? " · " + escapeHtml(relativeTime(item.updatedAt)) : "") + '</div>' + (controls ? '<div class="row">' + controls + '</div>' : "") + '</div>';
+    }
+
+    async function refreshOperator() {
+      const snapshot = await api("/operator/snapshot?surface=console&pageSize=25");
+      const section = (name) => snapshot.sections?.[name] || { items: [], counts: {} };
+      const work = section("work");
+      const attention = [...work.items, ...section("approvals").items, ...section("recovery").items, ...section("audit").items].filter((item) => item.attention || ["failed", "needs-review", "unknown"].includes(item.status));
+      $("operator-health").textContent = friendlyStatus(snapshot.health?.status || "unknown");
+      $("operator-health").className = "chip " + (snapshot.health?.status === "healthy" ? "ok" : "danger");
+      $("operator-attention").textContent = String(snapshot.health?.attention || 0);
+      $("operator-work-count").textContent = String(work.counts?.total || work.items.length || 0);
+      $("operator-approval-count").textContent = String(section("approvals").counts?.pending || section("approvals").items.length || 0);
+      $("operator-audit-status").textContent = friendlyStatus(section("audit").items[0]?.status || "unknown");
+      $("operator-generated").textContent = snapshot.generatedAt ? relativeTime(snapshot.generatedAt) : "—";
+      $("operator-runtime").innerHTML = section("runtime").items.map(renderOperatorItem).join("") || '<div class="empty-state"><strong>No runtime surfaces</strong><span>Nothing is registered.</span></div>';
+      $("operator-attention-list").innerHTML = attention.map(renderOperatorItem).join("") || '<div class="empty-state"><strong>Nothing needs attention</strong><span>Governed work is proceeding normally.</span></div>';
+      $("operator-work").innerHTML = work.items.map(renderOperatorItem).join("") || '<div class="empty-state"><strong>No recent work</strong><span>There is no durable work to show.</span></div>';
+      $("operator-work-page").textContent = (work.pagination?.total || 0) + " items · page " + (work.pagination?.page || 1) + " of " + (work.pagination?.pages || 1);
+      $("operator-payload").textContent = JSON.stringify(snapshot, null, 2);
+      $("nav-operator-attention").textContent = String(snapshot.health?.attention || 0);
+      $("nav-operator-attention").className = "badge " + (snapshot.health?.attention ? "danger" : "ok");
+      return snapshot;
+    }
+
+    async function runOperatorAction(action, targetId) {
+      const labels = { "cancel-job": "Cancel this job?", approve: "Approve this action once?", "cancel-workflow": "Cancel this workflow?", "resume-workflow": "Resume this workflow?" };
+      if (labels[action] && !window.confirm(labels[action])) return;
+      const result = await api("/operator/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, targetId, confirm: true, surface: "console" }) });
+      showOutput(result);
+      await refreshOperator();
+    }
+
     function switchView(name, options = {}) {
       if (name === "audit") {
         name = "usage";
@@ -5630,6 +5884,7 @@ function renderConsoleHtml(version = "development") {
         }
       }
       if (matchMedia("(max-width: 980px)").matches) closeMobileNavigation();
+      if (name === "operator") refreshOperator().catch((error) => showOutput(error.message));
       if (name === "capabilities") {
         refreshApprovals().catch((error) => showOutput(error.message));
         refreshBrowser().catch((error) => showOutput(error.message));
@@ -7607,6 +7862,19 @@ function renderConsoleHtml(version = "development") {
     });
     document.querySelectorAll("[data-view-jump]").forEach((button) => {
       button.addEventListener("click", () => switchView(button.dataset.viewJump));
+    });
+    $("refresh-operator").addEventListener("click", () => refreshOperator().catch((error) => showOutput(error.message)));
+    $("operator-attention-list").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-operator-action]");
+      if (button) runOperatorAction(button.dataset.operatorAction, button.dataset.operatorTarget).catch((error) => showOutput(error.message));
+    });
+    $("operator-runtime").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-operator-action]");
+      if (button) runOperatorAction(button.dataset.operatorAction, button.dataset.operatorTarget).catch((error) => showOutput(error.message));
+    });
+    $("operator-work").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-operator-action]");
+      if (button) runOperatorAction(button.dataset.operatorAction, button.dataset.operatorTarget).catch((error) => showOutput(error.message));
     });
 
     $("activity-tab-overview").addEventListener("click", () => setActivityTab("overview"));

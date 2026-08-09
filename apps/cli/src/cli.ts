@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, buildOperatorSnapshot, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -210,6 +210,10 @@ async function main() {
     case "status":
       await printJson(await status(args));
       break;
+    case "operator":
+    case "inspect":
+      await operatorCommand(command === "inspect" ? ["snapshot", ...args] : args);
+      break;
     case "tui":
       await tui(args);
       break;
@@ -309,6 +313,8 @@ Get started:
 
 Common commands:
   odinn status                      Check configuration and runtime health
+  odinn operator snapshot           Inspect every operator control plane
+  odinn operator action <action>    Apply a governed operator action
   odinn sessions                    List chats
   odinn runs                        Inspect recent work
   odinn doctor                      Diagnose the current setup
@@ -407,6 +413,8 @@ function usage() {
   odinn config channel enable|disable|remove <name> [--state .odinn]
   odinn status [--state .odinn]
   odinn doctor [--state .odinn]
+  odinn operator snapshot [--page <n>] [--page-size <n>] [--query <text>] [--state .odinn]
+  odinn operator action cancel-job|cancel-workflow|resume-workflow|verify-audit <id> [--confirm] [--state .odinn]
   odinn sessions [--limit 20] [--state .odinn]
   odinn audit [--state .odinn]
   odinn audit verify [--allow-unsigned] [--state .odinn]
@@ -2627,23 +2635,122 @@ function openAuthorizationUrl(url: any) {
   child.unref();
 }
 
+async function readOperatorRuntimeJobs(state: string): Promise<any[]> {
+  const databasePath = join(state, "db", "odinn.sqlite");
+  if (existsSync(databasePath)) {
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const table = database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_jobs'").get();
+      if (table) return database.prepare("SELECT id,status,attempts,retry_safe,updated_at,completed_at,created_at,error,execution_run_id,envelope_digest,audit_correlation_id FROM runtime_jobs ORDER BY updated_at DESC LIMIT 500").all() as any[];
+    } finally { database.close(); }
+  }
+  const legacy = await readJsonIfPresent(join(state, "jobs.json"), { jobs: {} });
+  return Object.entries(legacy?.jobs ?? {}).map(([id, value]: any) => ({ id, ...value }));
+}
+
+async function localOperatorSnapshot(args: any[], surface: any = "cli") {
+  const state = stateDir(args);
+  const config = await readConfig(state);
+  const current = await status(args);
+  const auditStore = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
+  try {
+    const [runs, events, jobs, verification] = await Promise.all([
+      auditStore.readRuns(), auditStore.readAll(), readOperatorRuntimeJobs(state),
+      auditStore.verifyIntegrity({ allowUnsigned: true }).catch(() => ({ valid: false, events: 0, unsigned: 0, failures: [{ reason: "audit verification unavailable" }] }))
+    ]);
+    const approvals = createApprovalStore({ path: join(state, "approvals.json") }).list();
+    const query = String(option(args, "--query", option(args, "--q", ""))).trim().toLowerCase();
+    const statusFilter = String(option(args, "--status", "")).trim();
+    const matches = (item: any) => (!query || [item.id, item.label, item.status, item.summary, item.kind].some((value) => String(value ?? "").toLowerCase().includes(query))) && (!statusFilter || statusFilter === "all" || item.status === statusFilter);
+    const jobsItems = jobs.map((job: any) => {
+      const status = String(job.status || "unknown");
+      return { id: String(job.id), kind: "job", label: String(job.tool || job.payload?.task?.tool || "job"), status, summary: ["failed", "needs-review"].includes(status) ? "Execution needs operator attention." : `${Number(job.attempts || 0)} attempt(s)`, updatedAt: job.updated_at || job.updatedAt || job.completed_at || job.created_at, attention: ["failed", "needs-review"].includes(status), controls: (["queued", "running", "cancelling", "awaiting-approval"].includes(status) ? ["cancel-job"] : []) as any, details: { attempts: Number(job.attempts || 0), retrySafe: Number(job.retry_safe) === 1 || job.retrySafe === true, ...(job.execution_run_id ? { executionRunId: job.execution_run_id } : {}) } };
+    }).filter(matches);
+    const runItems = runs.slice(0, 200).map((run: any) => { const status = String(run.status || "unknown"); return { id: String(run.id), kind: "run", label: String(run.tool || "run"), status, summary: String(run.message || "Audited run"), updatedAt: run.lastEventAt || run.completedAt || run.startedAt, attention: ["failed", "blocked", "needs-review"].includes(status), details: { eventCount: Number(run.eventCount || 0), actor: String(run.actor || "local") } }; }).filter(matches);
+    const approvalItems = approvals.map((approval: any) => ({ id: String(approval.id), kind: "approval", label: String(approval.tool || approval.type || "approval"), status: String(approval.status || "pending"), summary: "Waiting for an explicit operator decision.", updatedAt: approval.createdAt, attention: true, controls: ["approve"] as any, details: { ...(approval.runId ? { runId: approval.runId } : {}), ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {}) } })).filter(matches);
+    const readFileOr = async (name: string, fallback: any) => readJsonIfPresent(join(state, name), fallback).catch(() => ({ ...fallback, invalid: true }));
+    const recovery = await Promise.all([readFileOr("browser-recovery.json", { status: "clear" }), readFileOr("sandbox-recovery.json", { pending: [] }), readFileOr("process-recovery.json", { pending: [] })]);
+    const recoveryItems = [
+      { id: "browser-recovery", kind: "recovery", label: "Browser recovery", status: String(recovery[0].status || "clear"), summary: "Browser action recovery state", attention: ["executing", "unknown"].includes(String(recovery[0].status)), details: { pending: ["executing", "unknown"].includes(String(recovery[0].status)) } },
+      { id: "sandbox-recovery", kind: "recovery", label: "Sandbox recovery", status: Array.isArray(recovery[1].pending) && recovery[1].pending.length ? "needs-review" : "clear", summary: "Sandbox recovery state", attention: Array.isArray(recovery[1].pending) && recovery[1].pending.length > 0, details: { pending: Array.isArray(recovery[1].pending) ? recovery[1].pending.length : null } },
+      { id: "process-recovery", kind: "recovery", label: "Process recovery", status: recovery[2].invalid === true || (Array.isArray(recovery[2].pending) && recovery[2].pending.length) ? "needs-review" : "clear", summary: "Durable process recovery state", attention: recovery[2].invalid === true || (Array.isArray(recovery[2].pending) && recovery[2].pending.length > 0), details: { pending: Array.isArray(recovery[2].pending) ? recovery[2].pending.length : null } }
+    ].filter(matches);
+    const auditAttention = verification.valid === false;
+    const auditItem = { id: "audit-journal", kind: "audit", label: "Audit journal", status: auditAttention ? "needs-review" : "verified", summary: auditAttention ? "Audit integrity needs attention." : "Hash-chain verification passed.", attention: auditAttention, details: { events: events.length, runs: new Set(events.map((event: any) => event.runId).filter(Boolean)).size, unsigned: Number(verification.unsigned || 0), failures: Array.isArray(verification.failures) ? verification.failures.length : 0 } };
+    const runtime = config.runtime ?? {};
+    const runtimeItems = [{ id: "gateway", kind: "runtime", label: "Gateway", status: "available", summary: "Authenticated local control plane" }, { id: "mcp", kind: "runtime", label: "MCP", status: runtime.enableMcp === true ? "enabled" : "disabled", summary: "Governed MCP activation" }, { id: "workflows", kind: "runtime", label: "Durable workflows", status: runtime.enableDurableWorkflows === true ? "enabled" : "disabled", summary: "Durable workflow runtime" }, { id: "event-ingress", kind: "runtime", label: "Event ingress", status: runtime.enableEventIngress === true ? "enabled" : "disabled", summary: "Authenticated event and heartbeat ingress" }, { id: "project-context", kind: "runtime", label: "Project context", status: runtime.enableProjectContext === true ? "enabled" : "disabled", summary: "Bounded context retrieval" }].filter(matches);
+    const surfaces = ["CLI", "TUI", "HTTP JSON", "Web console"].map((label) => ({ id: label.toLowerCase().replace(/\s+/gu, "-"), kind: "surface", label, status: "available", summary: "Uses the shared operator contract" })).filter(matches);
+    const attention = jobsItems.filter((item: any) => item.attention).length + runItems.filter((item: any) => item.attention).length + approvalItems.length + recoveryItems.filter((item: any) => item.attention).length + (auditAttention ? 1 : 0);
+    const identity = applicationIdentity();
+    return buildOperatorSnapshot({ surface, identity: { state, workspaceRoot: invocationRoot(), version: identity.applicationVersion, commit: identity.applicationCommit }, health: { status: attention ? "attention" : "healthy", ok: attention === 0, attention, summary: attention ? `${attention} item(s) need operator attention.` : "All governed surfaces are operating normally." }, page: Number.parseInt(option(args, "--page", "1"), 10) || 1, pageSize: Number.parseInt(option(args, "--page-size", "10"), 10) || 10, sections: {
+      runtime: { items: runtimeItems }, work: { items: [...jobsItems, ...runItems], counts: { jobs: jobsItems.length, runs: runItems.length } }, approvals: { items: approvalItems, counts: { pending: approvalItems.length } }, automation: { items: [], counts: { workflows: 0, watches: 0, schedules: 0 } }, context: { items: [{ id: "project-context", kind: "context", label: "Project context", status: runtime.enableProjectContext === true ? "enabled" : "disabled", summary: "Context retrieval is governed and bounded." }] }, recovery: { items: recoveryItems }, audit: { items: [auditItem], counts: { events: events.length, runs: new Set(events.map((event: any) => event.runId).filter(Boolean)).size } }, surfaces: { items: surfaces }
+    } });
+  } finally { auditStore.close(); }
+}
+
+async function operatorGatewayRequest(args: any[], path: string, init: any = {}) {
+  const state = stateDir(args);
+  const base = String(option(args, "--gateway-url", "http://127.0.0.1:18790")).replace(/\/$/u, "");
+  const token = (await readFile(join(state, "gateway.token"), "utf8")).trim();
+  const response = await fetch(`${base}${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.headers || {}) } });
+  const body = await response.json();
+  if (!response.ok) throw new Error(String(body?.error || `gateway returned ${response.status}`));
+  return body;
+}
+
+async function operatorCommand(args: any[]) {
+  const [subcommand = "snapshot", ...rest] = args;
+  if (subcommand === "snapshot" || subcommand === "show") {
+    if (option(rest, "--gateway-url") || hasFlag(rest, "--remote")) {
+      const query = new URLSearchParams({ surface: "cli", page: option(rest, "--page", "1"), pageSize: option(rest, "--page-size", "10"), ...(option(rest, "--query") ? { q: option(rest, "--query") } : {}) });
+      await printJson(await operatorGatewayRequest(rest, `/operator/snapshot?${query.toString()}`));
+    } else {
+      const snapshot = await localOperatorSnapshot(rest, "cli");
+      if (hasFlag(rest, "--text")) console.log(renderTui(snapshot)); else await printJson(snapshot);
+    }
+    return;
+  }
+  if (subcommand !== "action") throw new Error("operator requires snapshot or action");
+  const action = String(rest[0] || "");
+  const targetId = action === "verify-audit" ? undefined : option(rest, "--target", rest.find((value: any, index: number) => index > 0 && !String(value).startsWith("-")));
+  if (!action) throw new Error("operator action requires an action name");
+  if (["cancel-job", "cancel-workflow", "resume-workflow", "approve"].includes(action) && !hasFlag(rest, "--confirm")) throw new Error("operator mutation requires --confirm");
+  if (action === "approve" || option(rest, "--gateway-url") || hasFlag(rest, "--remote")) {
+    await printJson(await operatorGatewayRequest(rest, "/operator/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, targetId, confirm: hasFlag(rest, "--confirm"), surface: "cli" }) }));
+    return;
+  }
+  const state = stateDir(rest); const config = await readConfig(state); const ledger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+  try {
+    let result: any;
+    if (action === "verify-audit") { const store = createAuditStore(join(state, config.auditLog ?? "audit.jsonl")); try { result = await store.verifyIntegrity({ allowUnsigned: true }); } finally { store.close(); } }
+    else if (action === "cancel-job") { if (!targetId) throw new Error("cancel-job requires a target id"); result = await new SqliteJobStore(ledger, { legacyPath: join(state, "jobs.json") }).cancel(targetId, { requestedBy: "cli", reason: "operator cancelled job" }); }
+    else if (action === "cancel-workflow" || action === "resume-workflow") { if (!targetId) throw new Error(`${action} requires a target id`); const workflows = new SqliteWorkflowStore(ledger.database); result = action === "cancel-workflow" ? workflows.cancel(targetId) : workflows.resume(targetId); }
+    else throw new Error("approve requires a running gateway; pass --gateway-url");
+    await printJson({ ok: true, action, ...(targetId ? { targetId } : {}), result, snapshot: await localOperatorSnapshot(rest, "cli") });
+  } finally { ledger.close(); }
+}
+
 async function tui(args: any) {
-  const render = async () => {
-    const current = await status(args);
-    const store = createAuditStore(join(current.state, current.auditLog ?? "audit.jsonl"));
-    try { return renderTui({ ...current, runs: await store.readRuns() }); }
-    finally { store.close(); }
-  };
+  const render = async () => renderTui(await localOperatorSnapshot(args, "tui"));
   if (!hasFlag(args, "--watch")) {
     console.log(await render());
     return;
   }
   const intervalMs = Number.parseInt(option(args, "--interval-ms", "2000"), 10);
   const delay = Number.isFinite(intervalMs) && intervalMs >= 250 ? intervalMs : 2000;
-  while (true) {
-    process.stdout.write("\x1b[2J\x1b[H");
-    console.log(await render());
-    await new Promise((resolve: any) => setTimeout(resolve, delay));
+  let stopped = false;
+  const stop = () => { stopped = true; };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    while (!stopped) {
+      process.stdout.write("\x1b[2J\x1b[H");
+      console.log(await render());
+      await new Promise((resolve: any) => setTimeout(resolve, delay));
+    }
+  } finally {
+    process.removeListener("SIGINT", stop);
+    process.removeListener("SIGTERM", stop);
   }
 }
 
@@ -3607,28 +3714,46 @@ function renderOnboardingDetails({ state, workspaceRoot, configPath, tools, allo
   ].join("\n");
 }
 
-function renderTui({ state, workspaceRoot, tools, allowedCapabilities, runs }: any) {
-  const recent = runs.slice(0, 8);
+function renderTui(snapshot: any) {
+  const section = (name: string) => snapshot.sections?.[name] ?? { items: [], counts: {} };
+  const work = section("work");
+  const approvals = section("approvals");
+  const recovery = section("recovery");
+  const audit = section("audit");
+  const runtime = section("runtime");
+  const recent = work.items.slice(0, 8);
+  const attention = [...work.items, ...approvals.items, ...recovery.items, ...audit.items].filter((item: any) => item.attention || ["failed", "needs-review", "unknown"].includes(item.status));
   return [
     "Odinn Forge TUI",
-    "=========",
-    `Workspace : ${workspaceRoot}`,
-    `State     : ${state}`,
-    `Tools     : ${tools.join(", ") || "(none)"}`,
-    `Policy    : ${allowedCapabilities.join(", ") || "(none)"}`,
+    "===============",
+    `Workspace : ${snapshot.identity?.workspaceRoot ?? "unknown"}`,
+    `State     : ${snapshot.identity?.state ?? "unknown"}`,
+    `Health    : ${snapshot.health?.status ?? "unknown"} (${snapshot.health?.attention ?? 0} attention)` ,
+    `Contract  : v${snapshot.schemaVersion ?? "?"} · ${snapshot.surface ?? "operator"}`,
+    "",
+    "Runtime surfaces",
+    "-----------------",
+    runtime.items.length ? runtime.items.map((item: any) => `${String(item.status).padEnd(12)} ${item.label}`).join("\n") : "No runtime surfaces recorded.",
     "",
     "Recent runs",
     "-----------",
     recent.length
-      ? recent.map((run: any) => `${run.status.padEnd(9)} ${run.id} ${run.tool ?? ""} ${run.message ?? ""}`.trimEnd()).join("\n")
-      : "No runs recorded yet.",
+      ? recent.map((item: any) => `${String(item.status).padEnd(12)} ${item.kind.padEnd(9)} ${item.label} ${item.summary ?? ""}`.trimEnd()).join("\n")
+      : "No work recorded yet.",
     "",
-    "Commands",
-    "--------",
-    `Run smoke : ${odinnCommand()} plan --file examples/local-smoke.plan.json`,
-    `Remember  : ${odinnCommand()} memory remember --text 'A useful fact.'`,
-    `Watch TUI : ${odinnCommand()} tui --watch`,
-    `Console   : ${odinnCommand()} start`
+    "Operator attention",
+    "------------------",
+    attention.length ? attention.slice(0, 8).map((item: any) => `${String(item.status).padEnd(12)} ${item.kind.padEnd(9)} ${item.label} ${item.summary ?? ""}`.trimEnd()).join("\n") : "Nothing requires attention.",
+    "",
+    `Approvals : ${approvals.counts?.pending ?? approvals.items.length}`,
+    `Audit     : ${audit.items[0]?.status ?? "unknown"} · ${audit.items[0]?.details?.events ?? 0} events`,
+    "",
+    "Control commands",
+    "----------------",
+    `${odinnCommand()} operator snapshot --text`,
+    `${odinnCommand()} operator action verify-audit`,
+    `${odinnCommand()} tui --watch`,
+    `${odinnCommand()} start`
   ].join("\n");
 }
 
