@@ -726,6 +726,16 @@ export class RunLedger {
           }
         };
       }
+      if (latest?.state === "awaiting-approval") {
+        return {
+          ...persisted,
+          replay: true,
+          attempt: {
+            id: String(latest.id), runId, attemptNumber: Number(latest.attempt_number), state: "awaiting-approval" as const,
+            createdAt: String(latest.created_at)
+          }
+        };
+      }
       if (envelope.retrySafety !== "retry-safe") {
         const error = new Error(`execution ${runId} is not eligible for automatic retry`) as Error & { code?: string };
         error.code = "EXECUTION_RETRY_UNSAFE";

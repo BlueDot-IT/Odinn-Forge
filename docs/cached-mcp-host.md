@@ -1,17 +1,78 @@
 # Cached MCP host foundation
 
 Ódinn exposes a dependency-light, optional MCP host foundation at
-`@odinn/kernel/mcp-host`. The subpath is not imported by the kernel root,
-Gateway, CLI, or runtime. Import and construction perform no discovery, network
-access, process launch, filesystem access, environment lookup, timer creation,
-or authentication. Existing request latency and runtime behavior are unchanged.
+`@odinn/kernel/mcp-host` and a separately governed activation layer at
+`@odinn/kernel/mcp-runtime`. Import and construction perform no discovery,
+network access, process launch, filesystem access, environment lookup, or
+authentication. Runtime activation remains disabled unless
+`config.runtime.enableMcp` is explicitly `true` and a server is explicitly
+configured and enabled.
 
-The module is deliberately not a ready-to-connect MCP client. An integrator
+The foundation is deliberately not a general remote MCP client. An integrator
 must explicitly call `start()` or `refresh()` and supply both a discovery
-transport and an audited dispatcher. Those caller-owned adapters are the only
-places that can connect to a server or obtain authorization. Ódinn supplies no
-endpoint, headers, credentials, auth handles, subprocess transport, network
-fallback, retry, or provider-specific behavior.
+transport and an audited dispatcher. Stage 9's governed runtime supplies one
+narrow adapter: a trusted, enabled, whole-bundle-digest-pinned `type: "mcp"`
+extension in the existing OCI container sandbox. The sandbox receives no
+network, environment, headers, credentials, endpoint, URL, or secret material;
+unconfined-process MCP manifests remain refused. There is no remote URL,
+broker, host fallback, retry, or provider-specific transport.
+
+## Governed Stage 9 activation
+
+The activation flag and server registry are additive configuration:
+
+```json
+{
+  "runtime": { "enableMcp": true },
+  "mcp": {
+    "servers": {
+      "fixture": {
+        "extensionId": "fixture-mcp",
+        "enabled": true,
+        "maxConcurrency": 1,
+        "snapshotTtlMs": 300000
+      }
+    }
+  }
+}
+```
+
+The server entry contains only bounded lifecycle and resource settings. It
+cannot contain an endpoint, command, environment, header, credential, URL, or
+network grant. The referenced extension must be trusted and enabled, use the
+confined OCI sandbox, have a full bundle digest and digest-pinned image, and
+hold explicit `mcp.discover`/`mcp.invoke` grants. Configuration alone never
+trusts or enables an extension.
+
+The runtime sends the supported MCP JSON-RPC subset as one bounded JSONL
+session per operation. It writes `initialize` and waits for the matching
+response before writing `notifications/initialized` and `tools/list` or
+`tools/call`; it never pipelines the handshake. It requires matching
+JSON-RPC ids, a negotiated date-shaped protocol version, bounded JSON, and no
+unsolicited response lines.
+Tool metadata is projected to the host's strict schema subset; unsupported
+schema keywords, pagination, authority-shaped identifiers, and extra metadata
+fail closed. Discovered tool names remain data, not executable registry entries.
+
+`mcp.discover` is explicit and retry-safe. `mcp.invoke` requires a fresh,
+generation/fingerprint/schema-pinned snapshot, an executable-manifest
+fingerprint, explicit `mcp.invoke` capability, and a one-time approval bound to
+the server, tool, schema, argument digest, executable identity, and run. Both
+fixed tools enter `ExecutionAdmissionService`; invocations are available only
+through the durable `/jobs` execution surface, use
+`execution.kind: "mcp-tool"`, and are not automatically retried. Approval
+continuation resumes the original awaiting-approval run. The public approval
+record contains only the bounded digest projection; the exact approved input
+is held in memory or an authenticated encrypted sealed envelope and is
+recovered only after the operator claims that approval.
+
+Durable audit, ledger, and job projections retain ids, generations,
+schema/argument/result digests, bounded status, and categorical error codes.
+Raw MCP arguments and results are absent from audit, ledger, job, and public
+approval projections; an approved input exists only inside the sealed approval
+continuation envelope. A backend dispatch that
+times out, is cancelled, loses physical cleanup, or cannot complete audit
+correlation becomes `needs-review`; it is never silently replayed.
 
 ## Discovery and cache boundary
 
@@ -96,7 +157,8 @@ Shutdown stops admission, aborts active discovery and calls, and returns within
 its configured deadline. Its result reports physical work that remains. A
 non-cooperative adapter cannot keep shutdown pending indefinitely.
 
-This foundation adds no persistence, configuration, runtime activation, or
-migration. Rollback consists of removing the optional subpath and explicit
-integrator callers. Activating an MCP transport requires a separate review of
-authentication, policy, approvals, auditing, privacy, lifecycle, and latency.
+The host foundation still adds no persistence or migration. The Stage 9 runtime
+keeps snapshots and call results volatile and shuts down every host during
+runtime teardown. Rollback is the reversible removal of the explicit runtime
+flag/configuration or the MCP runtime wiring; extension lifecycle rollback
+continues to use the extension registry's existing trust and integrity rules.

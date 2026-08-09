@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -719,8 +719,13 @@ export async function createGatewayServer({
     policy,
     enabled: config.runtime?.enableSkillLifecycle === true
   });
-  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore, skillDisclosure });
-  const governedRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure });
+  const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
+  const extensionExecutor = new ExtensionExecutor(extensionRegistry, { workspaceRoot: root, config: config.sandbox });
+  const mcpRuntime = config.runtime?.enableMcp === true
+    ? createGovernedMcpRuntime({ enabled: true, config: config.mcp, extensionRegistry, extensionExecutor, auditStore, runLedger: runtime.ledger })
+    : undefined;
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore, skillDisclosure, mcpRuntime });
+  const governedRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime });
   const gatewayToken = await loadGatewayToken(state);
   const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
@@ -742,7 +747,6 @@ export async function createGatewayServer({
   const quotaGate = createQuotaGate(quotas);
   const cronStore = new CronStore(join(state, "cron-jobs.json"));
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
-  const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
   const channelSupervisor = await createChannelSupervisor({
     config,
     state,
@@ -921,6 +925,10 @@ export async function createGatewayServer({
             ...extensions.filter((extension: any) => extension.type === "skill").map((extension: any) => ({ ...extension, source: "legacy-extension", status: "unmanaged", path: extension.entrypoint }))
           ]
         });
+      }
+      if (request.method === "GET" && url.pathname === "/mcp") {
+        if (!mcpRuntime) throw new GatewayError(404, "MCP activation is disabled");
+        return json(response, 200, { ok: true, ...mcpRuntime.status() });
       }
       if (request.method === "GET" && url.pathname === "/skills/catalog") {
         if (config.runtime?.enableProgressiveSkills !== true) throw new GatewayError(404, "progressive skill disclosure is disabled");
@@ -1309,7 +1317,7 @@ export async function createGatewayServer({
           }
         }
         const safety = toolSafetyDescriptor(task.tool, registry.get(task.tool));
-        const durableExecution = task.tool === "process.exec" || task.tool === "agent.delegate";
+        const durableExecution = task.tool === "process.exec" || task.tool === "agent.delegate" || task.tool === "mcp.invoke";
         const sandboxProcessConfig = task.tool === "process.exec" ? normalizeSandboxConfig(config).process : undefined;
         const requestedTimeout = Number.isSafeInteger(task.input?.timeoutMs) ? Number(task.input.timeoutMs) : sandboxProcessConfig?.limits.timeoutMs;
         const requestedGraphTimeout = Number.isSafeInteger(task.input?.maxRunMs) ? Number(task.input.maxRunMs) : 120_000;
@@ -1444,12 +1452,33 @@ export async function createGatewayServer({
             throw error;
           }
         }
+        const recoveredMcp = pending.tool === "mcp.invoke" ? approvalStore.recover(id) : undefined;
+        if (pending.tool === "mcp.invoke" && (!recoveredMcp?.input || !pending.runId)) {
+          approvalStore.revoke(id);
+          if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approved MCP execution input could not be recovered") }).catch(() => undefined);
+          return json(response, 409, { ok: false, error: "approved MCP execution input could not be recovered; refusing dispatch" });
+        }
+        const linkedTask = linkedJob?.payload?.task && typeof linkedJob.payload.task === "object" && !Array.isArray(linkedJob.payload.task)
+          ? linkedJob.payload.task as Record<string, unknown>
+          : undefined;
+        const continuation = pending.tool === "mcp.invoke";
+        const pendingRunId = String(pending.runId ?? "");
+        const taskId = continuation ? pendingRunId : `${pendingRunId}:approval:${randomUUID()}`;
         try {
           const result = await isolatedTaskExecutor({
             approvalId: id,
             approvalRunId: pending.runId,
-            durableExecution: pending.tool === "process.exec",
-            task: { id: `${pending.runId}:approval:${randomUUID()}`, tool: pending.tool, input: pending.input, actor: "approval-executor", reason: "explicit user approval" },
+            trustedRecovery: continuation,
+            durableExecution: pending.tool === "process.exec" || continuation,
+            task: {
+              id: taskId,
+              tool: pending.tool,
+              input: continuation ? recoveredMcp!.input : pending.input,
+              actor: continuation
+                ? (typeof linkedTask?.actor === "string" && linkedTask.actor.trim() ? linkedTask.actor : pending.actor || "approval-executor")
+                : "approval-executor",
+              reason: "explicit user approval"
+            },
           });
           if (linkedJob) await supervisor.settleApproval(linkedJob.id, { result });
           return json(response, 200, result);
@@ -1786,7 +1815,7 @@ export async function createGatewayServer({
     if (improvementStartupTimer) clearTimeout(improvementStartupTimer);
     if (improvementTimer) clearInterval(improvementTimer);
     clearInterval(cronTimer);
-    Promise.allSettled([channelSupervisor.stop(), supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
+    Promise.allSettled([channelSupervisor.stop(), supervisor.shutdown(), isolatedTaskExecutor.shutdown?.(), mcpRuntime?.close()])
       .then(() => {
         let registryError: unknown;
         try { registry.close(); } catch (error) { registryError = error; }
@@ -2037,7 +2066,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
         if (readError?.code !== "ENOENT") throw readError;
       }
       await mkdir(state, { recursive: true });
-      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, runtime: { enableAgentGraphs: false, enableProgressiveSkills: false, enableSkillLifecycle: false }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, runtime: { enableAgentGraphs: false, enableProgressiveSkills: false, enableSkillLifecycle: false, enableMcp: false }, mcp: { servers: {} }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await chmod(path, 0o600);
       return config;
@@ -2110,7 +2139,10 @@ function validateGatewayConfig(config: any) {
     assertOptionalConfigBoolean(config.runtime, "enableAgentGraphs", "config.runtime");
     assertOptionalConfigBoolean(config.runtime, "enableProgressiveSkills", "config.runtime");
     assertOptionalConfigBoolean(config.runtime, "enableSkillLifecycle", "config.runtime");
+    assertOptionalConfigBoolean(config.runtime, "enableMcp", "config.runtime");
   }
+  try { normalizeMcpConfiguration(config.mcp); }
+  catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.mcp is invalid"); }
   if (config.channels !== undefined) {
     assertConfigRecord(config.channels, "config.channels");
     for (const [name, channel] of Object.entries(config.channels) as Array<[string, any]>) {

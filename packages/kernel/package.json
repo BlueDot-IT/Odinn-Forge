@@ -9,6 +9,7 @@
     "./async-telemetry": "./src/async-telemetry.ts",
     "./automation-primitives": "./src/automation-primitives.ts",
     "./mcp-host": "./src/mcp-host.ts",
+    "./mcp-runtime": "./src/mcp-runtime.ts",
     "./provider-capabilities": "./src/provider-capabilities.ts",
     "./session-lanes": "./src/session-lanes.ts",
     "./skill-disclosure": "./src/skill-disclosure.ts"

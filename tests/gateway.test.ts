@@ -926,6 +926,59 @@ test("gateway approval POST restores and executes the exact volatile browser inp
   }
 });
 
+test("gateway submits MCP invocations as durable approval-gated jobs", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-mcp-job-"));
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
+    runtime: { enableMcp: true },
+    mcp: { servers: { fixture: { extensionId: "fixture-mcp", enabled: true } } },
+    policy: { allowedCapabilities: ["mcp.invoke"] }
+  }, null, 2)}\n`, { mode: 0o600 });
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const response = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "gateway-mcp-approval" },
+      body: JSON.stringify({
+        task: {
+          tool: "mcp.invoke",
+          actor: "gateway-test",
+          input: {
+            serverId: "fixture",
+            generation: 1,
+            snapshotFingerprint: "a".repeat(64),
+            extensionFingerprint: "b".repeat(64),
+            toolName: "echo",
+            toolSchemaFingerprint: "c".repeat(64),
+            arguments: { text: "gateway MCP exact input" }
+          }
+        }
+      })
+    });
+    assert.equal(response.status, 202);
+    let job: any;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      job = await (await fetch(`${base}/jobs/gateway-mcp-approval`)).json();
+      if (job.status === "awaiting-approval" || job.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(job.status, "awaiting-approval");
+    const approval = (await getJson(`${base}/approvals`)).find((entry: any) => entry.runId === job.id);
+    assert.ok(approval?.id);
+    assert.doesNotMatch(JSON.stringify(await getJson(`${base}/approvals`)), /gateway MCP exact input/u);
+    const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+    try {
+      assert.equal(ledger.getExecutionAttempt(job.executionAttemptId)?.state, "awaiting-approval");
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
 test("gateway reuses one browser worker across sequential browser tasks", async (t: any) => {
   const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
   try {

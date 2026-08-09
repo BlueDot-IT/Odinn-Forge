@@ -29,6 +29,8 @@ import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.t
 import { readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 import { AGENT_GRAPH_TOOL, executeAgentGraph, type AgentGraphTaskInput } from "./agent-graph-runtime.ts";
 import { ProgressiveSkillDisclosure } from "./skill-disclosure.ts";
+import { createGovernedMcpRuntime, GovernedMcpRuntime } from "./mcp-runtime.ts";
+import { ExtensionExecutor, ExtensionRegistry } from "./extensions.ts";
 export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 import type { SandboxProcessInput } from "./sandbox-process.ts";
 type AnyRecord = Record<string, any>;
@@ -36,7 +38,7 @@ type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
 export { ProcessSupervisor, ProcessRecoveryError, createProcessExecutionDescriptor, digestProcessValue, reconcileProcessRecovery } from "./process-supervisor.ts";
 export type { ProcessExecutionDescriptor, ProcessExecutionSession, ProcessRecoveryAdapter, ProcessRecoveryPhase, ProcessRecoveryRecord, ProcessPresence, ProcessSupervisorOptions } from "./process-supervisor.ts";
-export { ExtensionRegistry, ExtensionExecutor, resolveConfiguredOciBackend } from "./extensions.ts";
+export { ExtensionRegistry, ExtensionExecutor, extensionIdentityFingerprint, resolveConfiguredOciBackend } from "./extensions.ts";
 export { DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, normalizeSandboxConfig, summarizeSandboxRisk, validateSandboxConfig } from "./sandbox-config.ts";
 export type { SandboxConfig, SandboxConfigInput, SandboxRiskSummary } from "./sandbox-config.ts";
 export { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, attestContainerConfiguration, buildNetworkDeniedOciArgs, compileSandboxProfile, detectOciBackend, probeOciBackend, reconcileSandboxRecovery, selectOciBackend, validateDigestPinnedOciImage, validateTrustedOciExecutable } from "./sandbox-backend.ts";
@@ -72,6 +74,8 @@ export { SkillLifecycleError, SkillLifecycleService } from "./skill-lifecycle.ts
 export type { SkillLifecycleContext, SkillLifecycleTransition } from "./skill-lifecycle.ts";
 export { ProgressiveSkillDisclosure, SkillDisclosureError } from "./skill-disclosure.ts";
 export type { HydratedSkill, SkillCatalogEntry, SkillDisclosureLimits } from "./skill-disclosure.ts";
+export { createGovernedMcpRuntime, GovernedMcpRuntime, normalizeMcpConfiguration } from "./mcp-runtime.ts";
+export type { GovernedMcpRuntimeOptions, McpRuntimeContext, McpRuntimeStatus, McpServerConfig } from "./mcp-runtime.ts";
 export { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
@@ -105,7 +109,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch, processExecutor, skillDisclosure }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch, processExecutor, skillDisclosure, mcpRuntime }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -118,6 +122,18 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
   const recordStore = new SqliteRecordStore(recordDatabasePath);
   const modelConfig = normalizeModelConfig(config);
   const mutationTools = createWorkspaceMutationTools({ workspaceRoot: root, stateDir, runLedger: config?.runLedger });
+  const ownedMcpRuntime = mcpRuntime ?? (() => {
+    if (config?.runtime?.enableMcp !== true || !auditStore) return undefined;
+    const extensionRegistry = new ExtensionRegistry(join(stateRoot, "extensions.json"));
+    return createGovernedMcpRuntime({
+      enabled: true,
+      config: config?.mcp,
+      extensionRegistry,
+      extensionExecutor: new ExtensionExecutor(extensionRegistry, { workspaceRoot: root, config: config?.sandbox }),
+      auditStore,
+      runLedger: config?.runLedger
+    });
+  })();
   const registry = new Map([
     ["job.healthcheck", {
       capability: "job.healthcheck",
@@ -763,12 +779,88 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       }
     });
   }
+  if (config?.runtime?.enableMcp === true && ownedMcpRuntime instanceof GovernedMcpRuntime) {
+    registry.set("mcp.discover", {
+      capability: "mcp.discover",
+      description: "Discover a bounded, explicitly configured MCP server through the audited OCI extension boundary. Discovery never grants capabilities.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          serverId: { type: "string", pattern: "^[a-z0-9][a-z0-9._-]{1,63}$" },
+          refresh: { type: "boolean" }
+        },
+        required: ["serverId"],
+        additionalProperties: false
+      },
+      execute: async (input: any, context: any) => ownedMcpRuntime.discover(input, {
+        request: context.request,
+        policy: context.policy,
+        auditStore: context.auditStore,
+        runLedger: context.runLedger,
+        signal: context.signal,
+        capabilityToken: context.request?.input?.capabilityToken,
+        effectiveCapabilities: context.effectiveCapabilities
+      })
+    });
+    registry.set("mcp.invoke", {
+      capability: "mcp.invoke",
+      description: "Invoke one explicitly pinned MCP tool through the audited OCI extension boundary. Calls require approval and are never automatically retried.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          serverId: { type: "string", pattern: "^[a-z0-9][a-z0-9._-]{1,63}$" },
+          generation: { type: "integer", minimum: 1 },
+          snapshotFingerprint: { type: "string", pattern: "^[a-f0-9]{64}$" },
+          extensionFingerprint: { type: "string", pattern: "^[a-f0-9]{64}$" },
+          toolName: { type: "string", minLength: 1, maxLength: 128 },
+          toolSchemaFingerprint: { type: "string", pattern: "^[a-f0-9]{64}$" },
+          arguments: { type: "object" },
+          timeoutMs: { type: "integer", minimum: 1, maximum: 300_000 }
+        },
+        required: ["serverId", "generation", "snapshotFingerprint", "extensionFingerprint", "toolName", "toolSchemaFingerprint", "arguments"],
+        additionalProperties: false
+      },
+      execute: async (input: any, context: any) => {
+        if (context.durableExecution !== true) throw new Error("mcp.invoke direct execution remains refused; MCP calls are available only through the durable /jobs execution surface");
+        const approvalInput = mcpApprovalBinding(input);
+        if (!context.trustedApprovalId) {
+          const approvalId = approvalStore.create({
+            type: "approval.required",
+            tool: "mcp.invoke",
+            runId: context.request?.id,
+            actor: context.request?.actor,
+            summary: "Invoke one approved MCP tool on a configured server",
+            input: approvalInput,
+            executionInput: { ...input }
+          });
+          return { type: "approval.required", approvalId, tool: "mcp.invoke", summary: "Invoke one approved MCP tool on a configured server", expiresInSeconds: 300 };
+        }
+        const approved = approvalStore.consume(context.trustedApprovalId, {
+          tool: "mcp.invoke",
+          runId: context.trustedApprovalRunId ?? context.request?.id,
+          actor: context.request?.actor,
+          input
+        });
+        if (!approved) throw new Error("MCP invocation approval is missing, expired, already used, or does not match this pinned request");
+        return ownedMcpRuntime.invoke(approved.input ?? input, {
+          request: context.request,
+          admission: context.admission,
+          policy: context.policy,
+          auditStore: context.auditStore,
+          runLedger: context.runLedger,
+          signal: context.signal,
+          effectiveCapabilities: context.effectiveCapabilities
+        });
+      }
+    });
+  }
   let closed = false;
   Object.defineProperty(registry, "close", {
     enumerable: false,
     value: () => {
       if (closed) return;
       closed = true;
+      void ownedMcpRuntime?.close();
       recordStore.close();
     }
   });
@@ -1215,7 +1307,21 @@ function sanitizeExecutionRequest(task: any) {
 }
 
 function taskRequestDigest(request: any): string {
-  return createHash("sha256").update(stableTaskValue({ tool: request.tool, input: request.input ?? {}, actor: request.actor ?? "unknown" })).digest("hex");
+  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke"
+    ? projectDurableToolInput(request.tool, request.input ?? {})
+    : request.input ?? {};
+  return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown" })).digest("hex");
+}
+
+function mcpApprovalBinding(input: any): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const key of ["serverId", "generation", "snapshotFingerprint", "extensionFingerprint", "toolName", "toolSchemaFingerprint", "timeoutMs"] as const) {
+    if (input?.[key] !== undefined) result[key] = input[key];
+  }
+  const encoded = stableTaskValue(input?.arguments ?? {});
+  result.argumentsDigest = createHash("sha256").update(encoded, "utf8").digest("hex");
+  result.argumentsBytes = Buffer.byteLength(encoded, "utf8");
+  return result;
 }
 
 function executionResourceForRequest(toolName: string, input: AnyRecord = {}) {
@@ -1257,6 +1363,7 @@ function executionResourceForRequest(toolName: string, input: AnyRecord = {}) {
       ["maxRunMs", input.maxRunMs]
     ]);
   }
+  if (toolName === "mcp.discover" || toolName === "mcp.invoke") return mcpApprovalBinding(input);
   return input.resource && typeof input.resource === "object" && !Array.isArray(input.resource) ? input.resource : {};
 }
 
@@ -1284,6 +1391,7 @@ function executionInputLimit(policy: any): number {
 
 function executionSandboxProfile(toolName: string, safety: ReturnType<typeof toolSafetyDescriptor>): string {
   if (toolName === AGENT_GRAPH_TOOL) return "agent.graph.readonly.v1";
+  if (toolName.startsWith("mcp.")) return "mcp.oci.network-denied.v1";
   if (safety.effects.includes("process")) return "sandbox.process.v1";
   if (safety.effects.includes("external-state")) return "network-allowlisted";
   if (safety.effects.includes("filesystem-write")) return "workspace-write";
@@ -1337,7 +1445,7 @@ export class ExecutionAdmissionService {
       runId: request.id,
       ...(parentRunId ? { parentRunId } : {}),
       principalId: executionReference("principal", request.actor),
-      execution: { kind: request.tool === AGENT_GRAPH_TOOL ? "agent" : "tool", id: request.tool },
+      execution: { kind: request.tool === AGENT_GRAPH_TOOL ? "agent" : request.tool.startsWith("mcp.") ? "mcp-tool" : "tool", id: request.tool },
       inputDigest,
       inputReference: `artifact:sha256:${ledgerStep.inputArtifact.digest}`,
       capabilityDecisionReferences: [decisionReference],
@@ -1393,12 +1501,12 @@ export class ExecutionAdmissionService {
       runLedger.transitionExecutionAttempt({ attemptId: persisted.attempt.id, from: "queued", to: "failed", errorCode: "AUDIT_CORRELATION_FAILED" });
       throw error;
     }
-    return { ...persisted, attemptId: persisted.attempt.id, state: "queued" };
+    return { ...persisted, attemptId: persisted.attempt.id, state: persisted.attempt.state };
   }
 
   start(admission: any) {
     if (!admission || !this.options.runLedger) return;
-    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: "queued", to: "running" });
+    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: admission.state ?? "queued", to: "running" });
     admission.state = "running";
   }
 
@@ -1599,7 +1707,8 @@ async function executeTaskThroughAdmission({
         workspaceRoot: runLedger.workspaceRoot
       });
     }
-    if (runLedger?.featureFlags?.capabilities === true && safety.requiresCapability) {
+    const mcpApprovalPending = request.tool === "mcp.invoke" && !trustedApprovalId;
+    if (runLedger?.featureFlags?.capabilities === true && safety.requiresCapability && !mcpApprovalPending) {
       const token = request.input?.capabilityToken;
       if (typeof token !== "string" || !token) {
         const error = new Error(`capability token required for ${request.tool}`) as NodeError;
@@ -1645,6 +1754,7 @@ async function executeTaskThroughAdmission({
     admissionService.start(admission);
     const output = await tool.execute(request.input, {
       request,
+      admission,
       policy,
       registry,
       modelRegistry,
@@ -1707,6 +1817,12 @@ async function executeTaskThroughAdmission({
         });
       }
     });
+    if (request.tool.startsWith("mcp.") && output?.status === "needs-review") {
+      backendReturned = true;
+      const uncertain = new Error("MCP execution outcome requires operator review") as NodeError;
+      uncertain.code = "MCP_OUTCOME_NEEDS_REVIEW";
+      throw uncertain;
+    }
     backendReturned = true;
     const graphTerminalStatus = request.tool === AGENT_GRAPH_TOOL
       && output && typeof output === "object" && ["completed", "failed", "cancelled", "needs-review"].includes(String(output.status))

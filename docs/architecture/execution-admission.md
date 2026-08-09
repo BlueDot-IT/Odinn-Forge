@@ -27,7 +27,8 @@
 | Agent tool call | `agent.run` -> `runTool` -> `runTask` | Parent task context and policy | Active with parent-run correlation and parent-child capability intersection. |
 | Browser work | Persistent isolated browser worker | Browser policy plus recovery JSON | Active before browser tool execution; browser recovery remains authoritative for browser uncertainty. |
 | Extension execution | Container extension executor | Extension registry and policy | Reuse as an execution backend behind admission. |
-| Agent graphs | Kernel graph dispatcher | Explicit `config.runtime.enableAgentGraphs` plus durable `/jobs` | Stage 7 activates one read-only node through admission, isolated workers, runtime SQLite graph/node state, and signed audit correlation. Skills now have a separate explicit disclosure/lifecycle boundary; MCP and automation foundations remain default-inert. |
+| MCP discovery/invocation | Fixed `mcp.discover` / `mcp.invoke` wrappers -> governed MCP runtime | Explicit `config.runtime.enableMcp`, trusted OCI manifest, snapshot pins, approval, and capability decision | Active only in the bounded Stage 9 subset; uses `execution.kind: "mcp-tool"`, sealed approval continuation, and `needs-review` for uncertain physical outcomes. |
+| Agent graphs | Kernel graph dispatcher | Explicit `config.runtime.enableAgentGraphs` plus durable `/jobs` | Stage 7 activates one read-only node through admission, isolated workers, runtime SQLite graph/node state, and signed audit correlation. Skills now have a separate explicit disclosure/lifecycle boundary; MCP activation is separately gated and remains default-inert. |
 
 ## Skill disclosure and lifecycle boundary
 
