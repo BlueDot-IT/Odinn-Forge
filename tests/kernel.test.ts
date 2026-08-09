@@ -470,15 +470,15 @@ test("process.exec cannot spawn after cancellation during asynchronous cwd admis
   await assert.rejects(readFile(marker), (error: any) => error.code === "ENOENT");
 });
 
-test("self-improvement defaults to automatic observation without a review gate", async () => {
+test("self-improvement defaults to proposal mode without autonomous mutation", async () => {
   const { root, auditStore } = await fixture();
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn"), auditStore });
   await auditStore.append({ runId: "failed-a", type: "task.failed", actor: "test", tool: "web.fetch", message: "DNS validation failed" });
   await auditStore.append({ runId: "failed-b", type: "task.failed", actor: "test", tool: "web.fetch", message: "DNS validation failed" });
   const result = await runTask({ task: { id: "learn-1", tool: "improve.learn", input: {}, actor: "test" }, auditStore, registry });
   assert.equal(result.output.applied.length, 0);
-  assert.equal(result.output.mode, "auto");
-  assert.equal(result.output.requiresHumanDecision, false);
+  assert.equal(result.output.mode, "propose");
+  assert.equal(result.output.requiresHumanDecision, true);
   assert.equal(result.output.generated.length, 1);
 });
 
@@ -572,6 +572,14 @@ test("self-improvement autonomously applies and rolls back allowlisted runtime t
   assert.equal(JSON.parse(await readFile(join(stateDir, "config.json"), "utf8")).runtime.modelRetries, 2);
 
   const improvementId = learned.output.applied[0].improvementId;
+  const appliedConfig = JSON.parse(await readFile(join(stateDir, "config.json"), "utf8"));
+  const changedByOperator = { ...appliedConfig, operatorNote: "do not overwrite" };
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify(changedByOperator, null, 2)}\n`);
+  await assert.rejects(
+    runTask({ task: { id: "learn-rollback-conflict", tool: "improve.rollback", input: { improvementId }, actor: "test" }, auditStore, registry }),
+    /configuration changed after the improvement was applied; refusing to overwrite newer operator changes/u
+  );
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify(appliedConfig, null, 2)}\n`);
   const rolledBack = await runTask({ task: { id: "learn-rollback", tool: "improve.rollback", input: { improvementId }, actor: "test" }, auditStore, registry });
   assert.equal(rolledBack.output.type, "improvement.rolled-back");
   assert.equal(JSON.parse(await readFile(join(stateDir, "config.json"), "utf8")).runtime.modelRetries, 1);

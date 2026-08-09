@@ -1,4 +1,4 @@
-import type { JsonObject } from "@odinn/protocol";
+import { redactDurableValue, type JsonObject } from "@odinn/protocol";
 
 export const OPERATOR_CONTRACT_VERSION = 1 as const;
 export const OPERATOR_MAX_PAGE_SIZE = 50;
@@ -9,6 +9,7 @@ export type OperatorHealth = "healthy" | "attention" | "degraded";
 export type OperatorActionName =
   | "cancel-job"
   | "approve"
+  | "deny-approval"
   | "cancel-workflow"
   | "resume-workflow"
   | "verify-audit";
@@ -81,6 +82,7 @@ export type OperatorSnapshot = {
 export type OperatorSectionInput = {
   status?: OperatorHealth;
   counts?: Record<string, number>;
+  attentionCount?: number;
   items?: OperatorSectionItemInput[];
 };
 
@@ -93,19 +95,21 @@ export type OperatorSnapshotInput = {
   sections?: Partial<Record<keyof OperatorSnapshot["sections"], OperatorSectionInput>>;
   page?: number;
   pageSize?: number;
+  pages?: Partial<Record<keyof OperatorSnapshot["sections"], number>>;
   actions?: OperatorActionDescriptor[];
 };
 
 const ACTIONS: OperatorActionDescriptor[] = [
   { action: "cancel-job", label: "Cancel job", mutation: true, requiresTarget: true, confirmation: true },
   { action: "approve", label: "Approve once", mutation: true, requiresTarget: true, confirmation: true },
+  { action: "deny-approval", label: "Deny approval", mutation: true, requiresTarget: true, confirmation: true },
   { action: "cancel-workflow", label: "Cancel workflow", mutation: true, requiresTarget: true, confirmation: true },
   { action: "resume-workflow", label: "Resume workflow", mutation: true, requiresTarget: true, confirmation: true },
   { action: "verify-audit", label: "Verify audit", mutation: false, requiresTarget: false, confirmation: false }
 ];
 
-const SENSITIVE_KEY = /(?:api.?key|access.?token|refresh.?token|client.?secret|password|authorization|cookie|header|credential|private.?key|prompt|content|result)/iu;
-const SENSITIVE_VALUE = /(?:bearer\s+|basic\s+|https?:\/\/[^\s/@:]+:[^\s/@]+@|(?:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|authorization)\s*[=:]\s*)/iu;
+const SENSITIVE_KEY = /(?:api.?key|access.?token|refresh.?token|client.?secret|password|authorization|cookie|header|credential|private.?key|prompt|content|result|secret|token)/iu;
+const SENSITIVE_VALUE = /(?:bearer\s+|basic\s+|https?:\/\/[^\s/@:]+:[^\s/@]+@|(?:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|authorization|secret|token)\s*[=:]\s*)/iu;
 
 function safeText(value: unknown, fallback = ""): string {
   const text = String(value ?? fallback).replace(/\s+/gu, " ").trim();
@@ -117,11 +121,12 @@ function safeText(value: unknown, fallback = ""): string {
 export function redactOperatorValue(value: unknown, depth = 0): unknown {
   if (depth > 4) return "[bounded]";
   if (value === null || typeof value === "boolean" || typeof value === "number") return value;
-  if (typeof value === "string") return safeText(value, "[redacted]");
-  if (Array.isArray(value)) return value.slice(0, 50).map((entry) => redactOperatorValue(entry, depth + 1));
-  if (!value || typeof value !== "object") return undefined;
+  const durable = redactDurableValue(value);
+  if (typeof durable === "string") return safeText(durable, "[redacted]");
+  if (Array.isArray(durable)) return durable.slice(0, 50).map((entry) => redactOperatorValue(entry, depth + 1));
+  if (!durable || typeof durable !== "object") return undefined;
   const output: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>).slice(0, 50)) {
+  for (const [key, entry] of Object.entries(durable as Record<string, unknown>).slice(0, 50)) {
     if (SENSITIVE_KEY.test(key)) {
       output[key] = "[redacted]";
       continue;
@@ -158,7 +163,7 @@ export function paginateOperatorItems<T>(items: readonly T[], page: unknown = 1,
 
 function sectionStatus(input: OperatorSectionInput): OperatorHealth {
   if (input.status) return input.status;
-  return (input.items ?? []).some((item) => item.attention === true || ["failed", "needs-review", "blocked", "degraded"].includes(item.status))
+  return (Number(input.attentionCount || 0) > 0 || (input.items ?? []).some((item) => item.attention === true || ["failed", "needs-review", "blocked", "degraded"].includes(item.status)))
     ? "attention"
     : "healthy";
 }
@@ -188,7 +193,10 @@ function buildSection(input: OperatorSectionInput = {}, page = 1, pageSize = OPE
   const allItems = (input.items ?? []).slice(0, 500).map(normalizeItem);
   const { items, pagination } = paginateOperatorItems(allItems, page, pageSize);
   const counts = Object.fromEntries(Object.entries(input.counts ?? {}).map(([key, value]) => [safeText(key, "other"), Math.max(0, Number(value) || 0)]));
-  if (!counts.total) counts.total = allItems.length;
+  if (counts.total === undefined) counts.total = allItems.length;
+  if (counts.attention === undefined) counts.attention = input.attentionCount === undefined
+    ? allItems.filter((item) => item.attention === true || ["failed", "needs-review", "blocked", "degraded"].includes(item.status)).length
+    : Math.max(0, Number(input.attentionCount) || 0);
   return { status: sectionStatus({ ...input, items: allItems }), counts, items, pagination };
 }
 
@@ -199,18 +207,19 @@ export function defaultOperatorActions(): OperatorActionDescriptor[] {
 export function buildOperatorSnapshot(input: OperatorSnapshotInput): OperatorSnapshot {
   const page = input.page ?? 1;
   const pageSize = input.pageSize ?? OPERATOR_DEFAULT_PAGE_SIZE;
+  const pageFor = (section: keyof OperatorSnapshot["sections"]) => input.pages?.[section] ?? page;
   const sections = input.sections ?? {};
   const normalizedSections = {
-    runtime: buildSection(sections.runtime, page, pageSize),
-    work: buildSection(sections.work, page, pageSize),
-    approvals: buildSection(sections.approvals, page, pageSize),
-    automation: buildSection(sections.automation, page, pageSize),
-    context: buildSection(sections.context, page, pageSize),
-    recovery: buildSection(sections.recovery, page, pageSize),
-    audit: buildSection(sections.audit, page, pageSize),
-    surfaces: buildSection(sections.surfaces, page, pageSize)
+    runtime: buildSection(sections.runtime, pageFor("runtime"), pageSize),
+    work: buildSection(sections.work, pageFor("work"), pageSize),
+    approvals: buildSection(sections.approvals, pageFor("approvals"), pageSize),
+    automation: buildSection(sections.automation, pageFor("automation"), pageSize),
+    context: buildSection(sections.context, pageFor("context"), pageSize),
+    recovery: buildSection(sections.recovery, pageFor("recovery"), pageSize),
+    audit: buildSection(sections.audit, pageFor("audit"), pageSize),
+    surfaces: buildSection(sections.surfaces, pageFor("surfaces"), pageSize)
   } satisfies OperatorSnapshot["sections"];
-  const attention = Object.values(normalizedSections).reduce((sum, section) => sum + section.items.filter((item) => item.attention === true || section.status !== "healthy").length, 0);
+  const attention = Object.values(normalizedSections).reduce((sum, section) => sum + Number(section.counts.attention || 0), 0);
   const status: OperatorHealth = input.health?.status ?? (attention ? "attention" : "healthy");
   return {
     schemaVersion: OPERATOR_CONTRACT_VERSION,

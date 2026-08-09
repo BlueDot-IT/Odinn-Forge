@@ -186,6 +186,11 @@ export class SqliteWorkflowStore {
       .map((row) => this.get(String(row.run_id))!).filter(Boolean);
   }
 
+  counts(): { total: number; attention: number } {
+    const row = this.database.db.prepare("SELECT count(*) AS total, sum(CASE WHEN status IN ('failed','needs-review','awaiting-approval') THEN 1 ELSE 0 END) AS attention FROM workflow_runs").get() as Row;
+    return { total: Number(row.total || 0), attention: Number(row.attention || 0) };
+  }
+
   claimNext(runId?: string): ClaimedWorkflowStep | undefined {
     const timestamp = now();
     return this.database.transaction((db) => {

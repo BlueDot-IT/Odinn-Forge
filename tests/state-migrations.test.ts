@@ -29,7 +29,7 @@ test("latest pre-v1 state plans, backs up, migrates atomically, and preserves st
       recovery: await readFile(join(state, "browser-recovery.json"), "utf8")
     };
     const dryRun = await planStateMigration(state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(dryRun.steps.map((step) => step.id), ["host-metadata-v0-to-v1"]);
+    assert.deepEqual(dryRun.steps.map((step) => step.id), ["records-v0-to-v1", "audit-v0-to-v1", "host-metadata-v0-to-v1"]);
     assert.equal(dryRun.rollbackCompatible, true);
     assert.ok(dryRun.backupLocation);
     await assert.rejects(() => readFile(join(state, "state-schema.json"), "utf8"), { code: "ENOENT" });
@@ -44,6 +44,8 @@ test("latest pre-v1 state plans, backs up, migrates atomically, and preserves st
     assert.equal(await readFile(join(state, "approvals.json"), "utf8"), before.approvals);
     assert.equal(await readFile(join(state, "browser-recovery.json"), "utf8"), before.recovery);
     assert.equal(await readFile(join(report.backupLocation!, "records.jsonl"), "utf8"), before.records);
+    assert.ok((await stat(join(state, "db", "records.sqlite"))).isFile());
+    assert.ok((await stat(join(state, "db", "audit.sqlite"))).isFile());
     if (process.platform !== "win32") {
       assert.equal((await stat(report.backupLocation!)).mode & 0o777, 0o700);
       assert.equal((await stat(join(report.backupLocation!, "config.json"))).mode & 0o777, 0o600);
@@ -412,7 +414,7 @@ test("CLI migration dry-run reports the plan without modifying state", async () 
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const plan = JSON.parse(result.stdout);
     assert.equal(plan.dryRun, true);
-    assert.deepEqual(plan.steps.map((step: any) => step.id), ["host-metadata-v0-to-v1"]);
+    assert.deepEqual(plan.steps.map((step: any) => step.id), ["records-v0-to-v1", "audit-v0-to-v1", "host-metadata-v0-to-v1"]);
     assert.equal(await readFile(join(state, "records.jsonl"), "utf8"), before);
     await assert.rejects(() => readFile(join(state, "state-schema.json"), "utf8"), { code: "ENOENT" });
   } finally {

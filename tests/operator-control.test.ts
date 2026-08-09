@@ -34,9 +34,29 @@ test("operator pagination clamps oversized pages and preserves deterministic ord
 });
 
 test("operator redaction removes authority-shaped fields and bounds arrays", () => {
-  const value: any = redactOperatorValue({ authorization: "token", nested: { prompt: "private", safe: "ok" }, values: Array.from({ length: 100 }, (_, index) => index) });
+  const value: any = redactOperatorValue({ authorization: "token", token: "abc123", secret: "shh", nested: { prompt: "private", safe: "ok", values: [{ token: "nested" }] }, values: Array.from({ length: 100 }, (_, index) => index) });
   assert.equal(value.authorization, "[redacted]");
+  assert.equal(value.token, "[redacted]");
+  assert.equal(value.secret, "[redacted]");
   assert.equal(value.nested.prompt, "[redacted]");
   assert.equal(value.nested.safe, "ok");
+  assert.equal(value.nested.values[0].token, "[redacted]");
   assert.equal(value.values.length, 50);
+});
+
+test("operator attention totals do not change with page selection and include automation", () => {
+  const input = {
+    surface: "http" as const,
+    identity: { state: "/state", workspaceRoot: "/workspace" },
+    pageSize: 1,
+    sections: {
+      work: { items: [{ id: "healthy", kind: "job", label: "job", status: "completed" }, { id: "failed", kind: "job", label: "job", status: "failed", attention: true }] },
+      automation: { items: [{ id: "workflow", kind: "workflow", label: "workflow", status: "failed", attention: true }] }
+    }
+  };
+  const first = buildOperatorSnapshot({ ...input, page: 1 });
+  const second = buildOperatorSnapshot({ ...input, page: 2 });
+  assert.equal(first.health.attention, 2);
+  assert.equal(second.health.attention, 2);
+  assert.equal(first.sections.automation.counts.attention, 1);
 });

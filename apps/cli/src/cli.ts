@@ -75,7 +75,7 @@ const EXPERIMENTAL_HOME = [
     id: "self-improvement",
     label: "Self-improvement",
     configKey: "selfImprovement",
-    description: "Watch for repeated reliability problems, ask the configured model for guidance, and apply only bounded changes with a restore point.",
+    description: "Watch for repeated reliability problems, ask the configured model for guidance, and propose bounded changes for review.",
     safeActions: [
       "odinn experimental self-improvement list [--state .odinn]",
       "odinn experimental self-improvement propose --title <title> --rationale <text> [--state .odinn]"
@@ -1327,6 +1327,16 @@ async function readJsonIfPresent(path: string, fallback: any) {
   catch (error: any) { if (error?.code === "ENOENT") return fallback; throw error; }
 }
 
+async function readBoundedJsonIfPresent(path: string, fallback: any, maxBytes = 4 * 1024 * 1024) {
+  try {
+    if ((await statPath(path)).size > maxBytes) return { ...fallback, invalid: true };
+    return JSON.parse(await readFile(path, "utf8"));
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return fallback;
+    throw error;
+  }
+}
+
 async function readRuntimeJobs(state: string) {
   const databasePath = join(state, "db", "odinn.sqlite");
   if (existsSync(databasePath)) {
@@ -1533,7 +1543,7 @@ function experimentalFeatureStatus(entry: any, config: any) {
     inspectionActions: [...entry.safeActions],
     enabledActions: [...entry.activeActions],
     guard: selfManaged
-      ? "runs automatically by default; application stays limited to reversible, allowlisted reliability settings"
+      ? "proposes changes by default; autonomous application remains an explicit opt-in for reversible, allowlisted reliability settings"
       : entry.id === "capabilities"
         ? `token issuance and consumption reject requests until ${entry.configKey}=true; list and revoke remain available for inspection and emergency cleanup`
         : `active runtime actions reject requests until ${entry.configKey}=true`
@@ -1559,7 +1569,7 @@ async function experimentalStatus(args: any, requestedFeature: any = undefined, 
     disabledByDefault: false,
     pluginModulesDisabledByDefault: true,
     experimentalFeaturesDisabledByDefault: true,
-    automaticSelfImprovementDefault: true,
+    automaticSelfImprovementDefault: false,
     features: visible
   };
 }
@@ -1585,8 +1595,8 @@ Status:
   }
   console.log(`Ódinn branded plugin modules and experimental systems
 
-The three optional runtime plugin flags are off by default. Automatic improvement runs by default
-and remains limited to reversible, allowlisted reliability adjustments.
+The three optional runtime plugin flags are off by default. Automatic improvement proposals are available by default;
+autonomous application remains an explicit opt-in and is limited to reversible, allowlisted reliability adjustments.
 
 Commands:
   odinn experimental list [--state .odinn]
@@ -2648,42 +2658,103 @@ async function readOperatorRuntimeJobs(state: string): Promise<any[]> {
   return Object.entries(legacy?.jobs ?? {}).map(([id, value]: any) => ({ id, ...value }));
 }
 
+async function readOperatorAutomation(state: string): Promise<{ items: any[]; counts: Record<string, number>; attentionCount: number }> {
+  const items: any[] = [];
+  const cronState = await readBoundedJsonIfPresent(join(state, "cron-jobs.json"), { jobs: [] });
+  const cronJobs = Array.isArray(cronState?.jobs) ? cronState.jobs.slice(0, 500) : [];
+  for (const job of cronJobs) {
+    const status = job?.lastStatus === "error" ? "needs-review" : job?.enabled === false ? "disabled" : "enabled";
+    items.push({
+      id: String(job?.id || "schedule"),
+      kind: "schedule",
+      label: String(job?.name || job?.id || "schedule"),
+      status,
+      summary: job?.lastStatus ? `Last run: ${String(job.lastStatus)}` : "Scheduled automation",
+      updatedAt: job?.updatedAt,
+      attention: status === "needs-review",
+      details: { nextRunAt: job?.nextRunAt ?? null }
+    });
+  }
+  const databasePath = join(state, "db", "odinn.sqlite");
+  let workflowTotal = 0;
+  let workflowAttention = 0;
+  let watchTotal = 0;
+  if (existsSync(databasePath)) {
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const hasTable = (name: string) => Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+      if (hasTable("workflow_runs")) {
+        const totals = database.prepare("SELECT count(*) AS total, sum(CASE WHEN status IN ('failed','needs-review','awaiting-approval') THEN 1 ELSE 0 END) AS attention FROM workflow_runs").get() as any;
+        workflowTotal = Number(totals?.total || 0);
+        workflowAttention = Number(totals?.attention || 0);
+        const runs = database.prepare("SELECT run_id,status,updated_at FROM workflow_runs ORDER BY updated_at DESC,run_id LIMIT 200").all() as any[];
+        for (const run of runs) {
+          const status = String(run.status || "unknown");
+          items.push({ id: String(run.run_id), kind: "workflow", label: "Workflow", status, summary: "Durable workflow automation", updatedAt: run.updated_at, attention: ["failed", "needs-review", "awaiting-approval"].includes(status), controls: ["cancel-workflow", ...(status === "needs-review" ? ["resume-workflow"] : [])] });
+        }
+      }
+      if (hasTable("event_watches")) {
+        watchTotal = Number((database.prepare("SELECT count(*) AS total FROM event_watches").get() as any)?.total || 0);
+        const watches = database.prepare("SELECT watch_id,enabled,updated_at FROM event_watches ORDER BY watch_id LIMIT 500").all() as any[];
+        for (const watch of watches) items.push({ id: String(watch.watch_id), kind: "event-watch", label: "Event watch", status: Number(watch.enabled) === 1 ? "enabled" : "disabled", summary: "Durable event ingress declaration", updatedAt: watch.updated_at });
+      }
+    } finally {
+      database.close();
+    }
+  }
+  return {
+    items,
+    counts: { workflows: workflowTotal, watches: watchTotal, schedules: cronJobs.length },
+    attentionCount: workflowAttention + items.filter((item) => item.kind === "schedule" && item.attention === true).length
+  };
+}
+
 async function localOperatorSnapshot(args: any[], surface: any = "cli") {
   const state = stateDir(args);
   const config = await readConfig(state);
   const current = await status(args);
   const auditStore = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
   try {
-    const [runs, events, jobs, verification] = await Promise.all([
-      auditStore.readRuns(), auditStore.readAll(), readOperatorRuntimeJobs(state),
-      auditStore.verifyIntegrity({ allowUnsigned: true }).catch(() => ({ valid: false, events: 0, unsigned: 0, failures: [{ reason: "audit verification unavailable" }] }))
+    const [runs, auditSummary, jobs, automation, verification] = await Promise.all([
+      typeof auditStore.readRunPage === "function" ? auditStore.readRunPage({ limit: 200 }) : Promise.resolve([]),
+      typeof auditStore.readSummary === "function" ? auditStore.readSummary() : Promise.resolve({ events: 0, runs: 0, attentionRuns: 0 }),
+      readOperatorRuntimeJobs(state),
+      readOperatorAutomation(state),
+      typeof auditStore.getIntegrityStatus === "function" ? Promise.resolve(auditStore.getIntegrityStatus()) : Promise.resolve({ valid: true, checked: false, events: 0, unsigned: 0, failures: [] })
     ]);
     const approvals = createApprovalStore({ path: join(state, "approvals.json") }).list();
     const query = String(option(args, "--query", option(args, "--q", ""))).trim().toLowerCase();
     const statusFilter = String(option(args, "--status", "")).trim();
     const matches = (item: any) => (!query || [item.id, item.label, item.status, item.summary, item.kind].some((value) => String(value ?? "").toLowerCase().includes(query))) && (!statusFilter || statusFilter === "all" || item.status === statusFilter);
-    const jobsItems = jobs.map((job: any) => {
+    const allJobsItems = jobs.map((job: any) => {
       const status = String(job.status || "unknown");
       return { id: String(job.id), kind: "job", label: String(job.tool || job.payload?.task?.tool || "job"), status, summary: ["failed", "needs-review"].includes(status) ? "Execution needs operator attention." : `${Number(job.attempts || 0)} attempt(s)`, updatedAt: job.updated_at || job.updatedAt || job.completed_at || job.created_at, attention: ["failed", "needs-review"].includes(status), controls: (["queued", "running", "cancelling", "awaiting-approval"].includes(status) ? ["cancel-job"] : []) as any, details: { attempts: Number(job.attempts || 0), retrySafe: Number(job.retry_safe) === 1 || job.retrySafe === true, ...(job.execution_run_id ? { executionRunId: job.execution_run_id } : {}) } };
-    }).filter(matches);
-    const runItems = runs.slice(0, 200).map((run: any) => { const status = String(run.status || "unknown"); return { id: String(run.id), kind: "run", label: String(run.tool || "run"), status, summary: String(run.message || "Audited run"), updatedAt: run.lastEventAt || run.completedAt || run.startedAt, attention: ["failed", "blocked", "needs-review"].includes(status), details: { eventCount: Number(run.eventCount || 0), actor: String(run.actor || "local") } }; }).filter(matches);
-    const approvalItems = approvals.map((approval: any) => ({ id: String(approval.id), kind: "approval", label: String(approval.tool || approval.type || "approval"), status: String(approval.status || "pending"), summary: "Waiting for an explicit operator decision.", updatedAt: approval.createdAt, attention: true, controls: ["approve"] as any, details: { ...(approval.runId ? { runId: approval.runId } : {}), ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {}) } })).filter(matches);
-    const readFileOr = async (name: string, fallback: any) => readJsonIfPresent(join(state, name), fallback).catch(() => ({ ...fallback, invalid: true }));
+    });
+    const jobsItems = allJobsItems.filter(matches);
+    const allRunItems = runs.map((run: any) => { const status = String(run.status || "unknown"); return { id: String(run.id), kind: "run", label: String(run.tool || "run"), status, summary: String(run.message || "Audited run"), updatedAt: run.lastEventAt || run.completedAt || run.startedAt, attention: ["failed", "blocked", "needs-review"].includes(status), details: { eventCount: Number(run.eventCount || 0), actor: String(run.actor || "local") } }; });
+    const runItems = allRunItems.filter(matches);
+    const allApprovalItems = approvals.map((approval: any) => ({ id: String(approval.id), kind: "approval", label: String(approval.tool || approval.type || "approval"), status: String(approval.status || "pending"), summary: String(approval.effect?.summary || "Review the bounded effect details before deciding."), updatedAt: approval.createdAt, attention: true, controls: ["approve", "deny-approval"] as any, details: { ...(approval.runId ? { runId: approval.runId } : {}), ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {}), ...(approval.effect ? { effect: approval.effect } : {}) } }));
+    const approvalItems = allApprovalItems.filter(matches);
+    const readFileOr = async (name: string, fallback: any) => readBoundedJsonIfPresent(join(state, name), fallback).catch(() => ({ ...fallback, invalid: true }));
     const recovery = await Promise.all([readFileOr("browser-recovery.json", { status: "clear" }), readFileOr("sandbox-recovery.json", { pending: [] }), readFileOr("process-recovery.json", { pending: [] })]);
-    const recoveryItems = [
+    const allRecoveryItems = [
       { id: "browser-recovery", kind: "recovery", label: "Browser recovery", status: String(recovery[0].status || "clear"), summary: "Browser action recovery state", attention: ["executing", "unknown"].includes(String(recovery[0].status)), details: { pending: ["executing", "unknown"].includes(String(recovery[0].status)) } },
       { id: "sandbox-recovery", kind: "recovery", label: "Sandbox recovery", status: Array.isArray(recovery[1].pending) && recovery[1].pending.length ? "needs-review" : "clear", summary: "Sandbox recovery state", attention: Array.isArray(recovery[1].pending) && recovery[1].pending.length > 0, details: { pending: Array.isArray(recovery[1].pending) ? recovery[1].pending.length : null } },
       { id: "process-recovery", kind: "recovery", label: "Process recovery", status: recovery[2].invalid === true || (Array.isArray(recovery[2].pending) && recovery[2].pending.length) ? "needs-review" : "clear", summary: "Durable process recovery state", attention: recovery[2].invalid === true || (Array.isArray(recovery[2].pending) && recovery[2].pending.length > 0), details: { pending: Array.isArray(recovery[2].pending) ? recovery[2].pending.length : null } }
-    ].filter(matches);
+    ];
+    const recoveryItems = allRecoveryItems.filter(matches);
     const auditAttention = verification.valid === false;
-    const auditItem = { id: "audit-journal", kind: "audit", label: "Audit journal", status: auditAttention ? "needs-review" : "verified", summary: auditAttention ? "Audit integrity needs attention." : "Hash-chain verification passed.", attention: auditAttention, details: { events: events.length, runs: new Set(events.map((event: any) => event.runId).filter(Boolean)).size, unsigned: Number(verification.unsigned || 0), failures: Array.isArray(verification.failures) ? verification.failures.length : 0 } };
+    const auditItem = { id: "audit-journal", kind: "audit", label: "Audit journal", status: auditAttention ? "needs-review" : verification.checked === false ? "unknown" : "verified", summary: auditAttention ? "Audit integrity needs attention." : verification.checked === false ? "Audit integrity has not been explicitly verified in this process." : "Hash-chain verification passed.", attention: auditAttention, details: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0), unsigned: Number(verification.unsigned || 0), failures: Array.isArray(verification.failures) ? verification.failures.length : 0, checked: verification.checked === true } };
     const runtime = config.runtime ?? {};
     const runtimeItems = [{ id: "gateway", kind: "runtime", label: "Gateway", status: "available", summary: "Authenticated local control plane" }, { id: "mcp", kind: "runtime", label: "MCP", status: runtime.enableMcp === true ? "enabled" : "disabled", summary: "Governed MCP activation" }, { id: "workflows", kind: "runtime", label: "Durable workflows", status: runtime.enableDurableWorkflows === true ? "enabled" : "disabled", summary: "Durable workflow runtime" }, { id: "event-ingress", kind: "runtime", label: "Event ingress", status: runtime.enableEventIngress === true ? "enabled" : "disabled", summary: "Authenticated event and heartbeat ingress" }, { id: "project-context", kind: "runtime", label: "Project context", status: runtime.enableProjectContext === true ? "enabled" : "disabled", summary: "Bounded context retrieval" }].filter(matches);
     const surfaces = ["CLI", "TUI", "HTTP JSON", "Web console"].map((label) => ({ id: label.toLowerCase().replace(/\s+/gu, "-"), kind: "surface", label, status: "available", summary: "Uses the shared operator contract" })).filter(matches);
-    const attention = jobsItems.filter((item: any) => item.attention).length + runItems.filter((item: any) => item.attention).length + approvalItems.length + recoveryItems.filter((item: any) => item.attention).length + (auditAttention ? 1 : 0);
+    const workAttention = allJobsItems.filter((item: any) => item.attention).length + Number(auditSummary.attentionRuns ?? allRunItems.filter((item: any) => item.attention).length);
+    const automationItems = automation.items.filter(matches);
+    const recoveryAttention = allRecoveryItems.filter((item: any) => item.attention).length;
+    const attention = workAttention + allApprovalItems.length + automation.attentionCount + recoveryAttention + (auditAttention ? 1 : 0);
     const identity = applicationIdentity();
     return buildOperatorSnapshot({ surface, identity: { state, workspaceRoot: invocationRoot(), version: identity.applicationVersion, commit: identity.applicationCommit }, health: { status: attention ? "attention" : "healthy", ok: attention === 0, attention, summary: attention ? `${attention} item(s) need operator attention.` : "All governed surfaces are operating normally." }, page: Number.parseInt(option(args, "--page", "1"), 10) || 1, pageSize: Number.parseInt(option(args, "--page-size", "10"), 10) || 10, sections: {
-      runtime: { items: runtimeItems }, work: { items: [...jobsItems, ...runItems], counts: { jobs: jobsItems.length, runs: runItems.length } }, approvals: { items: approvalItems, counts: { pending: approvalItems.length } }, automation: { items: [], counts: { workflows: 0, watches: 0, schedules: 0 } }, context: { items: [{ id: "project-context", kind: "context", label: "Project context", status: runtime.enableProjectContext === true ? "enabled" : "disabled", summary: "Context retrieval is governed and bounded." }] }, recovery: { items: recoveryItems }, audit: { items: [auditItem], counts: { events: events.length, runs: new Set(events.map((event: any) => event.runId).filter(Boolean)).size } }, surfaces: { items: surfaces }
+      runtime: { items: runtimeItems }, work: { items: [...jobsItems, ...runItems], counts: { total: allJobsItems.length + Number(auditSummary.runs || allRunItems.length), jobs: allJobsItems.length, runs: Number(auditSummary.runs || allRunItems.length) }, attentionCount: workAttention }, approvals: { items: approvalItems, counts: { total: allApprovalItems.length, pending: allApprovalItems.length }, attentionCount: allApprovalItems.length }, automation: { items: automationItems, counts: { total: automation.counts.workflows + automation.counts.watches + automation.counts.schedules, ...automation.counts }, attentionCount: automation.attentionCount }, context: { items: [{ id: "project-context", kind: "context", label: "Project context", status: runtime.enableProjectContext === true ? "enabled" : "disabled", summary: "Context retrieval is governed and bounded." }] }, recovery: { items: recoveryItems, counts: { total: allRecoveryItems.length }, attentionCount: recoveryAttention }, audit: { items: [auditItem], counts: { total: 1, events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0) } }, surfaces: { items: surfaces }
     } });
   } finally { auditStore.close(); }
 }
@@ -2714,8 +2785,8 @@ async function operatorCommand(args: any[]) {
   const action = String(rest[0] || "");
   const targetId = action === "verify-audit" ? undefined : option(rest, "--target", rest.find((value: any, index: number) => index > 0 && !String(value).startsWith("-")));
   if (!action) throw new Error("operator action requires an action name");
-  if (["cancel-job", "cancel-workflow", "resume-workflow", "approve"].includes(action) && !hasFlag(rest, "--confirm")) throw new Error("operator mutation requires --confirm");
-  if (action === "approve" || option(rest, "--gateway-url") || hasFlag(rest, "--remote")) {
+  if (["cancel-job", "cancel-workflow", "resume-workflow", "approve", "deny-approval"].includes(action) && !hasFlag(rest, "--confirm")) throw new Error("operator mutation requires --confirm");
+  if (action === "approve" || action === "deny-approval" || option(rest, "--gateway-url") || hasFlag(rest, "--remote")) {
     await printJson(await operatorGatewayRequest(rest, "/operator/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, targetId, confirm: hasFlag(rest, "--confirm"), surface: "cli" }) }));
     return;
   }
@@ -3156,7 +3227,12 @@ async function runRecordTool(args: any, tool: any, input: any) {
   const config = await readConfig(state);
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore });
+  const writeRuntimeConfig = async (nextConfig: any, expectedFingerprint: string) => {
+    if (!nextConfig || typeof nextConfig !== "object" || Array.isArray(nextConfig)) throw new Error("configuration must be an object");
+    configBaselines.set(nextConfig, expectedFingerprint);
+    return saveConfig(state, nextConfig);
+  };
+  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore, writeConfig: writeRuntimeConfig });
   try {
     const result = await runTask({
       task: { tool, input, actor: "cli" },
@@ -3608,6 +3684,7 @@ async function saveConfig(state: any, config: any) {
     ...(config.proof ? { proof: config.proof } : {}),
     ...(config.defaultModel ? { defaultModel: config.defaultModel } : {})
   }, null, 2)}\n`;
+  let fingerprint = "";
   await withStateMutationLock(state, async () => {
     await ensureSecureStateDirectory(state);
     const expected = config && typeof config === "object" ? configBaselines.get(config) : undefined;
@@ -3621,8 +3698,10 @@ async function saveConfig(state: any, config: any) {
       }
     }
     await atomicWrite(join(state, "config.json"), serialized, 0o600);
-    if (config && typeof config === "object") configBaselines.set(config, contentFingerprint(serialized));
+    fingerprint = contentFingerprint(serialized);
+    if (config && typeof config === "object") configBaselines.set(config, fingerprint);
   });
+  return fingerprint;
 }
 
 function contentFingerprint(value: string | Uint8Array): string {

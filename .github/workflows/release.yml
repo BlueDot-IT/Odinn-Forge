@@ -1,13 +1,10 @@
 name: Release
 
 on:
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing published release tag to retry
+        description: Existing draft release tag to verify and publish
         required: true
         type: string
 
@@ -21,7 +18,7 @@ concurrency:
 env:
   NODE_VERSION: "24"
   PNPM_VERSION: "10.14.0"
-  RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   verify:
@@ -63,7 +60,7 @@ jobs:
       - run: node scripts/ci/audit.ts high
 
   release-policy:
-    name: Validate published release and tag
+    name: Validate draft release and tag
     runs-on: ubuntu-latest
     outputs:
       release_commit: ${{ steps.release.outputs.commit }}
@@ -74,7 +71,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_TAG }}
-      - name: Validate existing published release and tag
+      - name: Validate existing draft release and tag
         id: release
         shell: bash
         env:
@@ -86,7 +83,7 @@ jobs:
           test "$tag_commit" = "$(git rev-parse HEAD)"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
           jq -e --arg tag "$TAG" \
-            '.tag_name == $tag and .draft == false' \
+            '.tag_name == $tag and .draft == true' \
             <<<"$release"
           echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
 
@@ -170,7 +167,7 @@ jobs:
         with:
           name: odinn-release-assets
           path: release-assets
-      - name: Revalidate published release and exact tag commit
+      - name: Revalidate draft release and exact tag commit
         id: tag
         shell: bash
         env:
@@ -181,11 +178,31 @@ jobs:
           git fetch --tags --force
           test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
-          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false' <<<"$release"
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true' <<<"$release"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-path: release-assets/*
+      - name: Upload and verify release assets
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          git fetch --tags --force
+          test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
+          expected_assets="$(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
+          existing_assets="$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)"
+          if [[ -z "$existing_assets" ]]; then
+            gh release upload "$TAG" release-assets/*
+          else
+            diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$existing_assets")
+          fi
+          mkdir -p downloaded-release-assets
+          gh release download "$TAG" --dir downloaded-release-assets
+          cmp release-assets/SHA256SUMS.txt downloaded-release-assets/SHA256SUMS.txt
+          (cd downloaded-release-assets && sha256sum -c SHA256SUMS.txt)
       - name: Publish npm package
         shell: bash
         run: |
@@ -199,17 +216,18 @@ jobs:
           if npm view "$package" version >/dev/null 2>&1; then
             echo "$package is already published"
           else
-            npm publish "$package_dir" --access public --provenance
+            if [[ "$version" == *-* ]]; then
+              npm publish "$package_dir" --tag next --access public --provenance
+            else
+              npm publish "$package_dir" --access public --provenance
+            fi
           fi
-      - name: Verify published release and upload assets
+      - name: Publish verified GitHub release
         shell: bash
         env:
-          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          git fetch --tags --force
-          test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
           is_draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
-          test "$is_draft" = "false"
-          gh release upload "$TAG" release-assets/* --clobber
+          test "$is_draft" = "true"
+          gh release edit "$TAG" --draft=false

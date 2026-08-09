@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { redactDurableValue } from "@odinn/protocol";
@@ -19,6 +19,8 @@ type SealedApprovalInput = {
 
 const durableApprovalKeys = new Map<string, Buffer>();
 const volatileApprovalActions = new Map<string, Map<string, ApprovalAction>>();
+const MAX_PENDING_APPROVALS = 500;
+const MAX_APPROVAL_FILE_BYTES = 4 * 1024 * 1024;
 
 export type ApprovalAction = {
   id?: string;
@@ -31,9 +33,21 @@ export type ApprovalAction = {
   actor?: string;
   tool: string;
   summary?: string;
+  effect?: ApprovalEffect;
   input?: Record<string, unknown>;
   /** Exact execution input kept only in volatile memory or the sealed input envelope. */
   executionInput?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export type ApprovalEffect = {
+  version: 1;
+  tool: string;
+  summary: string;
+  capability: string;
+  inputDigest: string;
+  reversible: "reversible" | "irreversible" | "uncertain";
+  idempotency: "idempotent" | "non-idempotent" | "unknown";
   [key: string]: unknown;
 };
 
@@ -45,7 +59,7 @@ export interface ApprovalStore {
   consume(id: unknown, action: ApprovalAction): ApprovalAction | undefined;
   take(id: unknown): ApprovalAction | undefined;
   revoke(id: unknown): boolean;
-  list(): ApprovalAction[];
+  list(options?: { limit?: number; offset?: number }): ApprovalAction[];
 }
 
 export function createApprovalStore({ path }: { path?: string } = {}): ApprovalStore {
@@ -98,8 +112,18 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
   const refresh = () => {
     if (!path) return;
     try {
+      if (statSync(path).size > MAX_APPROVAL_FILE_BYTES) {
+        const error = new Error(`approval state exceeds the ${MAX_APPROVAL_FILE_BYTES}-byte limit`) as NodeError;
+        error.code = "APPROVAL_STATE_TOO_LARGE";
+        throw error;
+      }
       const parsed = JSON.parse(readFileSync(path, "utf8"));
       const records = Array.isArray(parsed) ? parsed : parsed?.schemaVersion === 1 && Array.isArray(parsed.approvals) ? parsed.approvals : [];
+      if (records.length > MAX_PENDING_APPROVALS) {
+        const error = new Error(`approval state exceeds the ${MAX_PENDING_APPROVALS}-approval limit`) as NodeError;
+        error.code = "APPROVAL_STATE_TOO_LARGE";
+        throw error;
+      }
       pending.clear();
       for (const record of records) {
         if (record && typeof record.id === "string") {
@@ -133,10 +157,12 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
     create(action) {
       return withLock(() => {
         refresh();
+        expire();
+        if (pending.size >= MAX_PENDING_APPROVALS) throw new Error(`approval state is at its ${MAX_PENDING_APPROVALS}-approval limit`);
         const id = `approval_${randomUUID()}`;
         const normalized = normalizeApprovalAction(action);
         const { executionInput: _executionInput, ...publicAction } = action;
-        const sanitized = redactDurableValue({ ...publicAction, tool: normalized.tool, actor: normalized.actor, input: publicAction.input ?? {} }, { toolName: normalized.tool }) as ApprovalAction;
+        const sanitized = redactDurableValue({ ...publicAction, tool: normalized.tool, actor: normalized.actor, summary: normalized.effect?.summary, effect: normalized.effect, input: publicAction.input ?? {} }, { toolName: normalized.tool }) as ApprovalAction;
         const bindingTag = approvalBindingTag(bindingKey, normalized);
         volatile.set(id, normalized);
         pending.set(id, {
@@ -222,14 +248,17 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         return removed;
       });
     },
-    list() {
+    list(options: { limit?: number; offset?: number } = {}) {
       return withLock(() => {
         refresh();
         expire();
         persist();
+        const limit = Math.min(MAX_PENDING_APPROVALS, Math.max(0, Number.isSafeInteger(Number(options.limit)) ? Number(options.limit) : MAX_PENDING_APPROVALS));
+        const offset = Math.max(0, Number.isSafeInteger(Number(options.offset)) ? Number(options.offset) : 0);
         return Array.from(pending.values())
           .filter((action) => action.status === "pending")
-          .map(({ input, bindingTag: _bindingTag, sealedInput: _sealedInput, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
+          .map(({ input, bindingTag: _bindingTag, sealedInput: _sealedInput, ...action }) => ({ ...action, input: redactBrowserInput(input) }))
+          .slice(offset, offset + limit);
       });
     }
   };
@@ -262,8 +291,103 @@ function normalizeApprovalAction(action: ApprovalAction): ApprovalAction {
     runId: String(action.runId ?? "").trim(),
     accountId: String(action.accountId ?? "").trim(),
     actor: String(action.actor ?? "").trim(),
-    input
+    input,
+    effect: buildApprovalEffect(String(action.tool ?? "").trim(), input)
   };
+}
+
+function buildApprovalEffect(tool: string, input: Record<string, unknown>): ApprovalEffect {
+  const inputDigest = createHash("sha256").update(stableApprovalValue(input)).digest("hex");
+  const digest = inputDigest.slice(0, 16);
+  const base: ApprovalEffect = {
+    version: 1,
+    tool,
+    summary: `Perform one approved ${tool || "runtime"} action.`,
+    capability: tool,
+    inputDigest,
+    reversible: "uncertain",
+    idempotency: "unknown"
+  };
+  if (tool === "process.exec") {
+    const commandDigest = createHash("sha256").update(String(input.command ?? "")).digest("hex").slice(0, 16);
+    return {
+      ...base,
+      summary: `Run one approved process inside the configured process sandbox (command digest ${commandDigest}).`,
+      effectClass: "process execution",
+      isolation: "configured sandbox",
+      command: "[redacted]",
+      cwd: boundedEffectText(input.cwd, "."),
+      argsCount: Array.isArray(input.args) ? Math.min(input.args.length, 100) : 0,
+      commandDigest,
+      recovery: "An uncertain process outcome requires operator review before retry.",
+      reversible: "uncertain",
+      idempotency: "unknown"
+    };
+  }
+  if (tool.startsWith("browser.")) {
+    const target = boundedEffectText(input.expectedUrl ?? input.url ?? input.tabId, "the approved browser tab");
+    return {
+      ...base,
+      summary: `Perform one approved browser mutation on ${target}.`,
+      effectClass: "browser mutation",
+      target,
+      tabId: boundedEffectText(input.tabId, ""),
+      expectedUrl: boundedEffectText(input.expectedUrl ?? input.url, ""),
+      selector: boundedEffectText(input.selector ?? input.name, ""),
+      mutation: tool.slice("browser.".length),
+      recovery: "An uncertain browser mutation requires operator review before retry.",
+      reversible: "uncertain",
+      idempotency: "non-idempotent"
+    };
+  }
+  if (tool === "mcp.invoke") {
+    const server = boundedEffectText(input.serverId ?? input.server, "configured MCP server");
+    return {
+      ...base,
+      summary: `Invoke one approved MCP tool on ${server}.`,
+      effectClass: "MCP invocation",
+      server,
+      mcpTool: boundedEffectText(input.tool, "configured tool"),
+      argsDigest: boundedEffectText(input.argsDigest, digest),
+      recovery: "An uncertain MCP outcome requires operator review before retry.",
+      reversible: "uncertain",
+      idempotency: "unknown"
+    };
+  }
+  if (tool.startsWith("discord.")) {
+    const target = boundedEffectText(input.channelId ?? input.threadId ?? input.messageId, "the configured Discord target");
+    return {
+      ...base,
+      summary: `Perform one approved Discord mutation on ${target}.`,
+      effectClass: "Discord mutation",
+      target,
+      mutation: tool.slice("discord.".length),
+      payloadDigest: digest,
+      recovery: "An uncertain external mutation requires operator review before retry.",
+      reversible: tool.includes("delete") ? "irreversible" : "uncertain",
+      idempotency: "non-idempotent"
+    };
+  }
+  if (tool === "skill.lifecycle" || tool === "skill.install") {
+    return {
+      ...base,
+      summary: `Change the lifecycle state of approved skill ${boundedEffectText(input.skillId ?? input.id, "the selected skill")}.`,
+      effectClass: "skill lifecycle",
+      skillId: boundedEffectText(input.skillId ?? input.id, "the selected skill"),
+      skillVersion: boundedEffectText(input.version, ""),
+      action: boundedEffectText(input.action, "change"),
+      recovery: "A failed lifecycle change remains auditable and must be reviewed before retry.",
+      reversible: "uncertain",
+      idempotency: "unknown"
+    };
+  }
+  return { ...base, inputKeys: Object.keys(input).filter((key) => !/token|secret|password|credential|authorization|cookie|content|prompt/i.test(key)).slice(0, 20) };
+}
+
+function boundedEffectText(value: unknown, fallback: string): string {
+  const text = String(redactDurableValue(value) ?? "").replace(/\s+/gu, " ").trim();
+  if (!text || text === "[redacted]") return fallback;
+  return text.slice(0, 160);
 }
 
 function normalizeApprovalInput(input: Record<string, unknown> = {}): Record<string, unknown> {

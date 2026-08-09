@@ -277,8 +277,15 @@ export class SqliteJobStore {
     this.legacyPath = legacyPath ? resolve(legacyPath) : undefined;
   }
 
-  async list(): Promise<RuntimeJobRecord[]> {
-    return (this.ledger.database.db.prepare("SELECT * FROM runtime_jobs ORDER BY updated_at DESC, id").all() as SqlRow[]).map(hydrate);
+  async list({ limit = 500, offset = 0 }: { limit?: number; offset?: number } = {}): Promise<RuntimeJobRecord[]> {
+    const safeLimit = Number.isSafeInteger(Number(limit)) && Number(limit) > 0 ? Math.min(Number(limit), 500) : 500;
+    const safeOffset = Number.isSafeInteger(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
+    return (this.ledger.database.db.prepare("SELECT * FROM runtime_jobs ORDER BY updated_at DESC, id LIMIT ? OFFSET ?").all(safeLimit, safeOffset) as SqlRow[]).map(hydrate);
+  }
+
+  async count(): Promise<{ total: number; attention: number }> {
+    const row = this.ledger.database.db.prepare("SELECT count(*) AS total, sum(CASE WHEN status IN ('failed','needs-review') THEN 1 ELSE 0 END) AS attention FROM runtime_jobs").get() as SqlRow;
+    return { total: Number(row.total || 0), attention: Number(row.attention || 0) };
   }
 
   async get(id: string): Promise<RuntimeJobRecord | undefined> {

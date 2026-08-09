@@ -90,6 +90,8 @@ class GatewayError extends Error {
 }
 
 const CRON_SCHEMA_VERSION = 2;
+const CRON_MAX_JOBS = 500;
+const CRON_MAX_FILE_BYTES = 4 * 1024 * 1024;
 const CRON_DISPATCH_LEASE_MS = 10 * 60 * 1000;
 
 export class CronStore {
@@ -98,8 +100,13 @@ export class CronStore {
   constructor(path: string) { this.path = path; }
   async read() {
     try {
+      if ((await statPath(this.path)).size > CRON_MAX_FILE_BYTES) throw new GatewayError(409, `cron state exceeds the ${CRON_MAX_FILE_BYTES}-byte limit`);
       const value = JSON.parse(await readFile(this.path, "utf8"));
-      return (value?.schemaVersion === 1 || value?.schemaVersion === CRON_SCHEMA_VERSION) && Array.isArray(value.jobs)
+      if ((value?.schemaVersion !== 1 && value?.schemaVersion !== CRON_SCHEMA_VERSION) || !Array.isArray(value.jobs)) {
+        return { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
+      }
+      if (value.jobs.length > CRON_MAX_JOBS) throw new GatewayError(409, `cron state exceeds the ${CRON_MAX_JOBS}-job limit`);
+      return value.jobs.length
         ? { schemaVersion: CRON_SCHEMA_VERSION, jobs: value.jobs.map((job: any) => normalizeCronJob(job)) }
         : { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
     } catch (error: any) {
@@ -107,7 +114,12 @@ export class CronStore {
       throw error;
     }
   }
-  async list() { return (await this.read()).jobs.sort((left: any, right: any) => String(left.name).localeCompare(String(right.name))); }
+  async list({ limit = CRON_MAX_JOBS, offset = 0 }: { limit?: number; offset?: number } = {}) {
+    const jobs = (await this.read()).jobs.sort((left: any, right: any) => String(left.name).localeCompare(String(right.name)));
+    const boundedLimit = Math.min(CRON_MAX_JOBS, Math.max(0, Number.isSafeInteger(Number(limit)) ? Number(limit) : CRON_MAX_JOBS));
+    const boundedOffset = Math.max(0, Number.isSafeInteger(Number(offset)) ? Number(offset) : 0);
+    return jobs.slice(boundedOffset, boundedOffset + boundedLimit);
+  }
   async mutate(operation: (jobs: any[]) => any) {
     const pending = this.writeChain.then(() => withStateMutationLock(dirname(this.path), async () => {
       const state = await this.read();
@@ -126,6 +138,7 @@ export class CronStore {
   async create(input: any) {
     return this.mutate((jobs) => {
       const job = normalizeCronJob({ ...input, id: input.id || `cron_${randomBytes(8).toString("hex")}`, createdAt: new Date().toISOString() });
+      if (jobs.length >= CRON_MAX_JOBS) throw new GatewayError(409, `cron state is at its ${CRON_MAX_JOBS}-job limit`);
       if (jobs.some((item) => item.id === job.id)) throw new GatewayError(409, "cron job id already exists");
       jobs.push(job);
       return job;
@@ -724,8 +737,9 @@ export async function createGatewayServer({
   const mcpRuntime = config.runtime?.enableMcp === true
     ? createGovernedMcpRuntime({ enabled: true, config: config.mcp, extensionRegistry, extensionExecutor, auditStore, runLedger: runtime.ledger })
     : undefined;
-  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore, skillDisclosure, mcpRuntime });
-  const governedRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime });
+  const writeSelfImprovementConfig = (nextConfig: any, expectedFingerprint: string) => writeEditableConfig(state, { config: nextConfig, fingerprint: expectedFingerprint }, { hosted });
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
+  const governedRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const gatewayToken = await loadGatewayToken(state);
   const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
@@ -838,7 +852,17 @@ export async function createGatewayServer({
       tool: "improve.learn",
       input: { limit: 1000 },
       actor: "autonomous-improvement"
-    }).catch(() => undefined).finally(() => { improvementCycle = undefined; });
+    }).catch(async () => {
+      await auditStore.append({
+        runId: `improvement-cycle:${Date.now()}`,
+        type: "improvement.cycle_failed",
+        actor: "autonomous-improvement",
+        tool: "improve.learn",
+        decision: "needs-review",
+        message: "automatic improvement recovery or observation failed; inspect the operator surface before retrying"
+      }).catch(() => undefined);
+      return undefined;
+    }).finally(() => { improvementCycle = undefined; });
     return improvementCycle;
   };
   const automaticImprovement = selfImprovement.enabled && selfImprovement.mode === "auto";
@@ -908,18 +932,86 @@ export async function createGatewayServer({
     }
   };
 
+  const denyGatewayApproval = async (id: string) => {
+    const pending = approvalStore.list().find((approval: any) => approval.id === id);
+    if (!pending) throw new GatewayError(404, "approval not found or expired");
+    const linkedJob = pending.runId ? await supervisor.get(String(pending.runId)) : undefined;
+    const auditContext = {
+      runId: String(pending.runId || `approval:${id}`),
+      actor: "operator",
+      tool: String(pending.tool || "approval"),
+      data: { approvalId: id, ...(pending.runId ? { linkedRunId: pending.runId } : {}) }
+    };
+    try {
+      await auditStore.append({
+        ...auditContext,
+        type: "operator.approval_denial_requested",
+        decision: "deny-requested",
+        message: "operator requested denial of a pending approval"
+      });
+    } catch {
+      throw new GatewayError(503, "approval denial could not be recorded; no approval state was changed");
+    }
+    if (linkedJob && linkedJob.status !== "awaiting-approval") {
+      if (!approvalStore.revoke(id)) throw new GatewayError(404, "approval not found or expired");
+      await auditStore.append({
+        ...auditContext,
+        type: "operator.approval_denial_stale",
+        decision: "stale",
+        message: "approval was revoked after its originating job left the awaiting-approval state"
+      }).catch(() => undefined);
+      throw new GatewayError(409, "the originating job is no longer awaiting approval");
+    }
+    if (!approvalStore.revoke(id)) throw new GatewayError(404, "approval not found or expired");
+    try {
+      if (linkedJob) await supervisor.cancel(linkedJob.id);
+    } catch (error) {
+      await auditStore.append({
+        ...auditContext,
+        type: "operator.approval_denial_failed",
+        decision: "deny-failed",
+        message: `approval was revoked but linked job cancellation failed: ${error instanceof Error ? error.message : String(error)}`
+      }).catch(() => undefined);
+      throw new GatewayError(503, "approval was revoked but the originating job needs operator recovery");
+    }
+    try {
+      await auditStore.append({
+        ...auditContext,
+        type: "operator.approval_denied",
+        decision: "deny",
+        message: "operator denied a pending approval"
+      });
+    } catch {
+      await auditStore.append({
+        ...auditContext,
+        type: "operator.approval_denial_failed",
+        decision: "deny-failed",
+        message: "approval was revoked and the linked job was cancelled, but the final denial record could not be appended"
+      }).catch(() => undefined);
+      throw new GatewayError(503, "approval was denied but the final audit record needs operator verification");
+    }
+    return { approvalId: id, denied: true, ...(pending.runId ? { runId: pending.runId } : {}) };
+  };
+
   const readOperatorFile = async (name: string, fallback: any) => {
-    try { return JSON.parse(await readFile(join(state, name), "utf8")); }
+    try {
+      const path = join(state, name);
+      if ((await statPath(path)).size > 4 * 1024 * 1024) return { ...fallback, invalid: true };
+      return JSON.parse(await readFile(path, "utf8"));
+    }
     catch (error: any) { return error?.code === "ENOENT" ? fallback : { ...fallback, invalid: true }; }
   };
 
-  const operatorSnapshot = async (surface: any = "http", page = 1, pageSize = 10, query = "", statusFilter = "") => {
-    const [jobs, runs, events, cronJobs, auditVerification, browserRecovery, sandboxRecovery, processRecovery] = await Promise.all([
-      supervisor.list(),
-      auditStore.readRuns(),
-      auditStore.readAll(),
+  const operatorSnapshot = async (surface: any = "http", page = 1, pageSize = 10, query = "", statusFilter = "", pages: Record<string, number> = {}) => {
+    const [jobs, jobCounts, runs, auditSummary, cronJobs, auditVerification, browserRecovery, sandboxRecovery, processRecovery] = await Promise.all([
+      supervisor.list({ limit: 500 }),
+      supervisor.counts(),
+      typeof auditStore.readRunPage === "function" ? auditStore.readRunPage({ limit: 200 }) : Promise.resolve([]),
+      typeof auditStore.readSummary === "function" ? auditStore.readSummary() : Promise.resolve({ events: 0, runs: 0, attentionRuns: 0 }),
       cronStore.list(),
-      auditStore.verifyIntegrity({ allowUnsigned: true }).catch(() => ({ valid: false, events: 0, unsigned: 0, failures: [{ reason: "audit verification unavailable" }] })),
+      typeof auditStore.getIntegrityStatus === "function"
+        ? Promise.resolve(auditStore.getIntegrityStatus())
+        : Promise.resolve({ valid: true, checked: false, events: 0, unsigned: 0, failures: [] }),
       readOperatorFile("browser-recovery.json", { status: "clear" }),
       readOperatorFile("sandbox-recovery.json", { pending: [] }),
       readOperatorFile("process-recovery.json", { pending: [] })
@@ -928,7 +1020,7 @@ export async function createGatewayServer({
     const matches = (item: any) => (!queryText || [item.id, item.label, item.status, item.summary, item.kind].some((value) => String(value ?? "").toLowerCase().includes(queryText)))
       && (!statusFilter || statusFilter === "all" || item.status === statusFilter);
     const filter = (items: any[]) => items.filter(matches);
-    const jobsItems = filter(jobs.map((job: any) => {
+    const allJobItems = jobs.map((job: any) => {
       const task = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task) ? job.payload.task : {};
       const tool = String(task.tool || "job");
       const attention = ["failed", "needs-review"].includes(job.status);
@@ -949,8 +1041,9 @@ export async function createGatewayServer({
           ...(job.auditCorrelationId ? { auditCorrelationId: job.auditCorrelationId } : {})
         }
       };
-    }));
-    const runItems = filter(runs.slice(0, 200).map((run: any) => ({
+    });
+    const jobsItems = filter(allJobItems);
+    const allRunItems = runs.map((run: any) => ({
       id: String(run.id),
       kind: "run",
       label: String(run.tool || "run"),
@@ -959,42 +1052,49 @@ export async function createGatewayServer({
       updatedAt: run.lastEventAt || run.completedAt || run.startedAt,
       attention: ["failed", "blocked", "needs-review"].includes(String(run.status || "")),
       details: { eventCount: Number(run.eventCount || 0), actor: String(run.actor || "local") }
-    })));
-    const approvals = filter(approvalStore.list().map((approval: any) => ({
+    }));
+    const runItems = filter(allRunItems);
+    const allApprovalItems = approvalStore.list().map((approval: any) => ({
       id: String(approval.id),
       kind: "approval",
       label: String(approval.tool || approval.type || "approval"),
       status: String(approval.status || "pending"),
-      summary: "Waiting for an explicit operator decision.",
+      summary: String(approval.effect?.summary || "Review the bounded effect details before deciding."),
       updatedAt: approval.createdAt,
       attention: true,
-      controls: ["approve"],
+      controls: ["approve", "deny-approval"],
       details: {
         ...(approval.runId ? { runId: approval.runId } : {}),
-        ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {})
+        ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {}),
+        ...(approval.effect ? { effect: approval.effect } : {})
       }
-    })));
-    const workflowItems = workflowRuntime
-      ? filter(workflowRuntime.list(100).map((run: any) => ({
+    }));
+    const approvals = filter(allApprovalItems);
+    const allWorkflowItems = workflowRuntime
+      ? workflowRuntime.list(100).map((run: any) => ({
         id: String(run.runId), kind: "workflow", label: String(run.definitionDigest || "workflow"), status: String(run.status),
         summary: "Durable workflow run", updatedAt: run.updatedAt,
         attention: ["failed", "needs-review", "awaiting-approval"].includes(String(run.status)),
         controls: ["running", "queued", "awaiting-approval"].includes(String(run.status)) ? ["cancel-workflow"] : ["needs-review"].includes(String(run.status)) ? ["resume-workflow"] : []
-      })))
+      }))
       : [];
+    const workflowItems = filter(allWorkflowItems);
+    const workflowCounts = workflowRuntime?.counts?.() ?? { total: allWorkflowItems.length, attention: allWorkflowItems.filter((item: any) => item.attention).length };
+    const watchCount = eventIngress?.countWatches?.() ?? 0;
     const watchItems = eventIngress
       ? eventIngress.listWatches().map((watch: any) => ({ id: watch.watchId, kind: "event-watch", label: "Event watch", status: watch.enabled ? "enabled" : "disabled", summary: "Durable event ingress declaration", updatedAt: watch.updatedAt, details: { enabled: watch.enabled === true } }))
       : [];
-    const cronItems = filter(cronJobs.map((job: any) => ({ id: job.id, kind: "schedule", label: job.name, status: job.enabled ? "enabled" : "disabled", summary: job.lastStatus ? `Last run: ${job.lastStatus}` : "Scheduled automation", updatedAt: job.updatedAt, details: { nextRunAt: job.nextRunAt ?? null } })));
-    const recoveryItems = filter([
+    const allCronItems = cronJobs.map((job: any) => ({ id: job.id, kind: "schedule", label: job.name, status: job.lastStatus === "error" ? "needs-review" : job.enabled ? "enabled" : "disabled", summary: job.lastStatus ? `Last run: ${job.lastStatus}` : "Scheduled automation", updatedAt: job.updatedAt, attention: job.lastStatus === "error", details: { nextRunAt: job.nextRunAt ?? null } }));
+    const cronItems = filter(allCronItems);
+    const allRecoveryItems = [
       { id: "browser-recovery", kind: "recovery", label: "Browser recovery", status: String(browserRecovery.status || "clear"), summary: browserRecovery.status === "clear" ? "No browser action is awaiting resolution." : "Browser action recovery is required.", attention: ["executing", "unknown"].includes(String(browserRecovery.status)), details: { pending: ["executing", "unknown"].includes(String(browserRecovery.status)) } },
       { id: "sandbox-recovery", kind: "recovery", label: "Sandbox recovery", status: Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length ? "needs-review" : "clear", summary: "Sandbox process recovery state", attention: Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length > 0, details: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null } },
       { id: "process-recovery", kind: "recovery", label: "Process recovery", status: processRecovery.invalid === true ? "needs-review" : Array.isArray(processRecovery.pending) && processRecovery.pending.length ? "needs-review" : "clear", summary: "Durable process recovery state", attention: processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0), details: { pending: Array.isArray(processRecovery.pending) ? processRecovery.pending.length : null } }
-    ]);
-    const auditSummary = summarizeAuditEvents(events);
+    ];
+    const recoveryItems = filter(allRecoveryItems);
     const auditItem = {
-      id: "audit-journal", kind: "audit", label: "Audit journal", status: auditVerification.valid === false ? "needs-review" : "verified", summary: auditVerification.valid === false ? "Audit integrity needs attention." : "Hash-chain verification passed.", attention: auditVerification.valid === false,
-      details: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0), unsigned: Number(auditVerification.unsigned || 0), failures: Array.isArray(auditVerification.failures) ? auditVerification.failures.length : 0 }
+      id: "audit-journal", kind: "audit", label: "Audit journal", status: auditVerification.valid === false ? "needs-review" : auditVerification.checked === false ? "unknown" : "verified", summary: auditVerification.valid === false ? "Audit integrity needs attention." : auditVerification.checked === false ? "Audit integrity has not been explicitly verified in this process." : "Hash-chain verification passed.", attention: auditVerification.valid === false,
+      details: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0), unsigned: Number(auditVerification.unsigned || 0), failures: Array.isArray(auditVerification.failures) ? auditVerification.failures.length : 0, checked: auditVerification.checked === true }
     };
     const runtimeItems = [
       { id: "gateway", kind: "runtime", label: "Gateway", status: "running", summary: "Authenticated local control plane" },
@@ -1004,20 +1104,26 @@ export async function createGatewayServer({
       { id: "project-context", kind: "runtime", label: "Project context", status: projectContext ? "enabled" : "disabled", summary: projectContext ? "Bounded context retrieval" : "Disabled by default" }
     ];
     const surfaces = ["CLI", "TUI", "HTTP JSON", "Web console"].map((label) => ({ id: label.toLowerCase().replace(/\s+/gu, "-"), kind: "surface", label, status: "available", summary: "Uses the shared operator contract" }));
-    const attentionCount = jobsItems.filter((item: any) => item.attention).length + runItems.filter((item: any) => item.attention).length + approvals.length + recoveryItems.filter((item: any) => item.attention).length + (auditItem.attention ? 1 : 0);
+    const attentionCount = Number(jobCounts.attention || 0)
+      + Number(auditSummary.attentionRuns || 0)
+      + allApprovalItems.filter((item: any) => item.attention).length
+      + Number(workflowCounts.attention || 0)
+      + allRecoveryItems.filter((item: any) => item.attention).length
+      + (auditItem.attention ? 1 : 0);
     return buildOperatorSnapshot({
       surface,
       identity: { state, workspaceRoot: root, version, commit: await productCommit() },
       health: { status: attentionCount ? "attention" : "healthy", ok: attentionCount === 0, attention: attentionCount, summary: attentionCount ? `${attentionCount} item(s) need operator attention.` : "All governed surfaces are operating normally." },
       page,
       pageSize,
+      pages: pages as any,
       sections: {
         runtime: { items: runtimeItems },
-        work: { items: [...jobsItems, ...runItems], counts: { jobs: jobsItems.length, runs: runItems.length } },
-        approvals: { items: approvals, counts: { pending: approvals.length } },
-        automation: { items: [...workflowItems, ...watchItems, ...cronItems], counts: { workflows: workflowItems.length, watches: watchItems.length, schedules: cronItems.length } },
+        work: { items: [...jobsItems, ...runItems], counts: { total: Number(jobCounts.total || allJobItems.length) + Number(auditSummary.runs || allRunItems.length), jobs: Number(jobCounts.total || allJobItems.length), runs: Number(auditSummary.runs || allRunItems.length) }, attentionCount: Number(jobCounts.attention || 0) + Number(auditSummary.attentionRuns || 0) },
+        approvals: { items: approvals, counts: { total: allApprovalItems.length, pending: allApprovalItems.length }, attentionCount: allApprovalItems.filter((item: any) => item.attention).length },
+        automation: { items: [...workflowItems, ...watchItems, ...cronItems], counts: { total: Number(workflowCounts.total || allWorkflowItems.length) + watchCount + allCronItems.length, workflows: Number(workflowCounts.total || allWorkflowItems.length), watches: watchCount, schedules: allCronItems.length }, attentionCount: Number(workflowCounts.attention || 0) + allCronItems.filter((item: any) => item.attention).length },
         context: { items: [{ id: "project-context", kind: "context", label: "Project context", status: projectContext ? "enabled" : "disabled", summary: projectContext ? "Context retrieval is available through the governed context surface." : "Project context is disabled by default." }] },
-        recovery: { items: recoveryItems },
+        recovery: { items: recoveryItems, attentionCount: allRecoveryItems.filter((item: any) => item.attention).length },
         audit: { items: [auditItem], counts: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0) } },
         surfaces: { items: surfaces }
       }
@@ -1118,7 +1224,11 @@ export async function createGatewayServer({
         const surface = ["cli", "tui", "http", "console"].includes(requestedSurface) ? requestedSurface : "http";
         const page = Number.parseInt(url.searchParams.get("page") || "1", 10) || 1;
         const pageSize = Number.parseInt(url.searchParams.get("pageSize") || "10", 10) || 10;
-        const snapshot = await operatorSnapshot(surface, page, pageSize, url.searchParams.get("q") || "", url.searchParams.get("status") || "");
+        const pageNames = ["runtime", "work", "approvals", "automation", "context", "recovery", "audit", "surfaces"];
+        const pages = Object.fromEntries(pageNames
+          .map((name) => [name, Number.parseInt(url.searchParams.get(`${name}Page`) || "", 10)])
+          .filter(([, value]) => Number.isSafeInteger(value) && Number(value) > 0));
+        const snapshot = await operatorSnapshot(surface, page, pageSize, url.searchParams.get("q") || "", url.searchParams.get("status") || "", pages);
         return json(response, 200, { ok: true, ...snapshot });
       }
       if (request.method === "POST" && url.pathname === "/operator/actions") {
@@ -1134,6 +1244,8 @@ export async function createGatewayServer({
           result = await supervisor.cancel(targetId);
         } else if (action === "approve") {
           result = await approveGatewayApproval(targetId);
+        } else if (action === "deny-approval") {
+          result = await denyGatewayApproval(targetId);
         } else if (action === "cancel-workflow") {
           if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled");
           result = await workflowRuntime.cancel(targetId);
@@ -1792,6 +1904,10 @@ export async function createGatewayServer({
           if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error }).catch(() => undefined);
           throw error;
         }
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/deny")) {
+        const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/deny".length));
+        return json(response, 200, { ok: true, ...(await denyGatewayApproval(id)) });
       }
       if (request.method === "GET" && url.pathname === "/memory") {
         const query = url.searchParams.get("query") ?? "";
@@ -5155,7 +5271,7 @@ function renderConsoleHtml(version = "development") {
           <div class="page-head"><div><div class="section-kicker">Shared control plane</div><h1>Operator</h1><p>One bounded view of runtime health, durable work, approvals, recovery, audit, and every available operator surface.</p></div><div class="row"><span class="chip" id="operator-health">Loading</span><button class="secondary" id="refresh-operator" type="button">Refresh</button></div></div>
           <div class="stat-strip"><div class="stat-card"><strong id="operator-attention">0</strong><span>need attention</span></div><div class="stat-card"><strong id="operator-work-count">0</strong><span>work items</span></div><div class="stat-card"><strong id="operator-approval-count">0</strong><span>approvals</span></div><div class="stat-card"><strong id="operator-audit-status">—</strong><span>audit</span></div></div>
           <div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Runtime</h2><span class="muted" id="operator-generated">—</span></div><div id="operator-runtime" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Attention</h2><span class="muted">Bounded, redacted summaries</span></div><div id="operator-attention-list" class="list"></div></div></div>
-          <div class="panel stack"><div class="panel-head"><h2>Recent work</h2><span class="muted" id="operator-work-page">—</span></div><div id="operator-work" class="list"></div></div>
+          <div class="panel stack"><div class="panel-head"><h2>Recent work</h2><div class="row"><button class="secondary" id="operator-work-prev" type="button" disabled>Previous</button><span class="muted" id="operator-work-page">—</span><button class="secondary" id="operator-work-next" type="button" disabled>Next</button></div></div><div id="operator-work" class="list"></div></div>
           <details class="panel stack"><summary>Contract payload</summary><pre id="operator-payload" class="output">Loading…</pre></details>
         </div>
       </section>
@@ -5826,14 +5942,19 @@ function renderConsoleHtml(version = "development") {
 
     function renderOperatorItem(item) {
       const controls = (item.controls || []).map((action) => '<button class="secondary" data-operator-action="' + escapeHtml(action) + '" data-operator-target="' + escapeHtml(item.id) + '" type="button">' + escapeHtml(friendlyStatus(action)) + '</button>').join("");
-      return '<div class="item"><div class="item-line"><strong>' + escapeHtml(item.label || item.kind) + '</strong><span class="chip ' + (item.attention ? "danger" : item.status === "enabled" || item.status === "running" || item.status === "verified" || item.status === "available" ? "ok" : "warn") + '">' + escapeHtml(friendlyStatus(item.status)) + '</span></div><div>' + escapeHtml(item.summary || "") + '</div><div class="muted">' + escapeHtml(item.id || "") + (item.updatedAt ? " · " + escapeHtml(relativeTime(item.updatedAt)) : "") + '</div>' + (controls ? '<div class="row">' + controls + '</div>' : "") + '</div>';
+      const effect = item.details?.effect;
+      const effectView = effect?.summary ? '<div class="muted">Effect: ' + escapeHtml(effect.summary) + '</div>' : "";
+      return '<div class="item"><div class="item-line"><strong>' + escapeHtml(item.label || item.kind) + '</strong><span class="chip ' + (item.attention ? "danger" : item.status === "enabled" || item.status === "running" || item.status === "verified" || item.status === "available" ? "ok" : "warn") + '">' + escapeHtml(friendlyStatus(item.status)) + '</span></div><div>' + escapeHtml(item.summary || "") + '</div>' + effectView + '<div class="muted">' + escapeHtml(item.id || "") + (item.updatedAt ? " · " + escapeHtml(relativeTime(item.updatedAt)) : "") + '</div>' + (controls ? '<div class="row">' + controls + '</div>' : "") + '</div>';
     }
 
     async function refreshOperator() {
-      const snapshot = await api("/operator/snapshot?surface=console&pageSize=25");
+      state.operatorPages = state.operatorPages || { work: 1 };
+      const params = new URLSearchParams({ surface: "console", pageSize: "25", workPage: String(state.operatorPages.work || 1) });
+      const snapshot = await api("/operator/snapshot?" + params.toString());
+      state.operatorSnapshot = snapshot;
       const section = (name) => snapshot.sections?.[name] || { items: [], counts: {} };
       const work = section("work");
-      const attention = [...work.items, ...section("approvals").items, ...section("recovery").items, ...section("audit").items].filter((item) => item.attention || ["failed", "needs-review", "unknown"].includes(item.status));
+      const attention = [...work.items, ...section("approvals").items, ...section("automation").items, ...section("recovery").items, ...section("audit").items].filter((item) => item.attention || ["failed", "needs-review", "unknown"].includes(item.status));
       $("operator-health").textContent = friendlyStatus(snapshot.health?.status || "unknown");
       $("operator-health").className = "chip " + (snapshot.health?.status === "healthy" ? "ok" : "danger");
       $("operator-attention").textContent = String(snapshot.health?.attention || 0);
@@ -5845,6 +5966,9 @@ function renderConsoleHtml(version = "development") {
       $("operator-attention-list").innerHTML = attention.map(renderOperatorItem).join("") || '<div class="empty-state"><strong>Nothing needs attention</strong><span>Governed work is proceeding normally.</span></div>';
       $("operator-work").innerHTML = work.items.map(renderOperatorItem).join("") || '<div class="empty-state"><strong>No recent work</strong><span>There is no durable work to show.</span></div>';
       $("operator-work-page").textContent = (work.pagination?.total || 0) + " items · page " + (work.pagination?.page || 1) + " of " + (work.pagination?.pages || 1);
+      state.operatorPages.work = work.pagination?.page || 1;
+      $("operator-work-prev").disabled = state.operatorPages.work <= 1;
+      $("operator-work-next").disabled = state.operatorPages.work >= (work.pagination?.pages || 1);
       $("operator-payload").textContent = JSON.stringify(snapshot, null, 2);
       $("nav-operator-attention").textContent = String(snapshot.health?.attention || 0);
       $("nav-operator-attention").className = "badge " + (snapshot.health?.attention ? "danger" : "ok");
@@ -5852,8 +5976,16 @@ function renderConsoleHtml(version = "development") {
     }
 
     async function runOperatorAction(action, targetId) {
-      const labels = { "cancel-job": "Cancel this job?", approve: "Approve this action once?", "cancel-workflow": "Cancel this workflow?", "resume-workflow": "Resume this workflow?" };
-      if (labels[action] && !window.confirm(labels[action])) return;
+      const item = Object.values(state.operatorSnapshot?.sections || {}).flatMap((section) => section?.items || []).find((candidate) => candidate.id === targetId);
+      const effect = item?.details?.effect;
+      const effectSummary = effect?.summary || item?.summary || "the selected operator item";
+      const labels = { "cancel-job": "Cancel this job?", "deny-approval": "Deny this pending approval?", "cancel-workflow": "Cancel this workflow?", "resume-workflow": "Resume this workflow?" };
+      if (action === "approve") {
+        if (!window.confirm("Approve this effect once?\\n\\n" + effectSummary + "\\n\\nCapability: " + String(effect?.capability || item?.label || "unknown") + ".")) return;
+        if (effect?.reversible !== "reversible" || effect?.idempotency !== "idempotent") {
+          if (window.prompt("This effect is irreversible or its outcome is uncertain. Type APPROVE to continue.") !== "APPROVE") return;
+        }
+      } else if (labels[action] && !window.confirm(labels[action] + "\\n\\n" + (action === "deny-approval" ? effectSummary : ""))) return;
       const result = await api("/operator/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, targetId, confirm: true, surface: "console" }) });
       showOutput(result);
       await refreshOperator();
@@ -5947,7 +6079,7 @@ function renderConsoleHtml(version = "development") {
     }
 
     function renderSelfImprovementStatus(status) {
-      const settings = status?.selfImprovement || { enabled: true, mode: "auto", intervalMs: 300000, maxChangesPerCycle: 1, rollbackOnFailure: true };
+      const settings = status?.selfImprovement || { enabled: true, mode: "propose", intervalMs: 300000, maxChangesPerCycle: 1, rollbackOnFailure: true };
       const automatic = settings.enabled === true && settings.mode === "auto";
       $("improvement-controller-state").textContent = automatic ? "Running" : "Paused";
       const model = settings.advisor?.model || "";
@@ -6700,11 +6832,13 @@ function renderConsoleHtml(version = "development") {
     }
 
     function renderApproval(approval) {
-      return '<div class="item approval-card"><div class="item-line"><strong>' + escapeHtml(friendlyArea(approval.tool || "browser action")) + '</strong><span class="chip warn">waiting for you</span></div><div class="approval-summary">' + escapeHtml(approval.summary || "Ódinn wants to take an action on an external account.") + '</div><div class="row"><span class="muted">This permission will be used once.</span><button data-approve-id="' + escapeHtml(approval.id) + '" type="button">Allow once</button></div></div>';
+      const effectSummary = approval.effect?.summary || "Review the bounded effect details before deciding.";
+      return '<div class="item approval-card"><div class="item-line"><strong>' + escapeHtml(friendlyArea(approval.tool || "browser action")) + '</strong><span class="chip warn">waiting for you</span></div><div class="approval-summary">' + escapeHtml(effectSummary) + '</div><div class="row"><span class="muted">This permission will be used once.</span><button data-approve-id="' + escapeHtml(approval.id) + '" data-approval-action="approve" type="button">Allow once</button><button class="secondary" data-approve-id="' + escapeHtml(approval.id) + '" data-approval-action="deny" type="button">Deny</button></div></div>';
     }
 
     async function refreshApprovals() {
       const approvals = await api("/approvals");
+      state.approvals = approvals;
       $("cap-approval-count").textContent = approvals.length;
       $("approval-list").innerHTML = approvals.map(renderApproval).join("") || '<div class="empty-state"><strong>Nothing is waiting</strong><span>Ódinn will pause before changing an external account.</span></div>';
     }
@@ -6786,9 +6920,21 @@ function renderConsoleHtml(version = "development") {
     }
 
     async function approveAction(id) {
+      const approval = (state.approvals || []).find((candidate) => candidate.id === id);
+      const effect = approval?.effect || {};
+      if (!window.confirm("Approve this effect once?\\n\\n" + String(effect.summary || "Review the bounded effect details before deciding.") + "\\n\\nCapability: " + String(effect.capability || approval?.tool || "unknown") + ".")) return;
+      if (effect.reversible !== "reversible" || effect.idempotency !== "idempotent") {
+        if (window.prompt("This effect is irreversible or its outcome is uncertain. Type APPROVE to continue.") !== "APPROVE") return;
+      }
       const result = await api("/approvals/" + encodeURIComponent(id) + "/approve", { method: "POST" });
       await refreshApprovals();
       await refreshBrowser();
+      showOutput(result);
+    }
+
+    async function denyAction(id) {
+      const result = await api("/approvals/" + encodeURIComponent(id) + "/deny", { method: "POST" });
+      await refreshApprovals();
       showOutput(result);
     }
 
@@ -6933,7 +7079,7 @@ function renderConsoleHtml(version = "development") {
         const input = document.querySelector('[data-config-self="' + key + '"]');
         if (input) input.checked = selfImprovement[key] !== false;
       }
-      $("config-self-mode").value = selfImprovement.mode || "auto";
+      $("config-self-mode").value = selfImprovement.mode || "propose";
       $("config-self-interval").value = configNumber(selfImprovement.intervalMs, 300000);
       $("config-self-max").value = configNumber(selfImprovement.maxChangesPerCycle, 1);
       $("config-runtime-retries").value = configNumber(value.runtime?.modelRetries, 0);
@@ -7864,6 +8010,8 @@ function renderConsoleHtml(version = "development") {
       button.addEventListener("click", () => switchView(button.dataset.viewJump));
     });
     $("refresh-operator").addEventListener("click", () => refreshOperator().catch((error) => showOutput(error.message)));
+    $("operator-work-prev").addEventListener("click", () => { state.operatorPages = state.operatorPages || { work: 1 }; state.operatorPages.work = Math.max(1, (state.operatorPages.work || 1) - 1); refreshOperator().catch((error) => showOutput(error.message)); });
+    $("operator-work-next").addEventListener("click", () => { state.operatorPages = state.operatorPages || { work: 1 }; state.operatorPages.work = (state.operatorPages.work || 1) + 1; refreshOperator().catch((error) => showOutput(error.message)); });
     $("operator-attention-list").addEventListener("click", (event) => {
       const button = event.target.closest("[data-operator-action]");
       if (button) runOperatorAction(button.dataset.operatorAction, button.dataset.operatorTarget).catch((error) => showOutput(error.message));
@@ -7952,7 +8100,9 @@ function renderConsoleHtml(version = "development") {
     });
     $("approval-list").addEventListener("click", (event) => {
       const button = event.target.closest("[data-approve-id]");
-      if (button) approveAction(button.dataset.approveId).catch((error) => showOutput(error.message));
+      if (!button) return;
+      const action = button.dataset.approvalAction === "deny" ? denyAction : approveAction;
+      action(button.dataset.approveId).catch((error) => showOutput(error.message));
     });
 
     $("refresh").addEventListener("click", refresh);

@@ -33,7 +33,8 @@ export interface JobStore {
   claimApproval?(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
   update(id: string, patch: JsonObject): Promise<JobRecord>;
   get(id: string): Promise<JobRecord | undefined>;
-  list(): Promise<JobRecord[]>;
+  list(options?: { limit?: number; offset?: number }): Promise<JobRecord[]>;
+  count?(): Promise<{ total: number; attention: number }>;
   recover(options: { maxAttempts: number }): Promise<unknown>;
   cancel?(id: string, options?: { requestedBy?: string; reason?: string }): Promise<JobRecord>;
   renewLease?(id: string, lease: { token: string; owner: string; epoch: string; expiresAt: string }): Promise<boolean>;
@@ -194,7 +195,12 @@ export class JobSupervisor {
   }
 
   async get(id: string): Promise<JobRecord | undefined> { return this.store.get(id); }
-  async list(): Promise<JobRecord[]> { return this.store.list(); }
+  async list(options?: { limit?: number; offset?: number }): Promise<JobRecord[]> { return this.store.list(options); }
+  async counts(): Promise<{ total: number; attention: number }> {
+    if (typeof this.store.count === "function") return this.store.count();
+    const jobs = await this.store.list({ limit: 500 });
+    return { total: jobs.length, attention: jobs.filter((job) => ["failed", "needs-review"].includes(job.status)).length };
+  }
 
   getVolatileResult(id: string): unknown | undefined {
     const entry = this.volatileResults.get(id);

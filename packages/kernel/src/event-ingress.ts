@@ -125,8 +125,14 @@ export class DurableEventIngress {
     this.database.db.prepare("UPDATE event_watches SET enabled=0, updated_at=? WHERE watch_id=?").run(timestamp(), watchId);
   }
 
-  listWatches(): Array<{ watchId: string; declaration: AutomationDeclaration; enabled: boolean; updatedAt: string }> {
-    return (this.database.db.prepare("SELECT * FROM event_watches ORDER BY watch_id").all() as Row[]).map((row) => ({ watchId: String(row.watch_id), declaration: validateAutomationDeclaration(parse(row.declaration_json)), enabled: Number(row.enabled) === 1, updatedAt: String(row.updated_at) }));
+  listWatches({ limit = 256, offset = 0 }: { limit?: number; offset?: number } = {}): Array<{ watchId: string; declaration: AutomationDeclaration; enabled: boolean; updatedAt: string }> {
+    const boundedLimit = Math.min(256, Math.max(0, Number.isSafeInteger(Number(limit)) ? Number(limit) : 256));
+    const boundedOffset = Math.max(0, Number.isSafeInteger(Number(offset)) ? Number(offset) : 0);
+    return (this.database.db.prepare("SELECT * FROM event_watches ORDER BY watch_id LIMIT ? OFFSET ?").all(boundedLimit, boundedOffset) as Row[]).map((row) => ({ watchId: String(row.watch_id), declaration: validateAutomationDeclaration(parse(row.declaration_json)), enabled: Number(row.enabled) === 1, updatedAt: String(row.updated_at) }));
+  }
+
+  countWatches(): number {
+    return Number((this.database.db.prepare("SELECT count(*) AS count FROM event_watches").get() as Row).count || 0);
   }
 
   async ingest(input: unknown, authDigest: string): Promise<{ event: AutomationEvent; candidates: AutomationCandidate[]; deliveries: Array<{ idempotencyKey: string; status: DeliveryStatus }> }> {

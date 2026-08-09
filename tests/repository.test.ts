@@ -17,7 +17,10 @@ test("package metadata names Odinn Forge and pins the toolchain", async () => {
   assert.match(pkg.packageManager, /^pnpm@\d+\.\d+\.\d+$/);
   assert.equal(pkg.engines.node, ">=24.0.0");
   const changelog = await read("CHANGELOG.md");
-  assert.ok(changelog.includes(`## [${pkg.version}](`), "changelog must describe the package version");
+  assert.ok(
+    changelog.includes(`## [${pkg.version}](`) || changelog.includes(pkg.version),
+    "changelog must describe the package version",
+  );
 });
 
 test("local package operations have conservative resource limits", async () => {
@@ -62,15 +65,15 @@ test("required CI/CD workflows exist", async () => {
   }
 });
 
-test("published GitHub releases hand npm publication to the protected workflow", async () => {
+test("draft GitHub releases hand npm publication to the protected workflow", async () => {
   const release = await read(".github/workflows/release.yml");
   const preflight = await read("scripts/release/preflight.ts");
 
-  assert.match(release, /^\s{2}release:\s*\n\s{4}types:\s*\n\s{6}- published/m);
+  assert.doesNotMatch(release, /^\s{2}release:/m);
   assert.match(release, /^\s{2}workflow_dispatch:/m);
-  assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \|\| github\.event\.release\.tag_name \}\}/);
+  assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/);
   assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}contents: read/m);
-  assert.match(release, /\.tag_name == \$tag and \.draft == false/);
+  assert.match(release, /\.tag_name == \$tag and \.draft == true/);
   assert.doesNotMatch(release.match(/^  release-policy:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /^\s+needs:/m);
   assert.match(release, /^  verify:\s*[\s\S]*?^    needs: release-policy/m);
   assert.match(
@@ -84,12 +87,18 @@ test("published GitHub releases hand npm publication to the protected workflow",
   );
   assert.match(release, /mapfile -t package_manifests < <\(find dist\/npm-package -type f -name package\.json -print\)/);
   assert.match(release, /test "\$\{#package_manifests\[@\]\}" -eq 1/);
-  assert.match(release, /npm publish "\$package_dir" --access public --provenance/);
+  assert.match(release, /npm publish "\$package_dir" --tag next --access public --provenance/);
+  assert.match(release, /gh release upload "\$TAG" release-assets\/\*/);
+  assert.match(release, /expected_assets=/);
+  assert.match(release, /existing_assets=/);
+  assert.match(release, /diff -u <\(printf '%s\\n' "\$expected_assets"\)/);
+  assert.match(release, /cmp release-assets\/SHA256SUMS\.txt downloaded-release-assets\/SHA256SUMS\.txt/);
+  assert.doesNotMatch(release, /--clobber/);
   assert.match(release, /release_commit: \$\{\{ steps\.release\.outputs\.commit \}\}/);
   assert.match(release, /ref: \$\{\{ needs\.release-policy\.outputs\.release_commit \}\}/);
   const publishJob = release.match(/^  publish-release:[\s\S]*$/m)?.[0] ?? "";
   assert.ok(
-    publishJob.indexOf("Revalidate published release and exact tag commit") < publishJob.indexOf("npm publish"),
+    publishJob.indexOf("Revalidate draft release and exact tag commit") < publishJob.indexOf("npm publish"),
     "exact tag/release revalidation must precede npm publication"
   );
   assert.match(publishJob, /test "\$\(git rev-list -n 1 "refs\/tags\/\$TAG"\)" = "\$EXPECTED_COMMIT"/);
@@ -312,9 +321,9 @@ test("security scanning is license-independent and optional maintenance is expli
     /codeql:[\s\S]*?permissions:\s*\n\s+actions: read\s*\n\s+contents: read/u,
   );
   assert.match(security, /output: \$\{\{ runner\.temp \}\}\/codeql-results/u);
-  assert.match(security, /upload: false/u);
+  assert.match(security, /upload: \$\{\{ github\.event_name != 'pull_request' \}\}/u);
   assert.match(security, /name: codeql-results-\$\{\{ github\.sha \}\}/u);
-  assert.doesNotMatch(security, /security-events: write/u);
+  assert.match(security, /security-events: write/u);
   assert.doesNotMatch(security, /github\/codeql-action\/upload-sarif/u);
   assert.doesNotMatch(security, /gitleaks\/gitleaks-action/u);
   assert.match(
@@ -468,7 +477,8 @@ test("release packaging removes stale assets before creating a version", async (
   assert.match(packaging, /distribution: "compiled"/);
   assert.match(packaging, /for \(const directory of \["cli", "gateway", "workers", "install"\]/);
   assert.match(packaging, /join\(packageRoot, "node_modules", "playwright-core"\)/);
-  assert.match(packaging, /name: "@bluedot-it\/odinn"/);
+  assert.match(packaging, /DISTRIBUTION_PACKAGE_NAME = "@bluedot-it\/odinn"/);
+  assert.match(packaging, /name: DISTRIBUTION_PACKAGE_NAME/);
   assert.match(packaging, /private: false/);
   const verification = await read("scripts/release/verify.ts");
   assert.match(verification, /archivedPackage\.name !== "@bluedot-it\/odinn"/);

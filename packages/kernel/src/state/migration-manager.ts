@@ -2,9 +2,8 @@ import { randomBytes } from "node:crypto";
 import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { AUDIT_SCHEMA_VERSION } from "@odinn/protocol";
 import { FileAuditStore } from "@odinn/store-file";
-import { inspectAuthoritativeRecordSchema, inspectExistingSqliteSchema, SqliteAuditStore } from "@odinn/store-sqlite";
+import { inspectAuthoritativeRecordSchema, inspectExistingSqliteAuditSchema, inspectExistingSqliteSchema, SqliteAuditStore } from "@odinn/store-sqlite";
 import { STATE_MIGRATIONS, type StateMigrationDefinition, type StateMigrationResult } from "./migrations/index.ts";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
 import { withStateMutationLock } from "../state-mutation.ts";
@@ -119,15 +118,25 @@ export async function inspectStateSchemas(stateDir: string): Promise<StateInspec
   const authoritativeRecordPath = join(stateRoot, "db", "records.sqlite");
   const records = await exists(authoritativeRecordPath)
     ? presentInspection(inspectAuthoritativeRecordSchema(authoritativeRecordPath), "authoritative SQLite record store is readable")
-    : await inspectJsonLines(join(stateRoot, "records.jsonl"), 1, "record");
+    : await inspectJsonLines(join(stateRoot, "records.jsonl"), STATE_SCHEMA_TARGETS.records, "legacy record");
   put(statuses, "records", records);
-  for (const surface of ["sessions", "projects", "goals", "memory"] as const) put(statuses, surface, records);
+  // These are logical projections in the same authoritative database. A
+  // legacy records file makes the shared physical store pending, but it does
+  // not create four independent migrations for its projections.
+  const recordProjection = records.version === 0 && records.present
+    ? presentInspection(STATE_SCHEMA_TARGETS.sessions, "logical projection covered by the records SQLite cutover")
+    : records;
+  for (const surface of ["sessions", "projects", "goals", "memory"] as const) put(statuses, surface, recordProjection);
   put(statuses, "jobs", await inspectRuntimeJobs(stateRoot));
 
   const auditFilename = config.present ? await auditFilenameFromConfig(stateRoot) : "audit.jsonl";
-  const audit = await inspectJsonLines(join(stateRoot, auditFilename), AUDIT_SCHEMA_VERSION, "audit event");
+  const auditPath = join(stateRoot, auditFilename);
+  const auditDatabasePath = join(stateRoot, "db", `${basename(auditFilename, ".jsonl")}.sqlite`);
+  const audit = await exists(auditDatabasePath)
+    ? presentInspection(inspectExistingSqliteAuditSchema(auditDatabasePath), "authoritative SQLite audit store is readable")
+    : await inspectJsonLines(auditPath, STATE_SCHEMA_TARGETS.audit, "legacy audit event");
   await inspectAuditKeyring(join(stateRoot, `${auditFilename}.keys.json`));
-  put(statuses, "audit", audit, auditFilename);
+  put(statuses, "audit", audit, relative(stateRoot, await exists(auditDatabasePath) ? auditDatabasePath : auditPath));
 
   put(statuses, "approvals", await inspectApprovals(join(stateRoot, "approvals.json")));
   put(statuses, "browserRecovery", await inspectBrowserRecovery(stateRoot));
@@ -471,7 +480,7 @@ async function inspectJsonLines(path: string, target: number, label: string): Pr
     if (isCode(error, "ENOENT")) return absentInspection(target);
     throw error;
   }
-  const versions: number[] = [];
+  let entries = 0;
   for (const [index, line] of content.split("\n").entries()) {
     if (!line.trim()) continue;
     let value: unknown;
@@ -482,9 +491,12 @@ async function inspectJsonLines(path: string, target: number, label: string): Pr
     }
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${basename(path)} ${label} at line ${index + 1} must be an object`);
     const record = value as Record<string, unknown>;
-    versions.push("schemaVersion" in record ? schemaNumber(record.schemaVersion, `${label} line ${index + 1}`) : target);
+    if ("schemaVersion" in record && schemaNumber(record.schemaVersion, `${label} line ${index + 1}`) > target) {
+      throw new Error(`${label} schema is newer than supported schema ${target}`);
+    }
+    entries += 1;
   }
-  return presentInspection(versions.length ? Math.max(...versions) : target, `${versions.length} ${label}${versions.length === 1 ? "" : "s"} validated`);
+  return presentInspection(0, `${entries} ${label}${entries === 1 ? "" : "s"} validated; legacy JSONL requires SQLite cutover`);
 }
 
 async function inspectAuditKeyring(path: string): Promise<void> {
@@ -543,8 +555,11 @@ async function inspectHostMetadata(stateRoot: string, hasState: boolean): Promis
 async function appendMigrationAuditEvent(stateRoot: string, plan: StateMigrationPlan, migrationId: string): Promise<void> {
   const auditFilename = await auditFilenameFromConfig(stateRoot);
   const auditPath = join(stateRoot, auditFilename);
-  if (!await exists(auditPath)) return;
-  const store = new FileAuditStore(auditPath);
+  const databasePath = join(stateRoot, "db", `${basename(auditFilename, ".jsonl")}.sqlite`);
+  const store = await exists(databasePath)
+    ? new SqliteAuditStore(databasePath, { keyringPath: `${auditPath}.keys.json` })
+    : await exists(auditPath) ? new FileAuditStore(auditPath) : undefined;
+  if (!store) return;
   await store.append({
     runId: migrationId,
     type: "state.migration",
@@ -557,6 +572,7 @@ async function appendMigrationAuditEvent(stateRoot: string, plan: StateMigration
       rollbackCompatible: plan.rollbackCompatible
     }
   });
+  if (store instanceof SqliteAuditStore) store.close();
 }
 
 async function refreshHostMetadata(

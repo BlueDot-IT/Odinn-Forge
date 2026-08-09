@@ -77,7 +77,7 @@ export type { GoalCommandInput, GoalView, ProjectCommandInput, ProjectView, Sess
 export { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, listMemoryCandidates, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
 export type { MemoryCommandInput, MemoryRecordStore } from "./memory.ts";
 export { createApprovalStore } from "./approvals.ts";
-export type { ApprovalAction, ApprovalStore } from "./approvals.ts";
+export type { ApprovalAction, ApprovalEffect, ApprovalStore } from "./approvals.ts";
 export { SkillLifecycleError, SkillLifecycleService } from "./skill-lifecycle.ts";
 export type { SkillLifecycleContext, SkillLifecycleTransition } from "./skill-lifecycle.ts";
 export { ProgressiveSkillDisclosure, SkillDisclosureError } from "./skill-disclosure.ts";
@@ -119,7 +119,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch, processExecutor, skillDisclosure, mcpRuntime }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch, processExecutor, skillDisclosure, mcpRuntime, writeConfig }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -605,6 +605,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         stateDir: resolve(stateDir),
         config,
         modelConfig,
+        writeConfig,
         runModel: async (modelInput: any) => {
           const result = await context.runTool({
             id: `${context.request.id}:advisor`,
@@ -629,7 +630,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["improve.rollback", {
       capability: "improve.write",
       description: "Rollback an autonomously applied improvement to its captured configuration snapshot.",
-      execute: async (input: any) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config })
+      execute: async (input: any) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config, writeConfig })
     }],
     ["workspace.mutate", {
       capability: "workspace.mutate",

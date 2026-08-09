@@ -825,6 +825,17 @@ test("gateway stops browser state changes for explicit approval", async () => {
     const approvals = await getJson(`${base}/approvals`);
     assert.equal(approvals.length, 2);
     assert.doesNotMatch(JSON.stringify(approvals), /must-never-enter-audit/);
+    const operator = await getJson(`${base}/operator/snapshot?surface=http&pageSize=25`);
+    const review = operator.sections.approvals.items.find((item: any) => item.label === "browser.type");
+    assert.ok(review?.details?.effect?.summary);
+    assert.ok(review.controls.includes("deny-approval"));
+    assert.doesNotMatch(JSON.stringify(review), /must-never-enter-audit/);
+    const directDenied = await postJson(`${base}/approvals/${encodeURIComponent(approvals[0].id)}/deny`, {});
+    assert.equal(directDenied.denied, true);
+    assert.equal((await getJson(`${base}/approvals`)).length, 1);
+    const denied = await postJson(`${base}/operator/actions`, { action: "deny-approval", targetId: review.id, confirm: true, surface: "http" });
+    assert.equal(denied.result.denied, true);
+    assert.equal((await getJson(`${base}/approvals`)).length, 0);
     const runs = await getJson(`${base}/runs`);
     assert.equal(runs[0].status, "awaiting_approval");
   } finally {
