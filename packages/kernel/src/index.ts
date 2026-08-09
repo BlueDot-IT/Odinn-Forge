@@ -37,6 +37,8 @@ export { DurableEventIngress, sourceAuthDigest } from "./event-ingress.ts";
 export type { EventIngressDispatch, EventIngressOptions } from "./event-ingress.ts";
 export { ProjectContextService, createProjectContextService } from "./project-context.ts";
 export type { ProjectContextMemory, ProjectContextOptions, ProjectContextPacket, ProjectContextRequest } from "./project-context.ts";
+export { OPERATOR_CONTRACT_VERSION, OPERATOR_DEFAULT_PAGE_SIZE, OPERATOR_MAX_PAGE_SIZE, buildOperatorSnapshot, defaultOperatorActions, operatorActionNames, paginateOperatorItems, redactOperatorValue } from "./operator-control.ts";
+export type { OperatorActionDescriptor, OperatorActionName, OperatorHealth, OperatorItem, OperatorPage, OperatorSection, OperatorSectionInput, OperatorSnapshot, OperatorSnapshotInput, OperatorSurface } from "./operator-control.ts";
 export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 import type { SandboxProcessInput } from "./sandbox-process.ts";
 type AnyRecord = Record<string, any>;

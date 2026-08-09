@@ -13,6 +13,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   recovery, and bug reports.
 - [Operator console](operator-console.md) — projects, tasks, memory, and
   scheduled work in the local console.
+- [Unified operator control plane](operator-control-plane.md) — the shared
+  snapshot and governed actions across CLI, TUI, HTTP JSON, and web console.
 - [AI provider support](provider-support.md) — tested providers and
   compatibility labels.
 - [Messaging channels](channels.md) — current adapter scope and limitations.
