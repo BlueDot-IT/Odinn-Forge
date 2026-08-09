@@ -8,7 +8,7 @@ export function runtimeDatabaseMigration(from: number, to: number): StateMigrati
     surface: "runtimeDatabase",
     from,
     to,
-    rollbackCompatible: to < 6,
+    rollbackCompatible: to < 7,
     async apply({ stateRoot }) {
       const database = new SqliteStore(join(stateRoot, "db", "odinn.sqlite"), { targetVersion: to });
       let importedJobs = 0;

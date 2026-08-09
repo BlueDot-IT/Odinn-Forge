@@ -4,8 +4,8 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
-import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
+import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
   ChannelPluginRegistry,
@@ -717,7 +717,16 @@ export async function createGatewayServer({
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
   const supervisor = new JobSupervisor({
     store: new SqliteJobStore(runtime.ledger, { legacyPath: join(state, "jobs.json") }),
-    execute: isolatedTaskExecutor
+    execute: isolatedTaskExecutor,
+    onCancel: (job) => {
+      const task = job.payload?.task;
+      const taskTool = task && typeof task === "object" && !Array.isArray(task)
+        ? (task as Record<string, unknown>).tool
+        : undefined;
+      if (taskTool === AGENT_GRAPH_TOOL) {
+        runtime.ledger.cancelAgentGraphRunsForParent({ parentRunId: job.id });
+      }
+    }
   });
   const runIsolatedTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
   const runGovernedTask = (request: any): Promise<any> => executeTask({ ...request, auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
@@ -736,6 +745,37 @@ export async function createGatewayServer({
   });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry, runLedger: runtime.ledger });
   await supervisor.start();
+  runtime.ledger.reconcileAgentGraphRuns();
+  for (const recovery of runtime.ledger.listAgentGraphRecoveryEvents()) {
+    const auditRun = await auditStore.readRun(recovery.parentRunId);
+    const hasAuditRecovery = auditRun?.events?.some((event: any) =>
+      ["agent.graph.completed", "agent.graph.failed", "agent.graph.cancelled", "agent.graph.needs-review"].includes(String(event.type))
+      && String(event.data?.graphRunId) === recovery.graphRunId
+      && String(event.data?.status) === recovery.status
+    );
+    const auditType = recovery.status === "needs-review" ? "agent.graph.needs-review" : recovery.status === "failed" ? "agent.graph.failed" : "agent.graph.cancelled";
+    if (!hasAuditRecovery) {
+      await auditStore.append({
+        at: new Date().toISOString(),
+        runId: recovery.parentRunId,
+        type: auditType,
+        actor: "system",
+        tool: AGENT_GRAPH_TOOL,
+        capability: AGENT_GRAPH_TOOL,
+        decision: recovery.status === "needs-review" ? "pending" : "deny",
+        message: "agent graph recovery state requires operator review",
+        data: { graphRunId: recovery.graphRunId, status: recovery.status, errorCode: recovery.errorCode, recovered: true }
+      });
+    }
+    const ledgerRun = runtime.ledger.getRun(recovery.parentRunId);
+    const ledgerType = recovery.status === "needs-review" ? "agent-graph-needs-review" : recovery.status === "failed" ? "agent-graph-failed" : "agent-graph-cancelled";
+    const hasLedgerRecovery = ledgerRun?.events?.some((event: any) =>
+      ["agent-graph-completed", "agent-graph-failed", "agent-graph-cancelled", "agent-graph-needs-review"].includes(String(event.type))
+      && String(event.payload?.graphRunId) === recovery.graphRunId
+      && String(event.payload?.status) === recovery.status
+    );
+    if (!hasLedgerRecovery) runtime.ledger.appendEvent({ runId: recovery.parentRunId, type: ledgerType, payload: { graphRunId: recovery.graphRunId, status: recovery.status, errorCode: recovery.errorCode, recovered: true } });
+  }
   const cronTimer = setInterval(() => runDueCronJobs(
     cronStore,
     supervisor,
@@ -1197,6 +1237,20 @@ export async function createGatewayServer({
         const id = decodeURIComponent(url.pathname.slice("/cron/".length, -"/run".length));
         return json(response, 200, { ok: true, result: await runCronJob(cronStore, id, isolatedTaskExecutor) });
       }
+      if (request.method === "GET" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/result")) {
+        const id = decodeURIComponent(url.pathname.slice("/jobs/".length, -"/result".length));
+        const job = await supervisor.get(id);
+        if (!job) return json(response, 404, { ok: false, error: "job not found" });
+        const task = job.payload?.task;
+        const taskTool = task && typeof task === "object" && !Array.isArray(task) ? (task as Record<string, unknown>).tool : undefined;
+        if (job.status !== "completed" || job.payload?.executionKey !== id || taskTool !== "agent.run") {
+          return json(response, 409, { ok: false, error: "ephemeral channel result is unavailable" });
+        }
+        const result = supervisor.getVolatileResult(id);
+        return result === undefined
+          ? json(response, 409, { ok: false, error: "ephemeral channel result is unavailable" })
+          : json(response, 200, { ok: true, result });
+      }
       if (request.method === "GET" && url.pathname.startsWith("/jobs/")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length));
         const job = await supervisor.get(id);
@@ -1204,6 +1258,27 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/jobs") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const task = body.task && typeof body.task === "object" ? body.task : body;
+        if (task.tool === "agent.delegate" && body.kind !== "agent-graph") {
+          throw new GatewayError(400, "agent.delegate jobs require kind=agent-graph");
+        }
+        if (body.kind === "agent-graph" && task.tool !== "agent.delegate") {
+          throw new GatewayError(400, "kind=agent-graph requires task.tool=agent.delegate");
+        }
+        if (task.tool === AGENT_GRAPH_TOOL && config?.runtime?.enableAgentGraphs !== true) {
+          throw new GatewayError(403, "agent graph execution is disabled; enable config.runtime.enableAgentGraphs explicitly");
+        }
+        const parentCapabilities = task.tool === AGENT_GRAPH_TOOL
+          ? (() => {
+            try {
+              const capabilities = assertCapabilityIds(body.parentCapabilities, "parentCapabilities");
+              if (!capabilities.length) throw new Error("agent graph jobs require at least one explicit parent capability");
+              return capabilities;
+            } catch (error) {
+              throw new GatewayError(400, error instanceof Error ? error.message : "parentCapabilities is invalid");
+            }
+          })()
+          : undefined;
         const activeJobs = (await supervisor.list()).filter((job: any) => ["queued", "running"].includes(job.status)).length;
         if (activeJobs >= quotaGate.maximumActiveJobs) throw new GatewayError(429, "tenant active-job quota exceeded");
         const id = body.id || request.headers["idempotency-key"] || undefined;
@@ -1215,16 +1290,18 @@ export async function createGatewayServer({
             return json(response, 200, { ok: true, replayed: true, job: existing });
           }
         }
-        const task = body.task && typeof body.task === "object" ? body.task : body;
         const safety = toolSafetyDescriptor(task.tool, registry.get(task.tool));
-        const durableExecution = task.tool === "process.exec";
-        const sandboxProcessConfig = durableExecution ? normalizeSandboxConfig(config).process : undefined;
+        const durableExecution = task.tool === "process.exec" || task.tool === "agent.delegate";
+        const sandboxProcessConfig = task.tool === "process.exec" ? normalizeSandboxConfig(config).process : undefined;
         const requestedTimeout = Number.isSafeInteger(task.input?.timeoutMs) ? Number(task.input.timeoutMs) : sandboxProcessConfig?.limits.timeoutMs;
-        const effectiveTimeout = durableExecution
+        const requestedGraphTimeout = Number.isSafeInteger(task.input?.maxRunMs) ? Number(task.input.maxRunMs) : 120_000;
+        const effectiveTimeout = task.tool === "process.exec"
           ? Math.min(requestedTimeout ?? 120_000, sandboxProcessConfig?.limits.timeoutMs ?? 120_000) + 30_000
+          : task.tool === "agent.delegate"
+            ? Math.min(Math.max(requestedGraphTimeout, 1), 300_000) + 30_000
           : body.timeoutMs;
         const job = await supervisor.submit(
-          { durableExecution, task: { ...task, ...(id ? { id: String(id) } : {}) } },
+          { durableExecution, ...(parentCapabilities ? { parentCapabilities } : {}), ...(typeof body.executionKey === "string" ? { executionKey: body.executionKey } : {}), task: { ...task, ...(id ? { id: String(id) } : {}) } },
           { id: id ? String(id) : undefined, requestHash, timeoutMs: effectiveTimeout, retrySafe: safety.retrySafe === true }
         );
         return json(response, 202, { ok: true, job });
@@ -1934,7 +2011,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
         if (readError?.code !== "ENOENT") throw readError;
       }
       await mkdir(state, { recursive: true });
-      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, runtime: { enableAgentGraphs: false }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await chmod(path, 0o600);
       return config;
@@ -2001,6 +2078,10 @@ function validateGatewayConfig(config: any) {
   }
   if (config.defaultModel !== undefined && typeof config.defaultModel !== "string") {
     throw new GatewayError(400, "config.defaultModel must be a string");
+  }
+  if (config.runtime !== undefined) {
+    assertConfigRecord(config.runtime, "config.runtime");
+    assertOptionalConfigBoolean(config.runtime, "enableAgentGraphs", "config.runtime");
   }
   if (config.channels !== undefined) {
     assertConfigRecord(config.channels, "config.channels");

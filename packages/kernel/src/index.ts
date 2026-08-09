@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
-import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed } from "@odinn/policy";
+import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
 import { createRunId, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
@@ -27,6 +27,7 @@ import { decideImprovement, learnImprovements, listImprovements, normalizeSelfIm
 import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
 import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.ts";
 import { readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
+import { AGENT_GRAPH_TOOL, executeAgentGraph, type AgentGraphTaskInput } from "./agent-graph-runtime.ts";
 export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 import type { SandboxProcessInput } from "./sandbox-process.ts";
 type AnyRecord = Record<string, any>;
@@ -71,6 +72,8 @@ export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
 export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";
 export type { AgentManifest } from "./agents.ts";
+export { AGENT_GRAPH_REGISTRY_REF, AGENT_GRAPH_TOOL, executeAgentGraph } from "./agent-graph-runtime.ts";
+export type { AgentGraphExecutorOptions, AgentGraphTaskInput } from "./agent-graph-runtime.ts";
 
 
 export type BuiltInRegistry = Map<string, any> & { close(): void };
@@ -284,15 +287,67 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         memoryStore: recordStore,
         auditStore: context.auditStore,
         runId: context.request.id,
-        registry: context.registry,
+        registry: context.modelRegistry ?? context.registry,
         runTool: context.runTool,
         runLedger: context.runLedger,
         policy: context.policy,
         signal: context.signal,
+        allowNestedAgentExecution: context.allowNestedAgentExecution,
         onModelDelta: context.onModelDelta,
         onProviderAttempt: context.onProviderAttempt,
         onAgentProgress: context.onAgentProgress
       })
+    }],
+    [AGENT_GRAPH_TOOL, {
+      capability: AGENT_GRAPH_TOOL,
+      description: "Dispatch a bounded read-only child-agent DAG through the durable jobs boundary.",
+      execute: async (input: AgentGraphTaskInput, context: any) => {
+        if (config?.runtime?.enableAgentGraphs !== true) {
+          throw new Error("agent graph execution is disabled; enable config.runtime.enableAgentGraphs explicitly");
+        }
+        if (context?.durableExecution !== true) {
+          throw new Error("agent.delegate is available only through the durable /jobs execution surface");
+        }
+        if (typeof context.runTool !== "function" || typeof context.runLedger?.createAgentGraphRun !== "function") throw new Error("agent.delegate requires the governed durable child dispatcher");
+        const policy = context.policy;
+        const parentCapabilities = context.parentCapabilities;
+        if (!Array.isArray(parentCapabilities) || parentCapabilities.length === 0) {
+          throw new Error("agent.delegate requires explicit parentCapabilities from the durable job admission");
+        }
+        return executeAgentGraph(input, {
+          registry: context.registry,
+          policy,
+          parentCapabilities,
+          runId: context.request.id,
+          signal: context.signal,
+          appendEvent: (event) => context.runLedger?.appendEvent({ runId: context.request.id, type: event.type, payload: event.payload }),
+          appendAuditEvent: (event) => context.auditStore?.append({
+            at: new Date().toISOString(),
+            runId: context.request.id,
+            type: event.type,
+            actor: context.request.actor,
+            tool: AGENT_GRAPH_TOOL,
+            capability: AGENT_GRAPH_TOOL,
+            decision: event.payload.status === "completed" || event.payload.terminalStatus === "completed"
+              ? "allow"
+              : event.payload.status === "failed" || event.payload.status === "cancelled" || event.payload.terminalStatus === "failed" || event.payload.terminalStatus === "cancelled"
+                ? "deny"
+                : "pending",
+            data: event.payload
+          }),
+          readAuditRun: (runId) => context.auditStore?.readRun(runId),
+          getExecutionAttemptId: (runId) => context.runLedger.listExecutionAttempts(runId).at(-1)?.id,
+          persistGraph: {
+            create: (value) => context.runLedger.createAgentGraphRun(value),
+            startNode: (value) => context.runLedger.startAgentGraphNode(value),
+            cancel: (value) => context.runLedger.cancelAgentGraphRun(value),
+            beginCompletion: (value) => context.runLedger.beginAgentGraphCompletion(value),
+            recordNode: (value) => context.runLedger.recordAgentGraphNodeResult(value),
+            complete: (value) => context.runLedger.completeAgentGraphRun(value)
+          },
+          runChild: (childTask) => context.runTool(childTask)
+        });
+      }
     }],
     ["model.chat", {
       capability: "model.chat",
@@ -723,7 +778,7 @@ function modelVisibleAgentToolSchemas(registry: any) {
   });
 }
 
-async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, auditStore, runId, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt, onAgentProgress }: any = {}) {
+async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, auditStore, runId, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt, onAgentProgress, allowNestedAgentExecution = true }: any = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const agent = await loadAgent(stateDir, cleanString(input.agentId, defaultAgentId || DEFAULT_AGENT_ID));
   const memoryOptions = normalizeMemoryOptions(input.memory);
@@ -817,6 +872,11 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
     for (const [callIndex, call] of result.toolCalls.entries()) {
       let nested;
       try {
+        if (!allowNestedAgentExecution && ["agent.run", AGENT_GRAPH_TOOL].includes(call.name)) {
+          const error = new Error("recursive agent execution is disabled for this child-agent profile") as NodeError;
+          error.code = "AGENT_RECURSION_DISABLED";
+          throw error;
+        }
         const args = parseAgentToolArguments(call.arguments, registry?.get?.(call.name)?.inputSchema);
         nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
       } catch (error: any) {
@@ -1160,6 +1220,18 @@ function executionResourceForRequest(toolName: string, input: AnyRecord = {}) {
   if (toolName === "snapshot.restore") {
     return pick([["snapshotId", input.snapshotId]]);
   }
+  if (toolName === AGENT_GRAPH_TOOL) {
+    return pick([
+      ["graphDigest", createHash("sha256").update(String(input.graph ?? ""), "utf8").digest("hex")],
+      ["manifestsDigest", createHash("sha256").update(String(input.manifests ?? ""), "utf8").digest("hex")],
+      ["inputsDigest", createHash("sha256").update(stableTaskValue(input.inputs && typeof input.inputs === "object" ? input.inputs : {}), "utf8").digest("hex")],
+      ["principalNamespace", typeof input.principalNamespace === "string"
+        ? `sha256:${createHash("sha256").update(input.principalNamespace, "utf8").digest("hex")}`
+        : undefined],
+      ["maxConcurrency", input.maxConcurrency ?? 1],
+      ["maxRunMs", input.maxRunMs]
+    ]);
+  }
   return input.resource && typeof input.resource === "object" && !Array.isArray(input.resource) ? input.resource : {};
 }
 
@@ -1185,7 +1257,8 @@ function executionInputLimit(policy: any): number {
     : 16_384;
 }
 
-function executionSandboxProfile(safety: ReturnType<typeof toolSafetyDescriptor>): string {
+function executionSandboxProfile(toolName: string, safety: ReturnType<typeof toolSafetyDescriptor>): string {
+  if (toolName === AGENT_GRAPH_TOOL) return "agent.graph.readonly.v1";
   if (safety.effects.includes("process")) return "sandbox.process.v1";
   if (safety.effects.includes("external-state")) return "network-allowlisted";
   if (safety.effects.includes("filesystem-write")) return "workspace-write";
@@ -1197,6 +1270,19 @@ function executionErrorCode(error: unknown, fallback = "EXECUTION_FAILED"): stri
   const candidate = error && typeof error === "object" && "code" in error ? String(error.code) : fallback;
   const normalized = candidate.toUpperCase().replaceAll(/[^A-Z0-9_]/gu, "_").slice(0, 128);
   return /^[A-Z]/u.test(normalized) ? normalized : fallback;
+}
+
+function normalizeParentCapabilities(policy: RuntimePolicy, value: unknown): readonly CapabilityId[] | undefined {
+  if (value === undefined) return undefined;
+  const capabilities = assertCapabilityIds(value, "parentCapabilities");
+  const denied = capabilities.filter((capability) => !policy.allowedCapabilities.includes(capability)
+    && !policy.scopedCapabilities.some((grant) => grant.tool === AGENT_GRAPH_TOOL && grant.capability === capability));
+  if (denied.length) {
+    const error = new Error(`parent capabilities are not admitted by policy: ${denied.join(", ")}`) as NodeError;
+    error.code = "CAPABILITY_DENIED";
+    throw error;
+  }
+  return capabilities;
 }
 
 export class ExecutionAdmissionService {
@@ -1226,7 +1312,7 @@ export class ExecutionAdmissionService {
       runId: request.id,
       ...(parentRunId ? { parentRunId } : {}),
       principalId: executionReference("principal", request.actor),
-      execution: { kind: "tool", id: request.tool },
+      execution: { kind: request.tool === AGENT_GRAPH_TOOL ? "agent" : "tool", id: request.tool },
       inputDigest,
       inputReference: `artifact:sha256:${ledgerStep.inputArtifact.digest}`,
       capabilityDecisionReferences: [decisionReference],
@@ -1241,11 +1327,15 @@ export class ExecutionAdmissionService {
       idempotencyKey: executionReference("request", request.id),
       retrySafety: safety.retrySafe ? "retry-safe" : "not-retry-safe",
       workspaceRoot: runLedger.workspaceRoot,
-      sandboxProfile: executionSandboxProfile(safety),
+      sandboxProfile: executionSandboxProfile(request.tool, safety),
+      ...(request.tool === AGENT_GRAPH_TOOL ? { expectedResultReference: `result:graph:${request.id}` } : {}),
       auditCorrelationId: executionReference("audit", request.id),
       cancellationControlReference: executionReference("cancel", request.id)
     };
     const resuming = recoveryReplay && Boolean(runLedger.getExecutionEnvelope(request.id));
+    const attemptOptions = typeof this.options.executionAttemptId === "string" && this.options.executionAttemptId.length > 0
+      ? { attemptId: this.options.executionAttemptId }
+      : {};
     const persisted = resuming
       ? runLedger.resumeExecution({
           runId: request.id,
@@ -1253,7 +1343,7 @@ export class ExecutionAdmissionService {
           inputDigest,
           principalId: executionReference("principal", request.actor)
         })
-      : runLedger.admitExecution(envelope);
+      : runLedger.admitExecution(envelope, attemptOptions);
     try {
       await this.options.auditStore.append({
         at: this.options.now(),
@@ -1372,6 +1462,9 @@ async function executeTaskThroughAdmission({
   trustedRecovery = false,
   durableExecution = false,
   parentRunId,
+  modelRegistry,
+  allowNestedAgentExecution = true,
+  parentCapabilities,
   admissionService
 }: any) {
   const request = normalizeTaskRequest(task);
@@ -1440,6 +1533,7 @@ async function executeTaskThroughAdmission({
     ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: projectDurableToolInput(request.tool, request.input), safety, metadata: { actor: request.actor } });
   }
   const decision = evaluateTaskPolicy({ policy, request, tool });
+  const admittedParentCapabilities = normalizeParentCapabilities(policy, parentCapabilities);
 
   await auditStore.append({
     at: now(),
@@ -1453,7 +1547,8 @@ async function executeTaskThroughAdmission({
     data: {
       ...("details" in decision ? decision.details : {}),
       declaredCapabilities: tool?.capabilities ?? [],
-      effectiveCapabilities: decision.allowed ? decision.capabilities : []
+      effectiveCapabilities: decision.allowed ? decision.capabilities : [],
+      ...(admittedParentCapabilities ? { parentCapabilities: admittedParentCapabilities } : {})
     }
   });
 
@@ -1527,6 +1622,7 @@ async function executeTaskThroughAdmission({
       request,
       policy,
       registry,
+      modelRegistry,
       auditStore,
       signal,
       onModelDelta,
@@ -1550,25 +1646,58 @@ async function executeTaskThroughAdmission({
       trustedApprovalId,
       trustedApprovalRunId,
       durableExecution,
-      runTool: (nestedTask: any) => runTask({
-        task: { ...nestedTask, actor: nestedTask.actor ?? request.actor },
-        auditStore,
-        policy,
-        registry,
-        now,
-        signal,
-        runLedger: nestedTask.runLedger ?? runLedger,
-        parentRunId: request.id,
-        onModelDelta,
-        onProviderAttempt,
-        onAgentProgress,
-        durableExecution
-      })
+      allowNestedAgentExecution,
+      effectiveCapabilities: decision.allowed ? decision.capabilities : [],
+      parentCapabilities: admittedParentCapabilities,
+      runTool: (nestedTask: any) => {
+        const nestedTool = typeof nestedTask?.tool === "string" ? nestedTask.tool : "";
+        if (!allowNestedAgentExecution && ["agent.run", AGENT_GRAPH_TOOL].includes(nestedTool)) {
+          const error = new Error("recursive agent execution is disabled for this child-agent profile") as NodeError;
+          error.code = "AGENT_RECURSION_DISABLED";
+          throw error;
+        }
+        const nestedExecutionAttemptId = nestedTask && typeof nestedTask === "object" && typeof nestedTask.executionAttemptId === "string"
+          ? nestedTask.executionAttemptId
+          : undefined;
+        const nestedRequest = nestedTask && typeof nestedTask === "object"
+          ? Object.fromEntries(Object.entries(nestedTask).filter(([key]) => key !== "executionAttemptId"))
+          : nestedTask;
+        return runTask({
+          task: { ...nestedRequest, actor: nestedTask.actor ?? request.actor },
+          auditStore,
+          policy: nestedTask.policy ?? policy,
+          registry: nestedTask.registry ?? registry,
+          modelRegistry: nestedTask.modelRegistry,
+          now,
+          signal: nestedTask.signal ?? signal,
+          runLedger: nestedTask.runLedger ?? runLedger,
+          parentRunId: request.id,
+          onModelDelta,
+          onProviderAttempt,
+          onAgentProgress,
+          durableExecution,
+          allowNestedAgentExecution: nestedTask.allowNestedAgentExecution ?? allowNestedAgentExecution,
+          parentCapabilities: nestedTask.parentCapabilities,
+          executionAttemptId: nestedExecutionAttemptId
+        });
+      }
     });
     backendReturned = true;
-    throwIfAborted(signal);
+    const graphTerminalStatus = request.tool === AGENT_GRAPH_TOOL
+      && output && typeof output === "object" && ["completed", "failed", "cancelled", "needs-review"].includes(String(output.status))
+      ? String(output.status) as "completed" | "failed" | "cancelled" | "needs-review"
+      : undefined;
+    if (!graphTerminalStatus) throwIfAborted(signal);
     const awaitingApproval = output?.type === "approval.required";
     const durableOutput = projectDurableToolOutput(request.tool, output);
+    if (graphTerminalStatus) {
+      const graphFailure = graphTerminalStatus === "completed" ? undefined : new Error(`agent graph finished with status ${graphTerminalStatus}`);
+      const outputArtifact = runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output: durableOutput, status: graphTerminalStatus === "completed" ? "succeeded" : graphTerminalStatus, error: graphFailure?.message });
+      ledgerFinished = Boolean(runLedger);
+      if (graphTerminalStatus === "completed") admissionService.complete(admission, outputArtifact?.digest);
+      else admissionService.fail(admission, graphFailure, { cancelled: graphTerminalStatus === "cancelled", uncertain: graphTerminalStatus === "needs-review" });
+      return { id: request.id, tool: request.tool, capability: tool.capability, capabilities: tool.capabilities, ok: graphTerminalStatus === "completed", terminalStatus: graphTerminalStatus, output };
+    }
     await auditStore.append({
       at: now(),
       runId: request.id,

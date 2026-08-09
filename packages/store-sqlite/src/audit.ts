@@ -65,9 +65,20 @@ function statusFor(event: AuditEvent, prior: Row | undefined) {
   const summary: Row = prior ? JSON.parse(String(prior.summary_json)) : { id: event.runId, status: "unknown", eventCount: 0 };
   Object.assign(summary, { id: event.runId, actor: event.actor, tool: event.tool ?? summary.tool, capability: event.capability ?? summary.capability, lastEventAt: event.at, eventCount: Number(summary.eventCount) + 1 });
   if (event.type === "task.policy" && event.decision === "deny") Object.assign(summary, { status: "denied", message: event.message });
-  else if (["plan.started", "task.started"].includes(event.type)) Object.assign(summary, { status: "running", startedAt: event.at });
+  else if (["plan.started", "task.started", "agent.graph.validated", "agent.graph.node.started"].includes(event.type)) Object.assign(summary, { status: "running", startedAt: event.at });
   else if (["plan.completed", "task.completed"].includes(event.type)) Object.assign(summary, { status: "completed", completedAt: event.at });
   else if (["plan.failed", "task.failed"].includes(event.type)) Object.assign(summary, { status: "failed", completedAt: event.at, message: event.message });
+  else if (event.type === "agent.graph.completed") {
+    const status = event.data?.status;
+    Object.assign(summary, {
+      status: ["completed", "failed", "needs-review", "cancelled"].includes(String(status)) ? status : "needs-review",
+      completedAt: event.at,
+      ...(status === "needs-review" ? { message: "agent graph outcome requires operator review" } : {})
+    });
+  }
+  else if (event.type === "agent.graph.needs-review") Object.assign(summary, { status: "needs-review", completedAt: event.at, message: event.message ?? "agent graph outcome requires operator review" });
+  else if (event.type === "agent.graph.cancelled") Object.assign(summary, { status: "cancelled", completedAt: event.at, message: event.message });
+  else if (event.type === "agent.graph.failed") Object.assign(summary, { status: "failed", completedAt: event.at, message: event.message });
   else if (event.type === "task.approval_required") Object.assign(summary, { status: "awaiting_approval", message: event.message });
   else if (["task.blocked", "task.cancelled"].includes(event.type)) Object.assign(summary, { status: event.type.slice(5), completedAt: event.at, message: event.message });
   return summary;

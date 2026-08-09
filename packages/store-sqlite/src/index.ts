@@ -14,7 +14,7 @@ import {
 export { SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
 export type { AuditPage } from "./audit.ts";
 
-export const SQLITE_SCHEMA_VERSION = 6;
+export const SQLITE_SCHEMA_VERSION = 7;
 export type SqliteStoreOptions = { targetVersion?: number };
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
@@ -447,6 +447,57 @@ const MIGRATIONS = [
   CREATE INDEX IF NOT EXISTS idx_mutation_journal_group ON mutation_journal_entries(group_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_mutation_journal_checkpoint ON mutation_journal_entries(checkpoint_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_checkpoint_manifest_artifacts_checkpoint ON checkpoint_manifest_artifacts(checkpoint_id, manifest_digest);`
+  ,
+  `CREATE TABLE IF NOT EXISTS agent_graph_runs (
+    id TEXT PRIMARY KEY,
+    parent_run_id TEXT NOT NULL REFERENCES runs(id),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    graph_digest TEXT NOT NULL CHECK(length(graph_digest) = 64),
+    manifests_digest TEXT NOT NULL CHECK(length(manifests_digest) = 64),
+    graph_bytes INTEGER NOT NULL CHECK(graph_bytes >= 0 AND graph_bytes <= 32768),
+    manifests_bytes INTEGER NOT NULL CHECK(manifests_bytes >= 0 AND manifests_bytes <= 32768),
+    principal_namespace TEXT NOT NULL CHECK(length(principal_namespace) = 71 AND substr(principal_namespace, 1, 7) = 'sha256:' AND substr(principal_namespace, 8) NOT GLOB '*[^0-9a-f]*'),
+    request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+    status TEXT NOT NULL CHECK(status IN ('validated', 'running', 'publishing', 'completed', 'failed', 'cancelled', 'needs-review')),
+    max_concurrency INTEGER NOT NULL CHECK(max_concurrency = 1),
+    max_run_ms INTEGER NOT NULL CHECK(max_run_ms > 0),
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    error_code TEXT
+  );
+  CREATE TABLE IF NOT EXISTS agent_graph_nodes (
+    graph_run_id TEXT NOT NULL REFERENCES agent_graph_runs(id),
+    node_id TEXT NOT NULL,
+    manifest_id TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL CHECK(length(manifest_digest) = 64),
+    input_ref TEXT NOT NULL,
+    input_digest TEXT NOT NULL CHECK(length(input_digest) = 64),
+    result_ref TEXT NOT NULL,
+    node_call_id TEXT,
+    request_digest TEXT,
+    status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'needs-review', 'blocked')),
+    execution_run_id TEXT,
+    execution_attempt_id TEXT,
+    result_digest TEXT,
+    audit_ref TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    settled_at TEXT,
+    PRIMARY KEY(graph_run_id, node_id)
+  );
+  CREATE TABLE IF NOT EXISTS agent_graph_edges (
+    graph_run_id TEXT NOT NULL REFERENCES agent_graph_runs(id),
+    node_id TEXT NOT NULL,
+    depends_on_node_id TEXT NOT NULL,
+    PRIMARY KEY(graph_run_id, node_id, depends_on_node_id),
+    FOREIGN KEY(graph_run_id, node_id) REFERENCES agent_graph_nodes(graph_run_id, node_id),
+    FOREIGN KEY(graph_run_id, depends_on_node_id) REFERENCES agent_graph_nodes(graph_run_id, node_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_agent_graph_runs_parent ON agent_graph_runs(parent_run_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_agent_graph_runs_status ON agent_graph_runs(status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_agent_graph_nodes_status ON agent_graph_nodes(status, created_at);`
 ];
 
 export class SqliteStore {
@@ -471,6 +522,22 @@ export class SqliteStore {
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
     this.migrate(targetVersion);
+    this.normalizeAgentGraphPrincipalMetadata();
+  }
+
+  private normalizeAgentGraphPrincipalMetadata() {
+    const table = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_graph_runs'").get();
+    if (!table) return;
+    const rows = this.db.prepare("SELECT id, principal_namespace FROM agent_graph_runs WHERE length(principal_namespace) != 71 OR substr(principal_namespace, 1, 7) != 'sha256:' OR substr(principal_namespace, 8) GLOB '*[^0-9a-f]*'").all() as SqlRow[];
+    if (!rows.length) return;
+    this.transaction((db) => {
+      const update = db.prepare("UPDATE agent_graph_runs SET principal_namespace=? WHERE id=?");
+      for (const row of rows) {
+        const raw = String(row.principal_namespace);
+        if (!raw || Buffer.byteLength(raw, "utf8") > 256) throw new Error(`agent graph principal metadata is too large: ${String(row.id)}`);
+        update.run(`sha256:${digest(raw)}`, String(row.id));
+      }
+    });
   }
 
   migrate(targetVersion = SQLITE_SCHEMA_VERSION) {
@@ -886,6 +953,253 @@ export class RunLedger {
       db.prepare("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?").run(status === "succeeded" ? "completed-unverified" : status, now, runId);
     });
     return outputArtifact;
+  }
+
+  createAgentGraphRun({
+    graphRunId,
+    parentRunId,
+    graphDigest,
+    manifestsDigest,
+    graphBytes,
+    manifestsBytes,
+    principalNamespace,
+    requestDigest,
+    maxRunMs,
+    nodes
+  }: {
+    graphRunId: string;
+    parentRunId: string;
+    graphDigest: string;
+    manifestsDigest: string;
+    graphBytes: number;
+    manifestsBytes: number;
+    principalNamespace: string;
+    requestDigest: string;
+    maxRunMs: number;
+    nodes: readonly { nodeId: string; manifestId: string; manifestDigest: string; inputRef: string; inputDigest: string; resultRef: string; dependsOn: readonly string[] }[];
+  }) {
+    if (!/^[a-f0-9]{64}$/u.test(graphDigest) || !/^[a-f0-9]{64}$/u.test(manifestsDigest) || !/^[a-f0-9]{64}$/u.test(requestDigest)) throw new Error("agent graph digests must be lowercase SHA-256 values");
+    if (!Number.isSafeInteger(graphBytes) || graphBytes < 0 || graphBytes > 32_768 || !Number.isSafeInteger(manifestsBytes) || manifestsBytes < 0 || manifestsBytes > 32_768) throw new Error("agent graph byte metadata is invalid");
+    if (!Number.isSafeInteger(maxRunMs) || maxRunMs < 1 || maxRunMs > 300_000) throw new Error("agent graph maxRunMs is invalid");
+    if (typeof principalNamespace !== "string" || !principalNamespace || Buffer.byteLength(principalNamespace, "utf8") > 256) throw new Error("agent graph principal metadata is invalid");
+    const durablePrincipalNamespace = /^sha256:[a-f0-9]{64}$/u.test(principalNamespace)
+      ? principalNamespace
+      : `sha256:${digest(principalNamespace)}`;
+    return this.database.transaction((db) => {
+      const existing = db.prepare("SELECT graph_digest, manifests_digest, request_digest, max_run_ms FROM agent_graph_runs WHERE id = ?").get(graphRunId) as SqlRow | undefined;
+      if (existing) {
+        if (String(existing.graph_digest) !== graphDigest || String(existing.manifests_digest) !== manifestsDigest || String(existing.request_digest) !== requestDigest || Number(existing.max_run_ms) !== maxRunMs) {
+          const error = new Error(`agent graph run ${graphRunId} conflicts with an existing durable request`) as Error & { code?: string };
+          error.code = "AGENT_GRAPH_IDEMPOTENCY_CONFLICT";
+          throw error;
+        }
+        return { graphRunId, replay: true };
+      }
+      if (!db.prepare("SELECT 1 FROM runs WHERE id = ?").get(parentRunId)) throw new Error(`agent graph parent run does not exist: ${parentRunId}`);
+      const now = new Date().toISOString();
+      db.prepare(`INSERT INTO agent_graph_runs
+        (id, parent_run_id, schema_version, graph_digest, manifests_digest, graph_bytes, manifests_bytes, principal_namespace, request_digest, status, max_concurrency, max_run_ms, created_at)
+        VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'validated', 1, ?, ?)`).run(
+        graphRunId, parentRunId, graphDigest, manifestsDigest, graphBytes, manifestsBytes, durablePrincipalNamespace, requestDigest, maxRunMs, now
+      );
+      const insertNode = db.prepare(`INSERT INTO agent_graph_nodes
+        (graph_run_id, node_id, manifest_id, manifest_digest, input_ref, input_digest, result_ref, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`);
+      const insertEdge = db.prepare(`INSERT INTO agent_graph_edges(graph_run_id, node_id, depends_on_node_id) VALUES (?, ?, ?)`);
+      for (const node of nodes) {
+        if (!/^[a-f0-9]{64}$/u.test(node.inputDigest)) throw new Error(`agent graph node ${node.nodeId} input digest is invalid`);
+        insertNode.run(graphRunId, node.nodeId, node.manifestId, node.manifestDigest, node.inputRef, node.inputDigest, node.resultRef, now);
+        for (const dependency of node.dependsOn) insertEdge.run(graphRunId, node.nodeId, dependency);
+      }
+      return { graphRunId, replay: false };
+    });
+  }
+
+  startAgentGraphNode({ graphRunId, nodeId, nodeCallId, requestDigest, executionRunId, executionAttemptId, resultRef, auditRef }: { graphRunId: string; nodeId: string; nodeCallId: string; requestDigest: string; executionRunId: string; executionAttemptId: string; resultRef: string; auditRef: string }) {
+    return this.database.transaction((db) => {
+      const graph = db.prepare("SELECT status FROM agent_graph_runs WHERE id = ?").get(graphRunId) as SqlRow | undefined;
+      if (!graph) throw new Error(`agent graph run not found: ${graphRunId}`);
+      if (!["validated", "running"].includes(String(graph.status))) throw new Error(`agent graph run ${graphRunId} cannot dispatch from ${String(graph.status)}`);
+      const row = db.prepare("SELECT status, node_call_id, request_digest, execution_run_id, execution_attempt_id, result_ref, audit_ref FROM agent_graph_nodes WHERE graph_run_id = ? AND node_id = ?").get(graphRunId, nodeId) as SqlRow | undefined;
+      if (!row) throw new Error(`agent graph node not found: ${graphRunId}/${nodeId}`);
+      if (row.status === "running") {
+        if (String(row.node_call_id) === nodeCallId && String(row.request_digest) === requestDigest && String(row.execution_run_id) === executionRunId && String(row.execution_attempt_id) === executionAttemptId && String(row.result_ref) === resultRef && String(row.audit_ref) === auditRef) return { graphRunId, nodeId, state: "running" };
+        const error = new Error(`agent graph node ${graphRunId}/${nodeId} has a different active dispatch identity`) as Error & { code?: string };
+        error.code = "AGENT_GRAPH_STALE_DISPATCH";
+        throw error;
+      }
+      if (row.status !== "queued") throw new Error(`agent graph node ${graphRunId}/${nodeId} cannot start from ${String(row.status)}`);
+      const now = new Date().toISOString();
+      if (!executionRunId || !executionAttemptId || !resultRef || !auditRef) throw new Error("agent graph node dispatch identity is incomplete");
+      if (String(row.result_ref) !== resultRef || (row.audit_ref !== null && String(row.audit_ref) !== auditRef)) {
+        const error = new Error(`agent graph node ${graphRunId}/${nodeId} has a different predeclared result identity`) as Error & { code?: string };
+        error.code = "AGENT_GRAPH_STALE_DISPATCH";
+        throw error;
+      }
+      db.prepare(`UPDATE agent_graph_nodes SET status='running', node_call_id=?, request_digest=?, execution_run_id=?, execution_attempt_id=?, audit_ref=?, started_at=? WHERE graph_run_id=? AND node_id=? AND status='queued'`)
+        .run(nodeCallId, requestDigest, executionRunId, executionAttemptId, auditRef, now, graphRunId, nodeId);
+      db.prepare("UPDATE agent_graph_runs SET status='running', started_at=COALESCE(started_at, ?) WHERE id=?").run(now, graphRunId);
+      return { graphRunId, nodeId, state: "running", startedAt: now };
+    });
+  }
+
+  recordAgentGraphNodeResult({ graphRunId, nodeId, status, nodeCallId, requestDigest, executionRunId, executionAttemptId, resultDigest, resultRef, auditRef, errorCode }: {
+    graphRunId: string;
+    nodeId: string;
+    status: "completed" | "failed" | "cancelled" | "needs-review" | "blocked";
+    nodeCallId?: string;
+    requestDigest?: string;
+    executionRunId?: string;
+    executionAttemptId?: string;
+    resultDigest?: string;
+    resultRef?: string;
+    auditRef?: string;
+    errorCode?: string;
+  }) {
+    return this.database.transaction((db) => {
+      const row = db.prepare("SELECT n.status, n.node_call_id, n.request_digest, n.execution_run_id, n.execution_attempt_id, n.result_ref, n.audit_ref, g.status AS graph_status FROM agent_graph_nodes n JOIN agent_graph_runs g ON g.id = n.graph_run_id WHERE n.graph_run_id = ? AND n.node_id = ?").get(graphRunId, nodeId) as SqlRow | undefined;
+      if (!row) throw new Error(`agent graph node not found: ${graphRunId}/${nodeId}`);
+      const currentStatus = String(row.status);
+      if (["completed", "failed", "cancelled", "needs-review", "blocked"].includes(currentStatus) || ["publishing", "completed", "failed", "cancelled", "needs-review"].includes(String(row.graph_status))) {
+        return { graphRunId, nodeId, status: currentStatus, ignored: true };
+      }
+      if (currentStatus === "queued") return { graphRunId, nodeId, status: currentStatus, ignored: true, stale: true };
+      if (currentStatus !== "running") throw new Error(`agent graph node ${graphRunId}/${nodeId} cannot settle from ${currentStatus}`);
+      if (!nodeCallId || String(row.node_call_id) !== nodeCallId || !requestDigest || String(row.request_digest) !== requestDigest
+        || !executionRunId || String(row.execution_run_id) !== executionRunId
+        || !executionAttemptId || String(row.execution_attempt_id) !== executionAttemptId
+        || !resultRef || String(row.result_ref) !== resultRef
+        || !auditRef || String(row.audit_ref) !== auditRef
+        || typeof resultDigest !== "string" || !/^[a-f0-9]{64}$/u.test(resultDigest)) {
+        return { graphRunId, nodeId, status: currentStatus, ignored: true, stale: true };
+      }
+      const now = new Date().toISOString();
+      db.prepare(`UPDATE agent_graph_nodes SET status=?, result_digest=?, error_code=COALESCE(?, error_code), started_at=COALESCE(started_at, ?), settled_at=? WHERE graph_run_id=? AND node_id=? AND status='running' AND node_call_id=? AND request_digest=? AND execution_run_id=? AND execution_attempt_id=? AND result_ref=? AND audit_ref=?`)
+        .run(status, resultDigest, errorCode ?? null, now, now, graphRunId, nodeId, nodeCallId, requestDigest, executionRunId, executionAttemptId, resultRef, auditRef);
+      return { graphRunId, nodeId, status, settledAt: now };
+    });
+  }
+
+  cancelAgentGraphRun({ graphRunId, errorCode = "GRAPH_CANCELLATION_UNCERTAIN" }: { graphRunId: string; errorCode?: string }) {
+    return this.database.transaction((db) => {
+      const existing = db.prepare("SELECT status FROM agent_graph_runs WHERE id=?").get(graphRunId) as SqlRow | undefined;
+      if (!existing) throw new Error(`agent graph run not found: ${graphRunId}`);
+      const currentStatus = String(existing.status);
+      if (["completed", "failed", "cancelled", "needs-review"].includes(currentStatus)) return { graphRunId, status: currentStatus, ignored: true };
+      const now = new Date().toISOString();
+      db.prepare("UPDATE agent_graph_runs SET status='needs-review', completed_at=COALESCE(completed_at, ?), error_code=COALESCE(error_code, ?) WHERE id=? AND status IN ('validated','running','publishing')").run(now, errorCode, graphRunId);
+      db.prepare("UPDATE agent_graph_nodes SET status='needs-review', settled_at=COALESCE(settled_at, ?), error_code=COALESCE(error_code, ?) WHERE graph_run_id=? AND status IN ('queued','running')").run(now, errorCode, graphRunId);
+      return { graphRunId, status: "needs-review", errorCode };
+    });
+  }
+
+  cancelAgentGraphRunsForParent({ parentRunId, errorCode = "GRAPH_CANCELLATION_UNCERTAIN" }: { parentRunId: string; errorCode?: string }) {
+    return this.database.transaction((db) => {
+      const rows = db.prepare("SELECT id FROM agent_graph_runs WHERE parent_run_id=? AND status IN ('validated','running','publishing') ORDER BY id").all(parentRunId) as SqlRow[];
+      if (!rows.length) return { parentRunId, graphRunIds: [], status: "none" as const };
+      const now = new Date().toISOString();
+      db.prepare("UPDATE agent_graph_runs SET status='needs-review', completed_at=COALESCE(completed_at, ?), error_code=COALESCE(error_code, ?) WHERE parent_run_id=? AND status IN ('validated','running','publishing')").run(now, errorCode, parentRunId);
+      db.prepare("UPDATE agent_graph_nodes SET status='needs-review', settled_at=COALESCE(settled_at, ?), error_code=COALESCE(error_code, ?) WHERE graph_run_id IN (SELECT id FROM agent_graph_runs WHERE parent_run_id=? AND status='needs-review') AND status IN ('queued','running')").run(now, errorCode, parentRunId);
+      return { parentRunId, graphRunIds: rows.map((row) => String(row.id)), status: "needs-review" as const, errorCode };
+    });
+  }
+
+  completeAgentGraphRun({ graphRunId, status, errorCode }: { graphRunId: string; status: "completed" | "failed" | "cancelled" | "needs-review"; errorCode?: string }) {
+    return this.database.transaction((db) => {
+      const existing = db.prepare("SELECT status, error_code FROM agent_graph_runs WHERE id=?").get(graphRunId) as SqlRow | undefined;
+      if (!existing) throw new Error(`agent graph run not found: ${graphRunId}`);
+      const currentStatus = String(existing.status);
+      const unsettled = Number((db.prepare("SELECT COUNT(*) AS count FROM agent_graph_nodes WHERE graph_run_id=? AND status IN ('queued','running')").get(graphRunId) as SqlRow)?.count ?? 0);
+      if (["completed", "failed", "cancelled", "needs-review"].includes(currentStatus)) {
+        if (unsettled > 0) {
+          const now = new Date().toISOString();
+          const quarantineCode = errorCode ?? (existing.error_code === null ? undefined : String(existing.error_code)) ?? "GRAPH_OUTCOME_UNCERTAIN";
+          db.prepare("UPDATE agent_graph_nodes SET status='needs-review', settled_at=COALESCE(settled_at, ?), error_code=COALESCE(error_code, ?) WHERE graph_run_id=? AND status IN ('queued','running')")
+            .run(now, quarantineCode, graphRunId);
+          if (currentStatus !== "needs-review") {
+            db.prepare("UPDATE agent_graph_runs SET status='needs-review', completed_at=COALESCE(completed_at, ?), error_code=COALESCE(error_code, ?) WHERE id=?")
+              .run(now, quarantineCode, graphRunId);
+            return { graphRunId, status: "needs-review", ignored: true, quarantined: true };
+          }
+        }
+        return { graphRunId, status: currentStatus, ignored: true };
+      }
+      if (status === "completed" && unsettled > 0) {
+        const error = new Error(`agent graph ${graphRunId} has unsettled nodes`) as Error & { code?: string };
+        error.code = "AGENT_GRAPH_UNSETTLED_NODES";
+        throw error;
+      }
+      const now = new Date().toISOString();
+      let finalStatus = status;
+      if (unsettled > 0) {
+        finalStatus = "needs-review";
+        db.prepare("UPDATE agent_graph_nodes SET status='needs-review', settled_at=COALESCE(settled_at, ?), error_code=COALESCE(error_code, ?) WHERE graph_run_id=? AND status IN ('queued','running')")
+          .run(now, errorCode ?? "GRAPH_OUTCOME_UNCERTAIN", graphRunId);
+      }
+      const result = db.prepare("UPDATE agent_graph_runs SET status=?, completed_at=?, error_code=? WHERE id=? AND status IN ('validated','running','publishing')").run(finalStatus, now, errorCode ?? (finalStatus === "needs-review" ? "GRAPH_OUTCOME_UNCERTAIN" : null), graphRunId);
+      if (Number(result.changes) !== 1) throw new Error(`agent graph run not found: ${graphRunId}`);
+      return { graphRunId, status: finalStatus, completedAt: now };
+    });
+  }
+
+  beginAgentGraphCompletion({ graphRunId }: { graphRunId: string }) {
+    return this.database.transaction((db) => {
+      const existing = db.prepare("SELECT status FROM agent_graph_runs WHERE id=?").get(graphRunId) as SqlRow | undefined;
+      if (!existing) throw new Error(`agent graph run not found: ${graphRunId}`);
+      const currentStatus = String(existing.status);
+      if (currentStatus === "publishing") return { graphRunId, status: currentStatus, replay: true };
+      if (!["validated", "running"].includes(currentStatus)) {
+        if (["completed", "failed", "cancelled", "needs-review"].includes(currentStatus)) return { graphRunId, status: currentStatus, replay: true };
+        throw new Error(`agent graph run ${graphRunId} cannot publish from ${currentStatus}`);
+      }
+      db.prepare("UPDATE agent_graph_runs SET status='publishing' WHERE id=? AND status IN ('validated','running')").run(graphRunId);
+      return { graphRunId, status: "publishing", replay: false };
+    });
+  }
+
+  reconcileAgentGraphRuns() {
+    return this.database.transaction((db) => {
+      const now = new Date().toISOString();
+      const unresolved = db.prepare(`SELECT agr.id, rj.status AS job_status
+        FROM agent_graph_runs agr
+        LEFT JOIN runtime_jobs rj ON rj.execution_run_id = agr.parent_run_id
+          WHERE agr.status IN ('validated', 'running', 'publishing')
+          AND rj.status IN ('needs-review', 'failed', 'cancelled')`).all() as SqlRow[];
+      for (const row of unresolved) {
+        const graphStatus = row.job_status === "needs-review" ? "needs-review" : row.job_status;
+        db.prepare("UPDATE agent_graph_runs SET status=?, completed_at=COALESCE(completed_at, ?), error_code=COALESCE(error_code, ?) WHERE id=? AND status IN ('validated','running','publishing')")
+          .run(graphStatus, now, graphStatus === "needs-review" ? "GRAPH_OUTCOME_UNCERTAIN" : "PARENT_JOB_TERMINAL", row.id);
+        const nodeError = graphStatus === "needs-review" ? "GRAPH_OUTCOME_UNCERTAIN" : "PARENT_JOB_TERMINAL";
+        db.prepare("UPDATE agent_graph_nodes SET status=?, settled_at=COALESCE(settled_at, ?), error_code=COALESCE(error_code, ?) WHERE graph_run_id=? AND status IN ('queued','running')").run(graphStatus, now, nodeError, row.id);
+      }
+      db.prepare("UPDATE agent_graph_runs SET status='needs-review', completed_at=COALESCE(completed_at, ?), error_code=COALESCE(error_code, 'GRAPH_TERMINAL_PUBLICATION_UNCERTAIN') WHERE status='publishing'").run(now);
+      db.prepare("UPDATE agent_graph_nodes SET status='needs-review', settled_at=COALESCE(settled_at, ?), error_code=COALESCE(error_code, 'GRAPH_TERMINAL_PUBLICATION_UNCERTAIN') WHERE graph_run_id IN (SELECT id FROM agent_graph_runs WHERE status='needs-review' AND error_code='GRAPH_TERMINAL_PUBLICATION_UNCERTAIN') AND status IN ('queued','running')").run(now);
+      db.prepare("UPDATE agent_graph_runs SET status='needs-review', completed_at=COALESCE(completed_at, ?), error_code=COALESCE(error_code, 'GRAPH_UNSETTLED_NODES') WHERE status IN ('completed','failed','cancelled','needs-review') AND EXISTS (SELECT 1 FROM agent_graph_nodes WHERE graph_run_id=agent_graph_runs.id AND status IN ('queued','running'))").run(now);
+      db.prepare("UPDATE agent_graph_nodes SET status='needs-review', settled_at=COALESCE(settled_at, ?), error_code=COALESCE(error_code, 'GRAPH_UNSETTLED_NODES') WHERE graph_run_id IN (SELECT id FROM agent_graph_runs WHERE status='needs-review' AND error_code='GRAPH_UNSETTLED_NODES') AND status IN ('queued','running')").run(now);
+      return { reconciled: unresolved.length };
+    });
+  }
+
+  listAgentGraphRecoveryEvents() {
+    return (this.database.db.prepare(`SELECT id, parent_run_id, status, error_code
+      FROM agent_graph_runs
+      WHERE status IN ('failed', 'cancelled', 'needs-review')
+        AND error_code IN ('GRAPH_TERMINAL_PUBLICATION_UNCERTAIN', 'GRAPH_CANCELLATION_UNCERTAIN', 'GRAPH_OUTCOME_UNCERTAIN', 'GRAPH_UNSETTLED_NODES', 'PARENT_JOB_TERMINAL')
+      ORDER BY completed_at, id`).all() as SqlRow[]).map((row) => ({
+      graphRunId: String(row.id),
+      parentRunId: String(row.parent_run_id),
+      status: String(row.status) as "failed" | "cancelled" | "needs-review",
+      errorCode: String(row.error_code)
+    }));
+  }
+
+  getAgentGraphRun(graphRunId: string) {
+    const run = this.database.db.prepare("SELECT * FROM agent_graph_runs WHERE id=?").get(graphRunId) as SqlRow | undefined;
+    if (!run) return undefined;
+    const nodes = (this.database.db.prepare("SELECT * FROM agent_graph_nodes WHERE graph_run_id=? ORDER BY node_id").all(graphRunId) as SqlRow[]).map((node) => ({
+      graphRunId, nodeId: String(node.node_id), manifestId: String(node.manifest_id), manifestDigest: String(node.manifest_digest), inputRef: String(node.input_ref), inputDigest: String(node.input_digest), resultRef: String(node.result_ref), nodeCallId: node.node_call_id ?? undefined, requestDigest: node.request_digest ?? undefined, status: String(node.status), executionRunId: node.execution_run_id ?? undefined, executionAttemptId: node.execution_attempt_id ?? undefined, resultDigest: node.result_digest ?? undefined, auditRef: node.audit_ref ?? undefined, errorCode: node.error_code ?? undefined, createdAt: String(node.created_at), startedAt: node.started_at ?? undefined, settledAt: node.settled_at ?? undefined
+    }));
+    return { graphRunId, parentRunId: String(run.parent_run_id), graphDigest: String(run.graph_digest), manifestsDigest: String(run.manifests_digest), graphBytes: Number(run.graph_bytes), manifestsBytes: Number(run.manifests_bytes), principalNamespace: String(run.principal_namespace), requestDigest: String(run.request_digest), status: String(run.status), maxConcurrency: Number(run.max_concurrency), maxRunMs: Number(run.max_run_ms), createdAt: String(run.created_at), startedAt: run.started_at ?? undefined, completedAt: run.completed_at ?? undefined, errorCode: run.error_code ?? undefined, nodes };
   }
 
   listRuns({ limit = 20 }: { limit?: number } = {}) {

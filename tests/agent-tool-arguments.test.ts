@@ -57,6 +57,47 @@ async function auditText(fx: Awaited<ReturnType<typeof fixture>>) {
   return (await fx.auditStore.readAll()).map(JSON.stringify).join("\n");
 }
 
+test("child-agent execution rejects hidden recursive agent.run calls", async () => {
+  const fx = await fixture((request, index) => index === 1 ? {
+    id: "hidden-recursion",
+    choices: [{ message: { role: "assistant", content: "", tool_calls: [{ id: "recursive", type: "function", function: { name: "agent.run", arguments: JSON.stringify({ prompt: "recursive" }) } }] } }]
+  } : { id: "unexpected", choices: [{ message: { role: "assistant", content: "should not dispatch" } }] });
+  try {
+    await assert.rejects(() => runTask({
+      task: { id: "hidden-recursion-run", tool: "agent.run", input: { model: "test:test-model", prompt: "Use the hidden tool." }, actor: "test" },
+      auditStore: fx.auditStore,
+      registry: fx.registry,
+      policy: createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat"] }),
+      allowNestedAgentExecution: false
+    }), /recursive agent execution is disabled/u);
+    assert.equal(fx.requests.length, 1);
+  } finally {
+    await fx.close();
+  }
+});
+
+test("child-agent execution rejects indirect recursive agent.run calls at the common dispatcher", async () => {
+  const fx = await fixture(() => ({ id: "unused", choices: [{ message: { role: "assistant", content: "unused" } }] }));
+  try {
+    const registry = new Map(fx.registry);
+    const echo = registry.get("text.echo");
+    registry.set("text.echo", {
+      ...echo,
+      execute: async (_input: unknown, context: any) => context.runTool({ tool: "agent.run", input: { prompt: "recursive" }, actor: "nested" })
+    });
+    await assert.rejects(() => runTask({
+      task: { id: "indirect-recursion-run", tool: "text.echo", input: { text: "invoke nested" }, actor: "test" },
+      auditStore: fx.auditStore,
+      registry,
+      policy: createDefaultPolicy({ allowedCapabilities: ["workspace.inspect", "agent.delegate", "network.access"] }),
+      allowNestedAgentExecution: false
+    }), /recursive agent execution is disabled/u);
+    assert.equal(fx.requests.length, 0);
+  } finally {
+    await fx.close();
+  }
+});
+
 test("malformed arguments never dispatch, audit without raw payload, and valid {} remains compatible", async () => {
   const malformed = '{"text":"unterminated';
   const fx = await fixture((_request, index) => index === 1 ? {

@@ -49,6 +49,7 @@ export type JobExecute = (payload: JsonObject, context: JobExecutionContext) => 
 export interface JobSupervisorOptions {
   store: JobStore;
   execute: JobExecute;
+  onCancel?: (job: JobRecord) => Promise<void> | void;
   concurrency?: number;
   maxAttempts?: number;
   defaultTimeoutMs?: number;
@@ -65,11 +66,13 @@ const PROCESS_WORKER_ABORT_GRACE_MS = 30_000;
 export class JobSupervisor {
   readonly store: JobStore;
   readonly execute: JobExecute;
+  readonly onCancel?: (job: JobRecord) => Promise<void> | void;
   readonly concurrency: number;
   readonly maxAttempts: number;
   readonly defaultTimeoutMs: number;
   private readonly active: Map<string, ActiveJob>;
   private readonly volatilePayloads: Map<string, JsonObject>;
+  private readonly volatileResults: Map<string, { result: unknown; expiresAt: number }>;
   private readonly leaseOwner: string;
   private readonly leaseEpoch: string;
   private recoveryTimer?: NodeJS.Timeout;
@@ -78,16 +81,18 @@ export class JobSupervisor {
   private stopping: boolean;
 
   constructor(options: Partial<JobSupervisorOptions> = {}) {
-    const { store, execute, concurrency = 1, maxAttempts = 3, defaultTimeoutMs = 120_000 } = options;
+    const { store, execute, onCancel, concurrency = 1, maxAttempts = 3, defaultTimeoutMs = 120_000 } = options;
     if (!store || typeof store.create !== "function") throw new Error("JobSupervisor requires a durable store");
     if (typeof execute !== "function") throw new Error("JobSupervisor requires an execute function");
     this.store = store;
     this.execute = execute;
+    this.onCancel = onCancel;
     this.concurrency = Math.max(1, Number(concurrency) || 1);
     this.maxAttempts = Math.max(1, Number(maxAttempts) || 1);
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.active = new Map();
     this.volatilePayloads = new Map();
+    this.volatileResults = new Map();
     this.leaseOwner = `supervisor:${process.pid}`;
     this.leaseEpoch = randomUUID();
     this.started = false;
@@ -158,6 +163,21 @@ export class JobSupervisor {
     if (!job) throw new Error(`job not found: ${id}`);
     if (["completed", "failed", "cancelled", "needs-review"].includes(job.status)) return job;
     const running = this.active.get(id);
+    try {
+      await this.onCancel?.(job);
+    } catch (error) {
+      const quarantined = await this.store.update(id, {
+        status: "needs-review",
+        completedAt: new Date().toISOString(),
+        error: `cancellation fence failed: ${errorMessage(error)}`
+      });
+      running?.controller.abort(new Error("job cancellation fence failed"));
+      if (!running) {
+        this.volatilePayloads.delete(id);
+        await this.drain();
+      }
+      return quarantined;
+    }
     if (running) {
       const cancelling = this.store.cancel
         ? await this.store.cancel(id, { requestedBy: "operator", reason: "job cancelled by user" })
@@ -175,6 +195,15 @@ export class JobSupervisor {
 
   async get(id: string): Promise<JobRecord | undefined> { return this.store.get(id); }
   async list(): Promise<JobRecord[]> { return this.store.list(); }
+
+  getVolatileResult(id: string): unknown | undefined {
+    const entry = this.volatileResults.get(id);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      this.volatileResults.delete(id);
+      return undefined;
+    }
+    return entry.result;
+  }
 
   async settleApproval(id: string, { result, error }: { result?: unknown; error?: unknown }): Promise<JobRecord> {
     const current = await this.store.get(id);
@@ -242,6 +271,7 @@ export class JobSupervisor {
     this.stopping = true;
     this.started = false;
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    this.volatileResults.clear();
     for (const active of this.active.values()) active.controller.abort(new Error("supervisor shutting down"));
     await Promise.allSettled(Array.from(this.active.values(), (active) => active.promise));
   }
@@ -271,10 +301,25 @@ export class JobSupervisor {
         const result = await this.execute(job.payload, { signal: controller.signal, job });
         backendReturned = true;
         if (controller.signal.aborted) throw controller.signal.reason ?? new Error("job aborted");
+        if (job.payload.executionKey === job.id && (job.payload.task as JsonObject | undefined)?.tool === "agent.run") {
+          const now = Date.now();
+          for (const [id, entry] of this.volatileResults) {
+            if (entry.expiresAt <= now) this.volatileResults.delete(id);
+          }
+          this.volatileResults.set(job.id, { result, expiresAt: now + 5 * 60_000 });
+          while (this.volatileResults.size > 256) this.volatileResults.delete(this.volatileResults.keys().next().value as string);
+        }
         const awaitingApproval = Boolean(result && typeof result === "object"
           && (result as { output?: { type?: unknown } }).output?.type === "approval.required");
+        const terminalStatus = result && typeof result === "object"
+          && ["completed", "failed", "cancelled", "needs-review"].includes(String((result as { terminalStatus?: unknown }).terminalStatus))
+          ? String((result as { terminalStatus?: unknown }).terminalStatus)
+          : result && typeof result === "object" && (result as { output?: { status?: unknown } }).output
+            && ["completed", "failed", "cancelled", "needs-review"].includes(String((result as { output?: { status?: unknown } }).output?.status))
+            ? String((result as { output?: { status?: unknown } }).output?.status)
+            : undefined;
         await this.store.update(job.id, {
-          status: awaitingApproval ? "awaiting-approval" : "completed",
+          status: awaitingApproval ? "awaiting-approval" : terminalStatus ?? "completed",
           ...(awaitingApproval ? {} : { completedAt: new Date().toISOString() }),
           result,
           expectedLeaseToken: leaseToken,

@@ -768,8 +768,21 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
     while (true) {
       const status = String(job.status ?? "");
       if (status === "completed") {
+        const stored = job.result && typeof job.result === "object" && !Array.isArray(job.result)
+          ? job.result as Record<string, unknown>
+          : undefined;
+        const storedOutput = stored?.output && typeof stored.output === "object" && !Array.isArray(stored.output)
+          ? stored.output as Record<string, unknown>
+          : undefined;
+        // Older/custom Gateway implementations may still return a live result
+        // in the job envelope. Keep that compatibility path; the production
+        // Gateway stores model content as a digest and uses the ephemeral
+        // endpoint below instead.
+        const result = stored && typeof storedOutput?.content === "string"
+          ? stored
+          : requiredRecord((await this.#get(`/jobs/${encodeURIComponent(executionKey)}/result`, signal)).result, "gateway completed a channel run without an ephemeral result");
         await this.#reportExecutionState({ executionKey, state: "completed", message });
-        return requiredRecord(job.result, "gateway completed a channel run without a result");
+        return result;
       }
       if (status === "needs-review") {
         const error = typeof job.error === "string" ? job.error : "gateway lost the channel run outcome during restart";
