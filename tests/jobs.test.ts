@@ -44,6 +44,21 @@ test("job supervisor persists completion and replays recovered work", async () =
   await recovered.shutdown();
 });
 
+test("job supervisor projects a graph needs-review receipt instead of completed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-graph-status-"));
+  const store = new FileJobStore(join(root, "jobs.json"));
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async () => ({ ok: false, terminalStatus: "needs-review", output: { status: "needs-review", pendingPhysicalDispatches: 1 } })
+  });
+  await supervisor.start();
+  await supervisor.submit({ task: { tool: "agent.delegate", input: {} } }, { id: "job_graph_needs_review" });
+  const review = await waitFor(async () => (await supervisor.get("job_graph_needs_review"))?.status === "needs-review" ? supervisor.get("job_graph_needs_review") : undefined);
+  assert.equal(review.result.terminalStatus, "needs-review");
+  assert.equal(review.attempts, 1);
+  await supervisor.shutdown();
+});
+
 test("job supervisor quarantines uncertain cancellation and supports retry-safe timeout recovery", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-jobs-control-"));
   const store = new FileJobStore(join(root, "jobs.json"));
@@ -63,6 +78,33 @@ test("job supervisor quarantines uncertain cancellation and supports retry-safe 
   await supervisor.submit({ action: "timeout" }, { id: "job_timeout", timeoutMs: 10, retrySafe: true });
   const failed = await waitFor(async () => (await supervisor.get("job_timeout"))?.status === "failed" ? supervisor.get("job_timeout") : undefined);
   assert.match(failed.error, /timed out|aborted/);
+  await supervisor.shutdown();
+});
+
+test("job cancellation invokes the graph fence before aborting the worker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-cancellation-fence-"));
+  const store = new FileJobStore(join(root, "jobs.json"));
+  const order: string[] = [];
+  let activeSignal: AbortSignal | undefined;
+  const supervisor = new JobSupervisor({
+    store,
+    maxAttempts: 1,
+    onCancel: () => {
+      order.push(activeSignal?.aborted === true ? "aborted-before-fence" : "fence");
+    },
+    execute: async (_payload: any, { signal }: any) => {
+      activeSignal = signal;
+      order.push("started");
+      await new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    }
+  });
+  await supervisor.start();
+  await supervisor.submit({ task: { tool: "agent.delegate" } }, { id: "job_cancellation_fence" });
+  await waitFor(() => activeSignal);
+  await supervisor.cancel("job_cancellation_fence");
+  await waitFor(async () => ["cancelled", "needs-review"].includes(String((await supervisor.get("job_cancellation_fence"))?.status)));
+  assert.deepEqual(order.slice(0, 2), ["started", "fence"]);
+  assert.equal(activeSignal?.aborted, true);
   await supervisor.shutdown();
 });
 

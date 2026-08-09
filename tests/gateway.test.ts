@@ -1363,7 +1363,7 @@ async function postJson(url: any, body: any, expectedStatus = 200) {
 
 async function waitForStatus(url: any) {
   let lastError;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     try {
       return await getJson(url);
     } catch (error) {

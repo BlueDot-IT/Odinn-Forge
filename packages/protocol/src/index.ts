@@ -82,6 +82,7 @@ export function redactDurableValue(value: unknown, context: DurableRedactionCont
 const WORKSPACE_CONTENT_TOOLS = new Set(["workspace.readText", "workspace.read", "workspace.search", "workspace.diff"]);
 const WORKSPACE_MUTATION_TOOLS = new Set(["workspace.mutate", "workspace.patch"]);
 const PROCESS_TOOLS = new Set(["process.exec"]);
+const AGENT_TOOLS = new Set(["agent.run", "agent.delegate"]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -95,6 +96,7 @@ export function isWorkspaceContentTool(toolName: unknown): boolean {
 export function projectDurableToolInput(toolName: string, input: unknown): unknown {
   if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(input);
   if (PROCESS_TOOLS.has(toolName)) return projectProcessInput(input);
+  if (AGENT_TOOLS.has(toolName)) return projectAgentInput(input, toolName === "agent.delegate");
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
   if (typeof projected.before === "string") {
@@ -114,6 +116,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
 export function projectDurableToolOutput(toolName: string, output: unknown): unknown {
   if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(output);
   if (PROCESS_TOOLS.has(toolName)) return projectProcessOutput(output);
+  if (AGENT_TOOLS.has(toolName)) return projectAgentOutput(output, toolName === "agent.delegate");
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
   const record = output as JsonObject;
   if (toolName === "workspace.read" || toolName === "workspace.readText") {
@@ -207,6 +210,156 @@ function projectProcessOutput(value: unknown): unknown {
       projected[`${key}Digest`] = sha256Reference(text);
       projected[`${key}Bytes`] = Buffer.byteLength(text, "utf8");
     }
+  }
+  return projected;
+}
+
+const AGENT_MESSAGE_ROLES = new Set(["system", "user", "assistant"]);
+const AGENT_INPUT_REFERENCE = /^(?:input|artifact|memory):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const AGENT_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/u;
+const AGENT_FORBIDDEN_IDENTITY = /(?:token|secret|auth|credential|approval)/iu;
+const MAX_AGENT_PROJECTED_TEXT_BYTES = 256 * 1024;
+
+function boundedAgentText(value: unknown, maxBytes: number): string | undefined {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= maxBytes && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? value
+    : undefined;
+}
+
+function boundedAgentIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" && AGENT_IDENTIFIER.test(value) && !AGENT_FORBIDDEN_IDENTITY.test(value)
+    ? value
+    : undefined;
+}
+
+function boundedAgentPrincipalReference(value: unknown): string | undefined {
+  return boundedAgentIdentifier(value) === undefined ? undefined : sha256Reference(String(value));
+}
+
+function boundedAgentInteger(value: unknown, minimum: number, maximum: number): number | undefined {
+  return Number.isSafeInteger(value) && Number(value) >= minimum && Number(value) <= maximum ? Number(value) : undefined;
+}
+
+function copyAgentField(
+  projected: JsonObject,
+  key: string,
+  value: unknown,
+  validate: (candidate: unknown) => string | number | boolean | undefined
+): void {
+  if (value === undefined) return;
+  const safe = validate(value);
+  if (safe === undefined) projected[`${key}Invalid`] = true;
+  else projected[key] = safe;
+}
+
+function projectAgentInput(value: unknown, delegation: boolean): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const input = value as JsonObject;
+  const projected: JsonObject = {};
+  copyAgentField(projected, "model", input.model, (candidate) => boundedAgentText(candidate, 256));
+  copyAgentField(projected, "maxTurns", input.maxTurns, (candidate) => boundedAgentInteger(candidate, 1, 4));
+  copyAgentField(projected, "maxTokens", input.maxTokens, (candidate) => boundedAgentInteger(candidate, 1, 4_096));
+  copyAgentField(projected, "sessionId", input.sessionId, (candidate) => boundedAgentText(candidate, 256));
+  copyAgentField(projected, "projectId", input.projectId, (candidate) => boundedAgentText(candidate, 256));
+  copyAgentField(projected, "reasoningBudgetRecovery", input.reasoningBudgetRecovery, (candidate) => typeof candidate === "boolean" ? candidate : undefined);
+  copyAgentField(projected, "principalNamespace", input.principalNamespace, boundedAgentPrincipalReference);
+  copyAgentField(projected, "maxConcurrency", input.maxConcurrency, (candidate) => boundedAgentInteger(candidate, 1, 1));
+  copyAgentField(projected, "maxRunMs", input.maxRunMs, (candidate) => boundedAgentInteger(candidate, 1, 300_000));
+  const prompt = boundedAgentText(input.prompt, MAX_AGENT_PROJECTED_TEXT_BYTES);
+  if (prompt !== undefined) {
+    projected.promptDigest = sha256Reference(prompt);
+    projected.promptBytes = Buffer.byteLength(prompt, "utf8");
+  } else if (input.prompt !== undefined) {
+    projected.promptInvalid = true;
+  }
+  if (Array.isArray(input.messages)) {
+    projected.messages = input.messages.slice(0, 128).map((message) => {
+      if (!message || typeof message !== "object" || Array.isArray(message)) return { invalid: true };
+      const record = message as JsonObject;
+      if (typeof record.role !== "string" || !AGENT_MESSAGE_ROLES.has(record.role)) return { invalid: true };
+      const result: JsonObject = { role: record.role };
+      const content = boundedAgentText(record.content, MAX_AGENT_PROJECTED_TEXT_BYTES);
+      if (content !== undefined) {
+        result.contentDigest = sha256Reference(content);
+        result.contentBytes = Buffer.byteLength(content, "utf8");
+      } else if (record.content !== undefined) {
+        result.contentInvalid = true;
+      }
+      return result;
+    });
+    if (input.messages.length > 128) projected.messagesTruncated = true;
+  } else if (input.messages !== undefined) {
+    projected.messagesInvalid = true;
+  }
+  if (delegation) {
+    for (const key of ["graph", "manifests"] as const) {
+      const value = input[key];
+      if (typeof value === "string") {
+        projected[`${key}InputDigest`] = sha256Reference(value);
+        projected[`${key}InputBytes`] = Buffer.byteLength(value, "utf8");
+      } else if (value !== undefined) {
+        projected[`${key}InputInvalid`] = true;
+      }
+    }
+    if (input.inputs && typeof input.inputs === "object" && !Array.isArray(input.inputs)) {
+      const entries = Object.entries(input.inputs as JsonObject);
+      const safeInputs: Record<string, unknown> = {};
+      for (const [reference, child] of entries.slice(0, 128)) {
+        if (AGENT_INPUT_REFERENCE.test(reference)) safeInputs[reference] = projectAgentInput(child, false);
+        else projected.inputsInvalid = true;
+      }
+      if (entries.length > 128) projected.inputsTruncated = true;
+      projected.inputs = safeInputs;
+    } else if (input.inputs !== undefined) {
+      projected.inputsInvalid = true;
+    }
+  }
+  return projected;
+}
+
+function projectAgentOutput(value: unknown, delegation: boolean): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const output = value as JsonObject;
+  if (delegation) {
+    const report: JsonObject = {};
+    copyAgentField(report, "graphRunId", output.graphRunId, boundedAgentIdentifier);
+    copyAgentField(report, "principalNamespace", output.principalNamespace, boundedAgentPrincipalReference);
+    copyAgentField(report, "graphDigest", output.graphDigest, (candidate) => typeof candidate === "string" && /^[a-f0-9]{64}$/u.test(candidate) ? candidate : undefined);
+    copyAgentField(report, "status", output.status, (candidate) => typeof candidate === "string" && ["completed", "failed", "cancelled", "needs-review"].includes(candidate) ? candidate : undefined);
+    copyAgentField(report, "pendingPhysicalDispatches", output.pendingPhysicalDispatches, (candidate) => boundedAgentInteger(candidate, 0, 32));
+    if (Array.isArray(output.nodes)) {
+      report.nodes = output.nodes.slice(0, 32).map((node) => {
+        if (!node || typeof node !== "object" || Array.isArray(node)) return { invalid: true };
+        const record = node as JsonObject;
+        const projected: JsonObject = {};
+        copyAgentField(projected, "nodeId", record.nodeId, boundedAgentIdentifier);
+        copyAgentField(projected, "status", record.status, (candidate) => typeof candidate === "string" && ["completed", "failed", "cancelled", "needs-review", "blocked"].includes(candidate) ? candidate : undefined);
+        copyAgentField(projected, "nodeCallId", record.nodeCallId, boundedAgentIdentifier);
+        for (const key of ["requestDigest", "resultDigest"] as const) {
+          copyAgentField(projected, key, record[key], (candidate) => typeof candidate === "string" && /^[a-f0-9]{64}$/u.test(candidate) ? candidate : undefined);
+        }
+        copyAgentField(projected, "auditRef", record.auditRef, (candidate) => typeof candidate === "string" && /^audit:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(candidate) ? candidate : undefined);
+        copyAgentField(projected, "resultRef", record.resultRef, (candidate) => typeof candidate === "string" && /^(?:input|result|artifact|memory):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(candidate) ? candidate : undefined);
+        copyAgentField(projected, "errorCode", record.errorCode, (candidate) => typeof candidate === "string" && /^[A-Za-z][A-Za-z0-9_:-]{0,127}$/u.test(candidate) ? candidate : undefined);
+        return projected;
+      });
+      if (output.nodes.length > 32) report.nodesTruncated = true;
+    } else if (output.nodes !== undefined) {
+      report.nodesInvalid = true;
+    }
+    return report;
+  }
+  const projected: JsonObject = {};
+  if (typeof output.content === "string") {
+    projected.contentDigest = sha256Reference(output.content);
+    projected.contentBytes = Buffer.byteLength(output.content, "utf8");
+  }
+  for (const key of ["provider", "model", "usage", "answerShape", "memory", "modelRecovery"] as const) {
+    if (output[key] !== undefined) projected[key] = redactDurableValue(output[key]);
+  }
+  if (output.pendingApproval && typeof output.pendingApproval === "object") {
+    const approval = output.pendingApproval as JsonObject;
+    projected.pendingApproval = { type: approval.type, tool: approval.tool, expiresInSeconds: approval.expiresInSeconds };
   }
   return projected;
 }

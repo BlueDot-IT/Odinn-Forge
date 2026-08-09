@@ -13,7 +13,7 @@
 | Runs, steps, verification, execution intent | Run ledger | `db/odinn.sqlite` | Add execution envelopes, attempts, cancellation controls, and later execution graphs. |
 | Operator audit | Audit store | `db/audit.sqlite` with legacy JSONL compatibility | Remains authoritative; correlate by immutable run and audit IDs. |
 | Projects, sessions, goals, messages, memory | Authoritative record store | `db/records.sqlite` | Remains authoritative. |
-| Runtime jobs and leases | Run ledger | `db/odinn.sqlite` schema v5 | `runtime_jobs` is live authority; a validated `jobs.json` is imported once and retained as rollback evidence. |
+| Runtime jobs, leases, and graph/node state | Run ledger | `db/odinn.sqlite` schema v7 | `runtime_jobs` and the additive `agent_graph_*` tables are live authority; a validated `jobs.json` is imported once and retained as rollback evidence. |
 | Cron definitions | Gateway cron store | `cron-jobs.json` | Definitions may remain compatible; every occurrence will bind to an envelope. |
 
 ## Execution entry points at the accepted baseline
@@ -27,7 +27,7 @@
 | Agent tool call | `agent.run` -> `runTool` -> `runTask` | Parent task context and policy | Active with parent-run correlation and parent-child capability intersection. |
 | Browser work | Persistent isolated browser worker | Browser policy plus recovery JSON | Active before browser tool execution; browser recovery remains authoritative for browser uncertainty. |
 | Extension execution | Container extension executor | Extension registry and policy | Reuse as an execution backend behind admission. |
-| Experimental graphs, skills, MCP, automation | Kernel foundations | Default-inert feature flags | Activation must dispatch through admission; no parallel runtime. |
+| Agent graphs | Kernel graph dispatcher | Explicit `config.runtime.enableAgentGraphs` plus durable `/jobs` | Stage 7 activates one read-only node through admission, isolated workers, runtime SQLite graph/node state, and signed audit correlation. The broader graph, skills, MCP, and automation foundations remain default-inert. |
 
 ## Binding decisions
 
@@ -51,6 +51,18 @@ Runtime schema v5 adds:
 - `runtime_jobs`
 - `runtime_job_leases`
 - `runtime_job_imports`
+
+Runtime schema v7 adds:
+
+- `agent_graph_runs`
+- `agent_graph_nodes`
+- `agent_graph_edges`
+
+The first graph profile persists validated graph/manifest digests and bounded
+byte metadata, plus one queued node, before dispatch. A node that has crossed the child dispatch boundary is never
+automatically replayed after worker loss; startup reconciliation moves the
+parent job and graph/node projection to `needs-review` when the terminal audit
+or physical outcome is not provable.
 
 Every dispatch receives a token bound to a supervisor owner and process epoch. The owner renews the lease while the physical worker remains live; reconciliation ignores unexpired leases, and terminal writes present the expected token so a stale worker cannot settle a recovered generation. Lease expiry includes a settlement grace beyond the execution timeout.
 

@@ -170,6 +170,11 @@ function hash(value: unknown): string {
   return createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
+/** Return a stable digest for bounded graph receipts without retaining their content. */
+export function digestAgentRunValue(value: unknown): string {
+  return hash(value);
+}
+
 function cleanJson(input: unknown, label: string): unknown {
   let nodes = 0;
   const visit = (value: unknown, path: string): unknown => {
@@ -230,6 +235,11 @@ function principal(value: unknown): string {
   const result = identifier(value, "principalNamespace");
   if (FORBIDDEN_IDENTITY.test(result)) throw new Error("principalNamespace uses a forbidden authority namespace");
   return result;
+}
+
+/** Validate a graph principal before any durable graph state is created. */
+export function normalizeAgentPrincipalNamespace(value: unknown): string {
+  return principal(value);
 }
 
 function requestReference(value: unknown, label: string): string {

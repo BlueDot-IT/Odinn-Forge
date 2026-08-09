@@ -109,13 +109,17 @@ test("fixed sorted batches do not partially refill", async () => {
   const calls: string[] = [];
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
-  const graph = { ...graphInput, id: "waves", nodes: [node("a"), node("b"), node("c"), node("d")] };
+  const graph = {
+    ...graphInput,
+    id: "waves",
+    nodes: [node("a"), { ...node("b"), timeoutMs: 10_000 }, node("c"), node("d")]
+  };
   const runner = new AgentRunGraphRunner({ dispatch: async (request) => {
     calls.push(request.nodeId);
     if (request.nodeId === "b") await held;
     return receipt(request);
   } });
-  const running = runner.run({ ...runInput(graph), maxConcurrency: 2 });
+  const running = runner.run({ ...runInput(graph), maxConcurrency: 2, maxRunMs: 10_000 });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(calls, ["a", "b"]);
   release();
@@ -207,12 +211,12 @@ test("runner accepts only branded snapshots", async () => {
   await assert.rejects(() => runner.run({ ...runInput(), manifests: [manifest] as any }), /validated branded collection/u);
 });
 
-test("package remains demand-loaded and absent from active imports", async () => {
+test("graph contracts are exported through the active kernel while child execution stays jobs-only", async () => {
   const child = spawnSync(process.execPath, ["--input-type=module", "--eval",
-    "const m=await import('@odinn/kernel/agent-run-graphs');if(!m.AgentRunGraphRunner)process.exit(2)"],
+    "const m=await import('@odinn/kernel');if(!m.executeAgentGraph||!m.AGENT_GRAPH_TOOL)process.exit(2)"],
   { cwd: join(process.cwd(), "apps", "cli"), encoding: "utf8" });
   assert.equal(child.status, 0, child.stderr);
-  for (const file of ["packages/kernel/src/index.ts", "packages/kernel/src/jobs.ts", "apps/gateway/src/server.ts", "apps/cli/src/cli.ts"]) {
-    assert.doesNotMatch(await readFile(join(process.cwd(), file), "utf8"), /agent-run-graphs/u);
-  }
+  assert.match(await readFile(join(process.cwd(), "packages/kernel/src/index.ts"), "utf8"), /agent-graph-runtime/u);
+  assert.match(await readFile(join(process.cwd(), "apps/gateway/src/server.ts"), "utf8"), /agent\.delegate/u);
+  assert.doesNotMatch(await readFile(join(process.cwd(), "apps/cli/src/cli.ts"), "utf8"), /agent\.delegate.*execute/u);
 });

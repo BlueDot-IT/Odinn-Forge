@@ -1,8 +1,19 @@
 # Executable agent manifests and run graphs
 
-`@odinn/kernel/agent-run-graphs` is a demand-loaded, default-inert foundation
-for bounded child-agent execution. It is not imported by the kernel root,
-Gateway, job supervisor, or Agent SDK registry.
+`@odinn/kernel/agent-run-graphs` is the bounded graph contract used by the
+first Stage 7 execution slice. The live dispatcher is imported only by the
+kernel root and is reachable through the durable Gateway `/jobs` boundary when
+`config.runtime.enableAgentGraphs` is explicitly `true`. It remains disabled
+by default; `/run`, `/run/stream`, CLI execution, cron, replay, and direct SDK
+calls do not activate it. A disabled graph submission is rejected at Gateway
+admission with HTTP 403 and does not create a durable job.
+
+Every graph job must also carry an explicit top-level `parentCapabilities`
+array. Admission validates those grants against the configured policy and the
+child may receive only that bounded set; the child never inherits the ambient
+global policy allowlist. The live child profile requires explicit
+`agent.delegate` and `network.access` grants because its `agent.run` dispatch
+uses both capabilities.
 
 Executable manifests contain only a registry identity claim, declarative
 tool and capability requests, child and timeout limits, and a canonical
@@ -69,7 +80,33 @@ or recursively spawns nodes. Unresolved physical calls prevent admission of a
 later run; cancellation and bounded shutdown retain ownership until late
 physical settlement. A stopped instance cannot restart.
 
-This module performs no registry loading, filesystem, network, environment,
-provider, credential, or tool access. Timers are created only while the runner
-is explicitly invoked. Runtime integration, durable graph state, recovery,
-retries, and Gateway activation require separate review.
+The active profile is intentionally smaller than the general graph contract:
+exactly one node and one manifest, `maxConcurrency=1`, bounded graph deadline,
+and a fixed digest-checked registry reference. The manifest may request only
+the read-only child tools listed by the kernel dispatcher. Dynamic fan-out,
+recursive child-agent calls, browser mutations, workspace mutations, process
+execution, approvals, effectful tools, and retries are refused.
+
+Before dispatch, the kernel persists only graph/manifest digests, a principal
+digest marker, and bounded byte metadata, plus one queued node, in runtime
+SQLite schema v7. The child is dispatched through
+the existing admission, isolated-worker, ledger, and signed audit paths. A
+receipt is accepted only when the child audit run contains a terminal task
+event; missing or unreadable audit evidence becomes `needs-review`. Graph and
+node statuses are reconciled from the durable job/attempt state at Gateway
+startup. Cancellation writes a synchronous graph/node quarantine fence before
+the physical child is allowed to settle; late results with a stale call identity
+or a terminal/publication graph are ignored. Terminal publication first moves
+the graph to `publishing`, then crosses the signed-audit and ledger boundaries;
+startup reconciles an interrupted `publishing` graph to `needs-review`.
+Volatile prompt content is never stored in the graph journal, job
+projection, ledger payload, or audit output; only digests and bounded byte
+metadata remain. Completed channel-bound `agent.run` jobs expose their live
+response only through the bounded ephemeral `/jobs/:id/result` route; the
+volatile result is cleared on supervisor shutdown and is never reconstructed
+from a redacted durable projection.
+
+The runner itself still performs no registry loading, filesystem, network,
+environment, provider, credential, or tool access. Its dispatch callback is
+the security boundary. Timers are created only while the runner is explicitly
+invoked, and unresolved physical work remains quarantined rather than retried.

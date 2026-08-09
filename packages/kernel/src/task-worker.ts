@@ -9,7 +9,7 @@ let active = false;
 
 interface TaskWorkerMessage {
   type?: "task" | "abort";
-  payload?: { actor?: string; approvalId?: string; approvalRunId?: string; durableExecution?: boolean; plan?: unknown; task?: unknown };
+  payload?: { actor?: string; approvalId?: string; approvalRunId?: string; durableExecution?: boolean; parentCapabilities?: unknown; plan?: unknown; task?: unknown };
   stateDir?: string;
   workspaceRoot?: string;
   config?: { auditLog?: string; experimental?: unknown; [key: string]: unknown };
@@ -38,7 +38,7 @@ async function executeMessage(rawMessage: unknown) {
     runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
     const result = payload.plan
       ? await runPlan({ plan: payload.plan, auditStore, policy, registry, runLedger, actor: payload.actor, signal: controller.signal, durableExecution: payload.durableExecution === true })
-      : await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: controller.signal, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: trustedRecovery === true, durableExecution: payload.durableExecution === true });
+      : await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: controller.signal, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: trustedRecovery === true, durableExecution: payload.durableExecution === true, parentCapabilities: payload.parentCapabilities });
     process.send?.({ ok: true, result });
   } catch (error) {
     process.send?.({ ok: false, error: messageError(error) });

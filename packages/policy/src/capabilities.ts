@@ -84,6 +84,7 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
   tool("snapshot.create", ["restore.create"], []),
   tool("snapshot.restore", ["restore.apply"], []),
   tool("process.exec", ["process.execute"], ["process.exec"]),
+  tool("agent.delegate", ["agent.delegate"], ["agent.delegate"]),
   tool("web.search", ["network.access"], ["web.read"]),
   tool("web.fetch", ["network.access"], ["web.read"]),
   tool("browser.tabs", ["browser.read"], ["browser.read"]),
