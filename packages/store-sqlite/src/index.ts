@@ -1290,3 +1290,5 @@ export type {
 } from "./authoritative.ts";
 export { SqliteJobStore } from "./runtime-jobs.ts";
 export type { RuntimeJobRecord } from "./runtime-jobs.ts";
+export { SqliteWorkflowStore } from "./workflows.ts";
+export type { ClaimedWorkflowStep } from "./workflows.ts";

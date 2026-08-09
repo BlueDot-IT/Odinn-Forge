@@ -7,7 +7,8 @@
     ".": "./src/index.ts",
     "./memory-index": "./src/memory-index.ts",
     "./authoritative": "./src/authoritative.ts",
-    "./audit": "./src/audit.ts"
+    "./audit": "./src/audit.ts",
+    "./workflows": "./src/workflows.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"

@@ -692,3 +692,5 @@ export function normalizeAuditEvent(input: unknown): AuditEvent {
   if (value.data && typeof value.data === "object" && !Array.isArray(value.data)) event.data = value.data as JsonObject;
   return event;
 }
+
+export * from "./workflow.ts";

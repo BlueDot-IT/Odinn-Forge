@@ -31,6 +31,12 @@ import { AGENT_GRAPH_TOOL, executeAgentGraph, type AgentGraphTaskInput } from ".
 import { ProgressiveSkillDisclosure } from "./skill-disclosure.ts";
 import { createGovernedMcpRuntime, GovernedMcpRuntime } from "./mcp-runtime.ts";
 import { ExtensionExecutor, ExtensionRegistry } from "./extensions.ts";
+export { DurableWorkflowRuntime, createDurableWorkflowRuntime, workflowDefinitionFromSteps } from "./workflows.ts";
+export type { WorkflowDispatchContext, WorkflowDispatchResult, WorkflowRuntimeOptions, WorkflowSubmission } from "./workflows.ts";
+export { DurableEventIngress, sourceAuthDigest } from "./event-ingress.ts";
+export type { EventIngressDispatch, EventIngressOptions } from "./event-ingress.ts";
+export { ProjectContextService, createProjectContextService } from "./project-context.ts";
+export type { ProjectContextMemory, ProjectContextOptions, ProjectContextPacket, ProjectContextRequest } from "./project-context.ts";
 export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 import type { SandboxProcessInput } from "./sandbox-process.ts";
 type AnyRecord = Record<string, any>;
@@ -77,6 +83,8 @@ export type { HydratedSkill, SkillCatalogEntry, SkillDisclosureLimits } from "./
 export { createGovernedMcpRuntime, GovernedMcpRuntime, normalizeMcpConfiguration } from "./mcp-runtime.ts";
 export type { GovernedMcpRuntimeOptions, McpRuntimeContext, McpRuntimeStatus, McpServerConfig } from "./mcp-runtime.ts";
 export { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
+export { SqliteRecordStore } from "@odinn/store-sqlite";
+export { SqliteWorkflowStore } from "@odinn/store-sqlite";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
 export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";
