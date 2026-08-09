@@ -47,6 +47,12 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   candidate retrieval.
 - [Durable session lanes](durable-session-lanes.md) — persistent conversation
   lanes.
+- [Durable workflows](durable-workflows.md) — bounded, restart-aware workflow
+  definitions and step execution.
+- [Event ingress](event-ingress.md) — authenticated deterministic event and
+  heartbeat candidates at the durable job boundary.
+- [Project context](project-context.md) — scoped, bounded memory retrieval with
+  provenance and digest binding.
 - [Progressive skill disclosure](progressive-skill-disclosure.md) — bounded
   skill discovery and loading.
 - [Optional asynchronous telemetry foundation](async-telemetry.md) — local

@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -744,6 +744,36 @@ export async function createGatewayServer({
   });
   const runIsolatedTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
   const runGovernedTask = (request: any): Promise<any> => executeTask({ ...request, auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
+  const workflowRuntime = config.runtime?.enableDurableWorkflows === true
+    ? new DurableWorkflowRuntime({
+      store: new SqliteWorkflowStore(runtime.ledger.database),
+      concurrency: 1,
+      dispatch: async ({ run, step, signal }) => {
+        const output = await runGovernedTask({
+          task: { id: `${run.runId}:${step.stepId}:${step.attempt}`, tool: step.actionRef, input: step.input, actor: "workflow", reason: `workflow:${run.runId}` },
+          signal,
+          durableExecution: true
+        });
+        return output?.output?.type === "approval.required" || output?.type === "approval.required"
+          ? { status: "awaiting-approval" as const }
+          : { status: "completed" as const, result: output };
+      },
+      onEvent: async (event) => {
+        await auditStore.append({ at: new Date().toISOString(), runId: event.runId, type: event.type, actor: "workflow-runtime", tool: "workflow", capability: "workflow.execute", decision: "allow", data: event.data });
+      }
+    })
+    : undefined;
+  const eventIngress = config.runtime?.enableEventIngress === true
+    ? new DurableEventIngress({
+      database: runtime.ledger.database,
+      dispatch: async (candidate) => {
+        const job = await supervisor.submit({ durableExecution: true, task: { id: candidate.candidateId, tool: candidate.actionRef, input: { candidateId: candidate.candidateId, idempotencyKey: candidate.idempotencyKey }, actor: "event-ingress", reason: `automation:${candidate.declarationId}` } }, { id: candidate.idempotencyKey, requestHash: candidate.idempotencyKey, retrySafe: false, idempotent: true });
+        return ["queued", "running", "awaiting-approval", "completed"].includes(job.status) ? "completed" : "needs-review";
+      }
+    })
+    : undefined;
+  const contextRecords = config.runtime?.enableProjectContext === true ? new SqliteRecordStore(join(state, "db", "records.sqlite")) : undefined;
+  const projectContext = contextRecords ? new ProjectContextService({ records: contextRecords }) : undefined;
   const quotaGate = createQuotaGate(quotas);
   const cronStore = new CronStore(join(state, "cron-jobs.json"));
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
@@ -757,6 +787,7 @@ export async function createGatewayServer({
   });
   const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry, runLedger: runtime.ledger });
   await supervisor.start();
+  await workflowRuntime?.start();
   runtime.ledger.reconcileAgentGraphRuns();
   for (const recovery of runtime.ledger.listAgentGraphRecoveryEvents()) {
     const auditRun = await auditStore.readRun(recovery.parentRunId);
@@ -795,6 +826,10 @@ export async function createGatewayServer({
     (tool) => toolSafetyDescriptor(tool, registry.get(tool)).retrySafe === true
   ).catch(() => undefined), 30_000);
   cronTimer.unref();
+  const eventHeartbeatTimer = eventIngress
+    ? setInterval(() => eventIngress.heartbeat().catch(() => undefined), 30_000)
+    : undefined;
+  eventHeartbeatTimer?.unref?.();
   const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
   let improvementCycle: Promise<any> | undefined;
   const runImprovementCycle = () => {
@@ -884,6 +919,11 @@ export async function createGatewayServer({
           coreAdvanced: CORE_ADVANCED_FEATURES,
           pluginModules: [...runtime.plugins.values()].map(({ id, displayName, configKey, enabled }: any) => ({ id, displayName, configKey, enabled })),
           experimental: featureFlags,
+          runtimeSurfaces: {
+            durableWorkflows: { enabled: Boolean(workflowRuntime) },
+            eventIngress: { enabled: Boolean(eventIngress) },
+            projectContext: { enabled: Boolean(projectContext) }
+          },
           security: policy.security,
           selfImprovement: {
             ...selfImprovement,
@@ -1243,6 +1283,63 @@ export async function createGatewayServer({
       }
       if (request.method === "GET" && url.pathname === "/jobs") {
         return json(response, 200, { jobs: await supervisor.list() });
+      }
+      if (url.pathname === "/workflows" || url.pathname.startsWith("/workflows/")) {
+        if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled; enable config.runtime.enableDurableWorkflows explicitly");
+        if (request.method === "GET" && url.pathname === "/workflows") return json(response, 200, { workflows: workflowRuntime.list() });
+        if (request.method === "POST" && url.pathname === "/workflows") {
+          const body = await readJson(request, { maxBytes: requestMaxBytes });
+          const key = String(body.idempotencyKey || request.headers["idempotency-key"] || body.runId || `workflow:${randomUUID()}`);
+          const run = await workflowRuntime.submit({
+            schemaVersion: 1,
+            runId: String(body.runId || `workflow_${randomUUID()}`),
+            principalId: "gateway",
+            idempotencyKey: key,
+            definition: body.definition,
+            input: body.input ?? {}
+          });
+          return json(response, 202, { ok: true, run });
+        }
+        const workflowId = decodeURIComponent(url.pathname.slice("/workflows/".length));
+        if (request.method === "GET" && workflowId.endsWith("/events")) {
+          const id = workflowId.slice(0, -"/events".length);
+          return json(response, 200, { events: workflowRuntime.events(id) });
+        }
+        if (request.method === "POST" && workflowId.endsWith("/cancel")) {
+          return json(response, 200, { ok: true, run: await workflowRuntime.cancel(workflowId.slice(0, -"/cancel".length)) });
+        }
+        if (request.method === "POST" && workflowId.endsWith("/resume")) {
+          return json(response, 200, { ok: true, run: await workflowRuntime.resume(workflowId.slice(0, -"/resume".length)) });
+        }
+        if (request.method === "GET") {
+          const run = workflowRuntime.get(workflowId);
+          return run ? json(response, 200, { run }) : json(response, 404, { ok: false, error: "workflow not found" });
+        }
+      }
+      if (url.pathname === "/event-sources" || url.pathname === "/event-watches" || url.pathname === "/events/ingest" || url.pathname === "/heartbeat") {
+        if (!eventIngress) throw new GatewayError(403, "event ingress is disabled; enable config.runtime.enableEventIngress explicitly");
+        if (request.method === "POST" && url.pathname === "/event-sources") {
+          const body = await readJson(request, { maxBytes: requestMaxBytes });
+          return json(response, 200, { ok: true, source: eventIngress.registerSource({ source: String(body.source || ""), authDigest: String(body.authDigest || ""), oldestSequence: body.oldestSequence }) });
+        }
+        if (request.method === "GET" && url.pathname === "/event-watches") return json(response, 200, { watches: eventIngress.listWatches() });
+        if (request.method === "POST" && url.pathname === "/event-watches") {
+          const body = await readJson(request, { maxBytes: requestMaxBytes });
+          return json(response, 200, { ok: true, watchId: body.watchId, declaration: eventIngress.registerWatch(String(body.watchId || ""), body.declaration) });
+        }
+        if (request.method === "POST" && url.pathname === "/events/ingest") {
+          const body = await readJson(request, { maxBytes: requestMaxBytes });
+          return json(response, 202, { ok: true, ...(await eventIngress.ingest(body.event, String(body.authDigest || ""))) });
+        }
+        if (request.method === "POST" && url.pathname === "/heartbeat") return json(response, 202, { ok: true, candidates: await eventIngress.heartbeat(Number((await readJson(request, { maxBytes: requestMaxBytes })).nowUnixMs ?? Date.now())) });
+      }
+      if (url.pathname === "/context" || url.pathname.startsWith("/projects/") && url.pathname.endsWith("/context")) {
+        if (!projectContext) throw new GatewayError(403, "project context is disabled; enable config.runtime.enableProjectContext explicitly");
+        if (request.method === "GET") {
+          const projectId = url.pathname.startsWith("/projects/") ? decodeURIComponent(url.pathname.slice("/projects/".length, -"/context".length)) : url.searchParams.get("projectId") || undefined;
+          return json(response, 200, await projectContext.build({ query: url.searchParams.get("query") || "", projectId, sessionId: url.searchParams.get("sessionId") || undefined, limit: Number(url.searchParams.get("limit") || 12) }));
+        }
+        if (request.method === "POST" && url.pathname === "/context") return json(response, 200, await projectContext.build(await readJson(request, { maxBytes: requestMaxBytes })));
       }
       if (request.method === "GET" && url.pathname === "/cron") {
         return json(response, 200, { enabled: true, jobs: await cronStore.list(), nextWake: await cronStore.nextWake() });
@@ -1815,12 +1912,14 @@ export async function createGatewayServer({
     if (improvementStartupTimer) clearTimeout(improvementStartupTimer);
     if (improvementTimer) clearInterval(improvementTimer);
     clearInterval(cronTimer);
-    Promise.allSettled([channelSupervisor.stop(), supervisor.shutdown(), isolatedTaskExecutor.shutdown?.(), mcpRuntime?.close()])
+    if (eventHeartbeatTimer) clearInterval(eventHeartbeatTimer);
+    Promise.allSettled([channelSupervisor.stop(), supervisor.shutdown(), workflowRuntime?.shutdown(), isolatedTaskExecutor.shutdown?.(), mcpRuntime?.close()])
       .then(() => {
         let registryError: unknown;
         try { registry.close(); } catch (error) { registryError = error; }
         try { governedRegistry.close(); } catch (error) { registryError ??= error; }
         try { auditStore.close?.(); } catch (error) { registryError ??= error; }
+        try { contextRecords?.close?.(); } catch (error) { registryError ??= error; }
         close((serverError: unknown) => callback?.(serverError ?? registryError));
       })
       .catch((error: any) => callback?.(error));
@@ -2066,7 +2165,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
         if (readError?.code !== "ENOENT") throw readError;
       }
       await mkdir(state, { recursive: true });
-      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, runtime: { enableAgentGraphs: false, enableProgressiveSkills: false, enableSkillLifecycle: false, enableMcp: false }, mcp: { servers: {} }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, runtime: { enableAgentGraphs: false, enableProgressiveSkills: false, enableSkillLifecycle: false, enableMcp: false, enableDurableWorkflows: false, enableEventIngress: false, enableProjectContext: false }, mcp: { servers: {} }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await chmod(path, 0o600);
       return config;
@@ -2140,6 +2239,9 @@ function validateGatewayConfig(config: any) {
     assertOptionalConfigBoolean(config.runtime, "enableProgressiveSkills", "config.runtime");
     assertOptionalConfigBoolean(config.runtime, "enableSkillLifecycle", "config.runtime");
     assertOptionalConfigBoolean(config.runtime, "enableMcp", "config.runtime");
+    assertOptionalConfigBoolean(config.runtime, "enableDurableWorkflows", "config.runtime");
+    assertOptionalConfigBoolean(config.runtime, "enableEventIngress", "config.runtime");
+    assertOptionalConfigBoolean(config.runtime, "enableProjectContext", "config.runtime");
   }
   try { normalizeMcpConfiguration(config.mcp); }
   catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.mcp is invalid"); }

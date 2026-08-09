@@ -10,6 +10,9 @@
     "./automation-primitives": "./src/automation-primitives.ts",
     "./mcp-host": "./src/mcp-host.ts",
     "./mcp-runtime": "./src/mcp-runtime.ts",
+    "./workflows": "./src/workflows.ts",
+    "./event-ingress": "./src/event-ingress.ts",
+    "./project-context": "./src/project-context.ts",
     "./provider-capabilities": "./src/provider-capabilities.ts",
     "./session-lanes": "./src/session-lanes.ts",
     "./skill-disclosure": "./src/skill-disclosure.ts"
