@@ -28,15 +28,20 @@ export type ApprovalAction = {
   approvedAt?: string;
   runId?: string;
   accountId?: string;
+  actor?: string;
   tool: string;
   summary?: string;
   input?: Record<string, unknown>;
+  /** Exact execution input kept only in volatile memory or the sealed input envelope. */
+  executionInput?: Record<string, unknown>;
   [key: string]: unknown;
 };
 
 export interface ApprovalStore {
   create(action: ApprovalAction): string;
   claim(id: unknown): ApprovalAction | undefined;
+  /** Recover the exact approved action without consuming it; never exposes sealed storage. */
+  recover(id: unknown): ApprovalAction | undefined;
   consume(id: unknown, action: ApprovalAction): ApprovalAction | undefined;
   take(id: unknown): ApprovalAction | undefined;
   revoke(id: unknown): boolean;
@@ -130,7 +135,8 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         refresh();
         const id = `approval_${randomUUID()}`;
         const normalized = normalizeApprovalAction(action);
-        const sanitized = redactDurableValue({ ...action, ...normalized }, { toolName: normalized.tool }) as ApprovalAction;
+        const { executionInput: _executionInput, ...publicAction } = action;
+        const sanitized = redactDurableValue({ ...publicAction, tool: normalized.tool, actor: normalized.actor, input: publicAction.input ?? {} }, { toolName: normalized.tool }) as ApprovalAction;
         const bindingTag = approvalBindingTag(bindingKey, normalized);
         volatile.set(id, normalized);
         pending.set(id, {
@@ -161,6 +167,18 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         pending.set(key, { ...action, status: "approved", approvedAt: new Date().toISOString() });
         persist();
         return publicApprovalAction(pending.get(key)!);
+      });
+    },
+    recover(id) {
+      return withLock(() => {
+        refresh();
+        expire();
+        const key = String(id ?? "");
+        const action = pending.get(key);
+        if (!action || action.status !== "approved" || Number(action.expiresAt) <= Date.now()) return undefined;
+        const exact = volatile.get(key) ?? recoverSealedApprovalAction(bindingKey, key, action);
+        if (!exact || !action.bindingTag || !safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, exact))) return undefined;
+        return { ...publicApprovalAction(action), ...exact };
       });
     },
     consume(id, expected) {
@@ -238,11 +256,12 @@ function staleApprovalLock(path: string) {
 }
 
 function normalizeApprovalAction(action: ApprovalAction): ApprovalAction {
-  const input = normalizeApprovalInput(action.input);
+  const input = normalizeApprovalInput(action.executionInput ?? action.input);
   return {
     tool: String(action.tool ?? "").trim(),
     runId: String(action.runId ?? "").trim(),
     accountId: String(action.accountId ?? "").trim(),
+    actor: String(action.actor ?? "").trim(),
     input
   };
 }
@@ -268,6 +287,7 @@ function approvalBindingTag(key: Buffer, action: ApprovalAction): string {
     tool: action.tool,
     runId: action.runId ?? "",
     accountId: action.accountId ?? "",
+    actor: action.actor ?? "",
     input: action.input ?? {}
   })).digest("base64url");
 }
@@ -334,6 +354,7 @@ function recoverSealedApprovalAction(key: Buffer, approvalId: string, action: St
       tool: action.tool,
       runId: action.runId,
       accountId: action.accountId,
+      actor: action.actor,
       input: input as Record<string, unknown>
     });
   } catch {

@@ -4,7 +4,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
 import { redact } from "./run-ledger.ts";
 import { materializeSandboxBundle } from "./sandbox-bundle.ts";
-import { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, compileSandboxProfile, detectOciBackend, validateDigestPinnedOciImage, type OciCapabilityProbe, type SandboxExecutionResult } from "./sandbox-backend.ts";
+import { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, compileSandboxProfile, detectOciBackend, validateDigestPinnedOciImage, type OciCapabilityProbe, type SandboxExecutionResult, type SandboxInteractiveSession } from "./sandbox-backend.ts";
 import { normalizeSandboxConfig, type SandboxConfig, type SandboxConfigInput } from "./sandbox-config.ts";
 import type { JsonObject } from "@odinn/protocol";
 
@@ -30,14 +30,42 @@ interface EnableOptions { grants?: string[]; trust?: boolean; allowUnsafeSandbox
 type StateMutation<T> = (state: ExtensionState) => T | Promise<T>;
 type NodeError = Error & { code?: string };
 
+export function extensionIdentityFingerprint(extension: any): string {
+  return createHash("sha256").update(JSON.stringify({
+    id: extension?.id ?? "",
+    type: extension?.type ?? "",
+    installId: extension?.installId ?? "",
+    version: extension?.version ?? "",
+    bundleDigest: extension?.bundleDigest ?? "",
+    containerImage: extension?.containerImage ?? "",
+    entrypoint: extension?.entrypoint ?? "",
+    bundleRoot: extension?.bundleRoot ?? "",
+    capabilities: Array.isArray(extension?.capabilities) ? [...extension.capabilities].sort() : [],
+    grants: Array.isArray(extension?.grants) ? [...extension.grants].sort() : []
+  })).digest("hex");
+}
+
 interface ExtensionRuntime {
   runLedger: any;
   auditStore: { append(event: JsonObject): Promise<unknown> };
   runId?: string; featureFlags?: Record<string, boolean>; workspaceRoot?: string;
   actor?: string; policy?: any; capabilityToken?: string;
+  /** The enclosing governed MCP tool already consumed its capability at admission. */
+  authorizedByAdmission?: boolean;
 }
 interface ExtensionExecutorOptions { workspaceRoot?: string; defaultTimeoutMs?: number; config?: SandboxConfigInput }
-interface InvokeOptions { capability?: string; timeoutMs?: number; runtime?: ExtensionRuntime; capabilityToken?: string; signal?: AbortSignal }
+type McpMethod = "tools/list" | "tools/call";
+const MCP_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
+interface InvokeOptions {
+  capability?: string;
+  timeoutMs?: number;
+  runtime?: ExtensionRuntime;
+  capabilityToken?: string;
+  signal?: AbortSignal;
+  mcpMethod?: McpMethod;
+  onDispatchAuthorized?: (evidence: JsonObject) => void | Promise<void>;
+  expectedIdentityFingerprint?: string;
+}
 interface ExtensionRequest extends JsonObject {}
 interface ProcessOptions { timeoutMs: number; protocol: "mcp-jsonl" | "odinn-jsonl" }
 interface ProcessResponse extends JsonObject { result?: any; error?: { message?: string } }
@@ -155,9 +183,10 @@ export class ExtensionExecutor {
     this.sandboxConfig = normalizeSandboxConfig(config);
   }
 
-  async invoke(id: string, input: JsonObject = {}, { capability, timeoutMs = this.defaultTimeoutMs, runtime, capabilityToken, signal }: InvokeOptions = {}) {
+  async invoke(id: string, input: JsonObject = {}, { capability, timeoutMs = this.defaultTimeoutMs, runtime, capabilityToken, signal, mcpMethod, onDispatchAuthorized, expectedIdentityFingerprint }: InvokeOptions = {}) {
     const extension = await this.registry.get(id);
     if (!extension) throw new Error(`extension not found: ${id}`);
+    if (expectedIdentityFingerprint && extensionIdentityFingerprint(extension) !== expectedIdentityFingerprint) throw new Error(`extension manifest changed before governed execution: ${id}`);
     if (!extension.enabled || !extension.trusted) throw new Error(`extension is not enabled and trusted: ${id}`);
     if (!["unconfined-process", "container"].includes(extension.sandbox)) throw new Error(`extension sandbox is not executable by this adapter: ${extension.sandbox}`);
     const requested = String(capability || extension.capabilities[0] || "").trim();
@@ -184,7 +213,7 @@ export class ExtensionExecutor {
     }
     const protocol = extension.type === "mcp" ? "mcp-jsonl" : "odinn-jsonl";
     const request = protocol === "mcp-jsonl"
-      ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
+      ? (mcpMethod ? createMcpRequestSequence(mcpMethod, input) : { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } })
       : { type: "odinn.call", id: `call_${randomUUID()}`, input, capability: requested };
     if (!runtime) throw new Error("extension execution requires the audited runtime boundary");
     const snapshot = await createExtensionExecutionSnapshot(extension, entrypoint, bundleRoot, runtime.runLedger.stateDir, signal);
@@ -201,7 +230,9 @@ export class ExtensionExecutor {
       runtime: { ...runtime, capabilityToken },
       sandboxConfig: this.sandboxConfig,
       sealedBundleDigest: snapshot.sealedBundleDigest,
-      signal
+      signal,
+      mcpMethod,
+      onDispatchAuthorized
     });
   }
 }
@@ -217,8 +248,9 @@ async function createExtensionExecutionSnapshot(extension: ExtensionManifest, en
   return { bundleRoot: sealed.path, entrypoint: sealedEntrypoint, sealedBundleDigest: sealed.digest };
 }
 
-interface RuntimeInvocation { id: string; input: JsonObject; requested: string; extension: ExtensionManifest; entrypoint: string; bundleRoot: string; request: ExtensionRequest; protocol: "mcp-jsonl" | "odinn-jsonl"; timeoutMs: number; runtime: ExtensionRuntime; sandboxConfig: SandboxConfig; sealedBundleDigest?: string; signal?: AbortSignal }
-async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime, sandboxConfig, sealedBundleDigest, signal }: RuntimeInvocation) {
+type ExtensionRequestSequence = ExtensionRequest | readonly ExtensionRequest[];
+interface RuntimeInvocation { id: string; input: JsonObject; requested: string; extension: ExtensionManifest; entrypoint: string; bundleRoot: string; request: ExtensionRequestSequence; protocol: "mcp-jsonl" | "odinn-jsonl"; timeoutMs: number; runtime: ExtensionRuntime; sandboxConfig: SandboxConfig; sealedBundleDigest?: string; signal?: AbortSignal; mcpMethod?: McpMethod; onDispatchAuthorized?: (evidence: JsonObject) => void | Promise<void> }
+async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime, sandboxConfig, sealedBundleDigest, signal, mcpMethod, onDispatchAuthorized }: RuntimeInvocation) {
   const ledger = runtime.runLedger;
   const auditStore = runtime.auditStore;
   if (!ledger || !auditStore) throw new Error("extension runtime enforcement requires runLedger and auditStore");
@@ -226,15 +258,18 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
   const featureFlags = ledger.featureFlags ?? runtime.featureFlags ?? {};
   const safety = { toolName: "extension.invoke", effects: ["process", ...(extension.type === "mcp" ? ["network"] : [])], reversibility: "compensatable", requiresCapability: true, requiresApproval: false };
   ledger.ensureRun({ runId, objective: `extension:${id}`, workspaceRoot: runtime.workspaceRoot ?? ledger.workspaceRoot });
-  const ledgerStep = ledger.beginTool({ runId, toolName: "extension.invoke", input: { extensionId: id, input }, safety, metadata: { extensionType: extension.type } });
-  const safeInput = redact({ extensionId: id, input, capability: requested });
+  const auditedInput = extension.type === "mcp"
+    ? { extensionId: id, method: mcpMethod ?? "tools/call", input: summarizeMcpExtensionInput(input) }
+    : { extensionId: id, input };
+  const ledgerStep = ledger.beginTool({ runId, toolName: "extension.invoke", input: auditedInput, safety, metadata: { extensionType: extension.type } });
+  const safeInput = extension.type === "mcp" ? auditedInput : redact(auditedInput);
   const append = (event: JsonObject) => auditStore.append({ at: new Date().toISOString(), runId, actor: runtime.actor ?? "extension", tool: "extension.invoke", capability: extension.capabilities[0], ...event });
   try {
     if (runtime.policy?.version === 1 && Array.isArray(runtime.policy.invariants) && runtime.policy.invariants.length) {
       new Sentinel({ ledger }).evaluate({ runId, stepId: ledgerStep.stepId, toolName: "extension.invoke", input: safeInput, policy: runtime.policy, workspaceRoot: runtime.workspaceRoot ?? ledger.workspaceRoot });
     }
     let claims;
-    if (featureFlags.capabilities === true) {
+    if (featureFlags.capabilities === true && runtime.authorizedByAdmission !== true) {
       const brokerOptions = { ledger, stateDir: ledger.stateDir, featureFlags };
       const consumeOptions = { runId, toolName: "extension.invoke", resource: { extensionId: id, capability: requested } };
       claims = new CapabilityBroker(brokerOptions).consume(runtime.capabilityToken ?? "", consumeOptions);
@@ -244,14 +279,16 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
     const output = await runContainerExtension(extension, entrypoint, bundleRoot, request, { timeoutMs, protocol, sandboxConfig, signal, stateDir: ledger.stateDir }, async (phase, evidence) => {
       sandboxEvidence = { ...sandboxEvidence, ...evidence, sealedBundleDigest };
       await append({ type: `sandbox.${phase}`, decision: "allow", data: { ...evidence, sealedBundleDigest } });
-    });
-    await append({ type: "task.completed", decision: "allow", data: { output: redact(output), ...(sandboxEvidence ? { sandbox: sandboxEvidence } : {}) } });
-    ledger.finishTool({ runId, stepId: ledgerStep.stepId, output, status: "succeeded" });
+    }, onDispatchAuthorized);
+    const durableOutput = extension.type === "mcp" ? summarizeMcpExtensionOutput(output) : redact(output);
+    await append({ type: "task.completed", decision: "allow", data: { output: durableOutput, ...(sandboxEvidence ? { sandbox: sandboxEvidence } : {}) } });
+    ledger.finishTool({ runId, stepId: ledgerStep.stepId, output: durableOutput, status: "succeeded" });
     return output;
   } catch (error) {
     const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError;
-    await append({ type: "task.failed", decision: "deny", message: failure.message, data: { code: failure.code ?? "EXTENSION_FAILED" } });
-    ledger.finishTool({ runId, stepId: ledgerStep.stepId, status: "failed", error: failure.message });
+    const message = extension.type === "mcp" ? "MCP extension execution failed" : failure.message;
+    await append({ type: "task.failed", decision: "deny", message, data: { code: failure.code ?? "EXTENSION_FAILED" } });
+    ledger.finishTool({ runId, stepId: ledgerStep.stepId, status: "failed", error: message });
     throw error;
   }
 }
@@ -260,9 +297,10 @@ async function runContainerExtension(
   extension: ExtensionManifest,
   entrypoint: string,
   bundleRoot: string,
-  request: ExtensionRequest,
+  request: ExtensionRequestSequence,
   { timeoutMs, protocol, sandboxConfig, signal, stateDir }: Pick<ProcessOptions, "timeoutMs" | "protocol"> & { sandboxConfig: SandboxConfig; signal?: AbortSignal; stateDir: string },
-  auditSandbox: (phase: "prepared" | "dispatch-authorized" | "settled", evidence: JsonObject) => Promise<void>
+  auditSandbox: (phase: "prepared" | "dispatch-authorized" | "settled", evidence: JsonObject) => Promise<void>,
+  onDispatchAuthorized?: (evidence: JsonObject) => void | Promise<void>
 ) {
   const relativeEntrypoint = relative(bundleRoot, entrypoint).replaceAll("\\", "/");
   if (!relativeEntrypoint || relativeEntrypoint.startsWith("..")) throw new Error("extension entrypoint must remain inside its immutable bundle");
@@ -302,12 +340,31 @@ async function runContainerExtension(
     mounts: profile.mounts.map((mount) => ({ target: mount.target, access: mount.access })),
     limits: profile.limits
   });
+  const requests = Array.isArray(request) ? request : [request];
+  const interactive = protocol === "mcp-jsonl" && Array.isArray(request)
+    ? async (session: SandboxInteractiveSession) => {
+        await session.write(`${JSON.stringify(requests[0])}\n`);
+        const initializeLine = await session.readLine();
+        let initialize: ProcessResponse;
+        try { initialize = JSON.parse(initializeLine); } catch { throw mcpProtocolError(); }
+        if (!initialize || typeof initialize !== "object" || Array.isArray(initialize) || initialize.jsonrpc !== "2.0" || initialize.id !== requests[0]!.id || initialize.error || !initialize.result || typeof initialize.result !== "object" || typeof initialize.result.protocolVersion !== "string" || !MCP_PROTOCOL_VERSIONS.has(initialize.result.protocolVersion)) throw mcpProtocolError();
+        await session.write(`${JSON.stringify(requests[1])}\n`);
+        await session.write(`${JSON.stringify(requests[2])}\n`);
+        const callLine = await session.readLine();
+        let call: ProcessResponse;
+        try { call = JSON.parse(callLine); } catch { throw mcpProtocolError(); }
+        if (!call || typeof call !== "object" || Array.isArray(call) || call.jsonrpc !== "2.0" || call.id !== requests[2]!.id) throw mcpProtocolError();
+      }
+    : undefined;
   let execution: SandboxExecutionResult;
   try {
     execution = await new OciSandboxBackend(capability, undefined, { recoveryStateDir: stateDir }).execute(profile, {
       signal,
-      stdin: `${JSON.stringify(request)}\n`,
-      onDispatchAuthorized: (evidence) => auditSandbox("dispatch-authorized", evidence)
+      ...(interactive ? { interactive } : { stdin: `${requests.map((item) => JSON.stringify(item)).join("\n")}\n` }),
+      onDispatchAuthorized: async (evidence) => {
+        await onDispatchAuthorized?.(evidence);
+        await auditSandbox("dispatch-authorized", evidence);
+      }
     });
   } catch (error) {
     if (error instanceof SandboxExecutionError) await auditSandbox("settled", sandboxSettlementEvidence(error.result, error.code));
@@ -316,12 +373,64 @@ async function runContainerExtension(
   await auditSandbox("settled", sandboxSettlementEvidence(execution));
   if (execution.cleanupUncertain) throw new Error("sandbox container cleanup could not be proven complete");
   if (execution.exitCode !== 0) throw new Error(`extension container exited before returning a result: ${execution.exitCode}`);
-  const line = execution.stdout.split(/\r?\n/u).find((value) => value.trim());
-  if (!line) throw new Error("extension container exited before returning a result");
-  let response: ProcessResponse;
-  try { response = JSON.parse(line); } catch { throw new Error("extension returned invalid JSON"); }
-  if (response.error) throw new Error(response.error.message || "extension returned an error");
-  return protocol === "mcp-jsonl" && response.result?.content ? response.result : response.result ?? response;
+  const lines = execution.stdout.split(/\r?\n/u).map((value) => value.trim()).filter(Boolean);
+  if (!lines.length) throw new Error("extension container exited before returning a result");
+  const responses: ProcessResponse[] = [];
+  for (const line of lines) {
+    let parsed: ProcessResponse;
+    try { parsed = JSON.parse(line); } catch { throw protocol === "mcp-jsonl" ? mcpProtocolError() : new Error("extension returned invalid JSON"); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw protocol === "mcp-jsonl" ? mcpProtocolError() : new Error("extension returned an invalid response");
+    if (protocol === "mcp-jsonl" && (parsed.jsonrpc !== "2.0" || !Object.hasOwn(parsed, "id"))) throw mcpProtocolError();
+    responses.push(parsed);
+  }
+  if (protocol === "mcp-jsonl") {
+    const expected = requests.filter((item) => Object.hasOwn(item, "id")).map((item) => item.id);
+    if (responses.length !== expected.length || responses.some((response, index) => response.id !== expected[index])) throw mcpProtocolError();
+    const initialize = responses[0];
+    if (requests.length > 1) {
+      if (!initialize || initialize.error || !initialize.result || typeof initialize.result !== "object" || typeof initialize.result.protocolVersion !== "string" || !MCP_PROTOCOL_VERSIONS.has(initialize.result.protocolVersion)) throw mcpProtocolError();
+    }
+  }
+  const response = responses[responses.length - 1]!;
+  if (response.error) throw protocol === "mcp-jsonl" ? mcpProtocolError() : new Error("extension returned an error");
+  return response.result ?? response;
+}
+
+function createMcpRequestSequence(method: McpMethod, input: JsonObject): readonly ExtensionRequest[] {
+  const params = method === "tools/call"
+    ? { name: input.name, arguments: input.arguments ?? {} }
+    : {};
+  return [
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "odinn", version: "1.0.0" } } },
+    { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+    { jsonrpc: "2.0", id: 2, method, params }
+  ];
+}
+
+function mcpProtocolError(): NodeError {
+  const error = new Error("MCP extension returned an invalid protocol response") as NodeError;
+  error.code = "MCP_PROTOCOL_INVALID";
+  return error;
+}
+
+function summarizeMcpExtensionInput(input: JsonObject): JsonObject {
+  const raw = input.arguments;
+  let encoded = "";
+  try { encoded = JSON.stringify(raw) ?? "null"; } catch { encoded = "[unserializable]"; }
+  return {
+    name: typeof input.name === "string" ? input.name : "",
+    argumentsDigest: createHash("sha256").update(encoded, "utf8").digest("hex"),
+    argumentsBytes: Buffer.byteLength(encoded, "utf8")
+  };
+}
+
+function summarizeMcpExtensionOutput(output: unknown): JsonObject {
+  let encoded = "";
+  try { encoded = JSON.stringify(output) ?? "null"; } catch { encoded = "[unserializable]"; }
+  return {
+    resultDigest: createHash("sha256").update(encoded, "utf8").digest("hex"),
+    resultBytes: Buffer.byteLength(encoded, "utf8")
+  };
 }
 
 export async function resolveConfiguredOciBackend(

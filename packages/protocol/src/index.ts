@@ -86,6 +86,8 @@ const AGENT_TOOLS = new Set(["agent.run", "agent.delegate"]);
 const SKILL_CATALOG_TOOLS = new Set(["skill.catalog"]);
 const SKILL_HYDRATE_TOOLS = new Set(["skill.hydrate"]);
 const SKILL_LIFECYCLE_TOOLS = new Set(["skill.install", "skill.lifecycle"]);
+const MCP_DISCOVER_TOOLS = new Set(["mcp.discover"]);
+const MCP_INVOKE_TOOLS = new Set(["mcp.invoke"]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -103,6 +105,8 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (SKILL_CATALOG_TOOLS.has(toolName)) return {};
   if (SKILL_HYDRATE_TOOLS.has(toolName)) return projectSkillHydrateInput(input);
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleInput(input);
+  if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverInput(input);
+  if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeInput(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
   if (typeof projected.before === "string") {
@@ -126,6 +130,8 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (SKILL_CATALOG_TOOLS.has(toolName)) return projectSkillCatalogOutput(output);
   if (SKILL_HYDRATE_TOOLS.has(toolName)) return projectSkillHydrateOutput(output);
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleOutput(output);
+  if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverOutput(output);
+  if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeOutput(output);
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
   const record = output as JsonObject;
   if (toolName === "workspace.read" || toolName === "workspace.readText") {
@@ -236,6 +242,66 @@ function projectSkillLifecycleOutput(value: unknown): unknown {
     const skill = record.skill as JsonObject;
     projected.skill = projectSkillLifecycleInput({ ...skill, skillId: skill.skillId ?? skill.id });
   }
+  return projected;
+}
+
+function projectMcpDiscoverInput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const input = value as JsonObject;
+  const projected: JsonObject = {};
+  if (typeof input.serverId === "string" && input.serverId.length <= 64) projected.serverId = input.serverId;
+  if (typeof input.refresh === "boolean") projected.refresh = input.refresh;
+  return projected;
+}
+
+function projectMcpInvokeInput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const input = value as JsonObject;
+  const projected: JsonObject = {};
+  for (const key of ["serverId", "snapshotFingerprint", "extensionFingerprint", "toolName", "toolSchemaFingerprint"] as const) {
+    if (typeof input[key] === "string" && input[key].length <= 256) projected[key] = input[key];
+  }
+  for (const key of ["generation", "timeoutMs"] as const) {
+    if (Number.isSafeInteger(input[key])) projected[key] = input[key];
+  }
+  if (input.arguments !== undefined) {
+    const encoded = JSON.stringify(input.arguments) ?? "null";
+    projected.argumentsDigest = sha256Reference(encoded);
+    projected.argumentsBytes = Buffer.byteLength(encoded, "utf8");
+  }
+  return projected;
+}
+
+function projectMcpDiscoverOutput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const output = value as JsonObject;
+  const projected: JsonObject = {};
+  for (const key of ["type", "serverId", "fingerprint", "extensionFingerprint"] as const) {
+    if (typeof output[key] === "string" && output[key].length <= 256) projected[key] = output[key];
+  }
+  for (const key of ["generation", "discoveredAtMs", "expiresAtMs", "staleUntilMs"] as const) {
+    if (Number.isSafeInteger(output[key])) projected[key] = output[key];
+  }
+  const tools = Array.isArray(output.tools) ? output.tools : [];
+  projected.toolCount = tools.length;
+  projected.tools = tools.slice(0, 128).flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const tool = item as JsonObject;
+    return typeof tool.name === "string" && typeof tool.schemaFingerprint === "string"
+      ? [{ name: tool.name, schemaFingerprint: tool.schemaFingerprint }]
+      : [];
+  });
+  return projected;
+}
+
+function projectMcpInvokeOutput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const output = value as JsonObject;
+  const projected: JsonObject = {};
+  for (const key of ["status", "callId", "requestDigest", "argumentDigest", "resultRef", "resultDigest", "authorizationRef", "auditRef", "errorCode"] as const) {
+    if (typeof output[key] === "string" && output[key].length <= 256) projected[key] = output[key];
+  }
+  if (output.status === "needs-review") projected.physicalPending = true;
   return projected;
 }
 

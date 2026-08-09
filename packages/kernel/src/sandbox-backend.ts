@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type SpawnOptions } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync, type Stats } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { basename, dirname, isAbsolute, posix, resolve } from "node:path";
 import { platform } from "node:os";
 import { SandboxRecoveryCoordinator, SandboxRecoveryError, type SandboxRecoveryIdentity, type SandboxRecoverySession } from "./sandbox-recovery.ts";
@@ -110,6 +111,14 @@ export interface SandboxExecutionOptions {
   readonly signal?: AbortSignal;
   readonly stdin?: Uint8Array | string;
   readonly onDispatchAuthorized?: (evidence: Readonly<{ backend: OciBackendId; containerName: string; profileDigest: string; controlsAttested: true }>) => void | Promise<void>;
+  /** Optional bounded JSONL session used by protocols that require response-gated writes. */
+  readonly interactive?: (session: SandboxInteractiveSession) => Promise<void>;
+}
+
+export interface SandboxInteractiveSession {
+  write(data: Uint8Array | string): Promise<void>;
+  end(): void;
+  readLine(): Promise<string>;
 }
 
 export class SandboxBackendRefusalError extends Error {
@@ -498,7 +507,7 @@ export class OciSandboxBackend implements SandboxBackend {
     return this.capability;
   }
 
-  async execute(profile: CompiledSandboxProfile, { signal, stdin, onDispatchAuthorized }: SandboxExecutionOptions = {}) {
+  async execute(profile: CompiledSandboxProfile, { signal, stdin, onDispatchAuthorized, interactive }: SandboxExecutionOptions = {}) {
     if (profile.backend !== this.id) {
       throw new SandboxBackendRefusalError(`compiled profile requires ${profile.backend}, not ${this.id}`, "SANDBOX_BACKEND_MISMATCH");
     }
@@ -508,6 +517,7 @@ export class OciSandboxBackend implements SandboxBackend {
       signal,
       stdin,
       onDispatchAuthorized,
+      interactive,
       adapter: boundAdapter,
       engineExecutable: this.capability.command,
       recoverySession
@@ -528,7 +538,7 @@ export async function reconcileSandboxRecovery(
 export async function executeOciProfile(
   backend: OciBackendId,
   profile: CompiledSandboxProfile,
-  { signal, stdin, onDispatchAuthorized, adapter = defaultLifecycleAdapter, engineExecutable, recoverySession }: SandboxExecutionOptions & { adapter?: OciLifecycleAdapter; engineExecutable?: string; recoverySession?: SandboxRecoverySession } = {}
+  { signal, stdin, onDispatchAuthorized, interactive, adapter = defaultLifecycleAdapter, engineExecutable, recoverySession }: SandboxExecutionOptions & { adapter?: OciLifecycleAdapter; engineExecutable?: string; recoverySession?: SandboxRecoverySession } = {}
 ): Promise<SandboxExecutionResult> {
   assertCompiledProfile(profile);
   if (profile.backend !== backend) throw new SandboxBackendRefusalError("sandbox backend does not match compiled profile", "SANDBOX_BACKEND_MISMATCH");
@@ -621,6 +631,38 @@ export async function executeOciProfile(
   let child: any;
 
   return await new Promise<SandboxExecutionResult>((resolveExecution, rejectExecution) => {
+    const decoder = new StringDecoder("utf8");
+    let lineBuffer = "";
+    const lineQueue: string[] = [];
+    const lineWaiters: Array<{ resolve: (line: string) => void; reject: (error: Error) => void }> = [];
+    let lineError: Error | undefined;
+    const rejectLines = (error: Error) => {
+      if (lineError) return;
+      lineError = error;
+      while (lineWaiters.length) lineWaiters.shift()!.reject(error);
+    };
+    const pushStdoutLines = (chunk: Buffer) => {
+      if (lineError) return;
+      lineBuffer += decoder.write(chunk);
+      while (true) {
+        const match = lineBuffer.match(/^(.*?)(?:\r?\n)/u);
+        if (!match) break;
+        lineBuffer = lineBuffer.slice(match[0].length);
+        const line = match[1]!;
+        if (Buffer.byteLength(line, "utf8") > MAX_SANDBOX_STDIN_BYTES) {
+          rejectLines(new Error("sandbox interactive response line is oversized"));
+          break;
+        }
+        const waiter = lineWaiters.shift();
+        if (waiter) waiter.resolve(line);
+        else lineQueue.push(line);
+      }
+    };
+    const readLine = (): Promise<string> => {
+      if (lineQueue.length) return Promise.resolve(lineQueue.shift()!);
+      if (lineError) return Promise.reject(lineError);
+      return new Promise<string>((resolve, reject) => lineWaiters.push({ resolve, reject }));
+    };
     const result = (exitCode: number, childSignal: NodeJS.Signals | null, reason?: "timeout" | "cancelled" | "output"): SandboxExecutionResult => deepFreeze({
       backend,
       containerName,
@@ -675,6 +717,7 @@ export async function executeOciProfile(
     const settleExceptional = async (reason: "timeout" | "cancelled" | "output") => {
       if (settling) return;
       settling = true;
+      rejectLines(new Error(`sandbox interactive session ended: ${reason}`));
       clearTimeout(timer);
       removeAbort();
       terminateClient();
@@ -692,6 +735,7 @@ export async function executeOciProfile(
     const settleRuntimeError = async (error: Error) => {
       if (settling) return;
       settling = true;
+      rejectLines(error);
       clearTimeout(timer);
       removeAbort();
       terminateClient();
@@ -750,10 +794,12 @@ export async function executeOciProfile(
       }
     };
     child.stdout?.on("data", (chunk: Buffer) => collect(stdout, chunk, "stdout"));
+    child.stdout?.on("data", (chunk: Buffer) => pushStdoutLines(chunk));
     child.stderr?.on("data", (chunk: Buffer) => collect(stderr, chunk, "stderr"));
     const settleClose = (exitCode: number | null, childSignal: NodeJS.Signals | null) => {
       if (settling) return;
       settling = true;
+      rejectLines(new Error("sandbox interactive session closed before the next response"));
       clearTimeout(timer);
       removeAbort();
       void (async () => {
@@ -790,7 +836,23 @@ export async function executeOciProfile(
         await settleRuntimeError(new Error("sandbox runtime did not provide a writable stdin pipe"));
         return;
       }
-      child.stdin.end(stdinBytes);
+      if (interactive) {
+        const session: SandboxInteractiveSession = {
+          write: async (data) => {
+            const bytes = normalizeStdin(data);
+            if (settling || !child.stdin || child.stdin.destroyed) throw new Error("sandbox interactive session is closed");
+            await new Promise<void>((resolveWrite, rejectWrite) => {
+              child.stdin.write(bytes, (error: Error | undefined) => error ? rejectWrite(error) : resolveWrite());
+            });
+          },
+          end: () => { if (child.stdin && !child.stdin.destroyed) child.stdin.end(); },
+          readLine
+        };
+        await interactive(session);
+        session.end();
+      } else {
+        child.stdin.end(stdinBytes);
+      }
     })().catch((error) => {
       void settleRuntimeError(error instanceof Error ? error : new Error(String(error)));
     });

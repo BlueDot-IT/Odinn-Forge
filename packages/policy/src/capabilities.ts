@@ -99,6 +99,8 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
   tool("browser.recovery.resolve", ["browser.mutate"], ["browser.act"]),
   tool("agent.run", ["agent.delegate", "network.access"], ["agent.run"]),
   tool("model.chat", ["network.access"], ["model.chat"]),
+  tool("mcp.discover", ["mcp.discover"], []),
+  tool("mcp.invoke", ["mcp.invoke"], []),
   tool("skill.catalog", ["skill.catalog"], ["skill.catalog"]),
   tool("skill.hydrate", ["skill.hydrate"], ["skill.hydrate"]),
   tool("skill.install", ["skill.manage"], ["skill.install"]),

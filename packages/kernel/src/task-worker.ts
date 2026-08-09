@@ -9,7 +9,7 @@ let active = false;
 
 interface TaskWorkerMessage {
   type?: "task" | "abort";
-  payload?: { actor?: string; approvalId?: string; approvalRunId?: string; durableExecution?: boolean; parentCapabilities?: unknown; plan?: unknown; task?: unknown };
+  payload?: { actor?: string; approvalId?: string; approvalRunId?: string; trustedRecovery?: boolean; durableExecution?: boolean; parentCapabilities?: unknown; plan?: unknown; task?: unknown };
   stateDir?: string;
   workspaceRoot?: string;
   config?: { auditLog?: string; experimental?: unknown; [key: string]: unknown };

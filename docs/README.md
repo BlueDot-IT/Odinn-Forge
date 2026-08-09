@@ -55,7 +55,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   agent graph primitives.
 - [Demand-loaded automation primitives](automation-primitives.md) — inert
   trigger and schedule primitives.
-- [Cached MCP host foundation](cached-mcp-host.md) — MCP process reuse and
+- [Cached MCP host foundation](cached-mcp-host.md) — bounded MCP host and
+  governed Stage 9 activation with OCI isolation and
   lifecycle foundations.
 - [Execution admission](architecture/execution-admission.md) — immutable execution
   envelopes, admission, attempts, cancellation, and recovery boundaries.
