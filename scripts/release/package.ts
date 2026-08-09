@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { chmod, cp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
 import { assertReleaseCommit } from "./commit.ts";
@@ -15,6 +15,7 @@ const base = `odinn-v${pkg.version}`;
 const packageRoot = join(staging, base);
 const compiledInfoPath = join(dist, "production-build-info.json");
 const compiledInfo = JSON.parse(await readFile(compiledInfoPath, "utf8"));
+const DISTRIBUTION_PACKAGE_NAME = "@bluedot-it/odinn";
 
 await rm(output, { recursive: true, force: true });
 await rm(staging, { recursive: true, force: true });
@@ -103,7 +104,7 @@ for (const path of [
 }
 
 const productionPackage = {
-  name: "@bluedot-it/odinn",
+  name: DISTRIBUTION_PACKAGE_NAME,
   version: pkg.version,
   description: pkg.description,
   private: false,
@@ -134,6 +135,7 @@ const stateSchemas = targetStateSchemaVersions();
 const releaseInfo = {
   schemaVersion: 2,
   name: pkg.name,
+  distributionName: productionPackage.name,
   version: pkg.version,
   commit,
   distribution: "compiled",
@@ -203,6 +205,33 @@ for (const path of archiveFiles) {
     licenseInfoInFile: ["NOASSERTION"]
   });
 }
+const productionMeta = JSON.parse(await readFile(join(dist, "production-esbuild-meta.json"), "utf8"));
+const bundledPackages = new Map<string, { name: string; version: string }>();
+for (const input of Object.keys(productionMeta.inputs ?? {})) {
+  const normalized = input.replaceAll("\\", "/");
+  if (!normalized.includes("/node_modules/")) continue;
+  let current = dirname(resolve(root, input));
+  for (;;) {
+    if (current === root) break;
+    try {
+      const metadata = JSON.parse(await readFile(join(current, "package.json"), "utf8"));
+      if (typeof metadata.name === "string" && typeof metadata.version === "string") {
+        bundledPackages.set(`${metadata.name}@${metadata.version}`, { name: metadata.name, version: metadata.version });
+        break;
+      }
+    } catch {
+      // Keep walking toward the workspace root; generated metafile inputs are untrusted paths.
+    }
+    const parent = dirname(current);
+    if (parent === current || (parent !== root && !parent.startsWith(`${root}${sep}`))) break;
+    current = parent;
+  }
+}
+const sbomPackages = [
+  { name: pkg.name, version: pkg.version },
+  { name: "playwright-core", version: "1.61.1" },
+  ...bundledPackages.values()
+].filter((entry, index, entries) => entries.findIndex((candidate) => candidate.name === entry.name && candidate.version === entry.version) === index);
 const sbom = {
   spdxVersion: "SPDX-2.3",
   dataLicense: "CC0-1.0",
@@ -213,19 +242,13 @@ const sbom = {
     created: new Date().toISOString(),
     creators: ["Tool: Odinn Forge production packager"]
   },
-  packages: [{
-    SPDXID: "SPDXRef-Package",
-    name: pkg.name,
-    versionInfo: pkg.version,
+  packages: sbomPackages.map((entry, index) => ({
+    SPDXID: `SPDXRef-Package-${index + 1}`,
+    name: entry.name,
+    versionInfo: entry.version,
     downloadLocation: "NOASSERTION",
     filesAnalyzed: true
-  }, {
-    SPDXID: "SPDXRef-Package-playwright-core",
-    name: "playwright-core",
-    versionInfo: "1.61.1",
-    downloadLocation: "NOASSERTION",
-    filesAnalyzed: true
-  }],
+  })),
   files: sbomFiles
 };
 await writeFile(join(output, "odinn.spdx.json"), `${JSON.stringify(sbom, null, 2)}\n`);
@@ -234,6 +257,7 @@ const lockfile = await readFile(join(root, "pnpm-lock.yaml"));
 const createdAt = new Date().toISOString();
 const manifest = {
   name: pkg.name,
+  distributionName: productionPackage.name,
   version: pkg.version,
   commit,
   distribution: "compiled",
@@ -247,6 +271,8 @@ const manifest = {
   sbom: "odinn.spdx.json",
   provenance: "release-provenance.json",
   runtimeDependencies: productionPackage.dependencies,
+  bundledDependencies: [...bundledPackages.values()].sort((left, right) => left.name.localeCompare(right.name) || left.version.localeCompare(right.version)),
+  sourceMaps: { included: true, sourcesContent: false, purpose: "post-release debugging without distributing source content" },
   stateSchemas,
   minimumApplicationVersionForTargetState: STATE_SCHEMA_MINIMUM_APPLICATION_VERSION,
   runtimeStateExcluded: [
@@ -270,6 +296,7 @@ await writeFile(
   `${JSON.stringify({
     schemaVersion: 1,
     subject: pkg.name,
+    distributionName: productionPackage.name,
     version: pkg.version,
     commit,
     distribution: "compiled",

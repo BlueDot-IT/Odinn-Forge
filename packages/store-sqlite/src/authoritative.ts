@@ -866,6 +866,10 @@ function migrationRow(store: SqliteRecordStore, sourcePath: string): SqlRow | un
   return store.db.prepare("SELECT * FROM record_migrations WHERE source_path = ?").get(sourcePath) as SqlRow | undefined;
 }
 
+function completedMigrationRow(store: SqliteRecordStore): SqlRow | undefined {
+  return store.db.prepare("SELECT * FROM record_migrations WHERE complete = 1 ORDER BY updated_at DESC LIMIT 1").get() as SqlRow | undefined;
+}
+
 function saveMigration(store: SqliteRecordStore, values: { sourcePath: string; sourceSha256: string; backupPath: string; nextByte: number; records: number; complete: boolean; startedAt: string }): void {
   store.db.prepare(`
     INSERT INTO record_migrations(source_path, source_sha256, backup_path, next_byte, records, complete, started_at, updated_at)
@@ -907,10 +911,16 @@ export function migrateLegacyRecordsToSqlite(options: LegacyRecordMigrationOptio
       if (sha256File(legacyPath) !== sourceSha256) throw new Error("legacy records changed during SQLite migration");
     };
     const current = migrationRow(store, legacyPath);
-    if (current && String(current.source_sha256) !== sourceSha256) throw new Error("legacy records changed during SQLite migration");
-    if (current?.complete) {
+    const completed = current ?? completedMigrationRow(store);
+    if (completed && String(completed.source_sha256) !== sourceSha256) throw new Error("legacy records changed during SQLite migration");
+    if (completed?.complete) {
       assertSourcesUnchanged();
-      return { migrated: false, complete: true, records: Number(current.records), nextByte: Number(current.next_byte ?? current.next_line ?? 0), backup: backupPath };
+      if (!current || String(current.backup_path) !== backupPath) {
+        store.transaction(() => {
+          store.db.prepare("UPDATE record_migrations SET source_path=?, backup_path=?, updated_at=? WHERE source_path=?").run(legacyPath, backupPath, new Date().toISOString(), String(completed.source_path));
+        });
+      }
+      return { migrated: false, complete: true, records: Number(completed.records), nextByte: Number(completed.next_byte ?? completed.next_line ?? 0), backup: backupPath };
     }
     let nextByte = Number(current?.next_byte ?? current?.next_line ?? 0);
     let records = Number(current?.records ?? 0);

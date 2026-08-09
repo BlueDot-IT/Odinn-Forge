@@ -11,8 +11,8 @@ import {
   type DurableRedactionContext,
   type ExecutionEnvelopeV1
 } from "@odinn/protocol";
-export { SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
-export type { AuditPage } from "./audit.ts";
+export { SQLITE_AUDIT_SCHEMA_VERSION, SqliteAuditStore, auditMigrationStatus, inspectExistingSqliteAuditSchema, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
+export type { AuditIntegrityStatus, AuditPage } from "./audit.ts";
 
 export const SQLITE_SCHEMA_VERSION = 7;
 export type SqliteStoreOptions = { targetVersion?: number };

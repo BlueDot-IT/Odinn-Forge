@@ -32,13 +32,18 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pkg.version)) {
 const refType = process.env.GITHUB_REF_TYPE;
 const refName = process.env.GITHUB_REF_NAME;
 const releaseTag = process.env.ODINN_RELEASE_TAG || (refType === "tag" ? refName : undefined);
+const packageTag = `v${pkg.version}`;
+const packageTagCommit = spawnSync("git", ["rev-list", "-n", "1", `refs/tags/${packageTag}`], { cwd: root, encoding: "utf8" });
+const headCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" });
+if (headCommit.status !== 0) throw new Error("release preflight: could not resolve HEAD");
+if (!releaseTag && packageTagCommit.status === 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
+  throw new Error(`release preflight: development HEAD is ahead of published ${packageTag}; bump the package version before building`);
+}
 if (releaseTag) {
   const expected = `v${pkg.version}`;
   if (releaseTag !== expected) throw new Error(`release preflight: tag ${releaseTag} does not match package version ${expected}`);
   const tagCommit = spawnSync("git", ["rev-list", "-n", "1", `refs/tags/${releaseTag}`], { cwd: root, encoding: "utf8" });
   if (tagCommit.status !== 0) throw new Error(`release preflight: could not resolve tag ${releaseTag}`);
-  const headCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" });
-  if (headCommit.status !== 0) throw new Error("release preflight: could not resolve HEAD");
   if (tagCommit.stdout.trim() !== headCommit.stdout.trim()) {
     throw new Error(`release preflight: checked-out commit is not ${releaseTag}`);
   }

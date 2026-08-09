@@ -1,6 +1,6 @@
 import { AUDIT_SCHEMA_VERSION } from "@odinn/protocol";
 import { STORE_SCHEMA_VERSION } from "@odinn/store-file";
-import { AUTHORITATIVE_RECORD_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION } from "@odinn/store-sqlite";
+import { AUTHORITATIVE_RECORD_SCHEMA_VERSION, SQLITE_AUDIT_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION } from "@odinn/store-sqlite";
 
 export const STATE_SCHEMA_MINIMUM_APPLICATION_VERSION = "0.4.0";
 
@@ -8,7 +8,7 @@ export const STATE_SCHEMA_TARGETS = Object.freeze({
   config: 1,
   records: AUTHORITATIVE_RECORD_SCHEMA_VERSION,
   jobs: STORE_SCHEMA_VERSION,
-  audit: AUDIT_SCHEMA_VERSION,
+  audit: SQLITE_AUDIT_SCHEMA_VERSION,
   approvals: 1,
   browserRecovery: 1,
   sandboxRecovery: 1,
@@ -39,7 +39,7 @@ export const STATE_SCHEMA_OWNERS: Readonly<Record<StateSurface, StateSchemaOwner
   config: { owner: "@odinn/kernel/config", location: "config.json", support: "stable", description: "Configuration and security policy" },
   records: { owner: "@odinn/store-sqlite", location: "db/records.sqlite", support: "stable", description: "Typed append-only product records" },
   jobs: { owner: "@odinn/store-sqlite", location: "db/odinn.sqlite:runtime_jobs", support: "stable", description: "Tasks, execution-attempt bindings, leases, retries, and uncertain outcomes; jobs.json is legacy import evidence" },
-  audit: { owner: "@odinn/protocol + @odinn/store-file", location: "audit*.jsonl", support: "stable", description: "Audit events and verification keyring" },
+  audit: { owner: "@odinn/store-sqlite", location: "db/audit.sqlite + audit*.jsonl.keys.json", support: "stable", description: "Authenticated SQLite audit journal and verification keyring; audit*.jsonl is legacy import evidence" },
   approvals: { owner: "@odinn/kernel/approvals", location: "approvals.json", support: "stable", description: "Pending and consumed approvals" },
   browserRecovery: { owner: "@odinn/kernel/browser", location: "browser-recovery.json + browser-tabs.json", support: "stable", description: "Browser uncertain-outcome recovery and durable handles" },
   sandboxRecovery: { owner: "@odinn/kernel/sandbox", location: "sandbox-recovery.json", support: "stable", description: "Sandbox execution reservations and cleanup quarantine" },

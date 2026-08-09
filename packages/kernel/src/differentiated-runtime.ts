@@ -549,7 +549,7 @@ export class SnapshotManager {
           rejectSymbolicPath(plan.workspaceRoot, target);
           const existed = present(target);
           const backup = `${target}.odinn-restore-backup-${process.pid}-${randomUUID()}`;
-          const item = { target, backup, existed } as { target: string; stage?: string; backup: string; existed: boolean };
+          const item: { target: string; stage?: string; backup: string; existed: boolean } = { target, backup, existed };
           if (root.existed) {
             const stage = `${target}.odinn-restore-stage-${process.pid}-${randomUUID()}`;
             item.stage = stage;

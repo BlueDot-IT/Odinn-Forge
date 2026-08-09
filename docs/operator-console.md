@@ -21,7 +21,9 @@ used by `odinn operator snapshot`, `odinn inspect`, and the terminal TUI. It
 combines runtime surfaces, durable work, approvals, automation, context,
 recovery, audit verification, and the other available operator surfaces in one
 redacted projection. The JSON source is `GET /operator/snapshot`; use `page`,
-`pageSize`, `q`, and `status` to keep inspection bounded.
+`pageSize`, `q`, and `status` to keep inspection bounded. Use section-specific
+page parameters such as `workPage`, `approvalsPage`, `automationPage`, and
+`recoveryPage` when a single collection needs deeper inspection.
 
 Operator mutations use `POST /operator/actions` and retain the gateway's
 authentication and origin checks. Cancel job, approve, cancel/resume workflow,
@@ -80,7 +82,10 @@ selection defaults to a preview. Plugin configuration changes require an
 intentional edit or `odinn experimental enable <feature> --confirm-impact`
 followed by a gateway restart.
 
-Automatic improvements has its own page and runs by default. It uses the configured model for plain-language assessment and applies only reversible, allowlisted reliability adjustments.
+Automatic improvements has its own page and runs in review-gated proposal mode
+by default. Operators may explicitly opt into automatic mode. The configured
+model supplies plain-language assessment, while any automatic change remains
+reversible, allowlisted, digest-bound, and evaluated for regression.
 
 ## Agent SDK packages
 

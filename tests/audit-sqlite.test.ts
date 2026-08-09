@@ -25,6 +25,9 @@ test("SQLite audit append is transactional across store instances and pages by d
   const first = await left.readPage({ limit: 37 }); const second = await left.readPage({ afterSequence: first.at(-1)!.sequence, limit: 100 });
   assert.equal(first.length, 37); assert.equal(second.length, 63); assert.deepEqual([...first, ...second].map((item) => item.sequence), Array.from({ length: 100 }, (_, index) => index + 1));
   assert.equal((await left.verifyIntegrity({ allowUnsigned: false })).valid, true);
+  assert.equal(left.getIntegrityStatus().checked, true);
+  await left.append(event("after-verify"));
+  assert.equal(left.getIntegrityStatus().checked, false);
 });
 
 test("SQLite audit append serializes independent writer processes", async (t) => {

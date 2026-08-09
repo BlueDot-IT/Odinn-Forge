@@ -13,7 +13,7 @@ const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const expectedRoot = `odinn-v${pkg.version}`;
 const manifest = JSON.parse(await readFile(join(releaseDir, "release-manifest.json"), "utf8"));
 
-if (manifest.name !== pkg.name || manifest.version !== pkg.version || manifest.distribution !== "compiled") {
+if (manifest.name !== pkg.name || manifest.distributionName !== "@bluedot-it/odinn" || manifest.version !== pkg.version || manifest.distribution !== "compiled") {
   throw new Error("release manifest must identify the compiled production package");
 }
 const lockDigest = createHash("sha256").update(await readFile(join(root, "pnpm-lock.yaml"))).digest("hex");
@@ -59,11 +59,17 @@ for (const archiveName of manifest.artifacts) {
 }
 
 const sbom = JSON.parse(await readFile(join(releaseDir, manifest.sbom ?? "odinn.spdx.json"), "utf8"));
-if (sbom.spdxVersion !== "SPDX-2.3" || !Array.isArray(sbom.files)) {
+if (sbom.spdxVersion !== "SPDX-2.3" || !Array.isArray(sbom.files) || !Array.isArray(sbom.packages)) {
   throw new Error("release SBOM is not a valid SPDX production inventory");
+}
+const sbomPackageKeys = new Set(sbom.packages.map((entry: any) => `${String(entry.name)}@${String(entry.versionInfo)}`));
+for (const dependency of Array.isArray(manifest.bundledDependencies) ? manifest.bundledDependencies : []) {
+  const key = `${String(dependency.name)}@${String(dependency.version)}`;
+  if (!sbomPackageKeys.has(key)) throw new Error(`release SBOM is missing bundled component ${key}`);
 }
 const provenance = JSON.parse(await readFile(join(releaseDir, manifest.provenance ?? "release-provenance.json"), "utf8"));
 if (provenance.commit !== manifest.commit
+  || provenance.distributionName !== manifest.distributionName
   || provenance.version !== manifest.version
   || provenance.distribution !== "compiled"
   || provenance.runtimeSha256 !== manifest.runtimeSha256) {
@@ -192,7 +198,9 @@ for (const extension of ["zip", "tar.gz"]) {
     }
 
     const releaseInfo = JSON.parse(await readFile(join(packageRoot, "release-info.json"), "utf8"));
-    if (releaseInfo.commit !== manifest.commit
+    if (releaseInfo.name !== manifest.name
+      || releaseInfo.distributionName !== manifest.distributionName
+      || releaseInfo.commit !== manifest.commit
       || releaseInfo.version !== manifest.version
       || releaseInfo.distribution !== "compiled"
       || releaseInfo.runtimeSha256 !== manifest.runtimeSha256

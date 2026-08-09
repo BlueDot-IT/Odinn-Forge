@@ -45,6 +45,18 @@ The packager archives `HEAD`, not uncommitted working-tree changes. Run the
 soak before checksums so its report is included in the final checksum set. If
 an artifact changes afterward, regenerate the checksums and rerun verification.
 
+## Publication sequence
+
+Create the GitHub release as a draft with the exact `vX.Y.Z` tag, then manually
+dispatch the protected **Release** workflow with that tag. Draft releases do
+not emit the `release.created` workflow event, so the manual dispatch is
+intentional. The workflow verifies the tag commit, builds and soaks the exact
+candidate, refuses asset replacement, downloads the release assets back, and
+checks their checksums before publishing npm or promoting the GitHub release.
+Prerelease packages use the npm `next` dist-tag. Enable GitHub immutable
+releases in repository administration before publishing a stable release; that
+setting cannot be established by the workflow itself.
+
 ## Evidence record
 
 For each platform and provider path, record the OS, architecture, Node.js and

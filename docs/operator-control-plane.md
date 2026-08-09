@@ -19,10 +19,12 @@ these sections:
 - `surfaces` — the available operator adapters.
 
 Every section is bounded and paginated. Use `page`, `pageSize` (capped at 50),
-`q`, and `status` query parameters. Snapshot projections contain identifiers,
-statuses, counts, timestamps, and digests only. Prompts, message content,
-credentials, headers, raw tool input, and raw tool results are not part of the
-contract.
+`q`, and `status` query parameters; section-specific pages such as `workPage`,
+`approvalsPage`, `automationPage`, and `recoveryPage` prevent one large
+collection from hiding smaller sections. Snapshot projections contain
+identifiers, statuses, counts, timestamps, digests, and bounded effect summaries
+only. Prompts, message content, credentials, headers, raw tool input, and raw
+tool results are not part of the contract.
 
 The HTTP route retains the gateway's bearer/cookie authentication and mutation
 origin checks. A web-console request can set `surface=console`; API clients
@@ -36,12 +38,13 @@ normally use `surface=http`.
 {"action":"cancel-job","targetId":"job-id","confirm":true}
 ```
 
-Supported actions are `cancel-job`, `approve`, `cancel-workflow`,
-`resume-workflow`, and `verify-audit`. Mutations require `confirm: true` and
-remain behind the existing supervisor, approval, workflow, audit, and recovery
-boundaries. A cancelled job also revokes approvals linked to that job. MCP and
-skill approvals use the same continuation path as the existing approval route;
-the operator projection never executes a tool directly.
+Supported actions are `cancel-job`, `approve`, `deny-approval`,
+`cancel-workflow`, `resume-workflow`, and `verify-audit`. Mutations require
+`confirm: true` and remain behind the existing supervisor, approval, workflow,
+audit, and recovery boundaries. Approval projections include a code-generated,
+bounded effect summary; the operator projection never executes a tool directly.
+A denied approval also settles its linked job or leaves an explicit recovery
+record if that settlement cannot be completed.
 
 ## Surfaces
 

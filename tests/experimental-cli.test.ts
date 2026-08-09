@@ -31,7 +31,7 @@ function expectOk(result: ReturnType<typeof invoke>) {
   return result.stdout.trim() ? JSON.parse(result.stdout) : undefined;
 }
 
-test("experimental CLI exposes three optional plugin modules while automatic improvement starts on", async () => {
+test("experimental CLI exposes three optional plugin modules while improvement starts review-gated", async () => {
   const { workspace, state } = await fixture();
   const help = invoke(workspace, ["experimental", "help"]);
   assert.equal(help.status, 0, help.stderr || help.stdout);
@@ -43,17 +43,17 @@ test("experimental CLI exposes three optional plugin modules while automatic imp
   }
   for (const coreFeature of ["proof", "sentinel", "rewind", "darwin"]) assert.doesNotMatch(help.stdout, new RegExp(`^\\s+${coreFeature}\\s`, "m"));
   assert.match(help.stdout, /three optional runtime plugin flags are off by default/);
-  assert.match(help.stdout, /Automatic improvement runs by default/);
+  assert.match(help.stdout, /Automatic improvement proposals are available by default/);
 
   const initial = expectOk(invoke(workspace, ["experimental", "status", "--state", state]));
   assert.equal(initial.configured, false);
   assert.equal(initial.disabledByDefault, false);
   assert.equal(initial.experimentalFeaturesDisabledByDefault, true);
-  assert.equal(initial.automaticSelfImprovementDefault, true);
+  assert.equal(initial.automaticSelfImprovementDefault, false);
   assert.equal(initial.features.length, 4);
   assert.ok(initial.features.filter((feature: any) => feature.id !== "self-improvement").every((feature: any) => feature.enabled === false));
   assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").enabled, true);
-  assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").mode, "auto");
+  assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").mode, "propose");
   assert.equal(initial.features.find((feature: any) => feature.id === "capabilities").label, "Rune Key — Scoped temporary access");
   assert.equal(initial.features.find((feature: any) => feature.id === "capsules").label, "Saga Archive — Portable run bundles");
   assert.equal(initial.features.find((feature: any) => feature.id === "counterfactual").label, "Worldtree Paths — Scenario comparison");
@@ -70,7 +70,7 @@ test("experimental CLI exposes three optional plugin modules while automatic imp
 
   const improvement = expectOk(invoke(workspace, ["experimental", "enable", "self-improvement", "--state", state]));
   assert.equal(improvement.selfImprovement.enabled, true);
-  assert.equal(improvement.selfImprovement.mode, "auto");
+  assert.equal(improvement.selfImprovement.mode, "propose");
 
   expectOk(invoke(workspace, ["experimental", "disable", "capabilities", "--state", state]));
   const persisted = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
