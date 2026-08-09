@@ -31,6 +31,11 @@ type SkillRecord = SkillManifest & {
 
 type RegistryState = { schemaVersion: 1; packages: SkillRecord[] };
 
+export type SkillTransitionPreconditions = {
+  version?: string;
+  integrity?: string;
+};
+
 type DisclosureIndexEntry = SkillDisclosureMetadata & { integrity: string };
 type DisclosureIndex = {
   schemaVersion: 1;
@@ -139,6 +144,24 @@ export class SkillPackageStore {
     return pending;
   }
 
+  /**
+   * Read the registry and verify its records without repairing or persisting
+   * anything. Control-plane inspection must not turn a GET into a quarantine
+   * mutation; callers that want recovery must invoke an explicit lifecycle
+   * operation.
+   */
+  async inspect() {
+    const pending = this.writeChain.then(() => withStateMutationLock(this.root, async () => {
+      const state = await this.read();
+      return Promise.all(state.packages.map(async (record) => ({
+        ...record,
+        verification: await this.verifyRecord(record)
+      })));
+    }));
+    this.writeChain = pending.catch(() => undefined);
+    return pending;
+  }
+
   async install(input: any) {
     const validated = validateSkillPackage(input);
     return this.mutate(async (state) => {
@@ -176,11 +199,21 @@ export class SkillPackageStore {
     });
   }
 
-  async transition(id: string, action: string) {
+  async transition(id: string, action: string, expected: SkillTransitionPreconditions = {}) {
     return this.mutate(async (state) => {
       const record = state.packages.find((entry) => entry.id === id);
       if (!record) throw new Error("skill package not found");
       if (!["enable", "disable", "quarantine"].includes(action)) throw new Error("unsupported skill lifecycle action");
+      if (expected.version !== undefined && record.version !== expected.version) {
+        const error = new Error("skill package version precondition failed") as Error & { code?: string };
+        error.code = "SKILL_STALE_VERSION";
+        throw error;
+      }
+      if (expected.integrity !== undefined && record.integrity !== expected.integrity) {
+        const error = new Error("skill package integrity precondition failed") as Error & { code?: string };
+        error.code = "SKILL_STALE_INTEGRITY";
+        throw error;
+      }
       const verification = await this.verifyRecord(record);
       if (action === "enable" && !verification.valid) {
         record.status = "quarantined";

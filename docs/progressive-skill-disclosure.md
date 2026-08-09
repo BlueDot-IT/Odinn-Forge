@@ -1,9 +1,11 @@
 # Progressive skill disclosure
 
-Odinn's progressive skill disclosure foundation separates skill selection from
-instruction loading. It is available only from the
-`@odinn/kernel/skill-disclosure` package subpath and is not imported by the
-kernel root, gateway, prompt assembly, or any live request path.
+Odinn's progressive skill disclosure separates skill selection from instruction
+loading. The kernel and gateway contain the implementation, but both runtime
+disclosure and managed lifecycle writes remain explicitly disabled by default.
+The first live slice is caller-selected: it exposes a bounded catalog and one
+exact hydration operation. It does not let a model create, enable, or replace
+skills, and it does not treat skill text as a system instruction.
 
 ## Default-inert behavior
 
@@ -78,16 +80,28 @@ from being accepted as the selected package.
 
 ## Activation gates
 
-This module is a foundation, not a runtime activation. A future integration
-must independently demonstrate:
+Runtime disclosure requires `config.runtime.enableProgressiveSkills: true` and
+explicit policy grants for `skill.catalog` and/or `skill.hydrate`. Managed
+creation, workshop writes, and lifecycle changes separately require
+`config.runtime.enableSkillLifecycle: true`, the `skill.manage` policy grant,
+and an authenticated control-plane request. A future integration must still
+independently demonstrate:
 
-1. no full instructions or complete tool schemas enter the default prompt;
+1. no skill-derived instructions or tool schemas enter the default prompt;
 2. exact selection occurs before hydration;
 3. catalog and hydration limits remain fail closed at every transport boundary;
 4. lifecycle and integrity checks cannot be bypassed by caches or races;
-5. the existing inference benchmark does not regress at p50 or p95;
-6. security review covers prompt injection, package tampering, path traversal,
+5. hydrated text remains clearly delimited untrusted reference material and
+   cannot grant capabilities or bypass execution admission;
+6. the existing inference benchmark does not regress at p50 or p95;
+7. security review covers prompt injection, package tampering, path traversal,
    and unintended capability disclosure.
 
-Until those gates pass, gateway routes and live prompt assembly must not import
-this subpath.
+`GET /skills` is an operator inspection surface and returns bounded managed
+metadata; it never returns package instructions, tests, secret names, network
+policy, managed paths, or file-integrity internals. `GET /skills/catalog` and
+`GET /skills/:id/hydrate` are unavailable while progressive disclosure is off.
+`POST /skills`, lifecycle transitions, and workshop save are rejected before
+their request bodies are parsed while lifecycle governance is off. Enablement
+uses a one-time approval bound to the exact package version and integrity
+digest; approval is invalid after replacement or tampering.

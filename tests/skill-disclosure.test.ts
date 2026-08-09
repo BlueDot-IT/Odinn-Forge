@@ -44,7 +44,7 @@ async function installEnabled(store: SkillPackageStore, id: string, overrides: R
   return installed;
 }
 
-test("package subpath resolves without adding progressive disclosure to the kernel root export", async () => {
+test("package subpath and kernel root export expose progressive disclosure explicitly", async () => {
   const probe = [
     "import('@odinn/kernel/skill-disclosure')",
     ".then((module) => process.stdout.write(typeof module.ProgressiveSkillDisclosure))"
@@ -54,7 +54,7 @@ test("package subpath resolves without adding progressive disclosure to the kern
   });
 
   assert.equal(stdout, "function");
-  assert.equal("ProgressiveSkillDisclosure" in kernelRoot, false);
+  assert.equal("ProgressiveSkillDisclosure" in kernelRoot, true);
 });
 
 test("catalog is compact, deterministic, and excludes instructions and private package fields", async (t) => {

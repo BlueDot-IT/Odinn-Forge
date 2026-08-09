@@ -27,7 +27,23 @@
 | Agent tool call | `agent.run` -> `runTool` -> `runTask` | Parent task context and policy | Active with parent-run correlation and parent-child capability intersection. |
 | Browser work | Persistent isolated browser worker | Browser policy plus recovery JSON | Active before browser tool execution; browser recovery remains authoritative for browser uncertainty. |
 | Extension execution | Container extension executor | Extension registry and policy | Reuse as an execution backend behind admission. |
-| Agent graphs | Kernel graph dispatcher | Explicit `config.runtime.enableAgentGraphs` plus durable `/jobs` | Stage 7 activates one read-only node through admission, isolated workers, runtime SQLite graph/node state, and signed audit correlation. The broader graph, skills, MCP, and automation foundations remain default-inert. |
+| Agent graphs | Kernel graph dispatcher | Explicit `config.runtime.enableAgentGraphs` plus durable `/jobs` | Stage 7 activates one read-only node through admission, isolated workers, runtime SQLite graph/node state, and signed audit correlation. Skills now have a separate explicit disclosure/lifecycle boundary; MCP and automation foundations remain default-inert. |
+
+## Skill disclosure and lifecycle boundary
+
+Stage 8 keeps skill package state out of the generic execution path until an
+operator explicitly enables both runtime configuration and the corresponding
+capability grants. `enableProgressiveSkills` exposes only the bounded
+`skill.catalog` and exact-selection `skill.hydrate` tools. Hydrated markdown is
+untrusted reference material, never a system prompt or authority source, and
+actual tool calls continue through `ExecutionAdmissionService`.
+
+Managed writes use the kernel-owned skill lifecycle service. Creation installs
+`disabled`/`trusted:false` records; enablement requires a one-time approval
+bound to the expected package version and integrity digest. Durable audit and
+ledger projections retain identifiers, versions, digests, status, and byte
+counts, not instructions, tests, secrets, or network declarations. Read-only
+inspection does not quarantine or rewrite state.
 
 ## Binding decisions
 

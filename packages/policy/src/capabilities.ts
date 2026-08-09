@@ -15,7 +15,9 @@ export const CAPABILITY_REGISTRY = Object.freeze([
   capability("agent.delegate", "Delegate bounded work to a child agent."),
   capability("mcp.discover", "Discover tools from a configured MCP server."),
   capability("mcp.invoke", "Invoke a tool on a configured MCP server."),
+  capability("skill.catalog", "List bounded metadata for explicitly enabled skill packages."),
   capability("skill.hydrate", "Hydrate a trusted, selected skill package."),
+  capability("skill.manage", "Create or change the lifecycle of a managed skill package."),
   capability("event.register", "Register a durable event source or trigger."),
   capability("secret.reference.use", "Use an opaque operator-provided secret reference."),
   capability("restore.create", "Create a bounded recovery snapshot."),
@@ -97,6 +99,10 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
   tool("browser.recovery.resolve", ["browser.mutate"], ["browser.act"]),
   tool("agent.run", ["agent.delegate", "network.access"], ["agent.run"]),
   tool("model.chat", ["network.access"], ["model.chat"]),
+  tool("skill.catalog", ["skill.catalog"], ["skill.catalog"]),
+  tool("skill.hydrate", ["skill.hydrate"], ["skill.hydrate"]),
+  tool("skill.install", ["skill.manage"], ["skill.install"]),
+  tool("skill.lifecycle", ["skill.manage"], ["skill.lifecycle"]),
   ...discordReadTools.map((name) => tool(name, ["network.access"], ["discord.read"])),
   ...discordMutationTools.map((name) => tool(name, ["network.access"], ["discord.write"]))
 ] as const);
