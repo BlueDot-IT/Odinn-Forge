@@ -13,7 +13,7 @@ Registry version 1 defines these capability identifiers:
 - `network.access`
 - `browser.read`, `browser.mutate`
 - `agent.delegate`
-- `mcp.discover`, `mcp.invoke`, `skill.hydrate`, `event.register`
+- `mcp.discover`, `mcp.invoke`, `skill.catalog`, `skill.hydrate`, `skill.manage`, `event.register`
 - `secret.reference.use`
 - `restore.create`, `restore.apply`
 

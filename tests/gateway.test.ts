@@ -706,8 +706,13 @@ test("assistant Markdown images remain inert for every network-capable URL form"
 test("gateway backs cron, Agent SDK packages, skills, and workshop with persisted APIs", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "odinn-console-data-"));
   const stateDir = join(workspace, ".odinn");
+  await mkdir(stateDir, { recursive: true });
   await mkdir(join(workspace, "skills", "fixture"), { recursive: true });
   await writeFile(join(workspace, "skills", "fixture", "SKILL.md"), '---\nname: "fixture-skill"\ndescription: "Use for fixture validation work."\n---\n\n# Fixture\n');
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
+    runtime: { enableSkillLifecycle: true },
+    policy: { allowedCapabilities: ["skill.manage"] }
+  }, null, 2)}\n`, { mode: 0o600 });
   const server = await createGatewayServer({ stateDir, workspaceRoot: workspace });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -737,6 +742,59 @@ test("gateway backs cron, Agent SDK packages, skills, and workshop with persiste
     assert.equal((await postJson(`${base}/skills/workshop/validate`, draft)).valid, true);
     assert.equal((await postJson(`${base}/skills/workshop/save`, draft)).status, "draft");
     assert.ok((await getJson(`${base}/skills`)).skills.some((skill: any) => skill.name === "draft-skill" && skill.status === "draft"));
+
+    const managedManifest = {
+      sdkVersion: "0.1",
+      id: "managed-fixture",
+      version: "1.0.0",
+      name: "Managed Fixture",
+      description: "Use for bounded managed lifecycle verification.",
+      instructions: "Inspect the selected fixture, perform the bounded check, and return verified results only.",
+      requestedTools: [],
+      requestedCapabilities: [],
+      requestedSecrets: [],
+      network: { default: "deny", allow: [] },
+      tests: []
+    };
+    const createdSkill = await postJson(`${base}/skills`, managedManifest);
+    assert.equal(createdSkill.skill.status, "disabled");
+    assert.equal(createdSkill.skill.trusted, false);
+    const approvalResponse = await postJson(`${base}/skills/${managedManifest.id}/lifecycle`, {
+      action: "enable",
+      version: createdSkill.skill.version,
+      integrity: createdSkill.skill.integrity
+    }, 202);
+    assert.equal(approvalResponse.skill.type, "approval.required");
+    assert.doesNotMatch(JSON.stringify(await getJson(`${base}/approvals`)), /Inspect the selected fixture/u);
+    const enabledSkill = await postJson(`${base}/approvals/${approvalResponse.skill.approvalId}/approve`, {}, 200);
+    assert.equal(enabledSkill.result.status, "enabled");
+    assert.equal(enabledSkill.result.trusted, true);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway keeps managed skill writes and progressive disclosure default-inert", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-skills-inert-"));
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const rejected = await fetch(`${base}/skills`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not-json"
+    });
+    assert.equal(rejected.status, 403);
+    assert.equal((await rejected.json()).category, "policy");
+
+    const catalog = await fetch(`${base}/skills/catalog`);
+    assert.equal(catalog.status, 404);
+    assert.equal((await catalog.json()).error, "progressive skill disclosure is disabled");
+
+    const listed = await getJson(`${base}/skills`);
+    assert.deepEqual(listed.skills, []);
+    await assert.rejects(access(join(stateDir, "skills", "registry.json")));
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

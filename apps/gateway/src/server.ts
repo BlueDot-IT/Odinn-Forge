@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ensureMainAgent, ensureStateCompatibility, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, previewExecutionAdmission, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteJobStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -710,8 +710,17 @@ export async function createGatewayServer({
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
-  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore });
-  const governedRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore });
+  const skillStore = new SkillPackageStore(state);
+  const skillDisclosure = new ProgressiveSkillDisclosure(skillStore);
+  const skillLifecycle = new SkillLifecycleService({
+    store: skillStore,
+    auditStore,
+    approvalStore,
+    policy,
+    enabled: config.runtime?.enableSkillLifecycle === true
+  });
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore, skillDisclosure });
+  const governedRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure });
   const gatewayToken = await loadGatewayToken(state);
   const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
@@ -733,7 +742,6 @@ export async function createGatewayServer({
   const quotaGate = createQuotaGate(quotas);
   const cronStore = new CronStore(join(state, "cron-jobs.json"));
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
-  const skillStore = new SkillPackageStore(state);
   const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
   const channelSupervisor = await createChannelSupervisor({
     config,
@@ -904,21 +912,32 @@ export async function createGatewayServer({
         return json(response, 200, { ok: true, agent: await agentStore.transition(id, body.action) });
       }
       if (request.method === "GET" && url.pathname === "/skills") {
-        const [managed, files, extensions] = await Promise.all([skillStore.list(), discoverSkills(root, state), extensionRegistry.list()]);
+        const [managed, files, extensions] = await Promise.all([skillLifecycle.inspect(), discoverSkills(root, state), extensionRegistry.list()]);
         return json(response, 200, {
           sdkVersion: "0.1",
           skills: [
-            ...managed.map((skill: any) => ({ ...skill, source: "managed", path: join(skill.packagePath, "SKILL.md") })),
+            ...managed.map((skill: any) => ({ ...skill, source: "managed" })),
             ...files,
             ...extensions.filter((extension: any) => extension.type === "skill").map((extension: any) => ({ ...extension, source: "legacy-extension", status: "unmanaged", path: extension.entrypoint }))
           ]
         });
       }
+      if (request.method === "GET" && url.pathname === "/skills/catalog") {
+        if (config.runtime?.enableProgressiveSkills !== true) throw new GatewayError(404, "progressive skill disclosure is disabled");
+        return json(response, 200, { ok: true, entries: await skillDisclosure.catalog() });
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/skills/") && url.pathname.endsWith("/hydrate")) {
+        if (config.runtime?.enableProgressiveSkills !== true) throw new GatewayError(404, "progressive skill disclosure is disabled");
+        const id = decodeURIComponent(url.pathname.slice("/skills/".length, -"/hydrate".length));
+        return json(response, 200, { ok: true, skill: await skillDisclosure.hydrate(id) });
+      }
       if (request.method === "POST" && url.pathname === "/skills/validate") {
         return json(response, 200, { ok: true, ...validateSkillPackage(await readJson(request, { maxBytes: requestMaxBytes })) });
       }
       if (request.method === "POST" && url.pathname === "/skills") {
-        return json(response, 200, { ok: true, skill: await skillStore.install(await readJson(request, { maxBytes: requestMaxBytes })) });
+        skillLifecycle.assertWritable();
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, { ok: true, skill: await skillLifecycle.create(body, { operationId: requestId, actor: "gateway", idempotencyKey: String(request.headers["idempotency-key"] ?? "") }) });
       }
       if (request.method === "GET" && url.pathname.startsWith("/skills/") && url.pathname.endsWith("/verify")) {
         const id = decodeURIComponent(url.pathname.slice("/skills/".length, -"/verify".length));
@@ -926,21 +945,20 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname.startsWith("/skills/") && url.pathname.endsWith("/lifecycle")) {
         const id = decodeURIComponent(url.pathname.slice("/skills/".length, -"/lifecycle".length));
+        skillLifecycle.assertWritable();
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, { ok: true, skill: await skillStore.transition(id, body.action) });
+        const skill = await skillLifecycle.transition({ ...body, id }, { operationId: requestId, actor: "gateway", idempotencyKey: String(request.headers["idempotency-key"] ?? "") });
+        return json(response, "type" in skill && skill.type === "approval.required" ? 202 : 200, { ok: true, skill });
       }
       if (request.method === "POST" && url.pathname === "/skills/workshop/validate") {
         return json(response, 200, validateSkillDraft(await readJson(request, { maxBytes: requestMaxBytes })));
       }
       if (request.method === "POST" && url.pathname === "/skills/workshop/save") {
+        skillLifecycle.assertWritable();
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const validation = validateSkillDraft(body);
         if (!validation.valid) throw new GatewayError(400, validation.errors.join("; "));
-        const directory = join(state, "skill-workshop", body.name);
-        await mkdir(directory, { recursive: true });
-        const path = join(directory, "SKILL.md");
-        await writeFile(path, validation.content, { mode: 0o600 });
-        return json(response, 200, { ok: true, path, digest: validation.digest, status: "draft" });
+        return json(response, 200, { ok: true, ...(await skillLifecycle.saveDraft(body, { operationId: requestId, actor: "gateway", idempotencyKey: String(request.headers["idempotency-key"] ?? "") })) });
       }
       if (request.method === "GET" && url.pathname === "/runtime/runs") {
         return json(response, 200, runtime.ledger.listRuns({ limit: Number.parseInt(url.searchParams.get("limit") ?? "100", 10) }));
@@ -1417,6 +1435,14 @@ export async function createGatewayServer({
         if (!pending) {
           if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
           return json(response, 404, { ok: false, error: "approval not found or expired" });
+        }
+        if (pending.type === "skill-lifecycle") {
+          try {
+            const result = await skillLifecycle.applyApproved(id, pending);
+            return json(response, 200, { ok: true, approvalId: id, result });
+          } catch (error) {
+            throw error;
+          }
         }
         try {
           const result = await isolatedTaskExecutor({
@@ -2011,7 +2037,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
         if (readError?.code !== "ENOENT") throw readError;
       }
       await mkdir(state, { recursive: true });
-      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, runtime: { enableAgentGraphs: false }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, channels: {}, plugins: { entries: {} }, defaultModel: "", experimental: { capabilities: false, capsules: false, counterfactual: false }, runtime: { enableAgentGraphs: false, enableProgressiveSkills: false, enableSkillLifecycle: false }, selfImprovement: normalizeSelfImprovementConfig(), sandbox: DEFAULT_SANDBOX_CONFIG };
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await chmod(path, 0o600);
       return config;
@@ -2082,6 +2108,8 @@ function validateGatewayConfig(config: any) {
   if (config.runtime !== undefined) {
     assertConfigRecord(config.runtime, "config.runtime");
     assertOptionalConfigBoolean(config.runtime, "enableAgentGraphs", "config.runtime");
+    assertOptionalConfigBoolean(config.runtime, "enableProgressiveSkills", "config.runtime");
+    assertOptionalConfigBoolean(config.runtime, "enableSkillLifecycle", "config.runtime");
   }
   if (config.channels !== undefined) {
     assertConfigRecord(config.channels, "config.channels");

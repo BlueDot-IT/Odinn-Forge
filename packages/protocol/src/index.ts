@@ -83,6 +83,9 @@ const WORKSPACE_CONTENT_TOOLS = new Set(["workspace.readText", "workspace.read",
 const WORKSPACE_MUTATION_TOOLS = new Set(["workspace.mutate", "workspace.patch"]);
 const PROCESS_TOOLS = new Set(["process.exec"]);
 const AGENT_TOOLS = new Set(["agent.run", "agent.delegate"]);
+const SKILL_CATALOG_TOOLS = new Set(["skill.catalog"]);
+const SKILL_HYDRATE_TOOLS = new Set(["skill.hydrate"]);
+const SKILL_LIFECYCLE_TOOLS = new Set(["skill.install", "skill.lifecycle"]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -97,6 +100,9 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(input);
   if (PROCESS_TOOLS.has(toolName)) return projectProcessInput(input);
   if (AGENT_TOOLS.has(toolName)) return projectAgentInput(input, toolName === "agent.delegate");
+  if (SKILL_CATALOG_TOOLS.has(toolName)) return {};
+  if (SKILL_HYDRATE_TOOLS.has(toolName)) return projectSkillHydrateInput(input);
+  if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleInput(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
   if (typeof projected.before === "string") {
@@ -117,6 +123,9 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(output);
   if (PROCESS_TOOLS.has(toolName)) return projectProcessOutput(output);
   if (AGENT_TOOLS.has(toolName)) return projectAgentOutput(output, toolName === "agent.delegate");
+  if (SKILL_CATALOG_TOOLS.has(toolName)) return projectSkillCatalogOutput(output);
+  if (SKILL_HYDRATE_TOOLS.has(toolName)) return projectSkillHydrateOutput(output);
+  if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleOutput(output);
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
   const record = output as JsonObject;
   if (toolName === "workspace.read" || toolName === "workspace.readText") {
@@ -149,6 +158,99 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
 
 function sha256Reference(value: string) {
   return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function projectSkillHydrateInput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const id = boundedSkillString((value as JsonObject).id, 64);
+  return id === undefined ? {} : { id };
+}
+
+function projectSkillLifecycleInput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const input = value as JsonObject;
+  const projected: JsonObject = {};
+  for (const key of ["skillId", "action", "version", "integrity", "requestDigest", "approvalId"] as const) {
+    const item = boundedSkillString(input[key], key === "integrity" || key === "requestDigest" ? 128 : 256);
+    if (item !== undefined) projected[key] = item;
+  }
+  if (Object.keys(projected).length === 0) projected.manifestDigest = sha256Reference(JSON.stringify(value));
+  return projected;
+}
+
+function projectSkillCatalogOutput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const record = value as JsonObject;
+  const rawEntries = Array.isArray(record.entries) ? record.entries : [];
+  const entries = rawEntries.slice(0, 128).flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const entry = item as JsonObject;
+    const id = boundedSkillString(entry.id, 64);
+    const version = boundedSkillString(entry.version, 128);
+    const name = boundedSkillString(entry.name, 120);
+    const description = boundedSkillString(entry.description, 64 * 1024);
+    if (id === undefined || version === undefined || name === undefined) return [];
+    return [{
+      id,
+      version,
+      name,
+      ...(description === undefined ? {} : { descriptionDigest: sha256Reference(description), descriptionBytes: Buffer.byteLength(description, "utf8") }),
+      requestedTools: boundedSkillList(entry.requestedTools),
+      requestedCapabilities: boundedSkillList(entry.requestedCapabilities)
+    }];
+  });
+  return { ...(typeof record.type === "string" ? { type: record.type } : {}), count: entries.length, entries };
+}
+
+function projectSkillHydrateOutput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const record = value as JsonObject;
+  const result: JsonObject = {};
+  for (const key of ["id", "version", "name", "integrity"] as const) {
+    const item = boundedSkillString(record[key], 256);
+    if (item !== undefined) result[key] = item;
+  }
+  const description = boundedSkillString(record.description, 64 * 1024);
+  const markdown = boundedSkillString(record.skillMarkdown ?? record.content, 256 * 1024);
+  if (description !== undefined) {
+    result.descriptionDigest = sha256Reference(description);
+    result.descriptionBytes = Buffer.byteLength(description, "utf8");
+  }
+  if (markdown !== undefined) {
+    result.skillMarkdownDigest = sha256Reference(markdown);
+    result.skillMarkdownBytes = Buffer.byteLength(markdown, "utf8");
+  }
+  result.requestedTools = boundedSkillList(record.requestedTools);
+  result.requestedCapabilities = boundedSkillList(record.requestedCapabilities);
+  return result;
+}
+
+function projectSkillLifecycleOutput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const record = value as JsonObject;
+  const projected = projectSkillLifecycleInput({ ...record, skillId: record.skillId ?? record.id }) as JsonObject;
+  for (const key of ["type", "status", "trusted", "expiresInSeconds"] as const) {
+    if (typeof record[key] === "string" || typeof record[key] === "boolean" || typeof record[key] === "number") projected[key] = record[key];
+  }
+  if (record.skill && typeof record.skill === "object" && !Array.isArray(record.skill)) {
+    const skill = record.skill as JsonObject;
+    projected.skill = projectSkillLifecycleInput({ ...skill, skillId: skill.skillId ?? skill.id });
+  }
+  return projected;
+}
+
+function boundedSkillString(value: unknown, maxBytes: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const bytes = Buffer.byteLength(value, "utf8");
+  return bytes <= maxBytes ? value : undefined;
+}
+
+function boundedSkillList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 128).flatMap((item) => {
+    const text = boundedSkillString(item, 256);
+    return text === undefined ? [] : [text];
+  });
 }
 
 function projectProcessInput(value: unknown): unknown {

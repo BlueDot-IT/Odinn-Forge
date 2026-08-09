@@ -78,9 +78,9 @@ Agent package state is stored in `.odinn/agents.json`. Keep package instructions
 
 **Experimental interface.** Skill SDK packages are not stable public v1 SDKs.
 
-The Skills SDK page is one Skill SDK v0.1 package registry and builder. `/skills/validate` validates the manifest and rendered `SKILL.md`; `/skills` installs it into managed storage; `/skills/<id>/verify` checks persisted integrity; and `/skills/<id>/lifecycle` enables, disables, or quarantines the package. New packages are disabled and untrusted. Enabling requires a clean integrity check.
+The Skills SDK page is one Skill SDK v0.1 package registry and builder. `/skills/validate` validates the manifest and rendered `SKILL.md`; `/skills` installs it into managed storage only when `enableSkillLifecycle` and the explicit `skill.manage` policy grant are active; `/skills/<id>/verify` checks persisted integrity; and `/skills/<id>/lifecycle` performs audited, conditional disable/quarantine or creates a digest-bound one-time approval for enablement. New packages are disabled and untrusted. Secret or network declarations cannot be activated in this first slice.
 
-The registry also discovers existing workspace and imported `SKILL.md` files as unmanaged packages. Discovery does not silently install, trust, enable, inject, or execute them. Managed package state lives under `.odinn/skills/`; legacy workshop endpoints remain compatibility-only and are not shown in the console.
+The registry also discovers existing workspace and imported `SKILL.md` files as unmanaged packages. Discovery does not silently install, trust, enable, inject, or execute them. Managed package state lives under `.odinn/skills/`; workshop writes are service-owned compatibility staging and are disabled with the lifecycle flag.
 
 ## Memory
 

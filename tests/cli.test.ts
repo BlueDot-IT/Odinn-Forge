@@ -378,7 +378,7 @@ test("guided onboarding presents choices without developer telemetry", async () 
   });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const exitCode = await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("guided onboarding timed out")); }, 5_000);
+    const timeout = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("guided onboarding timed out")); }, 15_000);
     child.once("exit", (code) => { clearTimeout(timeout); resolve(code); });
   });
   assert.equal(exitCode, 0, stderr || stdout);

@@ -31,7 +31,7 @@ test("capability registry is versioned, immutable, and separates process authori
     "workspace.inspect", "workspace.mutate", "workspace.patch", "process.execute",
     "process.interactive", "process.shell", "network.access", "browser.read",
     "browser.mutate", "agent.delegate", "mcp.discover", "mcp.invoke",
-    "skill.hydrate", "event.register", "secret.reference.use", "restore.create", "restore.apply"
+    "skill.catalog", "skill.hydrate", "skill.manage", "event.register", "secret.reference.use", "restore.create", "restore.apply"
   ]);
   const processTool = TOOL_CAPABILITY_REGISTRY.find((entry) => entry.tool === "process.exec");
   assert.deepEqual(processTool?.capabilities, ["process.execute"]);
