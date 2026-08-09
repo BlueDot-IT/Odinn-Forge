@@ -219,8 +219,11 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
   const manifestsText = boundedJsonText(input?.manifests, "manifests");
   const graph = validateAgentRunGraph(graphText);
   const manifests = validateExecutableAgentManifestCollection(manifestsText);
-  const principalNamespace = normalizeAgentPrincipalNamespace(input?.principalNamespace);
-  const principalNamespaceDigest = `sha256:${digestAgentRunValue(principalNamespace)}`;
+  // Normalize the caller-supplied namespace only in memory, then immediately
+  // replace it with its bounded digest. No runner request, child task, audit
+  // projection, receipt, or graph result may carry the raw principal.
+  const principalNamespaceInput = normalizeAgentPrincipalNamespace(input?.principalNamespace);
+  const principalNamespace = `sha256:${digestAgentRunValue(principalNamespaceInput)}`;
   if (graph.nodes.length !== 1 || manifests.length !== 1) {
     throw new Error("the active agent graph profile permits exactly one read-only child node");
   }
@@ -274,7 +277,7 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
         graphBytes: Buffer.byteLength(graphText, "utf8"),
         manifestsBytes: Buffer.byteLength(manifestsText, "utf8"),
         // Durable graph state retains a digest marker, never the principal.
-        principalNamespace: principalNamespaceDigest,
+        principalNamespace,
         requestDigest: graphRequestDigest,
         maxRunMs: input.maxRunMs ?? 300_000,
         nodes: graph.nodes.map((node) => ({
@@ -403,7 +406,7 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
         id: childId,
         tool: "agent.run",
         input: resolved,
-        actor: `child-agent:sha256:${digestAgentRunValue(request.principalNamespace)}`,
+        actor: `child-agent:${request.principalNamespace}`,
         reason: `agent-graph:${request.graphRunId}:${request.nodeId}`,
         registry: registries.execution,
         modelRegistry: registries.model,

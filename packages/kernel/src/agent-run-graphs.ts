@@ -232,6 +232,7 @@ function identifier(value: unknown, label: string): string {
 }
 
 function principal(value: unknown): string {
+  if (typeof value === "string" && /^sha256:[a-f0-9]{64}$/u.test(value)) return value;
   const result = identifier(value, "principalNamespace");
   if (FORBIDDEN_IDENTITY.test(result)) throw new Error("principalNamespace uses a forbidden authority namespace");
   return result;
