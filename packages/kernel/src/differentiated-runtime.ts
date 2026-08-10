@@ -9,6 +9,7 @@ import { ProofVerifier, proofEvidenceView } from "./proof.ts";
 import { evaluatePolicyInvariants, normalizePolicyInvariants } from "@odinn/policy";
 import { ODINN_ERROR_CODES, OdinnRuntimeError } from "./runtime-errors.ts";
 import { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
+import { sanitizedChildEnvironment } from "./environment.ts";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 
@@ -291,7 +292,7 @@ export function validatePolicy(policy: unknown): AnyRecord {
 interface ProcessResult { code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean }
 function runProcess(command: string, args: string[], { cwd, timeoutMs = 120_000 }: { cwd?: string; timeoutMs?: number } = {}): Promise<ProcessResult> {
   return new Promise<ProcessResult>((resolveProcess, rejectProcess) => {
-    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { cwd, env: sanitizedChildEnvironment(), shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = ""; let stderr = ""; let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMs);
     child.stdout.on("data", (chunk) => { stdout += chunk; if (stdout.length > 1_000_000) child.kill("SIGTERM"); });

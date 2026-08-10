@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, buildOperatorSnapshot, CheckpointCoordinator, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, loadEnvironmentFiles, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -24,9 +24,16 @@ const INSTALL_METADATA_FILE = new URL(compiledRuntime ? "../../install-metadata.
 const configBaselines = new WeakMap<object, string | null>();
 if (rawArgs[0] === "--") rawArgs.shift();
 const [command, ...args] = rawArgs;
-const parentEnvironmentKeys = new Set(Object.keys(process.env));
-loadEnvironmentFiles({ workspaceRoot: invocationRoot(), stateDir: invocationRoot(), protectedKeys: parentEnvironmentKeys });
-loadEnvironmentFiles({ workspaceRoot: invocationRoot(), stateDir: stateDir(args), protectedKeys: parentEnvironmentKeys });
+const parentEnvironment = { ...process.env };
+const parentEnvironmentKeys = new Set(Object.keys(parentEnvironment));
+const startupWorkspaceRoot = invocationRoot(parentEnvironment);
+const startupStateDir = stateDir(args, parentEnvironment);
+assertPhysicalDirectory(startupStateDir);
+const startupEnvironmentFiles = readEnvironmentFiles({ workspaceRoot: startupWorkspaceRoot, stateDir: startupStateDir });
+const startupConfig = readBootstrapJsonIfPresent(join(startupStateDir, "config.json"));
+const startupWorkspaceCredentialKeys = configuredCredentialEnvironmentKeys(startupConfig);
+applyEnvironmentValues(startupEnvironmentFiles.workspace, process.env, { protectedKeys: parentEnvironmentKeys, allowedKeys: startupWorkspaceCredentialKeys });
+applyEnvironmentValues(startupEnvironmentFiles.state, process.env, { protectedKeys: parentEnvironmentKeys });
 
 const EXPERIMENTAL_HOME = [
   {
@@ -570,18 +577,23 @@ function ensureToolCapabilities(policyInput: any, tools: string[]) {
   return { ...policy, scopedCapabilities: [...scoped.values()].sort((left, right) => left.tool.localeCompare(right.tool) || left.capability.localeCompare(right.capability)) };
 }
 
-function invocationRoot() {
-  return resolve(process.env.INIT_CWD ?? process.cwd());
+function readBootstrapJsonIfPresent(path: string): unknown {
+  try { return JSON.parse(readFileSync(path, "utf8")); }
+  catch (error: any) { if (error?.code === "ENOENT") return undefined; throw error; }
+}
+
+function invocationRoot(environment: NodeJS.ProcessEnv = process.env) {
+  return resolve(environment.INIT_CWD ?? process.cwd());
 }
 
 function resolveInvocationPath(path: any) {
   return resolve(invocationRoot(), path);
 }
 
-function stateDir(args: any) {
-  const explicit = option(args, "--state", process.env.ODINN_STATE_DIR ?? "");
-  if (explicit) return resolveInvocationPath(explicit);
-  const projectState = resolveInvocationPath(".odinn");
+function stateDir(args: any, environment: NodeJS.ProcessEnv = process.env) {
+  const explicit = option(args, "--state", environment.ODINN_STATE_DIR ?? "");
+  if (explicit) return resolve(invocationRoot(environment), explicit);
+  const projectState = resolve(invocationRoot(environment), ".odinn");
   if (existsSync(join(projectState, "config.json"))) return projectState;
   return resolve(homedir(), ".odinn");
 }
@@ -2590,7 +2602,7 @@ async function connectCliAuth(provider: any) {
   console.log(`Starting ${command}. Complete sign-in in the CLI, then exit it to finish onboarding.`);
   await new Promise((resolveExit: any, rejectExit: any) => {
     const nodeScript = process.platform === "win32" && /\.[cm]?[jt]s$/iu.test(command);
-    const child = spawn(nodeScript ? process.execPath : command, nodeScript ? [command] : [], { stdio: "inherit" });
+    const child = spawn(nodeScript ? process.execPath : command, nodeScript ? [command] : [], { env: sanitizedChildEnvironment(), stdio: "inherit" });
     child.once("error", rejectExit);
     child.once("exit", (code: any, signal: any) => code === 0 ? resolveExit() : rejectExit(new Error(`${command} exited with ${code ?? signal}`)));
   });
@@ -2641,7 +2653,7 @@ function openAuthorizationUrl(url: any) {
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const commandArgs = process.platform === "win32" ? ["/c", "start", "", parsed.href] : [parsed.href];
   // lgtm[js/command-line-injection] - shell execution is disabled and the URL is restricted to HTTP(S).
-  const child = spawn(command, commandArgs, { detached: true, stdio: "ignore", shell: false });
+  const child = spawn(command, commandArgs, { detached: true, env: sanitizedChildEnvironment(), stdio: "ignore", shell: false });
   child.unref();
 }
 

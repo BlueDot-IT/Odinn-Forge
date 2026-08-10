@@ -8,6 +8,7 @@ import { basename, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { ensureSecureStateDirectory } from "@odinn/store-file";
+import { withStateMutationLock } from "@odinn/kernel";
 import { createGatewayServer } from "./server.ts";
 
 const scrypt: any = promisify(scryptCallback);
@@ -162,11 +163,35 @@ export async function createMultiUserHost({
       attemptWritePromise = (async () => {
         while (attemptWriteDirty) {
           attemptWriteDirty = false;
-          const snapshot = `${JSON.stringify({ schemaVersion: 2, attempts: Object.fromEntries(loginAttempts) })}\n`;
-          const temporary = `${attemptsPath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
-          await writeFile(temporary, snapshot, { mode: 0o600 });
-          await rename(temporary, attemptsPath);
-          await chmod(attemptsPath, 0o600);
+          await withStateMutationLock(root, async () => {
+            const merged = new Map<string, any>();
+            try {
+              const persisted = JSON.parse(await readFile(attemptsPath, "utf8"));
+              if (persisted?.schemaVersion === 2 && persisted.attempts && typeof persisted.attempts === "object") {
+                for (const [key, value] of Object.entries(persisted.attempts) as any) {
+                  if (Number.isInteger(value?.count) && value.count > 0 && Number(value.resetAt) > Date.now()) merged.set(String(key).slice(0, 256), {
+                    count: value.count,
+                    resetAt: Number(value.resetAt),
+                    updatedAt: Number(value.updatedAt) || Date.now()
+                  });
+                }
+              }
+            } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+            for (const [key, value] of loginAttempts) {
+              const previous = merged.get(key);
+              merged.set(key, previous && previous.count > value.count
+                ? previous
+                : { count: Math.max(previous?.count ?? 0, value.count), resetAt: Math.max(previous?.resetAt ?? 0, value.resetAt), updatedAt: Math.max(previous?.updatedAt ?? 0, value.updatedAt) });
+            }
+            loginAttempts.clear();
+            for (const [key, value] of merged) loginAttempts.set(key, value);
+            trimLoginAttempts();
+            const snapshot = `${JSON.stringify({ schemaVersion: 2, attempts: Object.fromEntries(loginAttempts) })}\n`;
+            const temporary = `${attemptsPath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
+            await writeFile(temporary, snapshot, { mode: 0o600 });
+            await rename(temporary, attemptsPath);
+            await chmod(attemptsPath, 0o600);
+          });
         }
       })().finally(() => {
         attemptWritePromise = undefined;
@@ -344,11 +369,15 @@ export async function addHostUser({ stateDir = ".odinn-host", id, password, work
   const workspace = await realpath(resolve(workspaceRoot));
   const credentials = await hashPassword(password);
   const path = join(root, "users.json");
-  let config: any = { schemaVersion: 1, users: [] };
-  try { config = JSON.parse(await readFile(path, "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
-  const user = { id, workspaceRoot: workspace, salt: credentials.salt, passwordHash: credentials.hash, disabled: false };
-  config.users = [...(config.users ?? []).filter((item: any) => item.id !== id), user];
-  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 }); await chmod(path, 0o600);
+  await withStateMutationLock(root, async () => {
+    let config: any = { schemaVersion: 1, users: [] };
+    try { config = JSON.parse(await readFile(path, "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+    const user = { id, workspaceRoot: workspace, salt: credentials.salt, passwordHash: credentials.hash, disabled: false };
+    config.users = [...(config.users ?? []).filter((item: any) => item.id !== id), user];
+    const temporary = `${path}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, path); await chmod(path, 0o600);
+  });
   return { id, workspaceRoot: workspace };
 }
 

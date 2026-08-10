@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { request as requestHttp, type IncomingHttpHeaders } from "node:http";
 import { request as requestHttps } from "node:https";
 import { connect } from "node:net";
+import { sanitizedChildEnvironment } from "@odinn/kernel";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 18_790;
@@ -482,7 +483,7 @@ async function launchBrowserCommand(candidate: BrowserCommand, timeoutMs: number
     let timer: NodeJS.Timeout | undefined;
     const child = spawn(candidate.command, candidate.args, {
       detached: true,
-      env: env ?? process.env,
+      env: env ?? sanitizedChildEnvironment(),
       shell: false,
       stdio: "ignore"
     });

@@ -147,7 +147,7 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
   const expire = () => {
     const now = Date.now();
     for (const [id, action] of pending) {
-      if (action.status === "pending" && Number(action.expiresAt) <= now) {
+      if (Number(action.expiresAt) <= now) {
         pending.delete(id);
         volatile.delete(id);
       }
@@ -199,6 +199,7 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
       return withLock(() => {
         refresh();
         expire();
+        persist();
         const key = String(id ?? "");
         const action = pending.get(key);
         if (!action || action.status !== "approved" || Number(action.expiresAt) <= Date.now()) return undefined;
@@ -256,8 +257,12 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         const limit = Math.min(MAX_PENDING_APPROVALS, Math.max(0, Number.isSafeInteger(Number(options.limit)) ? Number(options.limit) : MAX_PENDING_APPROVALS));
         const offset = Math.max(0, Number.isSafeInteger(Number(options.offset)) ? Number(options.offset) : 0);
         return Array.from(pending.values())
-          .filter((action) => action.status === "pending")
-          .map(({ input, bindingTag: _bindingTag, sealedInput: _sealedInput, ...action }) => ({ ...action, input: redactBrowserInput(input) }))
+          .filter((action) => action.status === "pending" || action.status === "approved")
+          .map(({ input, bindingTag: _bindingTag, sealedInput: _sealedInput, ...action }) => ({
+            ...action,
+            ...(action.status === "approved" ? { status: "claimed", recovery: "execution claim is in flight; inspect before retrying" } : {}),
+            input: redactBrowserInput(input)
+          }))
           .slice(offset, offset + limit);
       });
     }

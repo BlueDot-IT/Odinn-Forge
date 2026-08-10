@@ -7,8 +7,8 @@ import { createRunId, isWorkspaceContentTool, normalizeTaskRequest, projectDurab
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
-export { loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS } from "./environment.ts";
-export type { EnvironmentLoadOptions, LoadedEnvironmentFile } from "./environment.ts";
+export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isCredentialEnvironmentName, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
+export type { EnvironmentLoadOptions, LoadedEnvironmentFile, ParsedEnvironmentFiles } from "./environment.ts";
 export { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
 export type { LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";

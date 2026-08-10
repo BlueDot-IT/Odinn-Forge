@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   createScheduleCandidate,
   formatAutomationCursor,
@@ -62,6 +62,13 @@ function initialize(database: SqliteStore): void {
     CREATE INDEX IF NOT EXISTS idx_event_deliveries_watch ON event_deliveries(watch_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_event_deliveries_status ON event_deliveries(status, created_at);
   `);
+  for (const statement of [
+    "ALTER TABLE event_deliveries ADD COLUMN dispatch_token TEXT",
+    "ALTER TABLE event_deliveries ADD COLUMN dispatch_lease_expires_at TEXT"
+  ]) {
+    try { database.db.exec(statement); } catch (error: any) { if (!String(error?.message ?? error).includes("duplicate column name")) throw error; }
+  }
+  database.db.prepare("UPDATE event_deliveries SET status='needs-review', error_code='EVENT_DISPATCH_LEASE_EXPIRED', updated_at=? WHERE status='queued' AND dispatch_token IS NOT NULL AND dispatch_lease_expires_at <= ?").run(timestamp(), timestamp());
 }
 
 function validSource(value: string): string {
@@ -174,6 +181,37 @@ export class DurableEventIngress {
     return Number((this.database.db.prepare("SELECT count(*) AS count FROM event_watches").get() as Row).count || 0);
   }
 
+  private claimDelivery(idempotencyKey: string): string | undefined {
+    const token = randomUUID();
+    const expires = new Date(Date.now() + 30_000).toISOString();
+    const result = this.database.db.prepare(`UPDATE event_deliveries
+      SET dispatch_token=?, dispatch_lease_expires_at=?, updated_at=?
+      WHERE idempotency_key=? AND status='queued' AND dispatch_token IS NULL`).run(token, expires, timestamp(), idempotencyKey);
+    return Number(result.changes) === 1 ? token : undefined;
+  }
+
+  private settleDelivery(idempotencyKey: string, token: string, status: DeliveryStatus): void {
+    this.database.db.prepare(`UPDATE event_deliveries
+      SET status=?, error_code=?, dispatch_token=NULL, dispatch_lease_expires_at=NULL, updated_at=?
+      WHERE idempotency_key=? AND status='queued' AND dispatch_token=?`).run(
+      status,
+      status === "completed" ? null : status === "needs-review" ? "EVENT_DISPATCH_UNCERTAIN" : "EVENT_DISPATCH_FAILED",
+      timestamp(), idempotencyKey, token
+    );
+  }
+
+  private async dispatchCandidate(candidate: AutomationCandidate): Promise<DeliveryStatus | undefined> {
+    if (!this.dispatch) return undefined;
+    const token = this.claimDelivery(candidate.idempotencyKey);
+    if (!token) return this.delivery(candidate.idempotencyKey)?.status;
+    const controller = new AbortController();
+    let status: DeliveryStatus = "completed";
+    try { status = await this.dispatch(candidate, { signal: controller.signal }); }
+    catch { status = "needs-review"; }
+    this.settleDelivery(candidate.idempotencyKey, token, status);
+    return this.delivery(candidate.idempotencyKey)?.status ?? status;
+  }
+
   async ingest(input: unknown, authDigest: string): Promise<{ event: AutomationEvent; candidates: AutomationCandidate[]; deliveries: Array<{ idempotencyKey: string; status: DeliveryStatus }> }> {
     const event = validateAutomationEvent(input);
     const source = this.source(event.source);
@@ -188,7 +226,13 @@ export class DurableEventIngress {
     const candidates = watches.map((watch) => matchAutomationEvent(watch.declaration, event, replayWindow)).filter((candidate): candidate is AutomationCandidate => Boolean(candidate));
     const deliveries: Array<{ idempotencyKey: string; status: DeliveryStatus }> = [];
     this.database.transaction((db) => {
-      if (!duplicate) db.prepare("UPDATE event_sources SET newest_sequence=?, updated_at=? WHERE source=? AND newest_sequence=?").run(event.sequence, timestamp(), source.source, source.newestSequence);
+      if (!duplicate) {
+        const updated = db.prepare("UPDATE event_sources SET newest_sequence=?, updated_at=? WHERE source=? AND newest_sequence=?").run(event.sequence, timestamp(), source.source, source.newestSequence);
+        if (Number(updated.changes) !== 1) {
+          const current = db.prepare("SELECT newest_sequence FROM event_sources WHERE source=?").get(source.source) as Row | undefined;
+          if (Number(current?.newest_sequence) !== event.sequence) throw new Error("event cursor is not the next authoritative sequence");
+        }
+      }
       for (const candidate of candidates) {
         const watch = watches.find((entry) => entry.declaration.declarationDigest === candidate.declarationDigest)!;
         const result = db.prepare(`INSERT OR IGNORE INTO event_deliveries(idempotency_key, candidate_id, watch_id, source, sequence, status, created_at, updated_at)
@@ -196,17 +240,9 @@ export class DurableEventIngress {
         if (Number(result.changes) === 1) deliveries.push({ idempotencyKey: candidate.idempotencyKey, status: "queued" });
       }
     });
-    if (this.dispatch) {
-      for (const candidate of candidates) {
-        const delivery = this.delivery(candidate.idempotencyKey);
-        if (!delivery || delivery.status !== "queued") continue;
-        const controller = new AbortController();
-        let status: DeliveryStatus = "completed";
-        try { status = await this.dispatch(candidate, { signal: controller.signal }); }
-        catch { status = "needs-review"; }
-        this.database.db.prepare("UPDATE event_deliveries SET status=?, error_code=?, updated_at=? WHERE idempotency_key=? AND status='queued'").run(status, status === "completed" ? null : status === "needs-review" ? "EVENT_DISPATCH_UNCERTAIN" : "EVENT_DISPATCH_FAILED", timestamp(), candidate.idempotencyKey);
-        deliveries.push({ idempotencyKey: candidate.idempotencyKey, status });
-      }
+    if (this.dispatch) for (const candidate of candidates) {
+      const status = await this.dispatchCandidate(candidate);
+      if (status) deliveries.push({ idempotencyKey: candidate.idempotencyKey, status });
     }
     return { event, candidates, deliveries };
   }
@@ -221,19 +257,15 @@ export class DurableEventIngress {
       if (occurrence === null || occurrence > nowUnixMs) continue;
       const candidate = createScheduleCandidate(watch.declaration, occurrence);
       if (!candidate) continue;
-      this.database.db.prepare(`INSERT INTO heartbeat_checkpoints(name, last_tick_unix_ms, updated_at) VALUES (?, ?, ?)
-        ON CONFLICT(name) DO UPDATE SET last_tick_unix_ms=excluded.last_tick_unix_ms, updated_at=excluded.updated_at`).run(watch.watchId, occurrence, timestamp());
+      this.database.transaction((db) => {
+        db.prepare(`INSERT OR IGNORE INTO event_deliveries(idempotency_key, candidate_id, watch_id, source, sequence, status, created_at, updated_at)
+          VALUES (?, ?, ?, ?, NULL, 'queued', ?, ?)`).run(candidate.idempotencyKey, candidate.candidateId, watch.watchId, "heartbeat", timestamp(), timestamp());
+        db.prepare(`INSERT INTO heartbeat_checkpoints(name, last_tick_unix_ms, updated_at) VALUES (?, ?, ?)
+          ON CONFLICT(name) DO UPDATE SET last_tick_unix_ms=excluded.last_tick_unix_ms, updated_at=excluded.updated_at
+          WHERE heartbeat_checkpoints.last_tick_unix_ms < excluded.last_tick_unix_ms`).run(watch.watchId, occurrence, timestamp());
+      });
       candidates.push(candidate);
-      if (this.dispatch) {
-        try {
-          const status = await this.dispatch(candidate, { signal: new AbortController().signal });
-          this.database.db.prepare(`INSERT OR IGNORE INTO event_deliveries(idempotency_key, candidate_id, watch_id, source, sequence, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`).run(candidate.idempotencyKey, candidate.candidateId, watch.watchId, "heartbeat", status, timestamp(), timestamp());
-        } catch {
-          this.database.db.prepare(`INSERT OR IGNORE INTO event_deliveries(idempotency_key, candidate_id, watch_id, source, sequence, status, error_code, created_at, updated_at)
-            VALUES (?, ?, ?, ?, NULL, 'needs-review', 'HEARTBEAT_DISPATCH_UNCERTAIN', ?, ?)`).run(candidate.idempotencyKey, candidate.candidateId, watch.watchId, "heartbeat", timestamp(), timestamp());
-        }
-      }
+      await this.dispatchCandidate(candidate);
     }
     return candidates;
   }

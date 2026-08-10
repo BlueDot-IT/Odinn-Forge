@@ -9,6 +9,7 @@ import { STATE_SCHEMA_TARGETS } from "../packages/kernel/src/state/schema-regist
 import {
   checkForUpdate,
   resolveGitHubTagCommit,
+  verifyGitHubReleaseAttestation,
   rollbackApplication,
   uninstallApplication,
   updateApplication
@@ -42,6 +43,31 @@ test("remote release tag resolution rejects mismatched and malformed refs", asyn
     /wrong ref/u
   );
   await assert.rejects(() => resolveGitHubTagCommit("../main", async () => new Response()), /tag name is invalid/u);
+});
+
+test("updater accepts only a verified GitHub attestation bound to the release artifact and source", async () => {
+  const artifactName = "odinn-v1.0.0.tar.gz";
+  const digest = "d".repeat(64);
+  const commit = NEXT_COMMIT;
+  const statement = {
+    subject: [{ name: artifactName, digest: { sha256: digest } }],
+    predicateType: "https://slsa.dev/provenance/v1",
+    predicate: {
+      buildDefinition: {
+        externalParameters: {
+          workflow: {
+            repository: "BlueDot-IT/Odinn-Forge",
+            ref: "refs/tags/v1.0.0",
+            sha: commit,
+            path: ".github/workflows/release.yml"
+          }
+        }
+      }
+    }
+  };
+  const fetchImplementation = async () => new Response(JSON.stringify({ attestations: [{ verification_status: "verified", bundle: { dsseEnvelope: { payload: Buffer.from(JSON.stringify(statement)).toString("base64") } } }] }), { status: 200 });
+  await verifyGitHubReleaseAttestation({ artifactName, artifactDigest: digest, version: "1.0.0", commit, fetchImplementation });
+  await assert.rejects(() => verifyGitHubReleaseAttestation({ artifactName, artifactDigest: "e".repeat(64), version: "1.0.0", commit, fetchImplementation }), /no verified GitHub build attestation/u);
 });
 
 async function lifecycleFixture() {

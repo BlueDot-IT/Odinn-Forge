@@ -460,8 +460,8 @@ test("concurrent console read surfaces remain HTTP 200 under shared-state conten
     const rounds = process.platform === "win32" ? 8 : 3;
     for (let round = 0; round < rounds; round += 1) {
       const responses = await Promise.all(paths.map((path) => fetch(`${gateway.base}${path}`)));
-      assert.deepEqual(responses.map((response) => response.status), paths.map(() => 200));
-      await Promise.all(responses.map((response) => response.json()));
+      const bodies = await Promise.all(responses.map(async (response) => ({ status: response.status, body: await response.text() })));
+      assert.deepEqual(bodies.map((response) => response.status), paths.map(() => 200), JSON.stringify({ paths, bodies }));
     }
   } finally {
     await gateway.close();

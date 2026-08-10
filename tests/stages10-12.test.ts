@@ -45,6 +45,47 @@ test("Stage 10 persists and completes a dependency-bound workflow", async () => 
   ledger.close();
 });
 
+test("Stage 10 counts independent steps per lease and cancels every active step", async () => {
+  const state = await stateRoot("workflow-concurrency");
+  const ledger = createRunLedger({ stateDir: state });
+  const store = new SqliteWorkflowStore(ledger.database);
+  let active = 0;
+  let maximum = 0;
+  let started = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const definition = workflowDefinitionFromSteps({
+    id: "fixture.parallel-workflow",
+    name: "Parallel fixture workflow",
+    steps: ["one", "two", "three", "four"].map((id) => ({ id, actionRef: "text.echo", input: { id } }))
+  });
+  const runtime = new DurableWorkflowRuntime({
+    store,
+    concurrency: 2,
+    dispatch: async ({ signal }) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      started += 1;
+      await new Promise<void>((resolve, reject) => {
+        if (signal.aborted) return reject(signal.reason);
+        const onAbort = () => { signal.removeEventListener("abort", onAbort); reject(signal.reason); };
+        signal.addEventListener("abort", onAbort, { once: true });
+        gate.then(() => { signal.removeEventListener("abort", onAbort); resolve(); }, reject);
+      }).finally(() => { active -= 1; });
+      return { status: "completed" };
+    }
+  });
+  await runtime.submit({ runId: "workflow-parallel-1", principalId: "test", idempotencyKey: "workflow-parallel-key", definition, input: {} });
+  for (let attempt = 0; attempt < 100 && started < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(started, 2);
+  assert.equal(maximum, 2);
+  await runtime.cancel("workflow-parallel-1");
+  release();
+  await runtime.shutdown();
+  assert.equal(active, 0);
+  ledger.close();
+});
+
 test("Stage 11 authenticates event sources and suppresses duplicate candidates", async () => {
   const state = await stateRoot("events");
   const ledger = createRunLedger({ stateDir: state });
@@ -60,6 +101,39 @@ test("Stage 11 authenticates event sources and suppresses duplicate candidates",
   assert.equal(duplicate.candidates.length, 1);
   assert.equal(dispatches, 1);
   await assert.rejects(() => ingress.ingest({ ...event, sequence: 2, cursor: "odinn-event-v1/fixture/2" }, authDigest), /next authoritative sequence/u);
+  ledger.close();
+});
+
+test("Stage 11 claims duplicate delivery ownership before dispatch", async () => {
+  const state = await stateRoot("events-concurrent");
+  const ledger = createRunLedger({ stateDir: state });
+  let dispatches = 0;
+  let release!: () => void;
+  let firstStarted!: () => void;
+  const started = new Promise<void>((resolve) => { firstStarted = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const authDigest = sourceAuthDigest("fixture-secret");
+  const ingress = new DurableEventIngress({
+    database: ledger.database,
+    dispatch: async () => {
+      dispatches += 1;
+      firstStarted();
+      await gate;
+      return "completed";
+    }
+  });
+  ingress.registerSource({ source: "fixture", authDigest });
+  ingress.registerWatch("watch-1", { schemaVersion: 1, id: "watch", revision: 1, enabled: true, actionRef: "text.echo", kind: "event", source: "fixture", event: "message", match: [] });
+  const event = { schemaVersion: 1, source: "fixture", event: "message", sequence: 0, cursor: "odinn-event-v1/fixture/0", occurredAtUnixMs: 1, attributes: { kind: "test" } };
+  const first = ingress.ingest(event, authDigest);
+  await started;
+  const duplicate = ingress.ingest(event, authDigest);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(dispatches, 1);
+  release();
+  await Promise.all([first, duplicate]);
+  const delivery = ledger.database.db.prepare("SELECT status FROM event_deliveries").get() as { status: string };
+  assert.equal(delivery.status, "completed");
   ledger.close();
 });
 
