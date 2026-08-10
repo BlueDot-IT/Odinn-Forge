@@ -236,6 +236,30 @@ test("legacy config, approvals, and browser recovery use explicit deterministic 
   }
 });
 
+test("audit-only legacy state plans and applies using the default audit filename", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-state-audit-only-"));
+  const state = join(temporary, "state");
+  try {
+    await mkdir(state, { recursive: true });
+    await writeFile(join(state, "audit.jsonl"), `${JSON.stringify({
+      schemaVersion: 1,
+      at: "2026-07-01T00:08:00.000Z",
+      runId: "audit-only-run",
+      type: "task.completed",
+      actor: "fixture",
+      tool: "text.echo"
+    })}\n`);
+    const plan = await planStateMigration(state, { applicationVersion: "1.1.0-rc.1", applicationCommit: "audit-only" });
+    assert.ok(plan.steps.some((step) => step.id === "audit-v0-to-v1"));
+    const report = await ensureStateCompatibility(state, { applicationVersion: "1.1.0-rc.1", applicationCommit: "audit-only" });
+    assert.ok(report?.steps.some((step) => step.id === "audit-v0-to-v1"));
+    assert.ok((await stat(join(state, "db", "audit.sqlite"))).isFile());
+    assert.equal(JSON.parse(await readFile(join(state, "state-schema.json"), "utf8")).storeVersions.audit, STATE_SCHEMA_TARGETS.audit);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("cron migration refuses invalid legacy definitions before cutover", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-state-cron-invalid-"));
   const state = join(temporary, "state");

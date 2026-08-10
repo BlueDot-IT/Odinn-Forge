@@ -29,6 +29,7 @@ export interface JobRecord {
 
 export interface JobStore {
   create(job: JsonObject & { id: string }): Promise<JobRecord>;
+  claimNextQueued?(patch: JsonObject): Promise<JobRecord | undefined>;
   claim(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
   claimApproval?(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
   update(id: string, patch: JsonObject): Promise<JobRecord>;
@@ -38,6 +39,7 @@ export interface JobStore {
   recover(options: { maxAttempts: number }): Promise<unknown>;
   cancel?(id: string, options?: { requestedBy?: string; reason?: string }): Promise<JobRecord>;
   renewLease?(id: string, lease: { token: string; owner: string; epoch: string; expiresAt: string }): Promise<boolean>;
+  queryJobs?(options?: { limit?: number; offset?: number; query?: string; status?: string }): Promise<{ items: JobRecord[]; total: number; attention: number; nextOffset?: number; nextCursor?: string }>;
 }
 
 export interface JobExecutionContext {
@@ -196,6 +198,16 @@ export class JobSupervisor {
 
   async get(id: string): Promise<JobRecord | undefined> { return this.store.get(id); }
   async list(options?: { limit?: number; offset?: number }): Promise<JobRecord[]> { return this.store.list(options); }
+  async queryJobs(options: { limit?: number; offset?: number; query?: string; status?: string } = {}) {
+    if (this.store.queryJobs) return this.store.queryJobs(options);
+    const query = String(options.query ?? "").trim().toLowerCase();
+    const status = String(options.status ?? "").trim();
+    const filtered = (await this.store.list()).filter((job) => (!status || job.status === status) && (!query || JSON.stringify(job).toLowerCase().includes(query)));
+    const offset = Math.max(0, Number.isSafeInteger(Number(options.offset)) ? Number(options.offset) : 0);
+    const limit = Math.max(0, Number.isSafeInteger(Number(options.limit)) ? Number(options.limit) : 50);
+    const items = filtered.slice(offset, offset + limit);
+    return { items, total: filtered.length, attention: filtered.filter((job) => ["failed", "needs-review"].includes(job.status)).length, ...(offset + items.length < filtered.length ? { nextOffset: offset + items.length, nextCursor: String(offset + items.length) } : {}) };
+  }
   async counts(): Promise<{ total: number; attention: number }> {
     if (typeof this.store.count === "function") return this.store.count();
     const jobs = await this.store.list({ limit: 500 });
@@ -239,23 +251,30 @@ export class JobSupervisor {
     this.draining = true;
     try {
       while (this.active.size < this.concurrency) {
-        const queued = (await this.store.list()).find((job) => job.status === "queued");
-        if (!queued) break;
-        const attempts = queued.attempts + 1;
-        const claimed = await this.store.claim(queued.id, {
+        const acquiredAt = new Date().toISOString();
+        const hasAtomicClaim = typeof this.store.claimNextQueued === "function";
+        const claimed = hasAtomicClaim
+          ? await this.store.claimNextQueued!({
           status: "running",
-          startedAt: new Date().toISOString(),
-          attempts,
+          startedAt: acquiredAt,
           dispatchLease: {
-            ...(queued.occurrenceKey ? { occurrenceKey: queued.occurrenceKey } : {}),
             token: randomUUID(),
             owner: this.leaseOwner,
             epoch: this.leaseEpoch,
-            acquiredAt: new Date().toISOString(),
-            expiresAt: new Date(Date.now() + Math.max((queued.timeoutMs || this.defaultTimeoutMs) + 30_000, 120_000)).toISOString()
+            acquiredAt
           }
+        })
+          : await this.claimQueuedCompatibility({
+            status: "running",
+            startedAt: acquiredAt,
+            dispatchLease: {
+              token: randomUUID(),
+              owner: this.leaseOwner,
+              epoch: this.leaseEpoch,
+              acquiredAt
+            }
         });
-        if (!claimed) continue;
+        if (!claimed) break;
         const volatilePayload = this.volatilePayloads.get(claimed.id);
         if (claimed.recoveryInputAvailable === false && !volatilePayload) {
           await this.store.update(claimed.id, {
@@ -271,6 +290,30 @@ export class JobSupervisor {
     } finally {
       this.draining = false;
     }
+  }
+
+  private async claimQueuedCompatibility(patch: JsonObject): Promise<JobRecord | undefined> {
+    const queued = (await this.store.list())
+      .filter((job) => job.status === "queued")
+      .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")) || left.id.localeCompare(right.id))[0];
+    if (!queued) return undefined;
+    const requestedLease = patch.dispatchLease && typeof patch.dispatchLease === "object" && !Array.isArray(patch.dispatchLease)
+      ? patch.dispatchLease as JsonObject
+      : undefined;
+    const now = new Date().toISOString();
+    const dispatchLease = requestedLease ? {
+      ...requestedLease,
+      ...(queued.occurrenceKey ? { occurrenceKey: queued.occurrenceKey } : {}),
+      acquiredAt: typeof requestedLease.acquiredAt === "string" ? requestedLease.acquiredAt : now,
+      expiresAt: typeof requestedLease.expiresAt === "string"
+        ? requestedLease.expiresAt
+        : new Date(Date.now() + Math.max((queued.timeoutMs || this.defaultTimeoutMs) + 30_000, 120_000)).toISOString()
+    } : undefined;
+    return this.store.claim(queued.id, {
+      ...patch,
+      attempts: queued.attempts + 1,
+      ...(dispatchLease ? { dispatchLease } : {})
+    });
   }
 
   async shutdown(): Promise<void> {

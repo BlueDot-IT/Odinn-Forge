@@ -837,7 +837,7 @@ test("gateway stops browser state changes for explicit approval", async () => {
     assert.equal(denied.result.denied, true);
     assert.equal((await getJson(`${base}/approvals`)).length, 0);
     const runs = await getJson(`${base}/runs`);
-    assert.equal(runs[0].status, "awaiting_approval");
+    assert.equal(runs[0].status, "denied");
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

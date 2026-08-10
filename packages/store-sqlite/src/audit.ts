@@ -19,6 +19,8 @@ export type AuditIntegrityStatus = {
   failures: Row[];
 };
 
+type CachedAuditIntegrityStatus = AuditIntegrityStatus & { headSignature: string | null };
+
 const MAX_PAGE = 10_000;
 const bounded = (value: unknown, fallback = 500) => {
   const parsed = Number(value ?? fallback);
@@ -88,6 +90,7 @@ function statusFor(event: AuditEvent, prior: Row | undefined) {
   else if (event.type === "agent.graph.needs-review") Object.assign(summary, { status: "needs-review", completedAt: event.at, message: event.message ?? "agent graph outcome requires operator review" });
   else if (event.type === "agent.graph.cancelled") Object.assign(summary, { status: "cancelled", completedAt: event.at, message: event.message });
   else if (event.type === "agent.graph.failed") Object.assign(summary, { status: "failed", completedAt: event.at, message: event.message });
+  else if (["task.approval_denied", "operator.approval_denied"].includes(event.type)) Object.assign(summary, { status: "denied", completedAt: event.at, message: event.message });
   else if (event.type === "task.approval_required") Object.assign(summary, { status: "awaiting_approval", message: event.message });
   else if (["task.blocked", "task.cancelled"].includes(event.type)) Object.assign(summary, { status: event.type.slice(5), completedAt: event.at, message: event.message });
   return summary;
@@ -109,7 +112,7 @@ export class SqliteAuditStore {
   readonly db: DatabaseSync;
   private watcher?: FSWatcher;
   private listeners = new Set<(sequence: number) => void>();
-  private cachedIntegrity?: AuditIntegrityStatus;
+  private cachedIntegrity?: CachedAuditIntegrityStatus;
   private closed = false;
 
   constructor(databasePath: string, { keyringPath = `${databasePath}.keys.json` }: { keyringPath?: string } = {}) {
@@ -164,6 +167,28 @@ export class SqliteAuditStore {
     const safeOffset = Number.isSafeInteger(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
     return (this.db.prepare("SELECT summary_json FROM audit_runs ORDER BY last_event_at DESC,run_id LIMIT ? OFFSET ?").all(bounded(limit, 100), safeOffset) as Row[]).map((row) => JSON.parse(String(row.summary_json)));
   }
+  async queryRuns({ offset = 0, limit = 100, query = "", status = "" }: { offset?: number; limit?: number; query?: string; status?: string } = {}) {
+    const safeOffset = Number.isSafeInteger(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
+    const safeLimit = Number.isSafeInteger(Number(limit)) && Number(limit) >= 0 ? Math.min(Number(limit), MAX_PAGE) : 100;
+    const needle = String(query).trim();
+    const normalizedStatus = String(status).trim();
+    const conditions = ["1=1"];
+    const parameters: any[] = [];
+    if (normalizedStatus) { conditions.push("json_extract(summary_json, '$.status') = ?"); parameters.push(normalizedStatus); }
+    if (needle) { conditions.push("instr(lower('run ' || summary_json), lower(?)) > 0"); parameters.push(needle); }
+    const where = conditions.join(" AND ");
+    const totalRow = this.db.prepare(`SELECT count(*) AS total,
+      sum(CASE WHEN json_extract(summary_json, '$.status') IN ('failed','blocked','needs-review') THEN 1 ELSE 0 END) AS attention
+      FROM audit_runs WHERE ${where}`).get(...parameters) as Row;
+    const rows = (this.db.prepare(`SELECT summary_json FROM audit_runs WHERE ${where}
+      ORDER BY last_event_at DESC,run_id LIMIT ? OFFSET ?`).all(...parameters, safeLimit, safeOffset) as Row[]).map((row) => JSON.parse(String(row.summary_json)));
+    return {
+      items: rows,
+      total: Number(totalRow.total || 0),
+      attention: Number(totalRow.attention || 0),
+      ...(safeOffset + rows.length < Number(totalRow.total || 0) ? { nextOffset: safeOffset + rows.length, nextCursor: String(safeOffset + rows.length) } : {})
+    };
+  }
   async readSummary() {
     const events = Number((this.db.prepare("SELECT count(*) AS count FROM audit_events").get() as Row).count);
     const runs = Number((this.db.prepare("SELECT count(*) AS count FROM audit_runs").get() as Row).count);
@@ -175,9 +200,14 @@ export class SqliteAuditStore {
     return rows.map((row) => normalizeAuditEvent(JSON.parse(String(row.event_json)))).filter((event) => event.type !== "task.policy" || event.decision === "deny").slice(0, bounded(limit, 100));
   }
   getIntegrityStatus(): AuditIntegrityStatus {
-    const head = this.db.prepare("SELECT head_sequence FROM audit_state WHERE singleton=1").get() as Row;
+    const head = this.db.prepare("SELECT head_sequence,head_signature FROM audit_state WHERE singleton=1").get() as Row;
     const events = Number(head.head_sequence || 0);
-    if (this.cachedIntegrity) return { ...this.cachedIntegrity, events };
+    const headSignature = head.head_signature === null ? null : String(head.head_signature);
+    if (this.cachedIntegrity && (this.cachedIntegrity.events !== events || this.cachedIntegrity.headSignature !== headSignature)) this.cachedIntegrity = undefined;
+    if (this.cachedIntegrity) {
+      const status = Object.fromEntries(Object.entries(this.cachedIntegrity).filter(([key]) => key !== "headSignature")) as AuditIntegrityStatus;
+      return { ...status, events };
+    }
     return { valid: true, checked: false, events, unsigned: 0, failures: [] };
   }
   async readRun(id: string) { const row = this.db.prepare("SELECT summary_json FROM audit_runs WHERE run_id=?").get(id) as Row | undefined; if (!row) return undefined; const events = (this.db.prepare("SELECT event_json FROM audit_events WHERE run_id=? ORDER BY sequence").all(id) as Row[]).map((item) => normalizeAuditEvent(JSON.parse(String(item.event_json)))); return { ...JSON.parse(String(row.summary_json)), events }; }
@@ -186,7 +216,7 @@ export class SqliteAuditStore {
 
   subscribe(listener: (sequence: number) => void) {
     this.listeners.add(listener);
-    if (!this.watcher) this.watcher = watch(dirname(this.notifyPath), (_event, filename) => { if (filename && String(filename) !== basename(this.notifyPath)) return; const sequence = Number.parseInt(readFileSync(this.notifyPath, "utf8"), 10); for (const item of this.listeners) item(Number.isFinite(sequence) ? sequence : 0); });
+    if (!this.watcher) this.watcher = watch(dirname(this.notifyPath), (_event, filename) => { if (filename && String(filename) !== basename(this.notifyPath)) return; this.cachedIntegrity = undefined; const sequence = Number.parseInt(readFileSync(this.notifyPath, "utf8"), 10); for (const item of this.listeners) item(Number.isFinite(sequence) ? sequence : 0); });
     return () => { this.listeners.delete(listener); if (!this.listeners.size) { this.watcher?.close(); this.watcher = undefined; } };
   }
   private signal(sequence: number) { for (const listener of this.listeners) listener(sequence); try { writeFileSync(this.notifyPath, `${sequence}\n`, { mode: 0o600 }); } catch { /* advisory: durable cursor recovery remains authoritative */ } }
@@ -203,7 +233,7 @@ export class SqliteAuditStore {
     for (const segment of segments) { const first = Number(segment.first_sequence); const last = segment.last_sequence === null ? undefined : Number(segment.last_sequence); if (first !== expectedFirst || (segment.anchor_signature ?? null) !== priorFinal) failures.push({ runId: "", reason: "audit segment order or anchor mismatch" }); if (last === undefined) { openSegments++; if (first > Number(head.head_sequence) + 1) failures.push({ runId: "", reason: "audit active segment boundary mismatch" }); } else { if (last < first - 1) failures.push({ runId: "", reason: "audit segment range mismatch" }); const boundary = this.db.prepare("SELECT signature FROM audit_events WHERE sequence=?").get(last) as Row | undefined; const knownFinal = boundary?.signature ?? archived.boundaries.get(last); if (knownFinal !== segment.final_signature) failures.push({ runId: "", reason: "audit segment final signature mismatch" }); expectedFirst = last + 1; priorFinal = segment.final_signature ?? null; } }
     if (openSegments !== 1) failures.push({ runId: "", reason: "audit active segment count mismatch" });
     const result = { valid: !failures.length, events: cursor, unsigned: unsignedCount, failures, currentKeyId: head.current_key_id ?? keyring.current, retiredKeyIds: Object.keys(keyring.keys).filter((id) => id !== (head.current_key_id ?? keyring.current)) };
-    this.cachedIntegrity = { valid: result.valid, checked: true, checkedAt: new Date().toISOString(), events: result.events, unsigned: result.unsigned, failures: result.failures };
+    this.cachedIntegrity = { valid: result.valid, checked: true, checkedAt: new Date().toISOString(), events: result.events, unsigned: result.unsigned, failures: result.failures, headSignature: head.head_signature === null ? null : String(head.head_signature) };
     return result;
   }
 

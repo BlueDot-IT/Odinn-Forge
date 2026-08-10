@@ -721,6 +721,7 @@ export async function createGatewayServer({
   const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags, proofOptions });
   new CheckpointCoordinator({ runLedger: runtime.ledger }).recover();
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  if (typeof auditStore.verifyIntegrity === "function") await auditStore.verifyIntegrity({ allowUnsigned: true }).catch(() => undefined);
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
   const skillStore = new SkillPackageStore(state);
@@ -1003,10 +1004,8 @@ export async function createGatewayServer({
   };
 
   const operatorSnapshot = async (surface: any = "http", page = 1, pageSize = 10, query = "", statusFilter = "", pages: Record<string, number> = {}) => {
-    const [jobs, jobCounts, runs, auditSummary, cronJobs, auditVerification, browserRecovery, sandboxRecovery, processRecovery] = await Promise.all([
-      supervisor.list({ limit: 500 }),
+    const [jobCounts, auditSummary, cronJobs, auditVerification, browserRecovery, sandboxRecovery, processRecovery] = await Promise.all([
       supervisor.counts(),
-      typeof auditStore.readRunPage === "function" ? auditStore.readRunPage({ limit: 200 }) : Promise.resolve([]),
       typeof auditStore.readSummary === "function" ? auditStore.readSummary() : Promise.resolve({ events: 0, runs: 0, attentionRuns: 0 }),
       cronStore.list(),
       typeof auditStore.getIntegrityStatus === "function"
@@ -1017,10 +1016,49 @@ export async function createGatewayServer({
       readOperatorFile("process-recovery.json", { pending: [] })
     ]);
     const queryText = String(query || "").trim().toLowerCase();
+    const queryStatus = statusFilter && statusFilter !== "all" ? String(statusFilter) : "";
+    const normalizedPageSize = Math.min(50, Math.max(1, Number.isSafeInteger(Number(pageSize)) && Number(pageSize) > 0 ? Number(pageSize) : 10));
+    const requestedPageFor = (section: string) => {
+      const requested = pages[section] ?? page;
+      return Number.isSafeInteger(Number(requested)) && Number(requested) > 0 ? Number(requested) : 1;
+    };
+    const makePage = (total: number, requested: number) => {
+      const safeTotal = Math.max(0, Number(total) || 0);
+      const pageCount = Math.max(1, Math.ceil(safeTotal / normalizedPageSize));
+      const currentPage = Math.min(Math.max(1, requested), pageCount);
+      const offset = (currentPage - 1) * normalizedPageSize;
+      return {
+        page: currentPage,
+        pageSize: normalizedPageSize,
+        pages: pageCount,
+        total: safeTotal,
+        from: safeTotal ? offset + 1 : 0,
+        to: safeTotal ? Math.min(offset + normalizedPageSize, safeTotal) : 0
+      };
+    };
+    const emptyQuery = () => ({ items: [] as any[], total: 0, attention: 0 });
+    const selectPage = async <T>(sectionPage: { page: number; pageSize: number }, categories: Array<{ total: number; fetch: (offset: number, limit: number) => Promise<T[]> }>) => {
+      let skip = (sectionPage.page - 1) * sectionPage.pageSize;
+      let remaining = sectionPage.pageSize;
+      const selected: T[] = [];
+      for (const category of categories) {
+        const total = Math.max(0, Number(category.total) || 0);
+        if (skip >= total) {
+          skip -= total;
+          continue;
+        }
+        const limit = Math.min(remaining, total - skip);
+        if (limit > 0) selected.push(...await category.fetch(skip, limit));
+        remaining -= limit;
+        skip = 0;
+        if (remaining <= 0) break;
+      }
+      return selected;
+    };
     const matches = (item: any) => (!queryText || [item.id, item.label, item.status, item.summary, item.kind].some((value) => String(value ?? "").toLowerCase().includes(queryText)))
       && (!statusFilter || statusFilter === "all" || item.status === statusFilter);
     const filter = (items: any[]) => items.filter(matches);
-    const allJobItems = jobs.map((job: any) => {
+    const mapJob = (job: any) => {
       const task = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task) ? job.payload.task : {};
       const tool = String(task.tool || "job");
       const attention = ["failed", "needs-review"].includes(job.status);
@@ -1041,9 +1079,8 @@ export async function createGatewayServer({
           ...(job.auditCorrelationId ? { auditCorrelationId: job.auditCorrelationId } : {})
         }
       };
-    });
-    const jobsItems = filter(allJobItems);
-    const allRunItems = runs.map((run: any) => ({
+    };
+    const mapRun = (run: any) => ({
       id: String(run.id),
       kind: "run",
       label: String(run.tool || "run"),
@@ -1052,8 +1089,36 @@ export async function createGatewayServer({
       updatedAt: run.lastEventAt || run.completedAt || run.startedAt,
       attention: ["failed", "blocked", "needs-review"].includes(String(run.status || "")),
       details: { eventCount: Number(run.eventCount || 0), actor: String(run.actor || "local") }
-    }));
-    const runItems = filter(allRunItems);
+    });
+    const [jobQuery, runQuery, workflowQuery, watchQuery] = await Promise.all([
+      supervisor.queryJobs({ limit: 0, offset: 0, query: queryText, status: queryStatus }),
+      typeof (auditStore as any).queryRuns === "function"
+        ? (auditStore as any).queryRuns({ limit: 0, offset: 0, query: queryText, status: queryStatus })
+        : (async () => {
+          const allRuns = typeof (auditStore as any).readRuns === "function" ? await (auditStore as any).readRuns() : [];
+          const filteredRuns = allRuns.filter((run: any) => (!queryStatus || String(run.status || "") === queryStatus) && (!queryText || JSON.stringify(run).toLowerCase().includes(queryText)));
+          return { items: [], total: filteredRuns.length, attention: filteredRuns.filter((run: any) => ["failed", "blocked", "needs-review"].includes(String(run.status || ""))).length, fetch: (offset: number, limit: number) => filteredRuns.slice(offset, offset + limit) };
+        })(),
+      workflowRuntime ? workflowRuntime.queryWorkflows({ limit: 0, offset: 0, query: queryText, status: queryStatus }) : Promise.resolve(emptyQuery()),
+      eventIngress ? Promise.resolve(eventIngress.queryWatches({ limit: 0, offset: 0, query: queryText, status: queryStatus })) : Promise.resolve(emptyQuery())
+    ]);
+    const allCronItems = cronJobs.map((job: any) => ({ id: job.id, kind: "schedule", label: job.name, status: job.lastStatus === "error" ? "needs-review" : job.enabled ? "enabled" : "disabled", summary: job.lastStatus ? `Last run: ${job.lastStatus}` : "Scheduled automation", updatedAt: job.updatedAt, attention: job.lastStatus === "error", details: { nextRunAt: job.nextRunAt ?? null } }));
+    const cronItems = filter(allCronItems);
+    const workPage = makePage(Number(jobQuery.total || 0) + Number(runQuery.total || 0), requestedPageFor("work"));
+    const workItems = await selectPage<any>(workPage, [
+      {
+        total: Number(jobQuery.total || 0),
+        fetch: async (offset, limit) => (await supervisor.queryJobs({ limit, offset, query: queryText, status: queryStatus })).items.map(mapJob)
+      },
+      {
+        total: Number(runQuery.total || 0),
+        fetch: async (offset, limit) => {
+          if (typeof (auditStore as any).queryRuns === "function") return (await (auditStore as any).queryRuns({ limit, offset, query: queryText, status: queryStatus })).items.map(mapRun);
+          if (typeof (runQuery as any).fetch === "function") return (runQuery as any).fetch(offset, limit).map(mapRun);
+          return [];
+        }
+      }
+    ]);
     const allApprovalItems = approvalStore.list().map((approval: any) => ({
       id: String(approval.id),
       kind: "approval",
@@ -1070,22 +1135,28 @@ export async function createGatewayServer({
       }
     }));
     const approvals = filter(allApprovalItems);
-    const allWorkflowItems = workflowRuntime
-      ? workflowRuntime.list(100).map((run: any) => ({
-        id: String(run.runId), kind: "workflow", label: String(run.definitionDigest || "workflow"), status: String(run.status),
-        summary: "Durable workflow run", updatedAt: run.updatedAt,
-        attention: ["failed", "needs-review", "awaiting-approval"].includes(String(run.status)),
-        controls: ["running", "queued", "awaiting-approval"].includes(String(run.status)) ? ["cancel-workflow"] : ["needs-review"].includes(String(run.status)) ? ["resume-workflow"] : []
-      }))
-      : [];
-    const workflowItems = filter(allWorkflowItems);
-    const workflowCounts = workflowRuntime?.counts?.() ?? { total: allWorkflowItems.length, attention: allWorkflowItems.filter((item: any) => item.attention).length };
-    const watchCount = eventIngress?.countWatches?.() ?? 0;
-    const watchItems = eventIngress
-      ? eventIngress.listWatches().map((watch: any) => ({ id: watch.watchId, kind: "event-watch", label: "Event watch", status: watch.enabled ? "enabled" : "disabled", summary: "Durable event ingress declaration", updatedAt: watch.updatedAt, details: { enabled: watch.enabled === true } }))
-      : [];
-    const allCronItems = cronJobs.map((job: any) => ({ id: job.id, kind: "schedule", label: job.name, status: job.lastStatus === "error" ? "needs-review" : job.enabled ? "enabled" : "disabled", summary: job.lastStatus ? `Last run: ${job.lastStatus}` : "Scheduled automation", updatedAt: job.updatedAt, attention: job.lastStatus === "error", details: { nextRunAt: job.nextRunAt ?? null } }));
-    const cronItems = filter(allCronItems);
+    const workflowCounts = workflowRuntime?.counts?.() ?? { total: 0, attention: 0 };
+    const automationPage = makePage(Number(workflowQuery.total || 0) + Number(watchQuery.total || 0) + cronItems.length, requestedPageFor("automation"));
+    const automationItems = await selectPage<any>(automationPage, [
+      {
+        total: Number(workflowQuery.total || 0),
+        fetch: async (offset, limit) => workflowRuntime
+          ? (await workflowRuntime.queryWorkflows({ limit, offset, query: queryText, status: queryStatus })).items.map((run: any) => ({
+            id: String(run.runId), kind: "workflow", label: String(run.definitionDigest || "workflow"), status: String(run.status),
+            summary: "Durable workflow run", updatedAt: run.updatedAt,
+            attention: ["failed", "needs-review", "awaiting-approval"].includes(String(run.status)),
+            controls: ["running", "queued", "awaiting-approval"].includes(String(run.status)) ? ["cancel-workflow"] : ["needs-review"].includes(String(run.status)) ? ["resume-workflow"] : []
+          }))
+          : []
+      },
+      {
+        total: Number(watchQuery.total || 0),
+        fetch: async (offset, limit) => eventIngress
+          ? (await eventIngress.queryWatches({ limit, offset, query: queryText, status: queryStatus })).items.map((watch: any) => ({ id: watch.watchId, kind: "event-watch", label: "Event watch", status: watch.enabled ? "enabled" : "disabled", summary: "Durable event ingress declaration", updatedAt: watch.updatedAt, details: { enabled: watch.enabled === true } }))
+          : []
+      },
+      { total: cronItems.length, fetch: async (offset, limit) => cronItems.slice(offset, offset + limit) }
+    ]);
     const allRecoveryItems = [
       { id: "browser-recovery", kind: "recovery", label: "Browser recovery", status: String(browserRecovery.status || "clear"), summary: browserRecovery.status === "clear" ? "No browser action is awaiting resolution." : "Browser action recovery is required.", attention: ["executing", "unknown"].includes(String(browserRecovery.status)), details: { pending: ["executing", "unknown"].includes(String(browserRecovery.status)) } },
       { id: "sandbox-recovery", kind: "recovery", label: "Sandbox recovery", status: Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length ? "needs-review" : "clear", summary: "Sandbox process recovery state", attention: Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length > 0, details: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null } },
@@ -1093,7 +1164,7 @@ export async function createGatewayServer({
     ];
     const recoveryItems = filter(allRecoveryItems);
     const auditItem = {
-      id: "audit-journal", kind: "audit", label: "Audit journal", status: auditVerification.valid === false ? "needs-review" : auditVerification.checked === false ? "unknown" : "verified", summary: auditVerification.valid === false ? "Audit integrity needs attention." : auditVerification.checked === false ? "Audit integrity has not been explicitly verified in this process." : "Hash-chain verification passed.", attention: auditVerification.valid === false,
+      id: "audit-journal", kind: "audit", label: "Audit journal", status: auditVerification.valid === false ? "needs-review" : auditVerification.checked === false ? "unknown" : "verified", summary: auditVerification.valid === false ? "Audit integrity needs attention." : auditVerification.checked === false ? "Audit integrity has not been explicitly verified in this process." : "Hash-chain verification passed.", attention: auditVerification.valid === false || auditVerification.checked === false,
       details: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0), unsigned: Number(auditVerification.unsigned || 0), failures: Array.isArray(auditVerification.failures) ? auditVerification.failures.length : 0, checked: auditVerification.checked === true }
     };
     const runtimeItems = [
@@ -1119,9 +1190,9 @@ export async function createGatewayServer({
       pages: pages as any,
       sections: {
         runtime: { items: runtimeItems },
-        work: { items: [...jobsItems, ...runItems], counts: { total: Number(jobCounts.total || allJobItems.length) + Number(auditSummary.runs || allRunItems.length), jobs: Number(jobCounts.total || allJobItems.length), runs: Number(auditSummary.runs || allRunItems.length) }, attentionCount: Number(jobCounts.attention || 0) + Number(auditSummary.attentionRuns || 0) },
+        work: { items: workItems, pagination: workPage, counts: { total: workPage.total, jobs: Number(jobQuery.total || 0), runs: Number(runQuery.total || 0), attention: Number(jobQuery.attention || 0) + Number(runQuery.attention || 0) }, attentionCount: Number(jobQuery.attention || 0) + Number(runQuery.attention || 0) },
         approvals: { items: approvals, counts: { total: allApprovalItems.length, pending: allApprovalItems.length }, attentionCount: allApprovalItems.filter((item: any) => item.attention).length },
-        automation: { items: [...workflowItems, ...watchItems, ...cronItems], counts: { total: Number(workflowCounts.total || allWorkflowItems.length) + watchCount + allCronItems.length, workflows: Number(workflowCounts.total || allWorkflowItems.length), watches: watchCount, schedules: allCronItems.length }, attentionCount: Number(workflowCounts.attention || 0) + allCronItems.filter((item: any) => item.attention).length },
+        automation: { items: automationItems, pagination: automationPage, counts: { total: automationPage.total, workflows: Number(workflowQuery.total || 0), watches: Number(watchQuery.total || 0), schedules: cronItems.length, attention: Number(workflowQuery.attention || 0) + Number(watchQuery.attention || 0) + cronItems.filter((item: any) => item.attention).length }, attentionCount: Number(workflowQuery.attention || 0) + Number(watchQuery.attention || 0) + cronItems.filter((item: any) => item.attention).length },
         context: { items: [{ id: "project-context", kind: "context", label: "Project context", status: projectContext ? "enabled" : "disabled", summary: projectContext ? "Context retrieval is available through the governed context surface." : "Project context is disabled by default." }] },
         recovery: { items: recoveryItems, attentionCount: allRecoveryItems.filter((item: any) => item.attention).length },
         audit: { items: [auditItem], counts: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0) } },

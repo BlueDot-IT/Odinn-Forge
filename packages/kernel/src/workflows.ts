@@ -65,6 +65,7 @@ export class DurableWorkflowRuntime {
 
   get(runId: string): WorkflowRunRecord | undefined { return this.store.get(runId); }
   list(limit?: number): WorkflowRunRecord[] { return this.store.list(limit); }
+  queryWorkflows(options: { limit?: number; offset?: number; query?: string; status?: string } = {}) { return this.store.queryWorkflows(options); }
   counts(): { total: number; attention: number } { return this.store.counts(); }
   events(runId: string, limit?: number) { return this.store.events(runId, limit); }
 

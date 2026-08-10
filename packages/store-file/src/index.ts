@@ -563,6 +563,10 @@ export class FileAuditStore {
         current.status = "failed";
         current.completedAt = event.at;
         current.message = event.message;
+      } else if (["task.approval_denied", "operator.approval_denied"].includes(String(event.type))) {
+        current.status = "denied";
+        current.completedAt = event.at;
+        current.message = event.message;
       }
       runs.set(event.runId, current);
     }
@@ -663,6 +667,49 @@ export class FileJobStore {
   async list() {
     const state = await this.readState();
     return Object.values(state.jobs).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  async queryJobs({ limit = 50, offset = 0, query = "", status = "" }: { limit?: number; offset?: number; query?: string; status?: string } = {}) {
+    const all = await this.list();
+    const needle = String(query).trim().toLowerCase();
+    const filtered = all.filter((job) => (!status || job.status === status) && (!needle || JSON.stringify(job).toLowerCase().includes(needle)));
+    const safeOffset = Number.isSafeInteger(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
+    const safeLimit = Number.isSafeInteger(Number(limit)) && Number(limit) >= 0 ? Number(limit) : 50;
+    const items = filtered.slice(safeOffset, safeOffset + safeLimit);
+    return { items, total: filtered.length, attention: filtered.filter((job) => ["failed", "needs-review"].includes(job.status)).length, ...(safeOffset + items.length < filtered.length ? { nextOffset: safeOffset + items.length, nextCursor: String(safeOffset + items.length) } : {}) };
+  }
+
+  async claimNextQueued(patch: JsonObject) {
+    return this.mutate((state) => {
+      const current = Object.values(state.jobs)
+        .filter((job) => job.status === "queued")
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))[0];
+      if (!current) return undefined;
+      const now = new Date().toISOString();
+      const requestedLease = patch.dispatchLease && typeof patch.dispatchLease === "object" && !Array.isArray(patch.dispatchLease)
+        ? patch.dispatchLease as JsonObject
+        : undefined;
+      const dispatchLease = requestedLease ? {
+        ...requestedLease,
+        ...(current.occurrenceKey ? { occurrenceKey: current.occurrenceKey } : {}),
+        acquiredAt: typeof requestedLease.acquiredAt === "string" ? requestedLease.acquiredAt : now,
+        expiresAt: typeof requestedLease.expiresAt === "string"
+          ? requestedLease.expiresAt
+          : new Date(Date.now() + Math.max(Number(current.timeoutMs || 120_000) + 30_000, 120_000)).toISOString()
+      } : undefined;
+      const claimed = normalizeJob({
+        ...current,
+        ...patch,
+        id: current.id,
+        status: "running",
+        attempts: current.attempts + 1,
+        createdAt: current.createdAt,
+        updatedAt: now,
+        ...(dispatchLease ? { dispatchLease } : {})
+      });
+      state.jobs[current.id] = claimed;
+      return claimed;
+    });
   }
 
   async get(id: string) {

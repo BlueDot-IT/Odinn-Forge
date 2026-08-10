@@ -186,6 +186,30 @@ export class SqliteWorkflowStore {
       .map((row) => this.get(String(row.run_id))!).filter(Boolean);
   }
 
+  queryWorkflows({ offset = 0, limit = 100, query = "", status = "" }: { offset?: number; limit?: number; query?: string; status?: string } = {}) {
+    const safeOffset = Number.isSafeInteger(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
+    const safeLimit = Number.isSafeInteger(Number(limit)) && Number(limit) >= 0 ? Math.min(Number(limit), 10_000) : 100;
+    const needle = String(query).trim();
+    const normalizedStatus = String(status).trim();
+    const conditions = ["1=1"];
+    const parameters: any[] = [];
+    if (normalizedStatus) { conditions.push("status = ?"); parameters.push(normalizedStatus); }
+    if (needle) { conditions.push("instr(lower('workflow durable workflow run ' || run_id || ' ' || definition_id || ' ' || definition_digest || ' ' || status), lower(?)) > 0"); parameters.push(needle); }
+    const where = conditions.join(" AND ");
+    const totals = this.database.db.prepare(`SELECT count(*) AS total,
+      sum(CASE WHEN status IN ('failed','needs-review','awaiting-approval') THEN 1 ELSE 0 END) AS attention
+      FROM workflow_runs WHERE ${where}`).get(...parameters) as Row;
+    const rows = (this.database.db.prepare(`SELECT run_id FROM workflow_runs WHERE ${where}
+      ORDER BY updated_at DESC,run_id LIMIT ? OFFSET ?`).all(...parameters, safeLimit, safeOffset) as Row[])
+      .map((row) => this.get(String(row.run_id))!).filter(Boolean);
+    return {
+      items: rows,
+      total: Number(totals.total || 0),
+      attention: Number(totals.attention || 0),
+      ...(safeOffset + rows.length < Number(totals.total || 0) ? { nextOffset: safeOffset + rows.length, nextCursor: String(safeOffset + rows.length) } : {})
+    };
+  }
+
   counts(): { total: number; attention: number } {
     const row = this.database.db.prepare("SELECT count(*) AS total, sum(CASE WHEN status IN ('failed','needs-review','awaiting-approval') THEN 1 ELSE 0 END) AS attention FROM workflow_runs").get() as Row;
     return { total: Number(row.total || 0), attention: Number(row.attention || 0) };

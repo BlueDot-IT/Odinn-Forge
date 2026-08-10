@@ -84,6 +84,8 @@ export type OperatorSectionInput = {
   counts?: Record<string, number>;
   attentionCount?: number;
   items?: OperatorSectionItemInput[];
+  /** Items are already selected by a storage-backed query. */
+  pagination?: OperatorPage;
 };
 
 type OperatorSectionItemInput = Partial<OperatorItem> & { id: string; kind: string; label: string; status: string };
@@ -190,8 +192,11 @@ function normalizeItem(input: OperatorSectionItemInput): OperatorItem {
 }
 
 function buildSection(input: OperatorSectionInput = {}, page = 1, pageSize = OPERATOR_DEFAULT_PAGE_SIZE): OperatorSection {
-  const allItems = (input.items ?? []).slice(0, 500).map(normalizeItem);
-  const { items, pagination } = paginateOperatorItems(allItems, page, pageSize);
+  const allItems = (input.items ?? []).map(normalizeItem);
+  const paged = input.pagination
+    ? { items: allItems.slice(0, Math.min(OPERATOR_MAX_PAGE_SIZE, Math.max(0, Number(input.pagination.pageSize) || pageSize))), pagination: input.pagination }
+    : paginateOperatorItems(allItems, page, pageSize);
+  const { items, pagination } = paged;
   const counts = Object.fromEntries(Object.entries(input.counts ?? {}).map(([key, value]) => [safeText(key, "other"), Math.max(0, Number(value) || 0)]));
   if (counts.total === undefined) counts.total = allItems.length;
   if (counts.attention === undefined) counts.attention = input.attentionCount === undefined

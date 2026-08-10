@@ -63,6 +63,47 @@ test("Stage 11 authenticates event sources and suppresses duplicate candidates",
   ledger.close();
 });
 
+test("Stage 11 dispatches active watches outside the bounded administrative listing", async () => {
+  const state = await stateRoot("event-watch-boundary");
+  const ledger = createRunLedger({ stateDir: state });
+  let eventDispatches = 0;
+  let scheduleDispatches = 0;
+  const ingress = new DurableEventIngress({
+    database: ledger.database,
+    dispatch: async (candidate) => {
+      if (candidate.trigger === "event") eventDispatches += 1;
+      if (candidate.trigger === "schedule") scheduleDispatches += 1;
+      return "completed";
+    }
+  });
+  const authDigest = sourceAuthDigest("fixture-secret");
+  ingress.registerSource({ source: "fixture", authDigest });
+  for (let index = 0; index < 256; index += 1) {
+    const suffix = String(index).padStart(3, "0");
+    ingress.registerWatch(`a-disabled-${suffix}`, {
+      schemaVersion: 1, id: `disabled-${suffix}`, revision: 1, enabled: true,
+      actionRef: "text.echo", kind: "event", source: "fixture", event: "message", match: []
+    });
+    ingress.disableWatch(`a-disabled-${suffix}`);
+  }
+  ingress.registerWatch("z-active-event", {
+    schemaVersion: 1, id: "active-event", revision: 1, enabled: true,
+    actionRef: "text.echo", kind: "event", source: "fixture", event: "message", match: []
+  });
+  ingress.registerWatch("z-active-schedule", {
+    schemaVersion: 1, id: "active-schedule", revision: 1, enabled: true,
+    actionRef: "text.echo", kind: "schedule", schedule: { type: "at", atUnixMs: 100 }
+  });
+  const event = { schemaVersion: 1, source: "fixture", event: "message", sequence: 0, cursor: "odinn-event-v1/fixture/0", occurredAtUnixMs: 1, attributes: { kind: "test" } };
+  const result = await ingress.ingest(event, authDigest);
+  const heartbeat = await ingress.heartbeat(100);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(heartbeat.length, 1);
+  assert.equal(eventDispatches, 1);
+  assert.equal(scheduleDispatches, 1);
+  ledger.close();
+});
+
 test("Stage 12 keeps project context scoped and digest-bound", async () => {
   const state = await stateRoot("context");
   const records = new SqliteRecordStore(join(state, "records.sqlite"));

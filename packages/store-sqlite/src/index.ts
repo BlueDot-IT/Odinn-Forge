@@ -389,6 +389,7 @@ const MIGRATIONS = [
     release_reason TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status ON runtime_jobs(status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_runtime_jobs_queue ON runtime_jobs(status, created_at, id);
   CREATE INDEX IF NOT EXISTS idx_runtime_jobs_execution ON runtime_jobs(execution_run_id, execution_attempt_id);
   CREATE INDEX IF NOT EXISTS idx_runtime_job_leases_job ON runtime_job_leases(job_id, acquired_at);`
   ,
@@ -522,7 +523,13 @@ export class SqliteStore {
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
     this.migrate(targetVersion);
+    this.ensureRuntimeJobIndexes();
     this.normalizeAgentGraphPrincipalMetadata();
+  }
+
+  private ensureRuntimeJobIndexes() {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_jobs'").get()) return;
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_runtime_jobs_queue ON runtime_jobs(status, created_at, id)");
   }
 
   private normalizeAgentGraphPrincipalMetadata() {

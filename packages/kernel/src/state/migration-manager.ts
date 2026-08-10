@@ -7,6 +7,7 @@ import { inspectAuthoritativeRecordSchema, inspectExistingSqliteAuditSchema, ins
 import { STATE_MIGRATIONS, type StateMigrationDefinition, type StateMigrationResult } from "./migrations/index.ts";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
 import { withStateMutationLock } from "../state-mutation.ts";
+import { auditFilenameFromConfig } from "./audit-path.ts";
 
 const MARKER_SCHEMA_VERSION = 1;
 const MANIFEST_FILENAME = "state-schema.json";
@@ -129,7 +130,7 @@ export async function inspectStateSchemas(stateDir: string): Promise<StateInspec
   for (const surface of ["sessions", "projects", "goals", "memory"] as const) put(statuses, surface, recordProjection);
   put(statuses, "jobs", await inspectRuntimeJobs(stateRoot));
 
-  const auditFilename = config.present ? await auditFilenameFromConfig(stateRoot) : "audit.jsonl";
+  const auditFilename = await auditFilenameFromConfig(stateRoot);
   const auditPath = join(stateRoot, auditFilename);
   const auditDatabasePath = join(stateRoot, "db", `${basename(auditFilename, ".jsonl")}.sqlite`);
   const audit = await exists(auditDatabasePath)
@@ -609,17 +610,6 @@ async function verifyAuditIntegrity(stateRoot: string): Promise<{ valid: boolean
   if (await exists(databasePath)) { const store = new SqliteAuditStore(databasePath, { keyringPath: `${auditPath}.keys.json` }); try { const result = await store.verifyIntegrity({ allowUnsigned: true }); return { valid: result.valid, events: result.events, unsigned: result.unsigned }; } finally { store.close(); } }
   if (!await exists(auditPath)) return { valid: true, events: 0, unsigned: 0 };
   const store = new FileAuditStore(auditPath); const result = await store.verifyIntegrity({ allowUnsigned: true }); return { valid: result.valid, events: result.events, unsigned: result.unsigned };
-}
-
-async function auditFilenameFromConfig(stateRoot: string): Promise<string> {
-  const config = await readJson(join(stateRoot, "config.json"));
-  const filename = config.present && config.value && typeof config.value === "object" && !Array.isArray(config.value)
-    ? String(config.value.auditLog ?? "audit.jsonl")
-    : "audit.jsonl";
-  if (!/^audit(?:-[A-Za-z0-9._-]+)?\.jsonl$/u.test(filename)) {
-    throw new Error("config.auditLog must be audit.jsonl or an audit-*.jsonl filename");
-  }
-  return filename;
 }
 
 async function appendHistory(stateRoot: string, report: StateMigrationReport): Promise<void> {
