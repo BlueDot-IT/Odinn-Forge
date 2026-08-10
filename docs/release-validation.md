@@ -53,9 +53,15 @@ not emit the `release.created` workflow event, so the manual dispatch is
 intentional. The workflow verifies the tag commit, builds and soaks the exact
 candidate, refuses asset replacement, downloads the release assets back, and
 checks their checksums before publishing npm or promoting the GitHub release.
-Prerelease packages use the npm `next` dist-tag. Enable GitHub immutable
-releases in repository administration before publishing a stable release; that
-setting cannot be established by the workflow itself.
+The GitHub release `prerelease` flag must match the tag: tags containing `-`
+must be prereleases, and stable tags must not be. Prerelease packages use the
+npm `next` dist-tag. If the npm version already exists, the workflow downloads
+the registry tarball and compares it byte-for-byte with the candidate before
+continuing. If GitHub promotion fails after npm publication, leave the release
+draft in place and rerun the same tag after resolving the GitHub failure; the
+workflow reports that partial-publication state explicitly. Enable GitHub
+immutable releases in repository administration before publishing a stable
+release; that setting cannot be established by the workflow itself.
 
 ## Evidence record
 

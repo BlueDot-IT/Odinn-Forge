@@ -31,6 +31,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ needs.release-policy.outputs.release_commit }}
+          persist-credentials: false
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -71,6 +72,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
       - name: Validate existing draft release and tag
         id: release
         shell: bash
@@ -82,8 +84,11 @@ jobs:
           tag_commit="$(git rev-list -n 1 "refs/tags/$TAG")"
           test "$tag_commit" = "$(git rev-parse HEAD)"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          expected_prerelease=false
+          [[ "$TAG" == *-* ]] && expected_prerelease=true
           jq -e --arg tag "$TAG" \
-            '.tag_name == $tag and .draft == true' \
+            --argjson expectedPrerelease "$expected_prerelease" \
+            '.tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' \
             <<<"$release"
           echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
 
@@ -101,6 +106,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ needs.release-policy.outputs.release_commit }}
+          persist-credentials: false
       - name: Record checked-out release commit
         shell: bash
         run: echo "ODINN_RELEASE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
@@ -155,6 +161,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ needs.release-policy.outputs.release_commit }}
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -175,10 +182,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
-          git fetch --tags --force
           test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
-          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true' <<<"$release"
+          expected_prerelease=false
+          [[ "$TAG" == *-* ]] && expected_prerelease=true
+          jq -e --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
+            '.tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' <<<"$release"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
@@ -190,7 +199,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          git fetch --tags --force
           test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
           expected_assets="$(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
           existing_assets="$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)"
@@ -214,7 +222,16 @@ jobs:
           test "$(node -p "require('./${package_manifests[0]}').name")" = "@bluedot-it/odinn"
           test "$(node -p "require('./${package_manifests[0]}').version")" = "$version"
           if npm view "$package" version >/dev/null 2>&1; then
-            echo "$package is already published"
+            echo "$package is already published; proving the registry tarball matches the candidate"
+            registry_tarball="$(npm view "$package" dist.tarball)"
+            test -n "$registry_tarball"
+            compare_dir="$(mktemp -d)"
+            trap 'rm -rf "$compare_dir"' EXIT
+            npm pack "$package_dir" --pack-destination "$compare_dir" >/dev/null
+            mapfile -t candidate_tarballs < <(find "$compare_dir" -maxdepth 1 -type f -name '*.tgz' -print)
+            test "${#candidate_tarballs[@]}" -eq 1
+            curl --fail --location --silent --show-error "$registry_tarball" --output "$compare_dir/registry.tgz"
+            cmp "${candidate_tarballs[0]}" "$compare_dir/registry.tgz"
           else
             if [[ "$version" == *-* ]]; then
               npm publish "$package_dir" --tag next --access public --provenance
@@ -222,7 +239,7 @@ jobs:
               npm publish "$package_dir" --access public --provenance
             fi
           fi
-      - name: Publish verified GitHub release
+      - name: Promote verified GitHub release (npm publication is already durable)
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -230,4 +247,7 @@ jobs:
         run: |
           is_draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
           test "$is_draft" = "true"
-          gh release edit "$TAG" --draft=false
+          if ! gh release edit "$TAG" --draft=false; then
+            echo "::error::npm publication completed or was already present, but GitHub release $TAG remains a draft; rerun this workflow with the same tag after resolving the GitHub release failure."
+            exit 1
+          fi

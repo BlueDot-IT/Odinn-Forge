@@ -73,7 +73,8 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /^\s{2}workflow_dispatch:/m);
   assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/);
   assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}contents: read/m);
-  assert.match(release, /\.tag_name == \$tag and \.draft == true/);
+  assert.match(release, /\.tag_name == \$tag and \.draft == true and \.prerelease == \$expectedPrerelease/);
+  assert.match(release, /persist-credentials: false/);
   assert.doesNotMatch(release.match(/^  release-policy:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /^\s+needs:/m);
   assert.match(release, /^  verify:\s*[\s\S]*?^    needs: release-policy/m);
   assert.match(
@@ -88,6 +89,9 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /mapfile -t package_manifests < <\(find dist\/npm-package -type f -name package\.json -print\)/);
   assert.match(release, /test "\$\{#package_manifests\[@\]\}" -eq 1/);
   assert.match(release, /npm publish "\$package_dir" --tag next --access public --provenance/);
+  assert.match(release, /proving the registry tarball matches the candidate/);
+  assert.match(release, /curl --fail --location --silent --show-error "\$registry_tarball"/);
+  assert.match(release, /cmp "\$\{candidate_tarballs\[0\]\}" "\$compare_dir\/registry\.tgz"/);
   assert.match(release, /gh release upload "\$TAG" release-assets\/\*/);
   assert.match(release, /expected_assets=/);
   assert.match(release, /existing_assets=/);

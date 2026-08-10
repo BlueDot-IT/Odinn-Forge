@@ -283,6 +283,70 @@ export class SqliteJobStore {
     return (this.ledger.database.db.prepare("SELECT * FROM runtime_jobs ORDER BY updated_at DESC, id LIMIT ? OFFSET ?").all(safeLimit, safeOffset) as SqlRow[]).map(hydrate);
   }
 
+  async queryJobs({ limit = 50, offset = 0, query = "", status = "" }: { limit?: number; offset?: number; query?: string; status?: string } = {}) {
+    const safeLimit = Number.isSafeInteger(Number(limit)) && Number(limit) >= 0 ? Math.min(Number(limit), 100_000) : 50;
+    const safeOffset = Number.isSafeInteger(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
+    const needle = String(query).trim();
+    const normalizedStatus = String(status).trim();
+    const conditions = ["1=1"];
+    const parameters: any[] = [];
+    if (normalizedStatus) { conditions.push("status = ?"); parameters.push(normalizedStatus); }
+    if (needle) { conditions.push("instr(lower('job ' || id || ' ' || status || ' ' || payload_json || ' ' || retry_safe || ' ' || attempts), lower(?)) > 0"); parameters.push(needle); }
+    const where = conditions.join(" AND ");
+    const totalRow = this.ledger.database.db.prepare(`SELECT count(*) AS total,
+      sum(CASE WHEN status IN ('failed','needs-review') THEN 1 ELSE 0 END) AS attention
+      FROM runtime_jobs WHERE ${where}`).get(...parameters) as SqlRow;
+    const rows = (this.ledger.database.db.prepare(`SELECT * FROM runtime_jobs WHERE ${where}
+      ORDER BY updated_at DESC, id LIMIT ? OFFSET ?`).all(...parameters, safeLimit, safeOffset) as SqlRow[]).map(hydrate);
+    return {
+      items: rows,
+      total: Number(totalRow.total || 0),
+      attention: Number(totalRow.attention || 0),
+      ...(safeOffset + rows.length < Number(totalRow.total || 0) ? { nextOffset: safeOffset + rows.length, nextCursor: String(safeOffset + rows.length) } : {})
+    };
+  }
+
+  async claimNextQueued(patch: JsonObject): Promise<RuntimeJobRecord | undefined> {
+    return this.ledger.database.transaction((db) => {
+      const row = db.prepare(`SELECT * FROM runtime_jobs
+        WHERE status = 'queued'
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1`).get() as SqlRow | undefined;
+      if (!row) return undefined;
+      const current = hydrate(row);
+      const now = new Date().toISOString();
+      const requestedLease = patch.dispatchLease && typeof patch.dispatchLease === "object" && !Array.isArray(patch.dispatchLease)
+        ? patch.dispatchLease as JsonObject
+        : undefined;
+      const dispatchLease = requestedLease ? {
+        ...requestedLease,
+        ...(current.occurrenceKey ? { occurrenceKey: current.occurrenceKey } : {}),
+        acquiredAt: optionalString(requestedLease.acquiredAt) ?? now,
+        expiresAt: optionalString(requestedLease.expiresAt)
+          ?? new Date(Date.now() + Math.max(current.timeoutMs + 30_000, 120_000)).toISOString()
+      } : undefined;
+      const normalized = normalizeJob({
+        ...current,
+        ...patch,
+        id: current.id,
+        status: "running",
+        attempts: current.attempts + 1,
+        createdAt: current.createdAt,
+        updatedAt: now,
+        ...(dispatchLease ? { dispatchLease } : {})
+      }, current);
+      writeJob(db, normalized);
+      if (normalized.leaseToken && normalized.leaseOwner && normalized.leaseEpoch && normalized.leaseAcquiredAt && normalized.leaseExpiresAt) {
+        db.prepare(`INSERT INTO runtime_job_leases(token, job_id, occurrence_key, owner, epoch, acquired_at, expires_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+          normalized.leaseToken, current.id, normalized.occurrenceKey ?? null, normalized.leaseOwner, normalized.leaseEpoch,
+          normalized.leaseAcquiredAt, normalized.leaseExpiresAt
+        );
+      }
+      return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(current.id) as SqlRow);
+    });
+  }
+
   async count(): Promise<{ total: number; attention: number }> {
     const row = this.ledger.database.db.prepare("SELECT count(*) AS total, sum(CASE WHEN status IN ('failed','needs-review') THEN 1 ELSE 0 END) AS attention FROM runtime_jobs").get() as SqlRow;
     return { total: Number(row.total || 0), attention: Number(row.attention || 0) };

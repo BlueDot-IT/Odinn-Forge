@@ -30,6 +30,16 @@ test("SQLite audit append is transactional across store instances and pages by d
   assert.equal(left.getIntegrityStatus().checked, false);
 });
 
+test("SQLite audit run queries reach records beyond the legacy operator window", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-run-query-boundary-")); t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new SqliteAuditStore(join(root, "audit.sqlite"), { keyringPath: join(root, "keys.json") }); t.after(() => store.close());
+  for (let index = 0; index < 220; index += 1) await store.append(event(`run-query-${String(index).padStart(4, "0")}`));
+  const deepPage = await store.queryRuns({ offset: 200, limit: 50 });
+  assert.equal(deepPage.total, 220);
+  assert.equal(deepPage.items.length, 20);
+  assert.equal((await store.queryRuns({ limit: 0 })).items.length, 0);
+});
+
 test("SQLite audit append serializes independent writer processes", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-audit-processes-")); t.after(() => rm(root, { recursive: true, force: true })); const path = join(root, "audit.sqlite"); const keys = join(root, "keys.json"); const worker = fileURLToPath(new URL("../scripts/ci/audit-soak-worker.ts", import.meta.url));
   const run = (id: number) => new Promise<void>((resolve, reject) => { const child = spawn(process.execPath, [worker, path, keys, String(id), "25"], { stdio: ["ignore", "ignore", "pipe"] }); let error = ""; child.stderr.on("data", (chunk) => { error += chunk; }); child.on("error", reject); child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(error))); });

@@ -109,10 +109,10 @@ export class DurableEventIngress {
     if (!WATCH_ID.test(watchId)) throw new Error("event watch id is invalid");
     const declaration = validateAutomationDeclaration(declarationInput);
     if (!declaration.enabled) throw new Error("disabled automation declarations cannot be activated as watches");
-    const existing = this.database.db.prepare("SELECT watch_id, declaration_digest FROM event_watches WHERE watch_id=?").get(watchId) as Row | undefined;
+    const existing = this.database.db.prepare("SELECT watch_id, declaration_digest, enabled FROM event_watches WHERE watch_id=?").get(watchId) as Row | undefined;
     if (existing && String(existing.declaration_digest) !== declaration.declarationDigest) throw new Error("event watch identity is immutable; create a new revision id");
     const count = Number((this.database.db.prepare("SELECT count(*) AS count FROM event_watches WHERE enabled=1").get() as Row).count);
-    if (!existing && count >= this.maxWatches) throw new Error("event watch capacity reached");
+    if (count >= this.maxWatches && (!existing || Number(existing.enabled) !== 1)) throw new Error("event watch capacity reached");
     const at = timestamp();
     this.database.db.prepare(`INSERT INTO event_watches(watch_id, declaration_json, declaration_digest, enabled, created_at, updated_at)
       VALUES (?, ?, ?, 1, ?, ?)
@@ -131,6 +131,45 @@ export class DurableEventIngress {
     return (this.database.db.prepare("SELECT * FROM event_watches ORDER BY watch_id LIMIT ? OFFSET ?").all(boundedLimit, boundedOffset) as Row[]).map((row) => ({ watchId: String(row.watch_id), declaration: validateAutomationDeclaration(parse(row.declaration_json)), enabled: Number(row.enabled) === 1, updatedAt: String(row.updated_at) }));
   }
 
+  queryWatches({ limit = 50, offset = 0, query = "", status = "" }: { limit?: number; offset?: number; query?: string; status?: string } = {}) {
+    const safeLimit = Number.isSafeInteger(Number(limit)) && Number(limit) >= 0 ? Math.min(Number(limit), 10_000) : 50;
+    const safeOffset = Number.isSafeInteger(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
+    const needle = String(query).trim();
+    const normalizedStatus = String(status).trim();
+    const conditions = ["1=1"];
+    const parameters: any[] = [];
+    if (normalizedStatus && normalizedStatus !== "enabled" && normalizedStatus !== "disabled") conditions.push("0=1");
+    else if (normalizedStatus === "enabled" || normalizedStatus === "disabled") { conditions.push("enabled = ?"); parameters.push(normalizedStatus === "enabled" ? 1 : 0); }
+    if (needle) { conditions.push("instr(lower('event-watch event watch durable event ingress declaration ' || watch_id || ' ' || declaration_json), lower(?)) > 0"); parameters.push(needle); }
+    const where = conditions.join(" AND ");
+    const totals = this.database.db.prepare(`SELECT count(*) AS total, 0 AS attention FROM event_watches WHERE ${where}`).get(...parameters) as Row;
+    const rows = (this.database.db.prepare(`SELECT * FROM event_watches WHERE ${where}
+      ORDER BY watch_id LIMIT ? OFFSET ?`).all(...parameters, safeLimit, safeOffset) as Row[]).map((row) => ({
+      watchId: String(row.watch_id),
+      declaration: validateAutomationDeclaration(parse(row.declaration_json)),
+      enabled: Number(row.enabled) === 1,
+      updatedAt: String(row.updated_at)
+    }));
+    return {
+      items: rows,
+      total: Number(totals.total || 0),
+      attention: Number(totals.attention || 0),
+      ...(safeOffset + rows.length < Number(totals.total || 0) ? { nextOffset: safeOffset + rows.length, nextCursor: String(safeOffset + rows.length) } : {})
+    };
+  }
+
+  private listActiveWatches(kind?: AutomationDeclaration["kind"]): Array<{ watchId: string; declaration: AutomationDeclaration; enabled: true; updatedAt: string }> {
+    const rows = (this.database.db.prepare(`SELECT * FROM event_watches
+      WHERE enabled = 1${kind ? " AND json_extract(declaration_json, '$.kind') = ?" : ""}
+      ORDER BY watch_id`).all(...(kind ? [kind] : [])) as Row[]);
+    return rows.map((row) => ({
+      watchId: String(row.watch_id),
+      declaration: validateAutomationDeclaration(parse(row.declaration_json)),
+      enabled: true as const,
+      updatedAt: String(row.updated_at)
+    }));
+  }
+
   countWatches(): number {
     return Number((this.database.db.prepare("SELECT count(*) AS count FROM event_watches").get() as Row).count || 0);
   }
@@ -143,7 +182,7 @@ export class DurableEventIngress {
     if (event.sequence < source.oldestSequence) throw new Error("event cursor is stale");
     const duplicate = event.sequence === source.newestSequence;
     if (!duplicate && event.sequence !== source.newestSequence + 1) throw new Error("event cursor is not the next authoritative sequence");
-    const watches = this.listWatches().filter((watch) => watch.enabled && watch.declaration.kind === "event");
+    const watches = this.listActiveWatches("event");
     const window = { source: source.source, oldestAvailableSequence: source.oldestSequence, oldestAvailableCursor: formatAutomationCursor(source.source, source.oldestSequence), newestAvailableSequence: event.sequence, newestAvailableCursor: event.cursor };
     const replayWindow = event.sequence === source.oldestSequence ? window : { ...window, afterCursor: formatAutomationCursor(source.source, event.sequence - 1) };
     const candidates = watches.map((watch) => matchAutomationEvent(watch.declaration, event, replayWindow)).filter((candidate): candidate is AutomationCandidate => Boolean(candidate));
@@ -175,8 +214,7 @@ export class DurableEventIngress {
   async heartbeat(nowUnixMs = Date.now()): Promise<AutomationCandidate[]> {
     if (!Number.isSafeInteger(nowUnixMs) || nowUnixMs < 0) throw new Error("heartbeat time is invalid");
     const candidates: AutomationCandidate[] = [];
-    for (const watch of this.listWatches()) {
-      if (!watch.enabled || watch.declaration.kind !== "schedule") continue;
+    for (const watch of this.listActiveWatches("schedule")) {
       const checkpoint = this.database.db.prepare("SELECT last_tick_unix_ms FROM heartbeat_checkpoints WHERE name=?").get(watch.watchId) as Row | undefined;
       const after = checkpoint ? Number(checkpoint.last_tick_unix_ms) : nowUnixMs - 1;
       const occurrence = nextAutomationDue(watch.declaration, after);

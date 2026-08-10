@@ -52,6 +52,56 @@ async function waitForJob(store: SqliteJobStore, id: string, status: string) {
   throw new Error(`runtime job ${id} did not reach ${status}: ${JSON.stringify(current)}`);
 }
 
+test("SQLite supervisor drains more than the operator list window in FIFO order", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-queue-boundary-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  const ids = Array.from({ length: 600 }, (_, index) => `queued-${String(index).padStart(4, "0")}`);
+  for (const id of ids) {
+    await store.create({ id, status: "queued", payload: { task: { id, tool: "text.echo", input: { text: id } } } });
+  }
+  let signalFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    signalFirstStarted = resolve;
+  });
+  let releaseFirst!: () => void;
+  let first = true;
+  const executions: string[] = [];
+  const supervisor = new JobSupervisor({
+    store,
+    concurrency: 1,
+    execute: async (payload) => {
+      const id = String((payload.task as JsonObject).id);
+      executions.push(id);
+      if (first) {
+        first = false;
+        signalFirstStarted();
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return { ok: true };
+    }
+  });
+  t.after(() => supervisor.shutdown());
+  await supervisor.start();
+  await firstStarted.catch(() => undefined);
+  releaseFirst();
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const row = ledger.database.db.prepare("SELECT COUNT(*) AS count FROM runtime_jobs WHERE status = 'completed'").get() as { count: number };
+    if (Number(row.count) === ids.length) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const statuses = ledger.database.db.prepare("SELECT status, COUNT(*) AS count FROM runtime_jobs GROUP BY status").all() as Array<{ status: string; count: number }>;
+  assert.deepEqual(Object.fromEntries(statuses.map((row) => [row.status, Number(row.count)])), { completed: ids.length });
+  assert.deepEqual(executions, ids);
+  const deepPage = await store.queryJobs({ status: "completed", offset: 500, limit: 100 });
+  assert.equal(deepPage.total, ids.length);
+  assert.equal(deepPage.items.length, 100);
+});
+
 test("live dispatch uses volatile input while restart fails closed when redacted input is unavailable", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-volatile-input-"));
   t.after(() => rm(root, { recursive: true, force: true }));
