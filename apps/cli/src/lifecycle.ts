@@ -11,6 +11,7 @@ import {
   createStateBackup,
   inspectStateSchemas,
   restoreStateBackup,
+  sanitizedChildEnvironment,
   STATE_SCHEMA_TARGETS,
   type StateSchemaVersions
 } from "@odinn/kernel";
@@ -92,7 +93,7 @@ export async function checkForUpdate(options: UpdateCheckOptions) {
     applicationRollbackCompatible: rollbackCompatible,
     downloadSize: release.sizes[artifactName] ?? null,
     releaseNotesLocation: release.releaseNotesLocation,
-    verificationRequirements: ["immutable Git tag commit", "SHA-256 checksum", "Odinn release manifest identity", "package release-info identity"],
+    verificationRequirements: ["immutable Git tag commit", "SHA-256 checksum", "GitHub build attestation", "Odinn release manifest identity", "package release-info identity"],
     artifact: artifactName,
     manifestLocation: release.manifestLocation
   };
@@ -443,6 +444,7 @@ async function discoverRelease(options: UpdateCheckOptions): Promise<ReleaseSour
     if (!asset?.browser_download_url) throw new Error(`release does not contain ${name}`);
     artifactLocations[name] = String(asset.browser_download_url);
     sizes[name] = Number(asset.size) || 0;
+    await verifyGitHubReleaseAttestation({ artifactName: name, artifactDigest: manifest.archiveSha256[name], version: manifest.version, commit: manifest.commit });
   }
   return {
     manifest,
@@ -453,6 +455,51 @@ async function discoverRelease(options: UpdateCheckOptions): Promise<ReleaseSour
     channel: release.prerelease ? "prerelease" : "stable",
     sizes
   };
+}
+
+const EXPECTED_RELEASE_REPOSITORY = "BlueDot-IT/Odinn-Forge";
+
+export async function verifyGitHubReleaseAttestation({
+  artifactName,
+  artifactDigest,
+  version,
+  commit,
+  fetchImplementation = globalThis.fetch
+}: {
+  artifactName: string;
+  artifactDigest: string;
+  version: string;
+  commit: string;
+  fetchImplementation?: typeof fetch;
+}): Promise<void> {
+  if (!safeAssetName(artifactName) || !/^[a-f0-9]{64}$/u.test(artifactDigest)) throw new Error("release attestation input is invalid");
+  const response = await fetchImplementation(`${DEFAULT_REPOSITORY_API}/attestations/${encodeURIComponent(`sha256:${artifactDigest}`)}`, {
+    headers: { accept: "application/vnd.github+json", "user-agent": "odinn-update-check" },
+    redirect: "error"
+  });
+  if (!response.ok) throw new Error(`release attestation lookup failed with HTTP ${response.status}`);
+  const body = await boundedJson(response, MAX_METADATA_BYTES);
+  const attestations = body && typeof body === "object" && Array.isArray((body as any).attestations) ? (body as any).attestations : [];
+  const expectedDigest = artifactDigest;
+  for (const attestation of attestations) {
+    if (attestation?.verification_status !== "verified") continue;
+    const payloadText = attestation?.bundle?.dsseEnvelope?.payload;
+    if (typeof payloadText !== "string") continue;
+    let statement: any;
+    try { statement = JSON.parse(Buffer.from(payloadText, "base64").toString("utf8")); }
+    catch { continue; }
+    const subjects = Array.isArray(statement?.subject) ? statement.subject : [];
+    const subjectMatches = subjects.some((subject: any) => String(subject?.name) === artifactName && String(subject?.digest?.sha256) === expectedDigest);
+    if (!subjectMatches) continue;
+    if (!String(statement?.predicateType ?? "").startsWith("https://slsa.dev/provenance/")) continue;
+    const serialized = JSON.stringify(statement);
+    const repositoryMatches = serialized.includes(EXPECTED_RELEASE_REPOSITORY)
+      || serialized.includes(`https://github.com/${EXPECTED_RELEASE_REPOSITORY}`)
+      || serialized.includes(`git+https://github.com/${EXPECTED_RELEASE_REPOSITORY}`);
+    if (!repositoryMatches || !serialized.includes(commit) || !serialized.includes(`v${version}`) || !serialized.includes("release.yml")) continue;
+    return;
+  }
+  throw new Error(`no verified GitHub build attestation matched ${artifactName} at ${commit}`);
 }
 
 export async function resolveGitHubTagCommit(tagName: string, fetchImplementation: typeof fetch = globalThis.fetch): Promise<string> {
@@ -688,7 +735,7 @@ function runCommand(command: string, args: string[], cwd: string): { stdout: str
     cwd,
     encoding: "utf8",
     shell: false,
-    env: { ...process.env, ODINN_NONINTERACTIVE: "1" }
+    env: { ...sanitizedChildEnvironment(), ODINN_NONINTERACTIVE: "1" }
   });
   if (result.status !== 0) {
     throw new Error(`${basename(command)} failed: ${String(result.stderr || result.stdout || result.error?.message).trim()}`);

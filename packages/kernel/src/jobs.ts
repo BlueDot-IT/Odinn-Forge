@@ -3,6 +3,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve, sep } from "node:path";
 import type { JsonObject } from "@odinn/protocol";
+import { configuredCredentialEnvironmentKeys, sanitizedChildEnvironment } from "./environment.ts";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 
@@ -460,6 +461,14 @@ interface PendingRequest {
   finish(error?: Error, result?: unknown): void;
 }
 
+export function sanitizedWorkerEnvironment(config?: unknown): NodeJS.ProcessEnv {
+  const environment = sanitizedChildEnvironment(process.env, configuredCredentialEnvironmentKeys(config));
+  for (const key of ["ODINN_ANTIGRAVITY_CLI", "ODINN_CHROMIUM_PATH", "ODINN_EXTENSION_CONTAINER_RUNTIME", "ODINN_SEARCH_ENDPOINT"]) {
+    if (process.env[key] !== undefined) environment[key] = process.env[key];
+  }
+  return environment;
+}
+
 function isWorkerResponse(message: unknown): message is WorkerResponse {
   return Boolean(message && typeof message === "object" && "ok" in message && typeof (message as { ok?: unknown }).ok === "boolean");
 }
@@ -487,7 +496,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
       return browserExecutor({ ...payload, workspaceRoot: taskWorkspaceRoot }, { signal, job });
     }
     return new Promise<unknown>((resolve, reject) => {
-      const child = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+      const child = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"], env: sanitizedWorkerEnvironment(config) });
       children.add(child);
       let settled = false;
       let abortGraceTimer: NodeJS.Timeout | undefined;
@@ -557,7 +566,7 @@ function createPersistentWorkerExecutor(options: WorkerConfiguration & { workerP
 
   const ensureChild = (): ChildProcess => {
     if (child?.connected) return child;
-    const currentChild = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    const currentChild = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"], env: sanitizedWorkerEnvironment(config) });
     child = currentChild;
     currentChild.on("message", (message) => {
       if (!isWorkerResponse(message) || typeof message.id !== "string") return;

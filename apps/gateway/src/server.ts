@@ -4,7 +4,7 @@ import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, loadEnvironmentFiles, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readEnvironmentFiles, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
@@ -8924,16 +8924,23 @@ function renderConsoleHtml(version = "development") {
 `;
 }
 
-function invocationRoot() {
-  return resolve(process.env.INIT_CWD ?? process.cwd());
+function invocationRoot(environment: NodeJS.ProcessEnv = process.env) {
+  return resolve(environment.INIT_CWD ?? process.cwd());
 }
 
 if (isGatewayEntrypoint()) {
-  const workspaceRoot = invocationRoot();
-  const parentEnvironmentKeys = new Set(Object.keys(process.env));
-  loadEnvironmentFiles({ workspaceRoot, stateDir: workspaceRoot, protectedKeys: parentEnvironmentKeys });
-  const stateDir = resolve(workspaceRoot, process.env.ODINN_STATE_DIR ?? ".odinn");
-  loadEnvironmentFiles({ workspaceRoot, stateDir, protectedKeys: parentEnvironmentKeys });
+  const parentEnvironment = { ...process.env };
+  const parentEnvironmentKeys = new Set(Object.keys(parentEnvironment));
+  const workspaceRoot = invocationRoot(parentEnvironment);
+  const stateDir = resolve(workspaceRoot, parentEnvironment.ODINN_STATE_DIR ?? ".odinn");
+  assertPhysicalDirectory(stateDir);
+  const environmentFiles = readEnvironmentFiles({ workspaceRoot, stateDir });
+  let config: unknown;
+  try { config = JSON.parse(await readFile(join(stateDir, "config.json"), "utf8")); }
+  catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+  const workspaceCredentialKeys = configuredCredentialEnvironmentKeys(config);
+  applyEnvironmentValues(environmentFiles.workspace, process.env, { protectedKeys: parentEnvironmentKeys, allowedKeys: workspaceCredentialKeys });
+  applyEnvironmentValues(environmentFiles.state, process.env, { protectedKeys: parentEnvironmentKeys });
   const host = process.env.ODINN_HOST ?? "127.0.0.1";
   assertLoopbackHost(host);
   const port = Number.parseInt(process.env.ODINN_PORT ?? "18790", 10);

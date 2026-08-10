@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { withStateMutationLock } from "../state-mutation.ts";
+import { sanitizedChildEnvironment } from "../environment.ts";
 
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string; details?: AnyRecord };
@@ -467,7 +468,7 @@ async function chatWithAntigravity(provider: any, parsed: any, messages: any, in
   const timeoutMs = normalizeTimeout(input.timeoutMs);
   const content = await new Promise<string>((resolveOutput, rejectOutput) => {
     const child = spawn(executable, executableArgs, {
-      env: { PATH: process.env.PATH ?? "", ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
+      env: sanitizedChildEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       windowsHide: true

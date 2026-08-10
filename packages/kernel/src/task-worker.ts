@@ -1,4 +1,4 @@
-import { closeBrowserManagers, createAuditStore, createApprovalStore, createBuiltInRegistry, createRunLedger, normalizeExperimentalFlags, runPlan, runTask } from "./index.ts";
+import { closeBrowserManagers, createAuditStore, createApprovalStore, createBuiltInRegistry, createRunLedger, normalizeExperimentalFlags, runPlan, runTask, withStateMutationLock } from "./index.ts";
 import { createSandboxProcessExecutor } from "./sandbox-process.ts";
 import { join } from "node:path";
 import type { RuntimePolicy } from "@odinn/policy";
@@ -20,7 +20,7 @@ interface TaskWorkerMessage {
 const messageError = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 async function executeMessage(rawMessage: unknown) {
-  let runLedger;
+  let runLedger: ReturnType<typeof createRunLedger> | undefined;
   let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
   let auditStore: ReturnType<typeof createAuditStore> | undefined;
   const controller = new AbortController();
@@ -30,12 +30,14 @@ async function executeMessage(rawMessage: unknown) {
     if (!rawMessage || typeof rawMessage !== "object") throw new Error("task worker received an invalid envelope");
     const { payload, stateDir, workspaceRoot, config = {}, policy, trustedRecovery } = rawMessage as TaskWorkerMessage;
     if (!payload || !stateDir || !workspaceRoot) throw new Error("task worker received an incomplete envelope");
-    auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
-    const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
-    const processExecutor = createSandboxProcessExecutor({ workspaceRoot, stateDir, config });
-    const registryOptions = { workspaceRoot, stateDir, config, approvalStore, auditStore, processExecutor };
-    registry = createBuiltInRegistry(registryOptions);
-    runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+    await withStateMutationLock(stateDir, async () => {
+      auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
+      const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
+      const processExecutor = createSandboxProcessExecutor({ workspaceRoot, stateDir, config });
+      const registryOptions = { workspaceRoot, stateDir, config, approvalStore, auditStore, processExecutor };
+      registry = createBuiltInRegistry(registryOptions);
+      runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+    });
     const result = payload.plan
       ? await runPlan({ plan: payload.plan, auditStore, policy, registry, runLedger, actor: payload.actor, signal: controller.signal, durableExecution: payload.durableExecution === true })
       : await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: controller.signal, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: trustedRecovery === true, durableExecution: payload.durableExecution === true, parentCapabilities: payload.parentCapabilities });

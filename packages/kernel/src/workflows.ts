@@ -27,7 +27,7 @@ export class DurableWorkflowRuntime {
   readonly dispatch: WorkflowRuntimeOptions["dispatch"];
   readonly concurrency: number;
   readonly onEvent?: WorkflowRuntimeOptions["onEvent"];
-  #active = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+  #active = new Map<string, { runId: string; controller: AbortController; promise: Promise<void> }>();
   #draining = false;
   #stopping = false;
   #started = false;
@@ -70,8 +70,7 @@ export class DurableWorkflowRuntime {
   events(runId: string, limit?: number) { return this.store.events(runId, limit); }
 
   async cancel(runId: string): Promise<WorkflowRunRecord> {
-    const active = this.#active.get(runId);
-    active?.controller.abort(new Error("workflow cancelled by operator"));
+    for (const active of this.#active.values()) if (active.runId === runId) active.controller.abort(new Error("workflow cancelled by operator"));
     const result = this.store.cancel(runId);
     await this.emit(runId, "workflow.cancelled", {});
     return result;
@@ -100,9 +99,10 @@ export class DurableWorkflowRuntime {
         if (!step) break;
         const controller = new AbortController();
         const promise = this.execute(step, controller);
-        this.#active.set(step.runId, { controller, promise });
+        const activeKey = `${step.runId}:${step.stepId}:${step.leaseToken}`;
+        this.#active.set(activeKey, { runId: step.runId, controller, promise });
         void promise.finally(() => {
-          if (this.#active.get(step.runId)?.promise === promise) this.#active.delete(step.runId);
+          if (this.#active.get(activeKey)?.promise === promise) this.#active.delete(activeKey);
           void this.drain();
         });
       }

@@ -131,6 +131,7 @@ test("approval records survive restart and consume exactly once for the bound ac
   const claimed = restarted.claim(id);
   assert.equal(claimed.status, "approved");
   assert.equal(claimed.runId, "run-browser-click");
+  assert.equal(createApprovalStore({ path }).list()[0].status, "claimed");
   const secondClaim = createApprovalStore({ path }).claim(id);
   assert.equal(secondClaim.status, "approved");
   assert.equal(secondClaim.runId, claimed.runId);
@@ -151,6 +152,21 @@ test("approval records survive restart and consume exactly once for the bound ac
   assert.equal(consumed?.id, id);
   assert.equal(createApprovalStore({ path }).consume(id, action), undefined);
   assert.deepEqual(createApprovalStore({ path }).list(), []);
+});
+
+test("claimed approvals expire and release durable capacity after an interrupted claim", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-claim-expiry-"));
+  const path = join(stateDir, "approvals.json");
+  const store = createApprovalStore({ path });
+  const id = store.create({ tool: "browser.click", runId: "interrupted-claim", input: { selector: "#send" } });
+  assert.equal(store.claim(id)?.status, "approved");
+  const persisted = JSON.parse(await readFile(path, "utf8"));
+  persisted.approvals[0].expiresAt = Date.now() - 1;
+  await writeFile(path, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
+  assert.equal(createApprovalStore({ path }).recover(id), undefined);
+  assert.deepEqual(createApprovalStore({ path }).list(), []);
+  assert.doesNotMatch(await readFile(path, "utf8"), new RegExp(id));
+  assert.ok(createApprovalStore({ path }).create({ tool: "browser.click", input: { selector: "#new" } }));
 });
 
 test("process approval bindings survive a worker restart without persisting command contents", async () => {

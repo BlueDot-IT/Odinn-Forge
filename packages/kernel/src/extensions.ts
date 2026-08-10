@@ -6,6 +6,7 @@ import { redact } from "./run-ledger.ts";
 import { materializeSandboxBundle } from "./sandbox-bundle.ts";
 import { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, compileSandboxProfile, detectOciBackend, validateDigestPinnedOciImage, type OciCapabilityProbe, type SandboxExecutionResult, type SandboxInteractiveSession } from "./sandbox-backend.ts";
 import { normalizeSandboxConfig, type SandboxConfig, type SandboxConfigInput } from "./sandbox-config.ts";
+import { withStateMutationLock } from "./state-mutation.ts";
 import type { JsonObject } from "@odinn/protocol";
 
 const EXTENSION_SCHEMA_VERSION = 1;
@@ -155,7 +156,7 @@ export class ExtensionRegistry {
   }
 
   async mutate<T>(fn: StateMutation<T>): Promise<T> {
-    const operation = this.writeChain.then(async () => {
+    const operation = this.writeChain.then(() => withStateMutationLock(dirname(this.path), async () => {
       const state = await this.readState();
       const result = await fn(state);
       await mkdir(dirname(this.path), { recursive: true });
@@ -163,7 +164,7 @@ export class ExtensionRegistry {
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
       await rename(temporary, this.path);
       return result;
-    });
+    }));
     this.writeChain = operation.catch(() => undefined);
     return operation;
   }
