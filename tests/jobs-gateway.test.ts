@@ -167,8 +167,8 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
   await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
   const providerPort = (provider.address() as any).port;
   const configPath = join(stateDir, "config.json");
-  const previousKey = process.env.ODINN_STAGE7_PROVIDER_KEY;
-  process.env.ODINN_STAGE7_PROVIDER_KEY = "stage7-test-key";
+  const previousKey = process.env.ODINN_STAGE7_PROVIDER_API_KEY;
+  process.env.ODINN_STAGE7_PROVIDER_API_KEY = "stage7-test-key";
   const manifest = validateExecutableAgentManifest(JSON.stringify({
     schemaVersion: 1,
     id: "reader",
@@ -189,7 +189,7 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
     version: 1,
     runtime: { enableAgentGraphs: true },
     defaultModel: "test:test-model",
-    providers: { test: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${providerPort}/v1`, apiKeyEnv: "ODINN_STAGE7_PROVIDER_KEY", models: ["test-model"] } },
+    providers: { test: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${providerPort}/v1`, apiKeyEnv: "ODINN_STAGE7_PROVIDER_API_KEY", models: ["test-model"] } },
     channels: {}
   }, null, 2)}\n`, { mode: 0o600 });
   const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
@@ -244,8 +244,8 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
-    if (previousKey === undefined) delete process.env.ODINN_STAGE7_PROVIDER_KEY;
-    else process.env.ODINN_STAGE7_PROVIDER_KEY = previousKey;
+    if (previousKey === undefined) delete process.env.ODINN_STAGE7_PROVIDER_API_KEY;
+    else process.env.ODINN_STAGE7_PROVIDER_API_KEY = previousKey;
   }
 });
 
@@ -268,13 +268,13 @@ test("gateway serves completed agent.run channel output only through the ephemer
   });
   await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
   const providerPort = (provider.address() as any).port;
-  const previousKey = process.env.ODINN_STAGE7_CHANNEL_KEY;
-  process.env.ODINN_STAGE7_CHANNEL_KEY = "stage7-channel-key";
+  const previousKey = process.env.ODINN_STAGE7_CHANNEL_API_KEY;
+  process.env.ODINN_STAGE7_CHANNEL_API_KEY = "stage7-channel-key";
   await mkdir(stateDir, { recursive: true });
   await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
     version: 1,
     defaultModel: "test:test-model",
-    providers: { test: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${providerPort}/v1`, apiKeyEnv: "ODINN_STAGE7_CHANNEL_KEY", models: ["test-model"] } },
+    providers: { test: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${providerPort}/v1`, apiKeyEnv: "ODINN_STAGE7_CHANNEL_API_KEY", models: ["test-model"] } },
     channels: {}
   }, null, 2)}\n`, { mode: 0o600 });
   const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
@@ -310,8 +310,8 @@ test("gateway serves completed agent.run channel output only through the ephemer
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
-    if (previousKey === undefined) delete process.env.ODINN_STAGE7_CHANNEL_KEY;
-    else process.env.ODINN_STAGE7_CHANNEL_KEY = previousKey;
+    if (previousKey === undefined) delete process.env.ODINN_STAGE7_CHANNEL_API_KEY;
+    else process.env.ODINN_STAGE7_CHANNEL_API_KEY = previousKey;
   }
 });
 

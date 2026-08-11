@@ -26,6 +26,10 @@ write human-readable progress or open a user interface. Errors write a
 credential-redacted message to standard error and return a nonzero exit code;
 success returns `0`. Human-readable wording is not an automation interface.
 
+The default state directory is `~/.odinn`. Project-local state is never inferred
+from repository contents; select it deliberately with `--state <directory>` or
+`ODINN_STATE_DIR` when that trust decision is intended.
+
 The stable command groups are:
 
 | Purpose | Inputs | Output |
@@ -52,7 +56,7 @@ services, plugin modules, extensions, Agent SDK, or Skill SDK surfaces.
 The single-user gateway listens on `http://127.0.0.1:18790/` by default.
 Loading `GET /` creates an HttpOnly, SameSite bootstrap cookie for the console.
 Scripts should instead read the owner-only `gateway.token` file inside the
-configured state directory (`.odinn/gateway.token` by default) and send:
+configured state directory (`~/.odinn/gateway.token` by default) and send:
 
 ```http
 Authorization: Bearer <gateway token>

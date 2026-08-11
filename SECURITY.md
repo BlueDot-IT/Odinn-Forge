@@ -58,11 +58,21 @@ odinn config security set --surface browser --require-approval false
 
 Private-network access can expose local services and metadata endpoints. Disabling browser approval allows the model to drive external accounts without a human checkpoint. Those settings are operator decisions, not safe defaults.
 
-Workspace `.env` files cannot set executable selectors or network service
-endpoints. `ODINN_CHROMIUM_PATH`, `ODINN_EXTENSION_CONTAINER_RUNTIME`, and
-`ODINN_SEARCH_ENDPOINT` are accepted only from the parent process or the
-operator-owned state `.env`. Explicit capability arrays remain exact across
-upgrades and are never widened by default migration.
+The default state directory is the operator-owned `~/.odinn`. A repository-local
+`.odinn` directory is workspace content unless the operator explicitly selects
+it with `--state` or `ODINN_STATE_DIR`; merely cloning `.odinn/config.json` never
+adopts it as trusted state. Workspace `.env` files cannot set executable
+selectors, network service endpoints, authentication controls, or other runtime
+controls. Existing repository-local state is reported with an actionable
+migration notice, but is never adopted automatically. Configured workspace
+credential names must use a credential suffix (`_API_KEY`, `_TOKEN`, `_SECRET`,
+`_PASSWORD`, `_CLIENT_ID`, `_CLIENT_SECRET`, `_APP_ID`, or `_TENANT_ID`) and
+cannot alias reserved controls; invalid names are rejected when configuration is
+written. `ODINN_CHROMIUM_PATH`,
+`ODINN_EXTENSION_CONTAINER_RUNTIME`, and `ODINN_SEARCH_ENDPOINT` are accepted
+only from the parent process or the explicitly selected operator state `.env`.
+Explicit capability arrays remain exact across upgrades and are never widened
+by default migration.
 
 The web tools follow redirects through the same URL policy and enforce blocked/allowed domains at each hop. `web.fetch` resolves DNS, rejects private/link-local/metadata ranges, and pins the validated address into the request so validation and connection do not use separate DNS answers. Browser navigation and post-action snapshots are checked against the same network and domain rules. Workspace reads resolve real paths and reject escaping symlinks. Ódinn does not expose file upload or download tools.
 

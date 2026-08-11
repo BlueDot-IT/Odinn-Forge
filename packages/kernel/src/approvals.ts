@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { redactDurableValue } from "@odinn/protocol";
 
 type NodeError = Error & { code?: string };
@@ -84,12 +84,7 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
       } catch (error) {
         const failure = error as NodeError;
         if (failure.code !== "EEXIST") throw error;
-        if (allowRecovery && staleApprovalLock(lockPath)) {
-          try {
-            unlinkSync(lockPath);
-          } catch (unlinkError) {
-            if ((unlinkError as NodeError).code !== "ENOENT") throw unlinkError;
-          }
+        if (allowRecovery && quarantineStaleApprovalLock(lockPath)) {
           return acquire(false);
         }
         const busy = new Error("approval store is busy; refusing an unsafe concurrent claim") as NodeError;
@@ -269,23 +264,102 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
   };
 }
 
-function staleApprovalLock(path: string) {
+type ApprovalLockSnapshot = {
+  identity: string;
+  raw: string;
+  mtimeMs: number;
+  token?: string;
+  pid?: number;
+  createdAt?: number;
+};
+
+function quarantineStaleApprovalLock(lockPath: string): boolean {
+  const expected = approvalLockSnapshot(lockPath);
+  if (!expected || !staleApprovalSnapshot(expected)) return false;
+  const recoveryIdentity = expected.token ?? `identity:${expected.identity}`;
+  const identityDigest = createHash("sha256").update(recoveryIdentity).digest("hex");
+  const recoveryPath = join(dirname(lockPath), `.odinn-approval-lock-recovery.${createHash("sha256").update(`${lockPath}\0${recoveryIdentity}`).digest("hex")}`);
+  const recoveryToken = randomUUID();
+  if (!acquireApprovalRecoveryMarker(recoveryPath, recoveryToken, true)) return false;
+
   try {
-    const lease = JSON.parse(readFileSync(path, "utf8"));
-    const ageMs = Date.now() - Number(lease?.createdAt ?? statSync(path).mtimeMs);
-    if (!Number.isInteger(lease?.pid) || lease.pid < 1 || ageMs < 5_000) return false;
+    const current = approvalLockSnapshot(lockPath);
+    if (!current || current.identity !== expected.identity || !staleApprovalSnapshot(current)) return false;
+    const quarantinePath = join(dirname(lockPath), `.odinn-approval-stale-lock.${createHash("sha256").update(lockPath).digest("hex")}.${identityDigest}.${recoveryToken}`);
     try {
-      process.kill(lease.pid, 0);
-      return false;
+      renameSync(lockPath, quarantinePath);
     } catch (error) {
-      return (error as NodeError).code === "ESRCH";
+      if ((error as NodeError).code === "ENOENT") return true;
+      throw error;
     }
-  } catch {
+    const quarantined = approvalLockSnapshot(quarantinePath);
+    if (!quarantined || quarantined.identity !== expected.identity) {
+      throw new Error("approval lock changed during stale-lock quarantine; refusing recovery");
+    }
+    return true;
+  } finally {
     try {
-      return Date.now() - statSync(path).mtimeMs >= 5_000;
-    } catch {
-      return false;
+      const recovery = JSON.parse(readFileSync(recoveryPath, "utf8"));
+      if (recovery?.token === recoveryToken) unlinkSync(recoveryPath);
+    } catch (error) {
+      if ((error as NodeError).code !== "ENOENT") throw error;
     }
+  }
+}
+
+function approvalLockSnapshot(path: string): ApprovalLockSnapshot | undefined {
+  try {
+    const before = statSync(path);
+    const raw = readFileSync(path, "utf8");
+    const after = statSync(path);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) return undefined;
+    let lease: any;
+    try { lease = JSON.parse(raw); } catch { lease = undefined; }
+    const physicalIdentity = `${after.dev}:${after.ino}:${after.birthtimeMs}:${after.size}:${createHash("sha256").update(raw).digest("hex")}`;
+    return {
+      identity: createHash("sha256").update(physicalIdentity).digest("hex"),
+      raw,
+      mtimeMs: after.mtimeMs,
+      ...(typeof lease?.token === "string" ? { token: lease.token } : {}),
+      ...(Number.isInteger(lease?.pid) ? { pid: Number(lease.pid) } : {}),
+      ...(Number.isFinite(Number(lease?.createdAt)) ? { createdAt: Number(lease.createdAt) } : {})
+    };
+  } catch (error) {
+    if ((error as NodeError).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function staleApprovalSnapshot(snapshot: ApprovalLockSnapshot): boolean {
+  const ageMs = Date.now() - (snapshot.createdAt ?? snapshot.mtimeMs);
+  if (ageMs < 5_000) return false;
+  if (!snapshot.token || !Number.isInteger(snapshot.pid) || Number(snapshot.pid) < 1) return true;
+  try {
+    process.kill(Number(snapshot.pid), 0);
+    return false;
+  } catch (error) {
+    return (error as NodeError).code === "ESRCH";
+  }
+}
+
+function acquireApprovalRecoveryMarker(recoveryPath: string, token: string, allowRecovery: boolean): boolean {
+  try {
+    const descriptor = openSync(recoveryPath, "wx", 0o600);
+    try {
+      writeFileSync(descriptor, JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }));
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeError).code !== "EEXIST") throw error;
+    // Apply the same token-bound protocol recursively. A dead recovery owner
+    // is never removed until a distinct recovery marker has been acquired.
+    if (allowRecovery && quarantineStaleApprovalLock(recoveryPath)) {
+      return acquireApprovalRecoveryMarker(recoveryPath, token, false);
+    }
+    return false;
   }
 }
 

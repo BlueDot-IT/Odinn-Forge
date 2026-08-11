@@ -21,6 +21,8 @@ type Row = Record<string, any>;
 const TERMINAL_STEP_STATUSES = new Set<WorkflowStepStatus>(["completed", "failed", "cancelled", "needs-review"]);
 const TERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>(["completed", "failed", "cancelled", "needs-review"]);
 const LEASE_MS = 120_000;
+const DEFAULT_CANCELLATION_GRACE_MS = 30_000;
+const DEFAULT_FAILURE_STOP_GRACE_MS = 30_000;
 
 function now(): string { return new Date().toISOString(); }
 function parse(value: unknown, fallback: any = {}) { try { return typeof value === "string" ? JSON.parse(value) : fallback; } catch { return fallback; } }
@@ -86,6 +88,17 @@ function initialize(database: SqliteStore): void {
     CREATE INDEX IF NOT EXISTS idx_workflow_steps_status ON workflow_steps(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_workflow_events_run ON workflow_events(run_id, sequence);
   `);
+  const runColumns = new Set((database.db.prepare("PRAGMA table_info(workflow_runs)").all() as Row[]).map((column) => String(column.name)));
+  for (const [column, definition] of [
+    ["cancellation_requested_at", "TEXT"],
+    ["cancellation_deadline_at", "TEXT"],
+    ["failure_requested_at", "TEXT"],
+    ["failure_deadline_at", "TEXT"]
+  ] as const) {
+    if (runColumns.has(column)) continue;
+    try { database.db.exec(`ALTER TABLE workflow_runs ADD COLUMN ${column} ${definition}`); }
+    catch (error) { if (!String((error as Error)?.message ?? error).includes("duplicate column name")) throw error; }
+  }
 }
 
 function durableProjection(value: unknown): { value: unknown; digest: string; recoveryInputAvailable: boolean } {
@@ -124,6 +137,11 @@ export type ClaimedWorkflowStep = WorkflowStepRecord & {
   definition: WorkflowDefinition;
   leaseToken: string;
   leaseExpiresAt: string;
+};
+
+export type WorkflowRecoveryResult = {
+  recovered: WorkflowRunRecord[];
+  nextRecoveryAt?: string;
 };
 
 export class SqliteWorkflowStore {
@@ -172,9 +190,12 @@ export class SqliteWorkflowStore {
   get(runId: string): WorkflowRunRecord | undefined {
     const row = this.database.db.prepare("SELECT * FROM workflow_runs WHERE run_id = ?").get(runId) as Row | undefined;
     if (!row) return undefined;
+    const storedStatus = String(row.status) as WorkflowRunStatus;
+    const status = row.cancellation_requested_at && !TERMINAL_RUN_STATUSES.has(storedStatus) ? "cancelling"
+      : row.failure_requested_at && !TERMINAL_RUN_STATUSES.has(storedStatus) ? "stopping" : storedStatus;
     return {
       runId: String(row.run_id), principalId: String(row.principal_id), idempotencyKey: String(row.idempotency_key),
-      definitionId: String(row.definition_id), definitionDigest: String(row.definition_digest), status: String(row.status) as WorkflowRunStatus,
+      definitionId: String(row.definition_id), definitionDigest: String(row.definition_digest), status,
       inputDigest: String(row.input_digest), recoveryInputAvailable: Number(row.recovery_input_available) === 1,
       createdAt: String(row.created_at), updatedAt: String(row.updated_at), steps: stepsFor(this.database, String(row.run_id))
     };
@@ -193,7 +214,14 @@ export class SqliteWorkflowStore {
     const normalizedStatus = String(status).trim();
     const conditions = ["1=1"];
     const parameters: any[] = [];
-    if (normalizedStatus) { conditions.push("status = ?"); parameters.push(normalizedStatus); }
+    if (normalizedStatus === "cancelling") conditions.push("cancellation_requested_at IS NOT NULL AND status NOT IN ('completed','failed','cancelled','needs-review')");
+    else if (normalizedStatus === "stopping") conditions.push("cancellation_requested_at IS NULL AND failure_requested_at IS NOT NULL AND status NOT IN ('completed','failed','cancelled','needs-review')");
+    else if (normalizedStatus) {
+      conditions.push(TERMINAL_RUN_STATUSES.has(normalizedStatus as WorkflowRunStatus)
+        ? "status = ?"
+        : "status = ? AND cancellation_requested_at IS NULL AND failure_requested_at IS NULL");
+      parameters.push(normalizedStatus);
+    }
     if (needle) { conditions.push("instr(lower('workflow durable workflow run ' || run_id || ' ' || definition_id || ' ' || definition_digest || ' ' || status), lower(?)) > 0"); parameters.push(needle); }
     const where = conditions.join(" AND ");
     const totals = this.database.db.prepare(`SELECT count(*) AS total,
@@ -215,13 +243,15 @@ export class SqliteWorkflowStore {
     return { total: Number(row.total || 0), attention: Number(row.attention || 0) };
   }
 
-  claimNext(runId?: string): ClaimedWorkflowStep | undefined {
+  claimNext(runId?: string, leaseMs = LEASE_MS): ClaimedWorkflowStep | undefined {
     const timestamp = now();
+    const boundedLeaseMs = Math.max(25, Math.min(10 * 60_000, Number(leaseMs) || LEASE_MS));
     return this.database.transaction((db) => {
       const candidates = (db.prepare(`SELECT s.*, r.status AS run_status, r.definition_id, r.definition_revision, d.definition_json
         FROM workflow_steps s JOIN workflow_runs r ON r.run_id = s.run_id
         JOIN workflow_definitions d ON d.id = r.definition_id AND d.revision = r.definition_revision
-        WHERE s.status = 'queued' AND r.status IN ('queued','running') ${runId ? "AND s.run_id = ?" : ""}
+        WHERE s.status = 'queued' AND r.status IN ('queued','running')
+          AND r.cancellation_requested_at IS NULL AND r.failure_requested_at IS NULL ${runId ? "AND s.run_id = ?" : ""}
         ORDER BY s.updated_at, s.run_id, s.step_id`).all(...(runId ? [runId] : [])) as Row[]);
       for (const row of candidates) {
         if (Number(row.recovery_input_available) !== 1) {
@@ -237,7 +267,7 @@ export class SqliteWorkflowStore {
           : [];
         if (statuses.length !== dependencies.length || statuses.some((dependency) => dependency.status !== "completed")) continue;
         const leaseToken = `wflease_${randomUUID()}`;
-        const leaseExpiresAt = new Date(Date.now() + LEASE_MS).toISOString();
+        const leaseExpiresAt = new Date(Date.now() + boundedLeaseMs).toISOString();
         const updated = db.prepare(`UPDATE workflow_steps SET status='running', attempt=attempt+1, lease_token=?, lease_expires_at=?, updated_at=?
           WHERE run_id=? AND step_id=? AND status='queued'`).run(leaseToken, leaseExpiresAt, timestamp, row.run_id, row.step_id);
         if (Number(updated.changes) !== 1) continue;
@@ -254,7 +284,9 @@ export class SqliteWorkflowStore {
   completeStep(runId: string, stepId: string, leaseToken: string, result: unknown): WorkflowRunRecord {
     const projection = projectWorkflowOutput(result);
     return this.database.transaction((db) => {
-      const row = db.prepare("SELECT status FROM workflow_steps WHERE run_id=? AND step_id=? AND lease_token=?").get(runId, stepId, leaseToken) as Row | undefined;
+      const row = db.prepare(`SELECT s.status FROM workflow_steps s JOIN workflow_runs r ON r.run_id=s.run_id
+        WHERE s.run_id=? AND s.step_id=? AND s.lease_token=? AND s.lease_expires_at > ?
+          AND r.cancellation_requested_at IS NULL AND r.failure_requested_at IS NULL`).get(runId, stepId, leaseToken, now()) as Row | undefined;
       if (!row) throw new Error("workflow step lease is missing or stale");
       validateWorkflowTransition(String(row.status) as WorkflowStepStatus, "completed");
       const timestamp = now();
@@ -266,9 +298,11 @@ export class SqliteWorkflowStore {
     });
   }
 
-  failStep(runId: string, stepId: string, leaseToken: string, errorCode: string, { uncertain = false } = {}): WorkflowRunRecord {
+  failStep(runId: string, stepId: string, leaseToken: string, errorCode: string, { uncertain = false, stopDeadlineAt = new Date(Date.now() + DEFAULT_FAILURE_STOP_GRACE_MS).toISOString() }: { uncertain?: boolean; stopDeadlineAt?: string } = {}): WorkflowRunRecord {
     return this.database.transaction((db) => {
-      const row = db.prepare("SELECT status, attempt, max_attempts, retry_safety FROM workflow_steps WHERE run_id=? AND step_id=? AND lease_token=?").get(runId, stepId, leaseToken) as Row | undefined;
+      const row = db.prepare(`SELECT s.status, s.attempt, s.max_attempts, s.retry_safety FROM workflow_steps s JOIN workflow_runs r ON r.run_id=s.run_id
+        WHERE s.run_id=? AND s.step_id=? AND s.lease_token=? AND s.lease_expires_at > ?
+          AND r.cancellation_requested_at IS NULL AND r.failure_requested_at IS NULL`).get(runId, stepId, leaseToken, now()) as Row | undefined;
       if (!row) throw new Error("workflow step lease is missing or stale");
       const timestamp = now();
       const retry = !uncertain && String(row.retry_safety) === "retry-safe" && Number(row.attempt) < Number(row.max_attempts);
@@ -277,14 +311,16 @@ export class SqliteWorkflowStore {
       db.prepare("UPDATE workflow_steps SET status=?, error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND step_id=? AND lease_token=?")
         .run(status, errorCode.slice(0, 256), timestamp, runId, stepId, leaseToken);
       appendEventUnsafe(db, runId, `workflow.step.${status}`, { stepId, errorCode: errorCode.slice(0, 256) });
-      if (status !== "queued") db.prepare("UPDATE workflow_runs SET status=?, error_code=?, updated_at=? WHERE run_id=? AND status NOT IN ('completed','cancelled')").run(status === "needs-review" ? "needs-review" : "failed", errorCode.slice(0, 256), timestamp, runId);
+      if (status !== "queued") beginFailureStopUnsafe(db, runId, timestamp, stopDeadlineAt, errorCode.slice(0, 256));
       return this.get(runId)!;
     });
   }
 
   awaitApproval(runId: string, stepId: string, leaseToken: string): WorkflowRunRecord {
     return this.database.transaction((db) => {
-      const row = db.prepare("SELECT status FROM workflow_steps WHERE run_id=? AND step_id=? AND lease_token=?").get(runId, stepId, leaseToken) as Row | undefined;
+      const row = db.prepare(`SELECT s.status FROM workflow_steps s JOIN workflow_runs r ON r.run_id=s.run_id
+        WHERE s.run_id=? AND s.step_id=? AND s.lease_token=? AND s.lease_expires_at > ?
+          AND r.cancellation_requested_at IS NULL AND r.failure_requested_at IS NULL`).get(runId, stepId, leaseToken, now()) as Row | undefined;
       if (!row) throw new Error("workflow step lease is missing or stale");
       validateWorkflowTransition(String(row.status) as WorkflowStepStatus, "awaiting-approval");
       const timestamp = now();
@@ -297,9 +333,11 @@ export class SqliteWorkflowStore {
 
   resume(runId: string): WorkflowRunRecord {
     return this.database.transaction((db) => {
-      const row = db.prepare("SELECT status FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
+      const row = db.prepare("SELECT status, cancellation_requested_at, failure_requested_at FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
       if (!row) throw new Error(`workflow run not found: ${runId}`);
       const status = String(row.status) as WorkflowRunStatus;
+      if (row.cancellation_requested_at && !TERMINAL_RUN_STATUSES.has(status)) throw new Error("workflow cancellation is already pending");
+      if (row.failure_requested_at && !TERMINAL_RUN_STATUSES.has(status)) throw new Error("workflow failure stop is already pending");
       if (status === "needs-review") throw new Error("workflow needs operator resolution before resume");
       if (status === "awaiting-approval") {
         db.prepare("UPDATE workflow_steps SET status='queued', lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND status='awaiting-approval'").run(now(), runId);
@@ -309,35 +347,161 @@ export class SqliteWorkflowStore {
     });
   }
 
-  cancel(runId: string): WorkflowRunRecord {
+  requestCancellation(runId: string, deadlineAt = new Date(Date.now() + DEFAULT_CANCELLATION_GRACE_MS).toISOString()): WorkflowRunRecord {
+    if (!Number.isFinite(Date.parse(deadlineAt))) throw new TypeError("workflow cancellation deadline must be an ISO-8601 timestamp");
     return this.database.transaction((db) => {
-      const row = db.prepare("SELECT status FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
+      const row = db.prepare("SELECT status, cancellation_requested_at FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
       if (!row) throw new Error(`workflow run not found: ${runId}`);
       const status = String(row.status) as WorkflowRunStatus;
       if (!TERMINAL_RUN_STATUSES.has(status)) {
         const timestamp = now();
         db.prepare("UPDATE workflow_steps SET status='cancelled', lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND status IN ('queued','awaiting-approval')").run(timestamp, runId);
-        db.prepare("UPDATE workflow_runs SET status='cancelled', updated_at=? WHERE run_id=?").run(timestamp, runId);
-        appendEventUnsafe(db, runId, "workflow.cancelled", {});
+        db.prepare(`UPDATE workflow_runs SET cancellation_requested_at=COALESCE(cancellation_requested_at, ?),
+          cancellation_deadline_at=COALESCE(cancellation_deadline_at, ?), updated_at=? WHERE run_id=?`)
+          .run(timestamp, deadlineAt, timestamp, runId);
+        if (!row.cancellation_requested_at) appendEventUnsafe(db, runId, "workflow.cancellation-requested", { deadlineAt });
       }
       return this.get(runId)!;
     });
   }
 
-  recover(): WorkflowRunRecord[] {
+  cancel(runId: string): WorkflowRunRecord {
+    const requested = this.requestCancellation(runId);
+    if (requested.status !== "cancelling") return requested;
+    return this.finalizeCancellation(runId, { quarantineRunning: true });
+  }
+
+  acknowledgeCancellation(runId: string, stepId: string, leaseToken: string, { uncertain = false, errorCode }: { uncertain?: boolean; errorCode?: string } = {}): WorkflowRunRecord {
+    return this.database.transaction((db) => {
+      const row = db.prepare(`SELECT s.status FROM workflow_steps s JOIN workflow_runs r ON r.run_id=s.run_id
+        WHERE s.run_id=? AND s.step_id=? AND s.lease_token=? AND s.lease_expires_at > ?
+          AND r.cancellation_requested_at IS NOT NULL`).get(runId, stepId, leaseToken, now()) as Row | undefined;
+      if (!row) throw new Error("workflow step cancellation lease is missing or stale");
+      const status: WorkflowStepStatus = uncertain ? "needs-review" : "cancelled";
+      validateWorkflowTransition(String(row.status) as WorkflowStepStatus, status);
+      const timestamp = now();
+      const code = (errorCode ?? (uncertain ? "WORKFLOW_CANCELLATION_OUTCOME_UNCERTAIN" : "WORKFLOW_CANCELLED")).slice(0, 256);
+      db.prepare("UPDATE workflow_steps SET status=?, error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND step_id=? AND lease_token=?")
+        .run(status, code, timestamp, runId, stepId, leaseToken);
+      appendEventUnsafe(db, runId, `workflow.step.${status}`, { stepId, errorCode: code });
+      settleCancellationUnsafe(db, runId, timestamp, false);
+      return this.get(runId)!;
+    });
+  }
+
+  acknowledgeStop(runId: string, stepId: string, leaseToken: string, { uncertain = false, errorCode }: { uncertain?: boolean; errorCode?: string } = {}): WorkflowRunRecord {
+    return this.database.transaction((db) => {
+      const row = db.prepare(`SELECT s.status FROM workflow_steps s JOIN workflow_runs r ON r.run_id=s.run_id
+        WHERE s.run_id=? AND s.step_id=? AND s.lease_token=? AND s.lease_expires_at > ?
+          AND r.failure_requested_at IS NOT NULL AND r.cancellation_requested_at IS NULL`).get(runId, stepId, leaseToken, now()) as Row | undefined;
+      if (!row) throw new Error("workflow step stop lease is missing or stale");
+      const status: WorkflowStepStatus = uncertain ? "needs-review" : "cancelled";
+      validateWorkflowTransition(String(row.status) as WorkflowStepStatus, status);
+      const timestamp = now();
+      const code = (errorCode ?? (uncertain ? "WORKFLOW_STOP_OUTCOME_UNCERTAIN" : "WORKFLOW_STOPPED_AFTER_FAILURE")).slice(0, 256);
+      db.prepare("UPDATE workflow_steps SET status=?, error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND step_id=? AND lease_token=?")
+        .run(status, code, timestamp, runId, stepId, leaseToken);
+      appendEventUnsafe(db, runId, `workflow.step.${status}`, { stepId, errorCode: code });
+      settleFailureUnsafe(db, runId, timestamp, false);
+      return this.get(runId)!;
+    });
+  }
+
+  finalizeCancellation(runId: string, { quarantineRunning = false }: { quarantineRunning?: boolean } = {}): WorkflowRunRecord {
+    return this.database.transaction((db) => {
+      const row = db.prepare("SELECT status, cancellation_requested_at FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
+      if (!row) throw new Error(`workflow run not found: ${runId}`);
+      if (!row.cancellation_requested_at || TERMINAL_RUN_STATUSES.has(String(row.status) as WorkflowRunStatus)) return this.get(runId)!;
+      settleCancellationUnsafe(db, runId, now(), quarantineRunning);
+      return this.get(runId)!;
+    });
+  }
+
+  quarantineStep(runId: string, stepId: string, leaseToken: string, errorCode = "WORKFLOW_OUTCOME_UNCERTAIN", stopDeadlineAt = new Date(Date.now() + DEFAULT_FAILURE_STOP_GRACE_MS).toISOString()): WorkflowRunRecord {
+    return this.database.transaction((db) => {
+      const row = db.prepare("SELECT status FROM workflow_steps WHERE run_id=? AND step_id=? AND lease_token=?").get(runId, stepId, leaseToken) as Row | undefined;
+      if (!row) throw new Error("workflow step quarantine lease is missing or stale");
+      validateWorkflowTransition(String(row.status) as WorkflowStepStatus, "needs-review");
+      const timestamp = now();
+      const code = errorCode.slice(0, 256);
+      db.prepare(`UPDATE workflow_steps SET status='needs-review', error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=?
+        WHERE run_id=? AND step_id=? AND lease_token=?`).run(code, timestamp, runId, stepId, leaseToken);
+      appendEventUnsafe(db, runId, "workflow.step.needs-review", { stepId, errorCode: code });
+      const run = db.prepare("SELECT cancellation_requested_at, failure_deadline_at FROM workflow_runs WHERE run_id=?").get(runId) as Row;
+      if (run.cancellation_requested_at) settleCancellationUnsafe(db, runId, timestamp, false);
+      else {
+        beginFailureStopUnsafe(db, runId, timestamp, String(run.failure_deadline_at || stopDeadlineAt), code);
+        settleFailureUnsafe(db, runId, timestamp, false);
+      }
+      return this.get(runId)!;
+    });
+  }
+
+  renewStepLease(runId: string, stepId: string, leaseToken: string, expiresAt: string): boolean {
+    const timestamp = now();
+    if (!Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.parse(timestamp)) return false;
+    const result = this.database.db.prepare(`UPDATE workflow_steps SET lease_expires_at=?, updated_at=?
+      WHERE run_id=? AND step_id=? AND status='running' AND lease_token=? AND lease_expires_at > ?
+        AND EXISTS (SELECT 1 FROM workflow_runs r WHERE r.run_id=workflow_steps.run_id
+          AND r.cancellation_requested_at IS NULL AND r.failure_requested_at IS NULL)`).run(
+      expiresAt, timestamp, runId, stepId, leaseToken, timestamp
+    );
+    return Number(result.changes) === 1;
+  }
+
+  recover({ uncertainLeaseTokens = [] }: { uncertainLeaseTokens?: string[] } = {}): WorkflowRecoveryResult {
     const recovered: WorkflowRunRecord[] = [];
+    const uncertainTokens = new Set(uncertainLeaseTokens);
     this.database.transaction((db) => {
-      const expired = db.prepare("SELECT run_id, step_id, retry_safety, attempt, max_attempts FROM workflow_steps WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").all(now()) as Row[];
+      const timestamp = now();
+      const expiredCancellations = db.prepare(`SELECT run_id FROM workflow_runs
+        WHERE cancellation_requested_at IS NOT NULL AND cancellation_deadline_at IS NOT NULL
+          AND cancellation_deadline_at <= ? AND status NOT IN ('completed','failed','cancelled','needs-review')`).all(timestamp) as Row[];
+      for (const row of expiredCancellations) settleCancellationUnsafe(db, String(row.run_id), timestamp, true);
+      const expiredFailures = db.prepare(`SELECT run_id FROM workflow_runs
+        WHERE cancellation_requested_at IS NULL AND failure_requested_at IS NOT NULL AND failure_deadline_at IS NOT NULL
+          AND failure_deadline_at <= ? AND status NOT IN ('completed','failed','cancelled','needs-review')`).all(timestamp) as Row[];
+      for (const row of expiredFailures) settleFailureUnsafe(db, String(row.run_id), timestamp, true);
+      const expired = db.prepare(`SELECT s.run_id, s.step_id, s.retry_safety, s.attempt, s.max_attempts, s.lease_token,
+          r.cancellation_requested_at, r.failure_requested_at
+        FROM workflow_steps s JOIN workflow_runs r ON r.run_id=s.run_id
+        WHERE s.status='running' AND s.lease_expires_at IS NOT NULL AND s.lease_expires_at <= ?`)
+        .all(timestamp) as Row[];
       for (const row of expired) {
-        const retry = String(row.retry_safety) === "retry-safe" && Number(row.attempt) < Number(row.max_attempts);
+        const cancellationPending = Boolean(row.cancellation_requested_at);
+        const failurePending = Boolean(row.failure_requested_at);
+        const locallyActive = uncertainTokens.has(String(row.lease_token));
+        const retry = !cancellationPending && !failurePending && !locallyActive && String(row.retry_safety) === "retry-safe" && Number(row.attempt) < Number(row.max_attempts);
         const status = retry ? "queued" : "needs-review";
-        db.prepare("UPDATE workflow_steps SET status=?, error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND step_id=? AND status='running'").run(status, retry ? "WORKFLOW_WORKER_EXPIRED" : "WORKFLOW_EFFECT_OUTCOME_UNCERTAIN", now(), row.run_id, row.step_id);
-        if (!retry) db.prepare("UPDATE workflow_runs SET status='needs-review', error_code='WORKFLOW_EFFECT_OUTCOME_UNCERTAIN', updated_at=? WHERE run_id=?").run(now(), row.run_id);
+        const errorCode = cancellationPending ? "WORKFLOW_CANCELLATION_OUTCOME_UNCERTAIN"
+          : failurePending ? "WORKFLOW_STOP_OUTCOME_UNCERTAIN"
+          : locallyActive ? "WORKFLOW_ACTIVE_LEASE_EXPIRED"
+            : retry ? "WORKFLOW_WORKER_EXPIRED" : "WORKFLOW_EFFECT_OUTCOME_UNCERTAIN";
+        const updated = db.prepare("UPDATE workflow_steps SET status=?, error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND step_id=? AND status='running'").run(status, errorCode, now(), row.run_id, row.step_id);
+        if (Number(updated.changes) !== 1) continue;
+        if (!retry) {
+          if (cancellationPending) settleCancellationUnsafe(db, String(row.run_id), timestamp, true);
+          else {
+            beginFailureStopUnsafe(db, String(row.run_id), timestamp, timestamp, errorCode);
+            settleFailureUnsafe(db, String(row.run_id), timestamp, true);
+          }
+        }
         appendEventUnsafe(db, String(row.run_id), "workflow.recovered", { stepId: String(row.step_id), status });
       }
+      const pendingCancellations = db.prepare("SELECT run_id FROM workflow_runs WHERE cancellation_requested_at IS NOT NULL AND status NOT IN ('completed','failed','cancelled','needs-review')").all() as Row[];
+      for (const row of pendingCancellations) settleCancellationUnsafe(db, String(row.run_id), now(), false);
     });
     for (const run of this.list()) if (["queued", "needs-review"].includes(run.status)) recovered.push(run);
-    return recovered;
+    const nextLease = this.database.db.prepare(`SELECT MIN(lease_expires_at) AS expires_at FROM workflow_steps
+      WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`).get(now()) as Row;
+    const nextCancellation = this.database.db.prepare(`SELECT MIN(cancellation_deadline_at) AS expires_at FROM workflow_runs
+      WHERE cancellation_requested_at IS NOT NULL AND cancellation_deadline_at IS NOT NULL
+        AND cancellation_deadline_at > ? AND status NOT IN ('completed','failed','cancelled','needs-review')`).get(now()) as Row;
+    const nextFailure = this.database.db.prepare(`SELECT MIN(failure_deadline_at) AS expires_at FROM workflow_runs
+      WHERE cancellation_requested_at IS NULL AND failure_requested_at IS NOT NULL AND failure_deadline_at IS NOT NULL
+        AND failure_deadline_at > ? AND status NOT IN ('completed','failed','cancelled','needs-review')`).get(now()) as Row;
+    const candidates = [nextLease.expires_at, nextCancellation.expires_at, nextFailure.expires_at].filter((value): value is string => typeof value === "string").sort();
+    return { recovered, ...(candidates[0] ? { nextRecoveryAt: candidates[0] } : {}) };
   }
 
   events(runId: string, limit = 200): JsonObject[] {
@@ -352,6 +516,15 @@ function appendEventUnsafe(database: any, runId: string, type: string, payload: 
 }
 
 function settleRunUnsafe(database: any, runId: string, timestamp: string): void {
+  const run = database.prepare("SELECT cancellation_requested_at, failure_requested_at FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
+  if (run?.cancellation_requested_at) {
+    settleCancellationUnsafe(database, runId, timestamp, false);
+    return;
+  }
+  if (run?.failure_requested_at) {
+    settleFailureUnsafe(database, runId, timestamp, false);
+    return;
+  }
   const rows = database.prepare("SELECT status FROM workflow_steps WHERE run_id=?").all(runId) as Row[];
   if (!rows.length || rows.some((row) => !TERMINAL_STEP_STATUSES.has(String(row.status) as WorkflowStepStatus))) return;
   const status: WorkflowRunStatus = rows.some((row) => row.status === "needs-review") ? "needs-review"
@@ -359,4 +532,47 @@ function settleRunUnsafe(database: any, runId: string, timestamp: string): void 
       : rows.some((row) => row.status === "cancelled") ? "cancelled" : "completed";
   database.prepare("UPDATE workflow_runs SET status=?, updated_at=? WHERE run_id=? AND status NOT IN ('cancelled','needs-review')").run(status, timestamp, runId);
   appendEventUnsafe(database, runId, `workflow.${status}`, {});
+}
+
+function settleCancellationUnsafe(database: any, runId: string, timestamp: string, quarantineRunning: boolean): void {
+  if (quarantineRunning) {
+    database.prepare(`UPDATE workflow_steps SET status='needs-review', error_code='WORKFLOW_CANCELLATION_OUTCOME_UNCERTAIN',
+      lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND status='running'`).run(timestamp, runId);
+  }
+  database.prepare("UPDATE workflow_steps SET status='cancelled', lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND status IN ('queued','awaiting-approval')")
+    .run(timestamp, runId);
+  const rows = database.prepare("SELECT status FROM workflow_steps WHERE run_id=?").all(runId) as Row[];
+  if (rows.some((row) => row.status === "running")) return;
+  const status: WorkflowRunStatus = rows.some((row) => row.status === "needs-review" || row.status === "failed") ? "needs-review" : "cancelled";
+  const errorCode = status === "needs-review" ? "WORKFLOW_CANCELLATION_OUTCOME_UNCERTAIN" : null;
+  const updated = database.prepare(`UPDATE workflow_runs SET status=?, error_code=?, updated_at=?
+    WHERE run_id=? AND cancellation_requested_at IS NOT NULL AND status NOT IN ('completed','failed','cancelled','needs-review')`)
+    .run(status, errorCode, timestamp, runId);
+  if (Number(updated.changes) === 1) appendEventUnsafe(database, runId, `workflow.${status}`, {});
+}
+
+function beginFailureStopUnsafe(database: any, runId: string, timestamp: string, deadlineAt: string, errorCode: string): void {
+  database.prepare("UPDATE workflow_steps SET status='cancelled', lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND status IN ('queued','awaiting-approval')")
+    .run(timestamp, runId);
+  database.prepare(`UPDATE workflow_runs SET status='running', failure_requested_at=COALESCE(failure_requested_at, ?),
+    failure_deadline_at=COALESCE(failure_deadline_at, ?), error_code=COALESCE(error_code, ?), updated_at=?
+    WHERE run_id=? AND status NOT IN ('completed','failed','cancelled','needs-review')`)
+    .run(timestamp, deadlineAt, errorCode, timestamp, runId);
+  settleFailureUnsafe(database, runId, timestamp, false);
+}
+
+function settleFailureUnsafe(database: any, runId: string, timestamp: string, quarantineRunning: boolean): void {
+  if (quarantineRunning) {
+    database.prepare(`UPDATE workflow_steps SET status='needs-review', error_code='WORKFLOW_STOP_OUTCOME_UNCERTAIN',
+      lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND status='running'`).run(timestamp, runId);
+  }
+  database.prepare("UPDATE workflow_steps SET status='cancelled', lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND status IN ('queued','awaiting-approval')")
+    .run(timestamp, runId);
+  const rows = database.prepare("SELECT status FROM workflow_steps WHERE run_id=?").all(runId) as Row[];
+  if (rows.some((row) => row.status === "running")) return;
+  const status: WorkflowRunStatus = rows.some((row) => row.status === "needs-review") ? "needs-review" : "failed";
+  const updated = database.prepare(`UPDATE workflow_runs SET status=?, updated_at=?
+    WHERE run_id=? AND cancellation_requested_at IS NULL AND failure_requested_at IS NOT NULL
+      AND status NOT IN ('completed','failed','cancelled','needs-review')`).run(status, timestamp, runId);
+  if (Number(updated.changes) === 1) appendEventUnsafe(database, runId, `workflow.${status}`, {});
 }

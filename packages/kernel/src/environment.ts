@@ -1,5 +1,5 @@
-import { lstatSync, readFileSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseEnv } from "node:util";
 
 export type EnvironmentLoadOptions = {
@@ -31,13 +31,20 @@ export type ParsedEnvironmentFiles = {
   loaded: LoadedEnvironmentFile[];
 };
 
-const CREDENTIAL_ENV_FIELDS = new Set(["apiKeyEnv", "tokenEnv", "clientIdEnv", "clientSecretEnv", "accessTokenEnv", "refreshTokenEnv"]);
-const CREDENTIAL_ENV_NAME = /(?:API_KEY|TOKEN|SECRET|PASSWORD|CLIENT_ID|CLIENT_SECRET)$/u;
+const CREDENTIAL_ENV_FIELDS = new Set([
+  "apiKeyEnv", "tokenEnv", "clientIdEnv", "clientSecretEnv", "accessTokenEnv", "refreshTokenEnv",
+  "appTokenEnv", "appIdEnv", "tenantIdEnv", "appSecretEnv", "verifyTokenEnv"
+]);
+const CREDENTIAL_ENV_NAME = /(?:API_KEY|TOKEN|SECRET|PASSWORD|CLIENT_ID|CLIENT_SECRET|APP_ID|TENANT_ID)$/u;
 const CHILD_ENV_BLOCKLIST = new Set([
   "NODE_OPTIONS", "NODE_PATH", "INIT_CWD", "ODINN_STATE_DIR", "ODINN_HOST", "ODINN_PORT", "ODINN_ALLOW_REMOTE", "ODINN_GATEWAY_AUTH",
-  "ODINN_ANTIGRAVITY_CLI", "ODINN_CHROMIUM_PATH", "ODINN_EXTENSION_CONTAINER_RUNTIME", "ODINN_SEARCH_ENDPOINT",
+  "ODINN_ANTIGRAVITY_CLI", "ODINN_CHROMIUM_PATH", "ODINN_EXTENSION_CONTAINER_RUNTIME", "ODINN_SEARCH_ENDPOINT", "ODINN_USER_PASSWORD",
   "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
   "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"
+]);
+const RESERVED_CREDENTIAL_ENVIRONMENT_KEYS = new Set([
+  ...CHILD_ENV_BLOCKLIST,
+  ...OPERATOR_ONLY_ENVIRONMENT_KEYS,
 ]);
 
 /** Return only environment names explicitly referenced as credential inputs by config. */
@@ -47,7 +54,9 @@ export function configuredCredentialEnvironmentKeys(config: unknown): Set<string
     if (Array.isArray(value)) { for (const item of value) visit(item); return; }
     if (!value || typeof value !== "object") return;
     for (const [key, child] of Object.entries(value)) {
-      if (CREDENTIAL_ENV_FIELDS.has(key) && typeof child === "string" && /^[A-Z][A-Z0-9_]*$/.test(child)) keys.add(child);
+      if (CREDENTIAL_ENV_FIELDS.has(key)
+        && typeof child === "string"
+        && isAllowedCredentialEnvironmentKey(child)) keys.add(child);
       visit(child);
     }
   };
@@ -57,6 +66,20 @@ export function configuredCredentialEnvironmentKeys(config: unknown): Set<string
 
 export function isCredentialEnvironmentName(value: string): boolean {
   return /^[A-Z][A-Z0-9_]*$/u.test(value) && CREDENTIAL_ENV_NAME.test(value);
+}
+
+export function isAllowedCredentialEnvironmentKey(value: string): boolean {
+  return isCredentialEnvironmentName(value) && !RESERVED_CREDENTIAL_ENVIRONMENT_KEYS.has(value);
+}
+
+/** Resolve both paths physically and fail closed when containment cannot be established. */
+export function isPhysicalPathInside(root: string, candidate: string): boolean {
+  try {
+    const relation = relative(realpathSync(root), realpathSync(candidate));
+    return relation === "" || (relation !== ".." && !relation.startsWith(`..${sep}`) && !isAbsolute(relation));
+  } catch {
+    return false;
+  }
 }
 
 /** Build an explicit child environment from the already-classified process environment. */

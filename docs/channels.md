@@ -118,16 +118,19 @@ View Channel, Send Messages, Read Message History, Add Reactions, Use External
 Emoji, Attach Files, Embed Links, and Create Public Threads as needed. Keep its
 token in an environment variable.
 
-Ódinn loads `.env` from the workspace root and then `.env` from the selected
-state directory. State values override workspace-file values, while variables
-already supplied by the parent process always win. Environment filenames and
-variable names may appear in diagnostics, but credential values are never
-written into channel configuration or command output. Restrict credential files
-to the owning account (for example, `chmod 600 .odinn/.env`).
+Ódinn loads credential-oriented variables from `.env` in the workspace root and
+then loads `.env` from the explicitly selected state directory. The default
+state directory is the operator-owned `~/.odinn`; a repository-local `.odinn`
+directory is not selected implicitly. State values override workspace-file
+values, while variables already supplied by the parent process always win.
+Environment filenames and variable names may appear in diagnostics, but
+credential values are never written into channel configuration or command
+output. Restrict credential files to the owning account (for example,
+`chmod 600 ~/.odinn/.env`).
 
 ```sh
-printf 'ODINN_DISCORD_BOT_TOKEN=...\\n' > .odinn/.env
-chmod 600 .odinn/.env
+printf 'ODINN_DISCORD_BOT_TOKEN=...\\n' > ~/.odinn/.env
+chmod 600 ~/.odinn/.env
 odinn config channel add discord community \
   --token-env ODINN_DISCORD_BOT_TOKEN \
   --allowlist discord:123456789 \

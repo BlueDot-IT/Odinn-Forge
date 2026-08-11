@@ -138,8 +138,8 @@ test("provider failures redact configured credentials", async () => {
     }));
   });
   const root = await mkdtemp(join(tmpdir(), "odinn-provider-redaction-"));
-  const previous = process.env.ODINN_PROVIDER_REDACTION_KEY;
-  process.env.ODINN_PROVIDER_REDACTION_KEY = secret;
+  const previous = process.env.ODINN_PROVIDER_REDACTION_API_KEY;
+  process.env.ODINN_PROVIDER_REDACTION_API_KEY = secret;
   try {
     const auditStore = createAuditStore(join(root, "audit.jsonl"));
     const registry = createBuiltInRegistry({
@@ -150,7 +150,7 @@ test("provider failures redact configured credentials", async () => {
         providers: {
           openai: {
             baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
-            apiKeyEnv: "ODINN_PROVIDER_REDACTION_KEY",
+            apiKeyEnv: "ODINN_PROVIDER_REDACTION_API_KEY",
             models: ["redaction-model"]
           }
         }
@@ -174,8 +174,8 @@ test("provider failures redact configured credentials", async () => {
     );
     assert.doesNotMatch(JSON.stringify(await auditStore.readAll()), new RegExp(secret, "u"));
   } finally {
-    if (previous === undefined) delete process.env.ODINN_PROVIDER_REDACTION_KEY;
-    else process.env.ODINN_PROVIDER_REDACTION_KEY = previous;
+    if (previous === undefined) delete process.env.ODINN_PROVIDER_REDACTION_API_KEY;
+    else process.env.ODINN_PROVIDER_REDACTION_API_KEY = previous;
     await new Promise((resolve: any) => server.close(resolve));
   }
 });
@@ -204,11 +204,11 @@ test("provider transport retries transient failures and normalizes streaming out
     stateDir: join(root, ".odinn"),
     config: {
       defaultModel: "test:stream-model",
-      providers: { test: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKeyEnv: "ODINN_PROVIDER_TEST_KEY", models: ["stream-model"] } }
+      providers: { test: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKeyEnv: "ODINN_PROVIDER_TEST_API_KEY", models: ["stream-model"] } }
     }
   });
-  const previous = process.env.ODINN_PROVIDER_TEST_KEY;
-  process.env.ODINN_PROVIDER_TEST_KEY = "provider-key";
+  const previous = process.env.ODINN_PROVIDER_TEST_API_KEY;
+  process.env.ODINN_PROVIDER_TEST_API_KEY = "provider-key";
   try {
     const result = await runTask({
       task: { id: "provider_retry_stream", tool: "model.chat", input: { stream: true, retries: 2, messages: [{ role: "user", content: "ping" }] } },
@@ -219,8 +219,8 @@ test("provider transport retries transient failures and normalizes streaming out
     assert.equal(result.output.content, "ODINN_STREAM_OK");
     assert.equal(result.output.usage.total_tokens, 4);
   } finally {
-    if (previous === undefined) delete process.env.ODINN_PROVIDER_TEST_KEY;
-    else process.env.ODINN_PROVIDER_TEST_KEY = previous;
+    if (previous === undefined) delete process.env.ODINN_PROVIDER_TEST_API_KEY;
+    else process.env.ODINN_PROVIDER_TEST_API_KEY = previous;
     await new Promise((resolve: any) => server.close(resolve));
   }
 });

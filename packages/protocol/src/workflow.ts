@@ -8,7 +8,7 @@ export const WORKFLOW_MAX_OUTPUT_BYTES = 64 * 1024;
 
 export type WorkflowRetrySafety = "retry-safe" | "effectful";
 export type WorkflowStepStatus = "queued" | "awaiting-approval" | "running" | "completed" | "failed" | "cancelled" | "needs-review";
-export type WorkflowRunStatus = "queued" | "running" | "awaiting-approval" | "completed" | "failed" | "cancelled" | "needs-review";
+export type WorkflowRunStatus = "queued" | "running" | "awaiting-approval" | "stopping" | "cancelling" | "completed" | "failed" | "cancelled" | "needs-review";
 
 export type WorkflowStepDefinition = {
   id: string;
@@ -223,9 +223,11 @@ export function projectWorkflowOutput(value: unknown): { digest: string; value: 
 
 export function validateWorkflowTransition(from: WorkflowRunStatus | WorkflowStepStatus, to: WorkflowRunStatus | WorkflowStepStatus): void {
   const transitions: Record<string, ReadonlySet<string>> = {
-    queued: new Set(["running", "awaiting-approval", "cancelled", "needs-review"]),
-    "awaiting-approval": new Set(["running", "cancelled", "failed", "needs-review"]),
-    running: new Set(["completed", "failed", "cancelled", "needs-review", "awaiting-approval"]),
+    queued: new Set(["running", "awaiting-approval", "stopping", "cancelling", "cancelled", "needs-review"]),
+    "awaiting-approval": new Set(["running", "stopping", "cancelling", "cancelled", "failed", "needs-review"]),
+    running: new Set(["completed", "failed", "stopping", "cancelling", "cancelled", "needs-review", "awaiting-approval"]),
+    stopping: new Set(["failed", "needs-review", "cancelling"]),
+    cancelling: new Set(["cancelled", "needs-review"]),
     completed: new Set(),
     failed: new Set(["queued", "needs-review"]),
     cancelled: new Set(),

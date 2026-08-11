@@ -5,10 +5,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, join, relative, resolve } from "node:path";
+import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isOwnerOnlyPath, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
@@ -109,7 +109,7 @@ const DANGEROUS_IMPACT_SUMMARIES = Object.freeze({
     authority: "Runs trusted extension code as the current Odinn operating-system user with that user's filesystem and network authority; it is not a security sandbox.",
     approvals: "Manifest trust, entrypoint integrity, explicit capability grants, and the audited execution boundary remain required. Container restrictions do not apply to this adapter.",
     rollback: "Disable or roll back the extension registry entry. This cannot undo external effects already caused by the process.",
-    audit: "Execution records are written to the configured Odinn audit journal, normally .odinn/audit.jsonl."
+    audit: "Execution records are written to the configured Odinn audit journal, normally ~/.odinn/audit.jsonl."
   },
   "network-capability": {
     title: "Network capability impact summary",
@@ -593,9 +593,12 @@ function resolveInvocationPath(path: any) {
 function stateDir(args: any, environment: NodeJS.ProcessEnv = process.env) {
   const explicit = option(args, "--state", environment.ODINN_STATE_DIR ?? "");
   if (explicit) return resolve(invocationRoot(environment), explicit);
-  const projectState = resolve(invocationRoot(environment), ".odinn");
-  if (existsSync(join(projectState, "config.json"))) return projectState;
-  return resolve(homedir(), ".odinn");
+  const homeState = resolve(homedir(), ".odinn");
+  const legacyProjectState = resolve(invocationRoot(environment), ".odinn");
+  if (existsSync(join(legacyProjectState, "config.json"))) {
+    console.error("Notice: repository-local .odinn state is no longer selected automatically. Use --state .odinn to adopt it explicitly, or migrate it to ~/.odinn.");
+  }
+  return homeState;
 }
 
 async function init(args: any) {
@@ -1467,7 +1470,7 @@ async function doctor(args: any) {
       needsReview: Array.isArray(processRecovery.pending) ? processRecovery.pending.filter((entry: any) => entry?.phase === "needs-review").length : null,
       quarantined: processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0)
     },
-    state: { ownerOnly, runtimeStateOutsideSourceCheckout: true, secretsExcludedFromDiagnostics: true }
+    state: { ownerOnly, runtimeStateOutsideSourceCheckout: !isPhysicalPathInside(invocationRoot(), state), secretsExcludedFromDiagnostics: true }
   };
 }
 
@@ -1755,7 +1758,7 @@ async function configCommand(args: any) {
       }
       if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name)) throw new Error("channel name contains unsupported characters");
       const tokenEnv = option(rest, "--token-env", "");
-      if (!/^[A-Z_][A-Z0-9_]{1,127}$/u.test(tokenEnv)) throw new Error("config channel add requires --token-env <UPPERCASE_ENV_NAME>");
+      if (!isAllowedCredentialEnvironmentKey(tokenEnv)) throw new Error("config channel add requires --token-env with a credential-oriented, non-reserved environment name");
       const historyLimit = Number.parseInt(option(rest, "--history-limit", "40"), 10);
       if (!Number.isSafeInteger(historyLimit) || historyLimit < 1 || historyLimit > 200) {
         throw new Error("--history-limit requires an integer from 1 through 200");
@@ -1779,7 +1782,7 @@ async function configCommand(args: any) {
       ].flatMap(([key, flag]) => {
         const value = option(rest, flag, "");
         if (!value) return [];
-        if (!/^[A-Z_][A-Z0-9_]{1,127}$/u.test(value)) throw new Error(`${flag} requires an uppercase environment variable name`);
+        if (!isAllowedCredentialEnvironmentKey(value)) throw new Error(`${flag} requires a credential-oriented, non-reserved environment name`);
         return [[key, value]];
       }));
       config.channels[name] = {
@@ -2270,6 +2273,9 @@ async function addProvider(state: any, args: any, name: any, existingConfig: any
   const models = splitCsv(option(args, "--model", ((sameAuthMode ? existing?.models : undefined) ?? authPreset.models ?? preset.models ?? []).join(",")));
   if (!models.length) throw new Error("provider requires at least one --model");
   const apiKeyEnv = authMode === "api-key" ? option(args, "--api-key-env", existing?.apiKeyEnv ?? preset.apiKeyEnv) : "";
+  if (apiKeyEnv && !isAllowedCredentialEnvironmentKey(apiKeyEnv)) {
+    throw new Error("provider credential environment name must use a credential suffix and must not be a reserved runtime control");
+  }
   config.providers ??= {};
   const provider: any = { type: preset.type, baseUrl, apiKeyEnv, models };
   if (authPreset.transport ?? preset.transport ?? (sameAuthMode ? existing?.transport : undefined)) provider.transport = authPreset.transport ?? preset.transport ?? existing?.transport;
