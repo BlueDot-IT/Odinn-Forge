@@ -2,7 +2,10 @@
 
 Ódinn treats model output, skills, extensions, MCP servers, child agents,
 scripts, packages, and workspace-controlled configuration as untrusted. The
-sandbox configuration in `.odinn/config.json` is operator-owned authority. A
+sandbox configuration in the selected state `config.json` (by default
+`~/.odinn/config.json`) is operator-owned authority. A repository-local
+`.odinn/config.json` is workspace content unless the operator explicitly selects
+that directory with `--state` or `ODINN_STATE_DIR`. A
 tool, manifest, child, or workspace file may request less authority, but cannot
 grant itself more authority than this configuration allows.
 

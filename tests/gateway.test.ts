@@ -255,11 +255,11 @@ test("gateway bounds and authenticates Microsoft Teams webhook activities end to
   const previousEnvironment = {
     ODINN_TEST_TEAMS_APP_ID: process.env.ODINN_TEST_TEAMS_APP_ID,
     ODINN_TEST_TEAMS_APP_PASSWORD: process.env.ODINN_TEST_TEAMS_APP_PASSWORD,
-    ODINN_TEST_TEAMS_PROVIDER_KEY: process.env.ODINN_TEST_TEAMS_PROVIDER_KEY
+    ODINN_TEST_TEAMS_PROVIDER_API_KEY: process.env.ODINN_TEST_TEAMS_PROVIDER_API_KEY
   };
   process.env.ODINN_TEST_TEAMS_APP_ID = "teams-test-app";
   process.env.ODINN_TEST_TEAMS_APP_PASSWORD = "teams-test-password";
-  process.env.ODINN_TEST_TEAMS_PROVIDER_KEY = "teams-provider-key";
+  process.env.ODINN_TEST_TEAMS_PROVIDER_API_KEY = "teams-provider-key";
   const outbound: any[] = [];
   const authenticated: any[] = [];
   let providerCalls = 0;
@@ -341,7 +341,7 @@ test("gateway bounds and authenticates Microsoft Teams webhook activities end to
       ci: {
         type: "openai-compatible",
         baseUrl: `http://127.0.0.1:${providerPort}/v1`,
-        apiKeyEnv: "ODINN_TEST_TEAMS_PROVIDER_KEY",
+        apiKeyEnv: "ODINN_TEST_TEAMS_PROVIDER_API_KEY",
         models: ["teams-test-model"]
       }
     },

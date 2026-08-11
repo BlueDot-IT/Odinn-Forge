@@ -7,7 +7,7 @@ import { createRunId, isWorkspaceContentTool, normalizeTaskRequest, projectDurab
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
-export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isCredentialEnvironmentName, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
+export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isAllowedCredentialEnvironmentKey, isCredentialEnvironmentName, isPhysicalPathInside, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile, ParsedEnvironmentFiles } from "./environment.ts";
 export { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
 export type { LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";

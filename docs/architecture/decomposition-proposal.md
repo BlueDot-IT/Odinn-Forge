@@ -1,12 +1,15 @@
 # Odinn Forge decomposition proposal
 
-_Status: proposal; no runtime decomposition is implemented by this document._
+_Status: incremental migration in progress. Gateway authentication, process
+bootstrap, and the embedded console have been extracted into separately
+auditable modules; route and runtime-service decomposition remains._
 
 ## Evidence from the current tree
 
-- `apps/gateway/src/server.ts` is the HTTP composition root. It owns transport
-  concerns, authentication/bootstrap handling, request normalization, and
-  assembly of kernel services.
+- `apps/gateway/src/server.ts` is the HTTP composition root. It owns request
+  normalization, routing, and assembly of kernel services. Authentication and
+  binding rules live in `security.ts`, process startup and state selection live
+  in `bootstrap.ts`, and the large console document lives under `src/public/`.
 - `apps/cli/src/cli.ts` is the command composition root. It owns command
   parsing, terminal-oriented output, onboarding, and lifecycle commands while
   calling the kernel directly.

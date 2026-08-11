@@ -56,7 +56,7 @@ export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions =
       ci: {
         type: "openai-compatible",
         baseUrl: `http://127.0.0.1:${providerPort}/v1`,
-        apiKeyEnv: "ODINN_CI_PROVIDER_KEY",
+        apiKeyEnv: "ODINN_CI_PROVIDER_API_KEY",
         models: ["odinn-ci-provider"]
       }
     }
@@ -65,7 +65,7 @@ export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions =
   const child = spawn(gatewayCommand, gatewayArgs, {
     shell: process.platform === "win32" && gatewayCommand.toLowerCase().endsWith(".cmd"),
     cwd: root,
-    env: { ...process.env, INIT_CWD: root, ODINN_PORT: "0", ODINN_STATE_DIR: stateDir, ODINN_CI_PROVIDER_KEY: "ci-provider-key" },
+    env: { ...process.env, INIT_CWD: root, ODINN_PORT: "0", ODINN_STATE_DIR: stateDir, ODINN_CI_PROVIDER_API_KEY: "ci-provider-key" },
     stdio: ["ignore", "pipe", "pipe"]
   });
   let childError = "";

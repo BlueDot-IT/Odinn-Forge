@@ -16,8 +16,14 @@ type Row = Record<string, any>;
 type Source = { source: string; authDigest: string; oldestSequence: number; newestSequence: number; enabled: boolean; updatedAt: string };
 type DeliveryStatus = "queued" | "completed" | "failed" | "needs-review";
 
-export type EventIngressDispatch = (candidate: AutomationCandidate, context: { signal: AbortSignal }) => Promise<"completed" | "failed" | "needs-review">;
-export type EventIngressOptions = { database: SqliteStore; dispatch?: EventIngressDispatch; maxWatches?: number };
+export type EventIngressDispatch = (candidate: AutomationCandidate, context: { signal: AbortSignal; renewLease: () => boolean }) => Promise<"completed" | "failed" | "needs-review">;
+export type EventIngressOptions = { database: SqliteStore; dispatch?: EventIngressDispatch; maxWatches?: number; dispatchLeaseMs?: number };
+
+type ActiveDispatch = {
+  controller: AbortController;
+  force: (errorCode: string) => void;
+  settled: Promise<void>;
+};
 
 const AUTH_DIGEST = /^[a-f0-9]{64}$/u;
 const WATCH_ID = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
@@ -68,7 +74,6 @@ function initialize(database: SqliteStore): void {
   ]) {
     try { database.db.exec(statement); } catch (error: any) { if (!String(error?.message ?? error).includes("duplicate column name")) throw error; }
   }
-  database.db.prepare("UPDATE event_deliveries SET status='needs-review', error_code='EVENT_DISPATCH_LEASE_EXPIRED', updated_at=? WHERE status='queued' AND dispatch_token IS NOT NULL AND dispatch_lease_expires_at <= ?").run(timestamp(), timestamp());
 }
 
 function validSource(value: string): string {
@@ -85,13 +90,20 @@ export class DurableEventIngress {
   readonly database: SqliteStore;
   readonly dispatch?: EventIngressDispatch;
   readonly maxWatches: number;
+  readonly dispatchLeaseMs: number;
+  #active = new Map<string, ActiveDispatch>();
+  #recoveryTimer?: ReturnType<typeof setTimeout>;
+  #closed = false;
+  #shutdownPromise?: Promise<void>;
 
   constructor(options: EventIngressOptions) {
     if (!options?.database) throw new Error("DurableEventIngress requires a database");
     this.database = options.database;
     this.dispatch = options.dispatch;
     this.maxWatches = Math.max(1, Math.min(256, Number(options.maxWatches) || 64));
+    this.dispatchLeaseMs = positiveDuration(options.dispatchLeaseMs, 30_000, "event dispatch lease");
     initialize(options.database);
+    this.reconcileExpiredDispatches();
   }
 
   registerSource({ source, authDigest, oldestSequence = 0, enabled = true }: { source: string; authDigest: string; oldestSequence?: number; enabled?: boolean }): Source {
@@ -183,33 +195,124 @@ export class DurableEventIngress {
 
   private claimDelivery(idempotencyKey: string): string | undefined {
     const token = randomUUID();
-    const expires = new Date(Date.now() + 30_000).toISOString();
+    const expires = new Date(Date.now() + this.dispatchLeaseMs).toISOString();
     const result = this.database.db.prepare(`UPDATE event_deliveries
       SET dispatch_token=?, dispatch_lease_expires_at=?, updated_at=?
       WHERE idempotency_key=? AND status='queued' AND dispatch_token IS NULL`).run(token, expires, timestamp(), idempotencyKey);
-    return Number(result.changes) === 1 ? token : undefined;
+    if (Number(result.changes) === 1) {
+      this.scheduleRecovery();
+      return token;
+    }
+    return undefined;
   }
 
-  private settleDelivery(idempotencyKey: string, token: string, status: DeliveryStatus): void {
-    this.database.db.prepare(`UPDATE event_deliveries
-      SET status=?, error_code=?, dispatch_token=NULL, dispatch_lease_expires_at=NULL, updated_at=?
-      WHERE idempotency_key=? AND status='queued' AND dispatch_token=?`).run(
-      status,
-      status === "completed" ? null : status === "needs-review" ? "EVENT_DISPATCH_UNCERTAIN" : "EVENT_DISPATCH_FAILED",
-      timestamp(), idempotencyKey, token
+  private renewDelivery(idempotencyKey: string, token: string): boolean {
+    if (this.#closed) return false;
+    const now = timestamp();
+    const result = this.database.db.prepare(`UPDATE event_deliveries
+      SET dispatch_lease_expires_at=?, updated_at=?
+      WHERE idempotency_key=? AND status='queued' AND dispatch_token=? AND dispatch_lease_expires_at > ?`).run(
+      new Date(Date.now() + this.dispatchLeaseMs).toISOString(), now, idempotencyKey, token, now
     );
+    if (Number(result.changes) === 1) this.scheduleRecovery();
+    return Number(result.changes) === 1;
+  }
+
+  private settleDelivery(idempotencyKey: string, token: string, status: DeliveryStatus, errorCode?: string): DeliveryStatus {
+    const now = timestamp();
+    const result = this.database.db.prepare(`UPDATE event_deliveries
+      SET status=?, error_code=?, dispatch_token=NULL, dispatch_lease_expires_at=NULL, updated_at=?
+      WHERE idempotency_key=? AND status='queued' AND dispatch_token=? AND dispatch_lease_expires_at > ?`).run(
+      status,
+      status === "completed" ? null : errorCode ?? (status === "needs-review" ? "EVENT_DISPATCH_UNCERTAIN" : "EVENT_DISPATCH_FAILED"),
+      now, idempotencyKey, token, now
+    );
+    if (Number(result.changes) !== 1) {
+      const current = this.database.db.prepare("SELECT status, dispatch_token, dispatch_lease_expires_at FROM event_deliveries WHERE idempotency_key=?").get(idempotencyKey) as Row | undefined;
+      if (current?.status === "queued") {
+        const expired = Date.parse(String(current.dispatch_lease_expires_at ?? "")) <= Date.now();
+        const currentToken = typeof current.dispatch_token === "string" ? current.dispatch_token : undefined;
+        this.database.db.prepare(`UPDATE event_deliveries
+          SET status='needs-review', error_code=?, dispatch_token=NULL, dispatch_lease_expires_at=NULL, updated_at=?
+          WHERE idempotency_key=? AND status='queued'`).run(
+          expired ? "EVENT_DISPATCH_LEASE_EXPIRED" : "EVENT_DISPATCH_LEASE_LOST", now, idempotencyKey
+        );
+        if (currentToken && currentToken !== token) this.#active.get(currentToken)?.force("EVENT_DISPATCH_LEASE_LOST");
+      }
+    }
+    this.scheduleRecovery();
+    return this.delivery(idempotencyKey)?.status ?? "needs-review";
   }
 
   private async dispatchCandidate(candidate: AutomationCandidate): Promise<DeliveryStatus | undefined> {
-    if (!this.dispatch) return undefined;
+    if (!this.dispatch || this.#closed) return undefined;
     const token = this.claimDelivery(candidate.idempotencyKey);
     if (!token) return this.delivery(candidate.idempotencyKey)?.status;
     const controller = new AbortController();
-    let status: DeliveryStatus = "completed";
-    try { status = await this.dispatch(candidate, { signal: controller.signal }); }
-    catch { status = "needs-review"; }
-    this.settleDelivery(candidate.idempotencyKey, token, status);
-    return this.delivery(candidate.idempotencyKey)?.status ?? status;
+    let forceOutcome!: (value: { status: DeliveryStatus; errorCode: string }) => void;
+    let settleActive!: () => void;
+    const forced = new Promise<{ status: DeliveryStatus; errorCode: string }>((resolve) => { forceOutcome = resolve; });
+    const settled = new Promise<void>((resolve) => { settleActive = resolve; });
+    let forcedOnce = false;
+    const force = (errorCode: string) => {
+      if (forcedOnce) return;
+      forcedOnce = true;
+      controller.abort(new Error(errorCode));
+      forceOutcome({ status: "needs-review", errorCode });
+    };
+    this.#active.set(token, { controller, force, settled });
+    const dispatch = Promise.resolve()
+      .then(() => this.dispatch!(candidate, {
+        signal: controller.signal,
+        renewLease: () => {
+          const renewed = this.renewDelivery(candidate.idempotencyKey, token);
+          if (!renewed) force("EVENT_DISPATCH_LEASE_EXPIRED");
+          return renewed;
+        }
+      }))
+      .then((status) => ({ status }), () => ({ status: "needs-review" as const, errorCode: "EVENT_DISPATCH_UNCERTAIN" }));
+    let outcome: { status: DeliveryStatus; errorCode?: string };
+    try {
+      outcome = await Promise.race([dispatch, forced]);
+      // shutdown() durably quarantines every active token synchronously before
+      // returning its Promise. Preserve legacy fire-and-forget close() callers:
+      // once closed, this continuation must never touch the parent-owned DB.
+      if (this.#closed) return "needs-review";
+      return this.settleDelivery(candidate.idempotencyKey, token, outcome.status, outcome.errorCode);
+    } finally {
+      this.#active.delete(token);
+      settleActive();
+    }
+  }
+
+  private reconcileExpiredDispatches(): void {
+    if (this.#closed) return;
+    const now = timestamp();
+    const expired = this.database.db.prepare(`SELECT idempotency_key, dispatch_token FROM event_deliveries
+      WHERE status='queued' AND dispatch_token IS NOT NULL AND dispatch_lease_expires_at <= ?`).all(now) as Row[];
+    for (const row of expired) {
+      const token = String(row.dispatch_token);
+      const result = this.database.db.prepare(`UPDATE event_deliveries
+        SET status='needs-review', error_code='EVENT_DISPATCH_LEASE_EXPIRED', dispatch_token=NULL,
+          dispatch_lease_expires_at=NULL, updated_at=?
+        WHERE idempotency_key=? AND status='queued' AND dispatch_token=? AND dispatch_lease_expires_at <= ?`).run(
+        now, String(row.idempotency_key), token, now
+      );
+      if (Number(result.changes) === 1) this.#active.get(token)?.force("EVENT_DISPATCH_LEASE_EXPIRED");
+    }
+    this.scheduleRecovery();
+  }
+
+  private scheduleRecovery(): void {
+    if (this.#recoveryTimer) clearTimeout(this.#recoveryTimer);
+    this.#recoveryTimer = undefined;
+    if (this.#closed) return;
+    const row = this.database.db.prepare(`SELECT min(dispatch_lease_expires_at) AS expires_at FROM event_deliveries
+      WHERE status='queued' AND dispatch_token IS NOT NULL`).get() as Row | undefined;
+    const expiry = Date.parse(String(row?.expires_at ?? ""));
+    if (!Number.isFinite(expiry)) return;
+    this.#recoveryTimer = setTimeout(() => this.reconcileExpiredDispatches(), Math.max(1, expiry - Date.now() + 1));
+    this.#recoveryTimer.unref?.();
   }
 
   async ingest(input: unknown, authDigest: string): Promise<{ event: AutomationEvent; candidates: AutomationCandidate[]; deliveries: Array<{ idempotencyKey: string; status: DeliveryStatus }> }> {
@@ -275,7 +378,37 @@ export class DurableEventIngress {
     return row ? { idempotencyKey: String(row.idempotency_key), candidateId: String(row.candidate_id), watchId: String(row.watch_id), status: String(row.status) as DeliveryStatus, ...(row.error_code ? { errorCode: String(row.error_code) } : {}) } : undefined;
   }
 
-  close(): void { /* The parent RunLedger owns the SQLite connection. */ }
+  shutdown(): Promise<void> {
+    if (this.#shutdownPromise) return this.#shutdownPromise;
+    this.#closed = true;
+    this.#shutdownPromise = this.finishShutdown();
+    return this.#shutdownPromise;
+  }
+
+  private async finishShutdown(): Promise<void> {
+    if (this.#recoveryTimer) clearTimeout(this.#recoveryTimer);
+    this.#recoveryTimer = undefined;
+    const active = [...this.#active.entries()];
+    for (const [token, entry] of active) {
+      entry.controller.abort(new Error("EVENT_DISPATCH_SHUTDOWN"));
+      entry.force("EVENT_DISPATCH_SHUTDOWN");
+      this.database.db.prepare(`UPDATE event_deliveries
+        SET status='needs-review', error_code='EVENT_DISPATCH_SHUTDOWN', dispatch_token=NULL,
+          dispatch_lease_expires_at=NULL, updated_at=?
+        WHERE status='queued' AND dispatch_token=?`).run(timestamp(), token);
+    }
+    await Promise.allSettled(active.map(([, entry]) => entry.settled));
+  }
+
+  close(): Promise<void> {
+    return this.shutdown();
+  }
 }
 
 export function sourceAuthDigest(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
+
+function positiveDuration(value: number | undefined, fallback: number, label: string): number {
+  const duration = value ?? fallback;
+  if (!Number.isInteger(duration) || duration < 1) throw new Error(`${label} must be a positive integer`);
+  return duration;
+}

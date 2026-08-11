@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, loadEnvironmentFiles, readEnvironmentFiles } from "../packages/kernel/src/environment.ts";
+import { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isPhysicalPathInside, loadEnvironmentFiles, readEnvironmentFiles } from "../packages/kernel/src/environment.ts";
 import { sanitizedWorkerEnvironment } from "../packages/kernel/src/jobs.ts";
 
 test("loads workspace and state .env files with safe precedence", async () => {
@@ -104,6 +104,25 @@ test("startup environment loading keeps workspace controls out of process.env", 
   assertPhysicalDirectory(state);
 });
 
+test("configured channel credential fields retain valid credential names", () => {
+  const keys = configuredCredentialEnvironmentKeys({
+    channels: {
+      slack: { tokenEnv: "SLACK_BOT_TOKEN", appTokenEnv: "SLACK_APP_TOKEN" },
+      teams: { appIdEnv: "TEAMS_APP_ID", tenantIdEnv: "TEAMS_TENANT_ID", appSecretEnv: "TEAMS_APP_SECRET" },
+      whatsapp: { verifyTokenEnv: "WHATSAPP_VERIFY_TOKEN" }
+    }
+  });
+
+  assert.deepEqual([...keys].sort(), [
+    "SLACK_APP_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "TEAMS_APP_ID",
+    "TEAMS_APP_SECRET",
+    "TEAMS_TENANT_ID",
+    "WHATSAPP_VERIFY_TOKEN"
+  ]);
+});
+
 test("environment files and state directories reject symlinks", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-env-links-"));
   const state = join(root, ".odinn");
@@ -117,6 +136,15 @@ test("environment files and state directories reject symlinks", async () => {
   assert.throws(() => assertPhysicalDirectory(linkedState), /physical directory/u);
 });
 
+test("physical path containment fails closed when either path cannot be resolved", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-env-containment-"));
+  const child = join(root, "child");
+  await mkdir(child);
+  assert.equal(isPhysicalPathInside(root, child), true);
+  assert.equal(isPhysicalPathInside(root, join(root, "missing")), false);
+  assert.equal(isPhysicalPathInside(join(root, "missing-root"), child), false);
+});
+
 test("fork worker environment strips preload and routing controls while preserving trusted runtime selectors", () => {
   const previous = { ...process.env };
   Object.assign(process.env, {
@@ -126,6 +154,7 @@ test("fork worker environment strips preload and routing controls while preservi
     PATH: "/workspace/bin",
     ODINN_STATE_DIR: "/workspace/state",
     ODINN_GATEWAY_AUTH: "off",
+    ODINN_USER_PASSWORD: "operator-password",
     ODINN_ANTIGRAVITY_CLI: "/workspace/agy",
     ODINN_CHROMIUM_PATH: "/workspace/chromium",
     LD_PRELOAD: "/workspace/payload.so",
@@ -133,7 +162,7 @@ test("fork worker environment strips preload and routing controls while preservi
   });
   try {
     const environment = sanitizedWorkerEnvironment();
-    for (const key of ["NODE_OPTIONS", "NODE_PATH", "INIT_CWD", "ODINN_STATE_DIR", "ODINN_GATEWAY_AUTH", "LD_PRELOAD"]) assert.equal(environment[key], undefined, key);
+    for (const key of ["NODE_OPTIONS", "NODE_PATH", "INIT_CWD", "ODINN_STATE_DIR", "ODINN_GATEWAY_AUTH", "ODINN_USER_PASSWORD", "LD_PRELOAD"]) assert.equal(environment[key], undefined, key);
     assert.equal(environment.PATH, "/workspace/bin");
     assert.equal(environment.ODINN_ANTIGRAVITY_CLI, "/workspace/agy");
     assert.equal(environment.ODINN_CHROMIUM_PATH, "/workspace/chromium");

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rename, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { assertGatewayBinding } from "../apps/gateway/src/security.ts";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { createApprovalStore, isOwnerOnlyPath } from "../packages/kernel/src/index.ts";
 
@@ -26,6 +28,21 @@ test("gateway control surfaces require bootstrap authentication and reject cross
     const configResponse = await fetch(`${base}/config`, { headers: { cookie } });
     assert.equal(configResponse.status, 200);
     const currentConfig = await configResponse.json();
+
+    for (const invalidConfig of [
+      { ...currentConfig.config, providers: { malicious: { type: "openai-compatible", apiKeyEnv: "ODINN_CHROMIUM_PATH", models: ["malicious"] } } },
+      { ...currentConfig.config, channels: { malicious: { type: "discord", tokenEnv: "ODINN_GATEWAY_AUTH" } } },
+      { ...currentConfig.config, plugins: { entries: { discord: { enabled: true, config: { accounts: { malicious: { tokenEnv: "ODINN_USER_PASSWORD" } } } } } } }
+    ]) {
+      const response = await fetch(`${base}/config`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+        body: JSON.stringify({ config: invalidConfig, fingerprint: currentConfig.fingerprint })
+      });
+      const body: any = await response.json();
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.match(body.error, /credential-oriented.*reserved runtime control/iu);
+    }
 
     const missingConfigOrigin = await fetch(`${base}/config`, {
       method: "PUT",
@@ -119,6 +136,20 @@ test("remote gateway binding never bootstraps the control token through a spoofe
     else process.env.ODINN_ALLOW_REMOTE = previousRemote;
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
+});
+
+test("remote gateway binding cannot disable authentication", () => {
+  assert.doesNotThrow(() => assertGatewayBinding("127.0.0.1", { allowRemote: false, authenticationDisabled: true }));
+  assert.doesNotThrow(() => assertGatewayBinding("::1", { allowRemote: false, authenticationDisabled: true }));
+  assert.doesNotThrow(() => assertGatewayBinding("0.0.0.0", { allowRemote: true, authenticationDisabled: false }));
+  assert.throws(
+    () => assertGatewayBinding("0.0.0.0", { allowRemote: false, authenticationDisabled: false }),
+    /refusing non-loopback gateway host/u
+  );
+  assert.throws(
+    () => assertGatewayBinding("0.0.0.0", { allowRemote: true, authenticationDisabled: true }),
+    /refusing to disable gateway authentication/u
+  );
 });
 
 test("approval records survive restart and consume exactly once for the bound action", async () => {
@@ -269,6 +300,59 @@ test("approval store recovers a crash-stale lock owned by a dead process", async
   }), { mode: 0o600 });
   const id = createApprovalStore({ path }).create({ tool: "browser.click", input: { selector: "#send" } });
   assert.match(id, /^approval_/);
+  const quarantined = (await readdir(stateDir)).filter((name) => name.startsWith(".odinn-approval-stale-lock."));
+  assert.equal(quarantined.length, 1);
+  assert.equal((await readdir(stateDir)).some((name) => name.startsWith(".odinn-approval-lock-recovery.")), false);
+});
+
+for (const [label, contents] of [["partial", "{"], ["empty", ""]] as const) {
+  test(`approval store identity-quarantines an old ${label} lock file`, async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), `odinn-approval-${label}-lock-`));
+    const path = join(stateDir, "approvals.json");
+    const lockPath = `${path}.lock`;
+    await writeFile(lockPath, contents, { mode: 0o600 });
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lockPath, old, old);
+    const id = createApprovalStore({ path }).create({ tool: "browser.click", input: { selector: "#send" } });
+    assert.match(id, /^approval_/u);
+    const quarantined = (await readdir(stateDir)).filter((name) => name.startsWith(".odinn-approval-stale-lock."));
+    assert.equal(quarantined.length, 1);
+    assert.equal(await readFile(join(stateDir, quarantined[0]!), "utf8"), contents);
+    assert.equal(existsSync(lockPath), false);
+  });
+}
+
+test("approval stale-lock recovery never removes a lock while another recovery owns its token", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-stale-lock-race-"));
+  const path = join(stateDir, "approvals.json");
+  const lock = { pid: 2_147_483_647, token: "contended-abandoned-lock", createdAt: Date.now() - 60_000 };
+  const recoveryPath = join(stateDir, `.odinn-approval-lock-recovery.${createHash("sha256").update(`${path}.lock\0${lock.token}`).digest("hex")}`);
+  await writeFile(`${path}.lock`, JSON.stringify(lock), { mode: 0o600 });
+  await writeFile(recoveryPath, JSON.stringify({ pid: process.pid, token: "live-recovery" }), { mode: 0o600 });
+  assert.throws(
+    () => createApprovalStore({ path }).create({ tool: "browser.click", input: { selector: "#send" } }),
+    (error: any) => error?.code === "APPROVAL_STORE_BUSY"
+  );
+  assert.deepEqual(JSON.parse(await readFile(`${path}.lock`, "utf8")), lock);
+  assert.equal((await readdir(stateDir)).some((name) => name.startsWith(".odinn-approval-stale-lock.")), false);
+});
+
+test("approval stale-lock recovery replaces a recovery marker abandoned by a dead owner", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-recovery-marker-"));
+  const path = join(stateDir, "approvals.json");
+  const lock = { pid: 2_147_483_647, token: "abandoned-primary", createdAt: Date.now() - 60_000 };
+  const recoveryName = `.odinn-approval-lock-recovery.${createHash("sha256").update(`${path}.lock\0${lock.token}`).digest("hex")}`;
+  await writeFile(`${path}.lock`, JSON.stringify(lock), { mode: 0o600 });
+  await writeFile(join(stateDir, recoveryName), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-recovery",
+    createdAt: Date.now() - 60_000
+  }), { mode: 0o600 });
+  const id = createApprovalStore({ path }).create({ tool: "browser.click", input: { selector: "#send" } });
+  assert.match(id, /^approval_/u);
+  const files = await readdir(stateDir);
+  assert.equal(files.some((name) => name.startsWith(".odinn-approval-stale-lock.")), true);
+  assert.equal(files.includes(recoveryName), false);
 });
 
 test("gateway state files and directory are owner-only", async () => {
