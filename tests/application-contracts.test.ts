@@ -8,6 +8,7 @@ import {
   assertChannelDeliveryReceiptMatchesEnvelopeV1,
   assertExecutionResultMatchesRequestV1,
   canonicalizeApplicationContractV1,
+  createDiagnosticsReadUseCase,
   createStatusReadUseCase,
   digestExecutionOperationV1,
   digestExecutionRequestV1,
@@ -19,6 +20,7 @@ import {
   validateInboundEnvelopeV1,
   validateOutboundEnvelopeV1,
   type ChannelPort,
+  type DiagnosticsReadRequestV1,
   type ExecutionPort,
   type ExecutionReceiptV1,
   type ExecutionRequestV1,
@@ -488,11 +490,74 @@ test("status.read snapshots authenticated authority before asynchronous port wor
   assert.equal(Object.isFrozen(observedContext.scope), true);
 });
 
+test("diagnostics.read snapshots authority, normalizes output, and rejects operation substitution", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let observedContext: any;
+  const diagnosticsRead = createDiagnosticsReadUseCase({
+    async readDiagnostics(context) {
+      await gate;
+      observedContext = context;
+      return { ok: true, state: { safe: true, omitted: undefined } } as any;
+    }
+  });
+  const request: DiagnosticsReadRequestV1 = {
+    version: 1,
+    kind: "diagnostics-read-request",
+    requestId: "request:diagnostics-alice",
+    context: {
+      principal: { principalId: "principal:alice", actorId: "actor:http", kind: "host-user" },
+      scope: { tenantId: "tenant:alice" },
+      sourceReference: "http:GET:/diagnostics",
+      correlationId: "correlation:diagnostics-alice",
+      cancellationControlReference: "cancel:diagnostics-alice"
+    },
+    operation: { kind: "query", id: "diagnostics.read" }
+  };
+  const pending = diagnosticsRead.execute(request);
+  (request as any).context.principal.principalId = "principal:bob";
+  (request as any).context.scope.tenantId = "tenant:bob";
+  (request as any).context.correlationId = "correlation:diagnostics-bob";
+  release();
+  const result = await pending;
+  assert.equal(observedContext.principal.principalId, "principal:alice");
+  assert.equal(observedContext.scope.tenantId, "tenant:alice");
+  assert.equal(result.correlationId, "correlation:diagnostics-alice");
+  assert.deepEqual(result.output, { ok: true, state: { safe: true } });
+  assert.equal(Object.isFrozen(observedContext), true);
+  assert.equal(Object.isFrozen(result.output), true);
+  await assert.rejects(
+    () => diagnosticsRead.execute({ ...request, operation: { kind: "query", id: "status.read" as any } }),
+    /diagnostics read operation/u
+  );
+});
+
+test("diagnostics.read honors cancellation before invoking its port", async () => {
+  let calls = 0;
+  const diagnosticsRead = createDiagnosticsReadUseCase({ async readDiagnostics() { calls += 1; return { ok: true }; } });
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(() => diagnosticsRead.execute({
+    version: 1,
+    kind: "diagnostics-read-request",
+    requestId: "request:diagnostics-cancelled",
+    context: {
+      principal: { principalId: "principal:operator", actorId: "actor:cli", kind: "operator" },
+      scope: { tenantId: "tenant:local" },
+      sourceReference: "cli:doctor",
+      correlationId: "correlation:diagnostics-cancelled",
+      cancellationControlReference: "cancel:diagnostics-cancelled"
+    },
+    operation: { kind: "query", id: "diagnostics.read" }
+  }, { signal: controller.signal }), { name: "AbortError" });
+  assert.equal(calls, 0);
+});
+
 test("application package resolves independently and excludes implementation dependencies", () => {
   const packageRoot = join(import.meta.dirname, "..", "packages", "application");
   const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), []);
-  const source = ["contracts.ts", "validation.ts", "ports.ts", "status.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
+  const source = ["contracts.ts", "validation.ts", "ports.ts", "status.ts", "diagnostics.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
   assert.doesNotMatch(source, /discord\.js|@slack|telegram|whatsapp|express|playwright|apps\/gateway|apps\/cli|packages\/kernel/u);
   assert.doesNotMatch(readFileSync(join(packageRoot, "src", "contracts.ts"), "utf8"), /\b(?:AbortSignal|Request|Response|Buffer|Readable|Writable)\b/u);
   const probe = spawnSync(process.execPath, ["--input-type=module", "--eval", "const application = await import('@odinn/application'); if (application.APPLICATION_CONTRACT_VERSION !== 1) process.exit(2);"], { cwd: packageRoot, encoding: "utf8" });

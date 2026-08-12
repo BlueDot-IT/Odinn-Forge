@@ -579,6 +579,8 @@ test("CLI doctor reports safe diagnostics without state paths or credentials", a
   assert.equal(report.providerMode[0].supportTier, "custom");
   assert.equal(report.providerMode[0].genericCompatibilityMode, true);
   assert.equal(report.state.secretsExcludedFromDiagnostics, true);
+  assert.equal("requestId" in report, false);
+  assert.equal("correlationId" in report, false);
   assert.doesNotMatch(doctor.stdout, new RegExp(state.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(doctor.stdout, /ODINN_DOCTOR_SECRET/);
 });
