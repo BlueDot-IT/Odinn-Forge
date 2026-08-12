@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { SqliteAuditStore } from "../packages/store-sqlite/src/audit.ts";
@@ -542,6 +542,26 @@ test("CLI exposes explicit security posture controls", async () => {
   assert.equal(restore.status, 0, restore.stderr || restore.stdout);
   assert.equal(JSON.parse(await readFile(join(state, "config.json"), "utf8")).policy.security.browser.requireApproval, true);
   assert.doesNotMatch(restore.stderr, /impact confirmation required/i);
+});
+
+test("CLI status preserves its stable JSON contract through the application boundary", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-status-"));
+  const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
+  const command = spawnSync("node", ["apps/cli/src/cli.ts", "status", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(command.status, 0, command.stderr || command.stdout);
+  const status = JSON.parse(command.stdout);
+  assert.equal(status.ok, true);
+  assert.equal(status.state, state);
+  assert.equal(status.workspaceRoot, resolve(root));
+  assert.equal(status.auditLog, "audit.jsonl");
+  assert.equal(status.capabilityRegistryVersion, 1);
+  assert.equal(status.capabilityMigration.automaticWidening, false);
+  assert.ok(status.tools.includes("text.echo"));
+  assert.ok(status.allowedTools.includes("agent.run"));
+  assert.ok(status.toolDetails.some((tool: any) => tool.name === "text.echo" && tool.capabilities.includes("workspace.inspect")));
+  assert.equal("requestId" in status, false);
+  assert.equal("correlationId" in status, false);
 });
 
 test("CLI doctor reports safe diagnostics without state paths or credentials", async () => {

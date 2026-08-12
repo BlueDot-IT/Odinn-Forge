@@ -84,6 +84,9 @@ importers:
 
   apps/cli:
     dependencies:
+      '@odinn/application':
+        specifier: workspace:*
+        version: link:../../packages/application
       '@odinn/gateway':
         specifier: workspace:*
         version: link:../gateway
@@ -96,6 +99,9 @@ importers:
 
   apps/gateway:
     dependencies:
+      '@odinn/application':
+        specifier: workspace:*
+        version: link:../../packages/application
       '@odinn/channel-discord':
         specifier: workspace:*
         version: link:../../adapters/channels/discord

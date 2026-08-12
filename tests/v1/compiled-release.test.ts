@@ -64,6 +64,14 @@ test("production package runs without pnpm or a source checkout", async () => {
     await mkdir(workspace, { recursive: true });
     assert.equal(run(cli, ["--version"], workspace).trim(), pkg.version);
     run(cli, ["onboard", "--state", state], workspace);
+    const runtimeStatus = JSON.parse(run(cli, ["status", "--state", state], workspace));
+    assert.equal(runtimeStatus.ok, true);
+    assert.equal(runtimeStatus.state, state);
+    assert.equal(typeof runtimeStatus.workspaceRoot, "string");
+    assert.ok(runtimeStatus.workspaceRoot.length > 0);
+    assert.ok(runtimeStatus.tools.includes("text.echo"));
+    assert.equal("requestId" in runtimeStatus, false);
+    assert.equal("correlationId" in runtimeStatus, false);
     const inputFile = join(workspace, "compiled-release-input.json");
     await writeFile(inputFile, `${JSON.stringify({ text: "ODINN_COMPILED_TEST_OK" })}\n`);
     const tool = run(cli, [

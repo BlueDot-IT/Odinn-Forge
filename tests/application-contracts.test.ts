@@ -8,6 +8,7 @@ import {
   assertChannelDeliveryReceiptMatchesEnvelopeV1,
   assertExecutionResultMatchesRequestV1,
   canonicalizeApplicationContractV1,
+  createStatusReadUseCase,
   digestExecutionOperationV1,
   digestExecutionRequestV1,
   digestOutboundEnvelopeV1,
@@ -23,7 +24,8 @@ import {
   type ExecutionRequestV1,
   type ExecutionResultV1,
   type InboundEnvelopeV1,
-  type OutboundEnvelopeV1
+  type OutboundEnvelopeV1,
+  type StatusReadRequestV1
 } from "../packages/application/src/index.ts";
 
 const timestamp = "2026-08-11T12:00:00.000Z";
@@ -393,11 +395,104 @@ test("ports keep runtime cancellation outside serialized transport-neutral DTOs"
   assert.equal(JSON.stringify(outbound).includes("AbortSignal"), false);
 });
 
+test("status.read preserves authenticated principal scope and normalizes transport-neutral output", async () => {
+  const request: StatusReadRequestV1 = {
+    version: 1,
+    kind: "status-read-request",
+    requestId: "request:status-001",
+    context: {
+      principal: { principalId: "principal:operator", actorId: "actor:cli", kind: "operator" },
+      scope: { tenantId: "tenant:local", projectId: "project:001" },
+      sourceReference: "cli:status",
+      correlationId: "correlation:status-001",
+      cancellationControlReference: "cancel:status-001"
+    },
+    operation: { kind: "query", id: "status.read" }
+  };
+  let observedContext: unknown;
+  const statusRead = createStatusReadUseCase({
+    async readStatus(context) {
+      observedContext = context;
+      return { ok: true, tools: ["text.echo"], nested: { omitted: undefined } } as any;
+    }
+  });
+  const result = await statusRead.execute(request);
+  assert.equal(result.requestId, request.requestId);
+  assert.equal(result.correlationId, request.context.correlationId);
+  assert.deepEqual(observedContext, request.context);
+  assert.deepEqual(result.output, { nested: {}, ok: true, tools: ["text.echo"] });
+  assert.equal(Object.isFrozen(result.output), true);
+  assert.equal(Object.isFrozen(result), true);
+  await assert.rejects(
+    () => statusRead.execute({ ...request, operation: { kind: "query", id: "diagnostics.read" as any } }),
+    /status read operation/u
+  );
+});
+
+test("status.read honors cancellation without invoking or publishing its port", async () => {
+  let calls = 0;
+  const statusRead = createStatusReadUseCase({ async readStatus() { calls += 1; return { ok: true }; } });
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(() => statusRead.execute({
+    version: 1,
+    kind: "status-read-request",
+    requestId: "request:status-cancelled",
+    context: {
+      principal: { principalId: "principal:operator", actorId: "actor:http", kind: "host-user" },
+      scope: { tenantId: "tenant:hosted" },
+      sourceReference: "http:GET:/status",
+      correlationId: "correlation:status-cancelled",
+      cancellationControlReference: "cancel:status-cancelled"
+    },
+    operation: { kind: "query", id: "status.read" }
+  }, { signal: controller.signal }), { name: "AbortError" });
+  assert.equal(calls, 0);
+});
+
+test("status.read snapshots authenticated authority before asynchronous port work", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let observedContext: any;
+  const statusRead = createStatusReadUseCase({
+    async readStatus(context) {
+      await gate;
+      observedContext = context;
+      return { ok: true };
+    }
+  });
+  const request: any = {
+    version: 1,
+    kind: "status-read-request",
+    requestId: "request:status-authority",
+    context: {
+      principal: { principalId: "principal:alice", actorId: "actor:http", kind: "host-user" },
+      scope: { tenantId: "tenant:alice" },
+      sourceReference: "http:GET:/status",
+      correlationId: "correlation:alice",
+      cancellationControlReference: "cancel:alice"
+    },
+    operation: { kind: "query", id: "status.read" }
+  };
+  const pending = statusRead.execute(request);
+  request.context.principal.principalId = "principal:bob";
+  request.context.scope.tenantId = "tenant:bob";
+  request.context.correlationId = "correlation:bob";
+  release();
+  const result = await pending;
+  assert.equal(observedContext.principal.principalId, "principal:alice");
+  assert.equal(observedContext.scope.tenantId, "tenant:alice");
+  assert.equal(result.correlationId, "correlation:alice");
+  assert.equal(Object.isFrozen(observedContext), true);
+  assert.equal(Object.isFrozen(observedContext.principal), true);
+  assert.equal(Object.isFrozen(observedContext.scope), true);
+});
+
 test("application package resolves independently and excludes implementation dependencies", () => {
   const packageRoot = join(import.meta.dirname, "..", "packages", "application");
   const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), []);
-  const source = ["contracts.ts", "validation.ts", "ports.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
+  const source = ["contracts.ts", "validation.ts", "ports.ts", "status.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
   assert.doesNotMatch(source, /discord\.js|@slack|telegram|whatsapp|express|playwright|apps\/gateway|apps\/cli|packages\/kernel/u);
   assert.doesNotMatch(readFileSync(join(packageRoot, "src", "contracts.ts"), "utf8"), /\b(?:AbortSignal|Request|Response|Buffer|Readable|Writable)\b/u);
   const probe = spawnSync(process.execPath, ["--input-type=module", "--eval", "const application = await import('@odinn/application'); if (application.APPLICATION_CONTRACT_VERSION !== 1) process.exit(2);"], { cwd: packageRoot, encoding: "utf8" });
