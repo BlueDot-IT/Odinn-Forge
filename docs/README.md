@@ -25,21 +25,21 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
 - [v1 compatibility policy](v1-compatibility.md) — the v1 product promise and
   its boundaries.
 
-## Benchmark evidence
+## Validation evidence
 
-- [Benchmark evidence and limitations](benchmarks.md) — enforced gates,
-  observational microbenchmarks, synthetic profiling, independent evaluation,
-  reproduction requirements, and publication caveats.
-- [CI/CD](ci-cd.md) — workflows that run the repository checks and benchmarks.
+- [CI/CD](ci-cd.md) — workflows that run correctness, security, integration,
+  invariant, platform, and package checks.
 - [Release validation](release-validation.md) — evidence expected from a
   release candidate.
+- [BlueDot agent benchmarks](https://github.com/BlueDot-IT/agent-benchmarks) —
+  comparative runtime/model evaluation, performance methodology, and reports.
 
 ## Runtime and architecture notes
 
 - [Runtime event ledger](architecture/event-ledger.md) — the hash-chained event
   ledger design.
 - [Audit storage operations](audit-storage.md) — indexed journal migration,
-  streaming cursors, verification, archives, retention, soak, and benchmarks.
+  streaming cursors, verification, archives, retention, and soak validation.
 - [Runtime ledger](runtime-ledger.md) — structured runtime records.
 - [Gateway Protocol v2](gateway-protocol-v2.md) — protocol schema and client
   behavior.

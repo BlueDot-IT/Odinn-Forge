@@ -61,4 +61,6 @@ Any future runtime integration requires a separate review covering:
 2. authenticated event ingress and authoritative replay windows;
 3. conversion into the existing audited job envelope;
 4. policy and approval enforcement;
-5. lifecycle, recovery, backpressure, and latency measurements.
+5. lifecycle, recovery, and backpressure validation, with comparative latency
+   evaluation maintained in
+   [BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).

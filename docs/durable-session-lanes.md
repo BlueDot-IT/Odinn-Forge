@@ -49,15 +49,18 @@ will quarantine it as `needs-review` during validated recovery. Repair or
 replace the store and construct a fresh scheduler rather than attempting to
 resume a degraded instance.
 
-## Latency acceptance
+## Activation acceptance
 
 This module must remain absent from existing runtime import graphs and must not
 change default behavior. Any future integration must:
 
 1. remain disabled by default until explicitly configured;
 2. avoid discovery, blocking I/O, and synchronous telemetry in request paths;
-3. preserve the repository's established p50/p95 benchmark gates; and
-4. benchmark enabled and disabled paths separately before activation.
+3. preserve all existing correctness, security, and resource-limit gates; and
+4. evaluate enabled and disabled performance externally before activation.
+
+Comparative performance evaluation belongs in
+[BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).
 
 This foundation does not add a gateway listener, session router, channel
 binding, background worker, cross-process admission protocol, automatic retry,

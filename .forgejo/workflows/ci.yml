@@ -89,11 +89,6 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # This runner executes jobs through a nested Docker container. Keep the
-    # default 2s benchmark budget elsewhere, but allow measured cold-start
-    # noise here without disabling the guardrail.
-    env:
-      ODINN_BENCHMARK_P95_MAX_MS: "4000"
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -117,5 +112,8 @@ jobs:
       - name: Inference protocol smoke
         run: pnpm smoke:inference
 
-      - name: CI benchmark guardrails
-        run: pnpm benchmark:ci
+      - name: Compiled inference protocol smoke
+        run: pnpm smoke:inference:compiled
+
+      - name: Product invariant tests
+        run: pnpm test:invariants

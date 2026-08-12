@@ -33,9 +33,9 @@ It includes:
 
 ### Nightly
 
-Runs the complete repository check, integration test, protocol smoke,
-performance threshold, dependency audit, and compiled production packaging
-every day. Nightly artifacts are retained for seven days.
+Runs the complete repository check, integration and product-invariant tests,
+protocol smoke, dependency audit, and compiled production packaging every day.
+Nightly artifacts are retained for seven days.
 
 ### Package Integrity
 
@@ -110,7 +110,8 @@ existing tag for recovery, but cannot release an untagged branch. The workflow:
 
 1. Checks out the exact tag.
 2. Verifies that the tag matches `package.json`.
-3. Runs all quality, integration, inference protocol, benchmark, and dependency-audit gates.
+3. Runs all quality, integration, product-invariant, inference protocol, and
+   dependency-audit gates.
 4. Compiles the CLI, gateway, workers, installer, and runtime packages to
    JavaScript with source maps.
 5. Assembles equivalent ZIP and tar.gz production archives with runtime
@@ -153,75 +154,21 @@ pnpm install --frozen-lockfile
 pnpm release:preflight
 pnpm check
 pnpm test:integration
+pnpm test:invariants
 pnpm smoke:inference
-pnpm benchmark:ci
 node scripts/ci/audit.ts high
 ```
 
-`benchmark:ci` first builds and stages the production package, then measures
-twenty cold packaged-gateway protocol runs from `dist/package-stage/`; it does
-not benchmark `apps/gateway/src/server.ts`. The raw report is retained at
-`dist/benchmark/benchmark.json` and uploaded by CI. The benchmark fails when
-p95 exceeds the 2-second budget. Invalid `ODINN_BENCHMARK_P95_MAX_MS` values
-(non-finite, zero, or negative) fail before sampling rather than becoming a
-silent `NaN` comparison. The local Forgejo integration runner executes inside
-nested Docker and uses a documented 4-second cold-start allowance; all other
-workflows retain the 2-second default. Set the threshold only when diagnosing a
-slower host; do not use it to hide a release regression. It then runs the
-assurance microbenchmarks, 10,000-record restart-recovery gate, and bounded
-large-workspace inspection gate described below.
+The invariant lane proves product properties that previously lived inside
+timing harnesses: exact restart classification for 10,000 mixed durable jobs,
+bounded deterministic traversal of a 10,000-file workspace, and exact ordered
+memory-index retrieval parity over 20,000 documents, plus mixed projection and
+scope correctness over 10,000 authoritative records. Compiled inference smoke
+separately exercises the staged production gateway. These are correctness and
+resource-bound checks; they do not publish latency or throughput claims.
 
-The gate uses 20 samples by default. `ODINN_BENCHMARK_SAMPLES` accepts a
-positive integer for bounded diagnostic or cross-platform entrypoint checks;
-record any override with the raw report and do not use a reduced sample count
-as release evidence. The subprocess regression also exercises Corepack-only
-Windows hosts and verifies packaged gateway process-tree cleanup.
-
-### Controlled-host benchmark reproduction
-
-Reproduce benchmark numbers only on a controlled host: use Node.js 24 or newer,
-the pinned pnpm version, a clean checkout at an exact commit, and
-`pnpm install --frozen-lockfile`. Keep the host idle of other CPU/memory-heavy
-work, use the loopback-only synthetic OpenAI-compatible provider supplied by the
-benchmark, and record OS, architecture, Node, pnpm, commit, threshold, and the
-raw JSON report. Aster's controlled comparison in hosted run `30565879814`
-measured the old source-entrypoint benchmark at p95 `15,415.13 ms` on Windows
-versus `1,226.16 ms` on Linux, a `12.572x` dispersion. That result is harness
-and platform-sensitive evidence, not a portable product-regression baseline.
-Do not compare a workstation result directly with a nested Docker or
-hosted-runner result; compare reports from equivalent host classes.
-
-```bash
-pnpm install --frozen-lockfile
-pnpm benchmark:ci
-cat dist/benchmark/benchmark.json
-cat dist/benchmark/workspace-inspection.json
-```
-
-`benchmark:assurance` measures the synchronous paths added by the core advanced
-services: ordinary tool dispatch with zero, one, three, and ten Gatewatch
-invariants, atomic execution-envelope persistence, complete admission with its
-separate signed audit commit, pinned Raven Route selection, and evidence-based
-selection over 100, 1,000, and 10,000 observations. The report includes p50,
-p95, and maximum latency plus the p95 difference between zero-invariant and
-three-invariant dispatch.
-
-```bash
-pnpm benchmark:assurance
-```
-
-Use `ODINN_ASSURANCE_BENCHMARK_SAMPLES` and
-`ODINN_ASSURANCE_BENCHMARK_WARMUPS` to adjust the bounded sample counts during
-diagnosis. Atomic execution-envelope persistence has an enforced 10 ms p95
-budget. The separate `synchronous=FULL` signed-audit commit and the other
-assurance scenarios remain observational so durability is not weakened to win
-a benchmark. The packaged-gateway threshold remains separately enforced.
-
-`benchmark:workspace-inspection` creates a deterministic 10,000-file fixture
-and proves bounded deterministic pages, cursor separation, depth, file and byte
-ceilings, heap growth, and a 15-second first-page traversal gate. It writes
-`dist/benchmark/workspace-inspection.json`; see
-[Benchmark evidence and limitations](benchmarks.md) before citing the result.
+Comparative runtime, model, and performance evaluation belongs in
+[BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).
 
 To inspect release output without publishing:
 

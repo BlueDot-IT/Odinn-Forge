@@ -93,7 +93,7 @@ independently demonstrate:
 4. lifecycle and integrity checks cannot be bypassed by caches or races;
 5. hydrated text remains clearly delimited untrusted reference material and
    cannot grant capabilities or bypass execution admission;
-6. the existing inference benchmark does not regress at p50 or p95;
+6. external comparative evaluation shows no unacceptable inference regression;
 7. security review covers prompt injection, package tampering, path traversal,
    and unintended capability disclosure.
 
@@ -105,3 +105,6 @@ policy, managed paths, or file-integrity internals. `GET /skills/catalog` and
 their request bodies are parsed while lifecycle governance is off. Enablement
 uses a one-time approval bound to the exact package version and integrity
 digest; approval is invalid after replacement or tampering.
+
+Comparative inference evaluation belongs in
+[BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).
