@@ -90,6 +90,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:integration
+      - run: pnpm test:invariants
       - name: Real OCI sandbox proof
         env:
           ODINN_RUN_OCI_TESTS: "1"

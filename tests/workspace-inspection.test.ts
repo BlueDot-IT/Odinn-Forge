@@ -353,6 +353,99 @@ test("list and search serialize within maxBytes and expose resumable cursors", a
   }
 });
 
+test("workspace.list enforces maxFiles before traversal exceeds the ceiling", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-workspace-file-limit-"));
+  try {
+    for (let index = 0; index < 4; index += 1) {
+      await writeFile(join(root, `entry-${index}.txt`), `${index}\n`, "utf8");
+    }
+    const exact = await workspaceList(root, { limit: 4, maxFiles: 4 });
+    assert.equal(exact.entries.length, 4);
+    await writeFile(join(root, "entry-4.txt"), "4\n", "utf8");
+    await assert.rejects(
+      workspaceList(root, { limit: 1, maxFiles: 4 }),
+      /maxFiles traversal ceiling/u
+    );
+    await rm(root, { recursive: true, force: true });
+    await mkdir(join(root, "a"), { recursive: true });
+    await mkdir(join(root, "b"), { recursive: true });
+    await writeFile(join(root, "a", "one.txt"), "one\n", "utf8");
+    await writeFile(join(root, "a", "two.txt"), "two\n", "utf8");
+    await writeFile(join(root, "b", "three.txt"), "three\n", "utf8");
+    await assert.rejects(
+      workspaceList(root, { recursive: true, limit: 100, maxFiles: 4 }),
+      /maxFiles traversal ceiling/u
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace.list excludes descendants beyond maxDepth", async () => {
+  const workspace = await fixture();
+  try {
+    await mkdir(join(workspace.root, "level-0", "level-1", "level-2"), { recursive: true });
+    await writeFile(join(workspace.root, "level-0", "visible.txt"), "visible\n", "utf8");
+    await writeFile(join(workspace.root, "level-0", "level-1", "hidden.txt"), "hidden\n", "utf8");
+    const listed = await workspaceList(workspace.root, { recursive: true, maxDepth: 1, limit: 100 });
+    assert.deepEqual(listed.entries.map((entry: any) => entry.path), [
+      "level-0",
+      "level-0/level-1",
+      "level-0/visible.txt"
+    ]);
+    const deeper = await workspaceList(workspace.root, { recursive: true, maxDepth: 2, limit: 100 });
+    assert.deepEqual(deeper.entries.map((entry: any) => entry.path), [
+      "level-0",
+      "level-0/level-1",
+      "level-0/level-1/hidden.txt",
+      "level-0/level-1/level-2",
+      "level-0/visible.txt"
+    ]);
+  } finally {
+    await closeFixture(workspace);
+  }
+});
+
+test("workspace.search returns matching files exactly once across byte-bounded pages", async () => {
+  const workspace = await fixture();
+  try {
+    const expected = Array.from({ length: 30 }, (_, index) => `entry-${String(index).padStart(3, "0")}.txt`);
+    for (const name of expected) await writeFile(join(workspace.root, name), `needle ${"x".repeat(80)}\n`, "utf8");
+    const paths: string[] = [];
+    const pages: any[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await workspaceSearch(workspace.root, {
+        query: "needle",
+        limit: 30,
+        maxBytes: 2_048,
+        ...(cursor ? { cursor } : {})
+      });
+      assert.ok(page.searchedBytes <= 2_048, String(page.searchedBytes));
+      assert.ok(page.resultBytes <= 2_048, String(page.resultBytes));
+      assert.ok(Buffer.byteLength(JSON.stringify(page), "utf8") <= 2_048);
+      paths.push(...page.matches.map((match: any) => match.path));
+      pages.push(page);
+      cursor = page.nextCursor;
+    } while (cursor);
+    assert.ok(pages.length > 1, String(pages.length));
+    assert.ok(pages[0].nextCursor);
+    assert.deepEqual(paths, expected);
+    assert.equal(new Set(paths).size, paths.length);
+    await assert.rejects(
+      workspaceSearch(workspace.root, {
+        query: "different",
+        limit: 30,
+        maxBytes: 2_048,
+        cursor: pages[0].nextCursor
+      }),
+      /cursor does not match/u
+    );
+  } finally {
+    await closeFixture(workspace);
+  }
+});
+
 test("workspace.diff rejects control-character injection in beforePath", async () => {
   const workspace = await fixture();
   try {
