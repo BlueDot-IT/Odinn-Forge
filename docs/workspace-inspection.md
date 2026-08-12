@@ -94,6 +94,11 @@ Traversal inputs use these bounds:
 | `maxFiles` | 10,000 | 100,000 | Traversal-entry ceiling |
 | `maxBytes` | 4 MiB | 8 MiB | Search content and serialized-result ceiling; list serialized-result ceiling |
 
+CI exercises a deterministic 10,000-file traversal as a product resource
+invariant. The traversal must remain exact and duplicate-free across bounded
+pages while keeping JavaScript heap growth at or below 96 MiB. This is a safety
+ceiling, not a comparative performance measurement.
+
 `workspace.list` recurses only when `recursive: true`. `workspace.search`
 always traverses recursively, reads at most 1,000,000 bytes from any one file,
 skips detected binary files, returns at most 100 matching lines per file, and
