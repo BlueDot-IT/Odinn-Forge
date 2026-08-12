@@ -20,18 +20,23 @@ Required jobs:
 The inference job launches the packaged Gateway, configures a local OpenAI-compatible protocol provider, and verifies a persisted model response through the public API. It is real packaged gateway behavior proof, but it is not proof of production-model quality or a live cloud-provider account.
 
 The quality job also runs `pnpm check:architecture`. This repository-owned
-TypeScript AST check rejects channel-adapter and direct adapter imports from
-`packages/kernel`, and rejects channel-adapter, direct adapter, and application
-transport imports from `packages/application`. Diagnostics name the source
-file, import specifier, and violated rule. Repository workspace package names
-and their subpath exports are resolved as well as relative paths, so aliases
-such as `@odinn/gateway` cannot bypass the boundary. Dynamic `import()` and
-`require()` calls in either protected package must use literal module
-specifiers so their dependency direction remains statically enforceable.
+TypeScript AST and manifest check enforces the [complete production workspace
+package graph](architecture/package-dependency-graph.md) across `apps/`,
+`packages/`, and `adapters/`. It validates source imports and every package
+dependency field, rejects package-to-app and adapter-to-adapter edges, requires
+source imports to be declared, and permits only package roots and subpaths
+listed in the target package's `exports` map. Relative or repository-root
+cross-package source imports are rejected so production code cannot depend on
+private TypeScript files that are not package API. Dynamic `import()` and
+`require()` calls in every production workspace package must use literal module
+specifiers so dependency direction and packaged build inputs remain statically
+enforceable.
 
-The dependency-direction check has no legacy exemptions. Channel transport
-implementations are assembled by `@odinn/runtime`; the kernel accepts only the
-shared channel-tool contract from `@odinn/channels`.
+Diagnostics name the source file or manifest, import/dependency specifier, and
+violated rule. The dependency-direction check has no legacy exemptions.
+Gateway and CLI retain their documented composition-root edges; the kernel
+accepts only the shared channel-tool contract from `@odinn/channels` and cannot
+import a channel adapter.
 
 ### Security
 

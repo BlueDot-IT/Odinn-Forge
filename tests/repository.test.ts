@@ -95,12 +95,16 @@ test("required CI/CD workflows exist", async () => {
   }
 });
 
-test("CI enforces application and kernel dependency direction", async () => {
+test("CI enforces the complete production workspace dependency graph", async () => {
   const pkg = JSON.parse(await read("package.json"));
   assert.equal(pkg.scripts["check:architecture"], "node scripts/ci/check-dependency-direction.ts");
   assert.match(pkg.scripts.check, /pnpm check:architecture/u);
   assert.match(await read(".github/workflows/ci.yml"), /pnpm check:architecture/u);
   assert.match(await read(".forgejo/workflows/ci.yml"), /pnpm check:architecture/u);
+  assert.match(
+    await read("docs/architecture/package-dependency-graph.md"),
+    /package-by-package allowlist/u,
+  );
 });
 
 test("kernel manifests and sources remain free of channel adapters", async () => {

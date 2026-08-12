@@ -38,6 +38,9 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
 
 ## Runtime and architecture notes
 
+- [Workspace package dependency graph](architecture/package-dependency-graph.md) —
+  the exact allowed package edges and CI-enforced source, manifest, export, and
+  packaged-source boundaries.
 - [Runtime event ledger](architecture/event-ledger.md) — the hash-chained event
   ledger design.
 - [Audit storage operations](audit-storage.md) — indexed journal migration,

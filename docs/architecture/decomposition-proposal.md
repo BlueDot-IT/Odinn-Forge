@@ -142,9 +142,13 @@ a time while preserving the current kernel exports as a compatibility facade.
 5. **In progress:** migrate channel adapters to the same inbound/outbound
    envelopes. Discord agent tools are adapter-owned and host-composed; inbound
    channel routing remains on the existing shared channel contracts.
-6. **Complete for protected packages:** enforce dependency direction in CI.
-   `packages/kernel` and `packages/application` have no channel-adapter or
-   direct-adapter imports; application-to-app imports are also rejected.
+6. **Complete for the production workspace:** enforce the exact package graph
+   in CI. Source imports and package manifest dependencies across `apps/`,
+   `packages/`, and `adapters/` are checked. Package-to-app,
+   adapter-to-adapter, private deep-import, undeclared workspace dependency,
+   and cross-package source-path violations are rejected while documented
+   composition-root edges and exported package subpaths remain allowed. See
+   [the package dependency graph](package-dependency-graph.md).
 
 ## Invariants and stop conditions
 
