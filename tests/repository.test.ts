@@ -32,6 +32,17 @@ test("package metadata names Odinn Forge and pins the toolchain", async () => {
   );
 });
 
+test("routine dependency groups exclude runtime and Node typing migrations", async () => {
+  const dependabot = await read(".github/dependabot.yml");
+  assert.match(dependabot, /npm-minor-and-patch:[\s\S]*exclude-patterns: \["@types\/node", "playwright-core"\]/u);
+  assert.match(
+    dependabot,
+    /github-actions:[\s\S]*exclude-patterns:[\s\S]*BlueDot-IT\/odinn-maintainer\/\.github\/workflows\/codex-security-remediation\.yml/u
+  );
+  assert.match(dependabot, /dependency-name: "@types\/node"[\s\S]*version-update:semver-major/u);
+  assert.match(dependabot, /dependency-name: typescript[\s\S]*version-update:semver-major/u);
+});
+
 test("local package operations have conservative resource limits", async () => {
   const npmrc = await read(".npmrc");
   assert.match(npmrc, /^child-concurrency=1$/m);
