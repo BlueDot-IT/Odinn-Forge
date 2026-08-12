@@ -18,6 +18,7 @@
     "node": ">=24.0.0"
   },
   "scripts": {
+    "check:architecture": "node scripts/ci/check-dependency-direction.ts",
     "format:check": "node scripts/ci/run.ts format",
     "lint": "node scripts/ci/run.ts lint",
     "typecheck": "node scripts/ci/run.ts typecheck",
@@ -39,7 +40,7 @@
     "test:compiled-release": "pnpm build && pnpm release:package && pnpm release:checksums && node scripts/release/verify.ts && node --test --test-concurrency=1 --test-reporter=spec tests/v1/compiled-release.test.ts",
     "build": "node scripts/ci/run.ts build",
     "build:production": "node scripts/build-production.ts",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm smoke:onboarding && pnpm build",
+    "check": "pnpm check:architecture && pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm smoke:onboarding && pnpm build",
     "odinn": "node ./apps/cli/src/cli.ts",
     "onboard": "pnpm --filter @odinn/cli start -- onboard",
     "tui": "pnpm --filter @odinn/cli start -- tui",

@@ -66,6 +66,9 @@ jobs:
       - name: Release preflight
         run: pnpm release:preflight
 
+      - name: Architecture dependency direction
+        run: pnpm check:architecture
+
       - name: Formatting
         run: pnpm format:check
 
