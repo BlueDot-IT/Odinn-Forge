@@ -79,6 +79,28 @@ test("CLI plural sessions alias forwards list options and explicit subcommands",
   assert.equal(sessions.status, 0, sessions.stderr || sessions.stdout);
   assert.deepEqual(JSON.parse(sessions.stdout), { sessions: [] });
 
+  const explicitList = spawnSync("node", [
+    "apps/cli/src/cli.ts",
+    "session",
+    "list",
+    "--limit",
+    "not-a-number",
+    "--state",
+    state
+  ], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  assert.equal(explicitList.status, 0, explicitList.stderr || explicitList.stdout);
+  assert.deepEqual(JSON.parse(explicitList.stdout), { sessions: [] });
+
+  const runs = spawnSync("node", ["apps/cli/src/cli.ts", "runs", "--state", state], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  assert.equal(runs.status, 0, runs.stderr || runs.stdout);
+  assert.ok(JSON.parse(runs.stdout).some((entry: any) => entry.tool === "session.list" && entry.status === "completed"));
+
   const created = spawnSync("node", [
     "apps/cli/src/cli.ts",
     "sessions",

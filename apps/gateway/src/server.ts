@@ -5,7 +5,7 @@ import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as stat
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createStatusReadUseCase } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit } from "@odinn/application";
 import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -765,7 +765,7 @@ export async function createGatewayServer({
       }
     }
   });
-  const runIsolatedTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
+  const runIsolatedTask = (request: any, options?: { signal?: AbortSignal }): Promise<any> => isolatedTaskExecutor(request, options) as Promise<any>;
   const runGovernedTask = (request: any): Promise<any> => executeTask({ ...request, auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
   const workflowRuntime = config.runtime?.enableDurableWorkflows === true
     ? new DurableWorkflowRuntime({
@@ -924,6 +924,12 @@ export async function createGatewayServer({
   const diagnosticsRead = createDiagnosticsReadUseCase({
     readDiagnostics: async () => diagnostics({ state, workspaceRoot: root, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError, sandboxRecoveryStartupError })
   });
+  const sessionList = createSessionListUseCase(createGatewaySessionListPort({
+    execute: runIsolatedTask,
+    auditStore,
+    policy,
+    registry
+  }));
 
   const approveGatewayApproval = async (id: string) => {
     const preview = approvalStore.list().find((approval: any) => approval.id === id);
@@ -2154,12 +2160,15 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/sessions") {
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
         const projectId = url.searchParams.get("projectId") ?? "";
-        return json(response, 200, (await runIsolatedTask({
-          task: { tool: "session.list", input: { limit, projectId }, actor: "gateway" },
-          auditStore,
-          policy,
-          registry
-        })).output);
+        const applicationRequestId = randomUUID();
+        const result = await sessionList.execute(createGatewaySessionListRequest({
+          applicationRequestId,
+          hostedUserId: trustedHostedUserId,
+          authentication,
+          limit: normalizeSessionListLimit(limit),
+          projectId
+        }));
+        return json(response, 200, result.output);
       }
       if (request.method === "POST" && url.pathname === "/sessions") {
         return json(response, 200, (await runIsolatedTask({
@@ -2421,6 +2430,51 @@ export function createGatewayDiagnosticsReadRequest({
       cancellationControlReference: `http:request:${applicationRequestId}`
     },
     operation: { kind: "query" as const, id: "diagnostics.read" as const }
+  };
+}
+
+export function createGatewaySessionListRequest({
+  applicationRequestId,
+  hostedUserId,
+  authentication,
+  limit,
+  projectId
+}: {
+  applicationRequestId: string;
+  hostedUserId?: string;
+  authentication: string;
+  limit: number;
+  projectId?: string;
+}) {
+  return {
+    version: APPLICATION_CONTRACT_VERSION,
+    kind: "session-list-request" as const,
+    requestId: applicationRequestId,
+    context: {
+      principal: {
+        principalId: hostedUserId ? `host-user:${normalizeHostedUserId(hostedUserId)}` : "local-gateway-user",
+        actorId: "gateway",
+        kind: "host-user" as const,
+        authenticationReference: authentication === "disabled" ? "gateway:auth-disabled" : `gateway:${authentication}`
+      },
+      scope: { tenantId: hostedUserId ? `tenant:${normalizeHostedUserId(hostedUserId)}` : "local" },
+      sourceReference: "http:GET:/sessions",
+      correlationId: applicationRequestId,
+      cancellationControlReference: `http:request:${applicationRequestId}`
+    },
+    operation: { kind: "query" as const, id: "session.list" as const },
+    input: { limit, ...(projectId ? { projectId } : {}) }
+  };
+}
+
+export function createGatewaySessionListPort({ execute, auditStore, policy, registry }: any) {
+  return {
+    readSessions: async (input: any, _context: any, options: { signal?: AbortSignal } = {}) => (await execute({
+      task: { tool: "session.list", input, actor: "gateway" },
+      auditStore,
+      policy,
+      registry
+    }, options.signal ? { signal: options.signal } : undefined)).output
   };
 }
 

@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createStatusReadUseCase } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit } from "@odinn/application";
 import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
@@ -3190,9 +3190,7 @@ async function session(args: any) {
       });
       break;
     case "list":
-      await runRecordTool(rest, "session.list", {
-        limit: Number.parseInt(option(rest, "--limit", "20"), 10)
-      });
+      await listSessionsThroughApplication(rest);
       break;
     case "read":
       await runRecordTool(rest, "session.read", {
@@ -3280,6 +3278,10 @@ async function runMemoryTool(args: any, tool: any, input: any) {
 }
 
 async function runRecordTool(args: any, tool: any, input: any) {
+  await printJson(await executeRecordTool(args, tool, input));
+}
+
+async function executeRecordTool(args: any, tool: any, input: any, signal?: AbortSignal) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
@@ -3296,14 +3298,37 @@ async function runRecordTool(args: any, tool: any, input: any) {
       auditStore,
       policy: createDefaultPolicy(config.policy),
       registry,
-      runLedger
+      runLedger,
+      ...(signal ? { signal } : {})
     });
-    await printJson(result.output);
+    return result.output;
   } finally {
     registry.close();
     auditStore.close();
     runLedger.close();
   }
+}
+
+async function listSessionsThroughApplication(args: any) {
+  const sessionList = createSessionListUseCase({
+    readSessions: (input, _context, options) => executeRecordTool(args, "session.list", input, options?.signal)
+  });
+  const requestId = randomUUID();
+  const result = await sessionList.execute({
+    version: APPLICATION_CONTRACT_VERSION,
+    kind: "session-list-request",
+    requestId,
+    context: {
+      principal: { principalId: "local-operator", actorId: "cli", kind: "operator" },
+      scope: { tenantId: "local" },
+      sourceReference: "cli:session:list",
+      correlationId: requestId,
+      cancellationControlReference: `cli:session:list:${requestId}`
+    },
+    operation: { kind: "query", id: "session.list" },
+    input: { limit: normalizeSessionListLimit(Number.parseInt(option(args, "--limit", "20"), 10)) }
+  });
+  await printJson(result.output);
 }
 
 function runtimeFor(args: any) {
