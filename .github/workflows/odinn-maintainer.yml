@@ -90,7 +90,7 @@ jobs:
       actions: write
       contents: write
       pull-requests: write
-    uses: BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml@0c5f7b0dea200979ea96107b6856ed3dc5e7bcc0 # credential-isolation
+    uses: BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml@0bbdd667c594dac8daa964edaf972aa56662014e # credential-isolation
     with:
       target_ref: main
     secrets:
