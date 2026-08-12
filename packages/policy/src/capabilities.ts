@@ -41,10 +41,41 @@ type ToolCapabilityEntry = Readonly<{
   tool: string;
   capabilities: readonly CapabilityId[];
   legacyCapabilities: readonly string[];
+  approval?: "required" | "not-required";
+  safety?: TrustedToolSafetyPolicy;
+  approvalEffect?: TrustedApprovalEffectPolicy;
 }>;
 
-const tool = (name: string, capabilities: readonly CapabilityId[], legacyCapabilities: readonly string[]): ToolCapabilityEntry =>
-  Object.freeze({ tool: name, capabilities: Object.freeze([...capabilities]), legacyCapabilities: Object.freeze([...legacyCapabilities]) });
+export type TrustedToolSafetyPolicy = Readonly<{
+  effects: readonly ("read" | "filesystem-write" | "process" | "network" | "credential" | "external-state")[];
+  reversibility: "pure" | "snapshot-reversible" | "compensatable" | "irreversible";
+  requiresCapability: boolean;
+  requiresApproval: boolean;
+  retrySafe: boolean;
+}>;
+
+export type TrustedApprovalEffectPolicy = Readonly<{
+  effectClass: string;
+  summaryAction: string;
+  targetFallback: string;
+  targetFields: readonly string[];
+  mutation: string;
+  recovery: string;
+  reversible: "reversible" | "irreversible" | "uncertain";
+  idempotency: "idempotent" | "non-idempotent" | "unknown";
+}>;
+
+const tool = (
+  name: string,
+  capabilities: readonly CapabilityId[],
+  legacyCapabilities: readonly string[],
+  options: Pick<ToolCapabilityEntry, "approval" | "safety" | "approvalEffect"> = {},
+): ToolCapabilityEntry => Object.freeze({
+  tool: name,
+  capabilities: Object.freeze([...capabilities]),
+  legacyCapabilities: Object.freeze([...legacyCapabilities]),
+  ...options,
+});
 
 const inspectTools = [
   ["job.healthcheck", "job.healthcheck"], ["text.echo", "text.echo"], ["workspace.readText", "workspace.readText"],
@@ -73,6 +104,49 @@ const discordMutationTools = [
   "discord.removeReaction", "discord.pinMessage", "discord.unpinMessage", "discord.sendPoll",
   "discord.createThread", "discord.replyThread"
 ] as const;
+
+const discordReadSafety: TrustedToolSafetyPolicy = Object.freeze({
+  effects: Object.freeze(["read", "network"] as const),
+  reversibility: "pure",
+  requiresCapability: true,
+  requiresApproval: false,
+  retrySafe: false
+});
+
+function discordMutationSafety(name: string): TrustedToolSafetyPolicy | undefined {
+  if (name === "discord.sendMessage" || name === "discord.addReaction") {
+    return Object.freeze({
+      effects: Object.freeze(["network", "credential", "external-state"] as const),
+      reversibility: "compensatable",
+      requiresCapability: true,
+      requiresApproval: true,
+      retrySafe: false
+    });
+  }
+  if (name === "discord.createThread") {
+    return Object.freeze({
+      effects: Object.freeze(["network", "credential", "external-state"] as const),
+      reversibility: "irreversible",
+      requiresCapability: true,
+      requiresApproval: true,
+      retrySafe: false
+    });
+  }
+  return undefined;
+}
+
+function discordApprovalEffect(name: string): TrustedApprovalEffectPolicy {
+  return Object.freeze({
+    effectClass: "Discord mutation",
+    summaryAction: "Discord mutation",
+    targetFallback: "the configured Discord target",
+    targetFields: Object.freeze(["channelId", "threadId", "messageId"]),
+    mutation: name.slice("discord.".length),
+    recovery: "An uncertain external mutation requires operator review before retry.",
+    reversible: name.includes("delete") ? "irreversible" : "uncertain",
+    idempotency: "non-idempotent"
+  });
+}
 
 export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
   ...inspectTools.map(([name, legacy]) => tool(name, ["workspace.inspect"], [legacy])),
@@ -105,8 +179,15 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
   tool("skill.hydrate", ["skill.hydrate"], ["skill.hydrate"]),
   tool("skill.install", ["skill.manage"], ["skill.install"]),
   tool("skill.lifecycle", ["skill.manage"], ["skill.lifecycle"]),
-  ...discordReadTools.map((name) => tool(name, ["network.access"], ["discord.read"])),
-  ...discordMutationTools.map((name) => tool(name, ["network.access"], ["discord.write"]))
+  ...discordReadTools.map((name) => tool(name, ["network.access"], ["discord.read"], {
+    approval: "not-required",
+    ...(["discord.listChannels", "discord.readMessages"].includes(name) ? { safety: discordReadSafety } : {})
+  })),
+  ...discordMutationTools.map((name) => tool(name, ["network.access"], ["discord.write"], {
+    approval: "required",
+    ...(discordMutationSafety(name) ? { safety: discordMutationSafety(name) } : {}),
+    approvalEffect: discordApprovalEffect(name)
+  }))
 ] as const);
 
 const capabilitySet = new Set<string>(CAPABILITY_IDS);
@@ -144,6 +225,25 @@ export function capabilitiesForTool(toolName: string): readonly CapabilityId[] {
   const entry = toolCapabilities.get(toolName);
   if (!entry) throw new CapabilityRegistryError("UNKNOWN_TOOL", `tool has no trusted capability declaration: ${toolName}`, { tool: toolName });
   return entry.capabilities;
+}
+
+export function legacyCapabilitiesForTool(toolName: string): readonly string[] {
+  const entry = toolCapabilities.get(toolName);
+  if (!entry) throw new CapabilityRegistryError("UNKNOWN_TOOL", `tool has no trusted capability declaration: ${toolName}`, { tool: toolName });
+  return entry.legacyCapabilities;
+}
+
+export function approvalRequirementForTool(toolName: string): boolean | undefined {
+  const approval = toolCapabilities.get(toolName)?.approval;
+  return approval === undefined ? undefined : approval === "required";
+}
+
+export function safetyPolicyForTool(toolName: string): TrustedToolSafetyPolicy | undefined {
+  return toolCapabilities.get(toolName)?.safety;
+}
+
+export function approvalEffectPolicyForTool(toolName: string): TrustedApprovalEffectPolicy | undefined {
+  return toolCapabilities.get(toolName)?.approvalEffect;
 }
 
 export type CapabilityMigrationEntry = Readonly<{

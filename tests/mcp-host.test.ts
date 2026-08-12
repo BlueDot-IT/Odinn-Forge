@@ -126,7 +126,7 @@ test("subpath resolves while root and active runtime remain isolated", async () 
   for (const path of [
     "apps/cli/src/cli.ts",
     "apps/gateway/src/host.ts",
-    "packages/kernel/src/task-worker.ts",
+    "packages/runtime/src/task-worker.ts",
     "packages/kernel/src/providers/runtime.ts"
   ]) {
     assert.doesNotMatch(await readFile(path, "utf8"), /mcp-host/u, path);

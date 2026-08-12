@@ -213,6 +213,14 @@ Every Discord mutation is bound to an exact account, run, tool name, and input
 and consumes a one-time approval before any Discord request is made. Individual
 tools can be disabled under `plugins.entries.discord.config.tools`.
 
+The Discord adapter owns these tool schemas, Discord identifiers, account
+selection, payload construction, and REST behavior. `@odinn/runtime` composes
+the definitions into the CLI, gateway, and isolated workers. The kernel sees
+only the shared channel-tool contract and remains authoritative for policy,
+capability intersection, one-time approval consumption, audit, and uncertain
+outcomes. A configured agent-tool account does not require the inbound Discord
+Gateway adapter to be running.
+
 ## Runtime status
 
 `odinn config channel list`, `odinn status`, `odinn doctor`, and

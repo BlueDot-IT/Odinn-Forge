@@ -9,8 +9,9 @@ import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit } from "@odinn/application";
-import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
+import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
 import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
@@ -556,7 +557,7 @@ async function runGovernedTool(args: any, tool: any, input: any, runIdOverride?:
       },
       auditStore,
       policy: createDefaultPolicy(config.policy),
-      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config: { ...config, runLedger }, auditStore }),
+      registry: createRuntimeRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config: { ...config, runLedger }, auditStore }),
       runLedger
     });
     await printJson(result.output);
@@ -1289,7 +1290,7 @@ async function status(args: any) {
   const config = await readConfig(state);
   const models = listConfiguredModels(normalizeModelConfig(config));
   const policy = createDefaultPolicy(config.policy);
-  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config });
+  const registry = createRuntimeRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config });
   const statusRead = createStatusReadUseCase({
     readStatus: async () => ({
       ok: true,
@@ -1520,7 +1521,7 @@ async function verifyConfiguredModel(state: any, config: any, timeoutMs = provid
   }
   const auditStore = createAuditStore(join(state, "onboarding-verification.jsonl"));
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
-  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore });
+  const registry = createRuntimeRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore });
   const policy = ensureToolCapabilities(config.policy, ["model.chat"]);
   try {
     const result: any = await runTask({
@@ -2898,7 +2899,7 @@ async function run(args: any) {
   const policy = createDefaultPolicy(config.policy);
   let result: any;
   if (tool.startsWith("browser.")) {
-    const executor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
+    const executor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
     try {
       result = await executor({ task: { tool, input, actor: "cli" } });
     } finally {
@@ -2907,7 +2908,7 @@ async function run(args: any) {
   } else {
     const runLedger = createRunLedger({ stateDir: state, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
     const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-    const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore });
+    const registry = createRuntimeRegistry({ workspaceRoot, stateDir: state, config, auditStore });
     try {
       result = await runTask({
         task: { tool, input, actor: "cli" },
@@ -2949,7 +2950,7 @@ async function plan(args: any) {
   const parsedPlan = JSON.parse(await readFile(resolveInvocationPath(file), "utf8"));
   const policy = createDefaultPolicy(config.policy);
   if (parsedPlan.steps?.some((step: any) => String(step?.tool ?? "").startsWith("browser."))) {
-    const executor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
+    const executor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
     try {
       await printJson(await executor({ plan: parsedPlan, actor: "cli" }));
     } finally {
@@ -2959,7 +2960,7 @@ async function plan(args: any) {
   }
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-  const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore });
+  const registry = createRuntimeRegistry({ workspaceRoot, stateDir: state, config, auditStore });
   try {
     const result = await runPlan({
       plan: parsedPlan,
@@ -3291,7 +3292,7 @@ async function executeRecordTool(args: any, tool: any, input: any, signal?: Abor
     configBaselines.set(nextConfig, expectedFingerprint);
     return saveConfig(state, nextConfig);
   };
-  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore, writeConfig: writeRuntimeConfig });
+  const registry = createRuntimeRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore, writeConfig: writeRuntimeConfig });
   try {
     const result = await runTask({
       task: { tool, input, actor: "cli" },
@@ -3396,7 +3397,7 @@ async function gatewatchCommand(args: any) {
   if (!toolName) throw new Error("gatewatch preview requires --tool");
   const state = stateDir(rest);
   const config = await readConfig(state);
-  const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config });
+  const registry = createRuntimeRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config });
   const optionalCapabilities = (name: string) => {
     const value = option(rest, name);
     return value === undefined ? undefined : splitCsv(value);
@@ -3615,7 +3616,7 @@ async function capsuleCommand(args: any) {
             input = { ...input, capabilityToken: issued.token };
           }
           let registry = replayRegistries.get(workspaceRoot);
-          if (!registry) { registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore: replayAuditStore }); replayRegistries.set(workspaceRoot, registry); }
+          if (!registry) { registry = createRuntimeRegistry({ workspaceRoot, stateDir: state, config, auditStore: replayAuditStore }); replayRegistries.set(workspaceRoot, registry); }
           return runTask({
             task: { id: taskId, tool, input, actor: "capsule-replay" },
             auditStore: replayAuditStore,
@@ -3657,7 +3658,7 @@ async function counterfactualCommand(args: any) {
         workspaceRoot: invocationRoot(),
         executor: async (task: any, context: any) => {
           let registry = executionRegistries.get(context.workspaceRoot);
-          if (!registry) { registry = createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore: executionAuditStore }); executionRegistries.set(context.workspaceRoot, registry); }
+          if (!registry) { registry = createRuntimeRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore: executionAuditStore }); executionRegistries.set(context.workspaceRoot, registry); }
           return runTask({ task, auditStore: executionAuditStore, policy: context.policy, registry, runLedger: runtime.ledger });
         }
       });

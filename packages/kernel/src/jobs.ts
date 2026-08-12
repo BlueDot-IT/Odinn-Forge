@@ -448,6 +448,8 @@ interface WorkerConfiguration {
   workspaceRoot?: string;
   config?: unknown;
   policy?: unknown;
+  taskWorkerPath?: string;
+  browserWorkerPath?: string;
 }
 
 interface WorkerResponse {
@@ -476,11 +478,11 @@ function isWorkerResponse(message: unknown): message is WorkerResponse {
 export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): TaskExecutor {
   const { stateDir, workspaceRoot, config, policy } = options;
   const authoritativeRoot = resolve(workspaceRoot ?? process.cwd());
-  const workerPath = fileURLToPath(new URL(
+  const workerPath = options.taskWorkerPath ?? fileURLToPath(new URL(
     typeof __ODINN_COMPILED__ !== "undefined" ? "../workers/task-worker.js" : "./task-worker.ts",
     import.meta.url
   ));
-  const browserWorkerPath = fileURLToPath(new URL(
+  const browserWorkerPath = options.browserWorkerPath ?? fileURLToPath(new URL(
     typeof __ODINN_COMPILED__ !== "undefined" ? "../workers/browser-worker.js" : "./browser-worker.ts",
     import.meta.url
   ));

@@ -314,9 +314,13 @@ The repository is a Node.js workspace:
 ```text
 apps/cli/              command-line interface and setup
 apps/gateway/          local service and browser-based console
+adapters/channels/     messaging-network adapters and agent tool definitions
+packages/application/ transport-neutral contracts and migrated use cases
+packages/channels/    shared channel contracts and routing abstractions
 packages/kernel/       AI providers, memory, sessions, and tool execution
 packages/policy/       permissions and safety rules
 packages/protocol/     shared request and activity formats
+packages/runtime/      host composition for kernel, adapters, and workers
 packages/store-file/   local append-only storage
 packages/store-sqlite/ durable run and artifact storage
 tests/                 unit, integration, CLI, and platform coverage

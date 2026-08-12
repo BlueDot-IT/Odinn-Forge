@@ -20,6 +20,7 @@
     "@odinn/channels": "workspace:*",
     "@odinn/kernel": "workspace:*",
     "@odinn/policy": "workspace:*",
+    "@odinn/runtime": "workspace:*",
     "@odinn/store-file": "workspace:*"
   }
 }

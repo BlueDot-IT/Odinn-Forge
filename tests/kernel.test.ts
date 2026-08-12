@@ -8,6 +8,7 @@ import test from "node:test";
 import { closeBrowserManagers, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.ts";
 import { executeWorkspaceProcess } from "../packages/kernel/src/workspace-tools.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
+import { createRuntimeRegistry } from "../packages/runtime/src/index.ts";
 
 process.env.ODINN_BROWSER_HEADLESS = "1";
 process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
@@ -111,7 +112,7 @@ test("kernel routes model.chat through an OpenAI-compatible provider", async () 
   await new Promise((resolve: any) => provider.listen(0, "127.0.0.1", resolve));
   const { port } = provider.address();
   const { root, auditStore, registry: unacknowledgedRegistry } = await fixture();
-  const registry = createBuiltInRegistry({
+  const registry = createRuntimeRegistry({
     workspaceRoot: root,
     stateDir: join(root, ".odinn"),
     config: {
@@ -816,7 +817,7 @@ test("agent auto-learns explicit facts and recalls them into later model context
   await new Promise((resolve: any) => provider.listen(0, "127.0.0.1", resolve));
   const { port } = provider.address();
   const { root, auditStore } = await fixture();
-  const registry = createBuiltInRegistry({
+  const registry = createRuntimeRegistry({
     workspaceRoot: root,
     stateDir: join(root, ".odinn"),
     config: {

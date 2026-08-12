@@ -1,9 +1,8 @@
-import type { ApprovalStore } from "./approvals.ts";
-import type { DiscordRestClient } from "@odinn/channel-discord";
+import type { ChannelAgentToolDefinition, ChannelAgentToolDefinitions } from "@odinn/channels";
+import { DiscordRestClient } from "./rest.ts";
 
 type DiscordToolOptions = {
   config?: Record<string, any>;
-  approvalStore: ApprovalStore;
   fetch?: typeof globalThis.fetch;
 };
 
@@ -39,21 +38,22 @@ const DISCORD_MUTATION_TOOLS = new Set([
   "discord.replyThread"
 ]);
 
-export function createDiscordAgentTools({ config = {}, approvalStore, fetch = globalThis.fetch }: DiscordToolOptions) {
+export function createDiscordAgentToolDefinitions({
+  config = {},
+  fetch = globalThis.fetch
+}: DiscordToolOptions = {}): ChannelAgentToolDefinitions {
   const plugin = resolveDiscordPluginConfig(config);
   if (!plugin.enabled) return new Map();
   const clients = new Map<string, DiscordRestClient>();
-  const execute = async (tool: string, input: Record<string, any>, context: Record<string, any> = {}) => {
+  const clientFor = (input: Record<string, unknown>) => {
     const account = resolveDiscordAccount(plugin.accounts, input.accountId);
-    const existingClient = clients.get(account.accountId);
-    const client = existingClient ?? new (await import("@odinn/channel-discord")).DiscordRestClient({
-      token: account.token,
-      fetch
-    });
+    const existing = clients.get(account.accountId);
+    const client = existing ?? new DiscordRestClient({ token: account.token, fetch });
     clients.set(account.accountId, client);
-    const normalizedInput = { ...input };
-    delete normalizedInput.confirmed;
-    delete normalizedInput.approvalId;
+    return client;
+  };
+  const invoke = async (tool: string, input: Record<string, unknown>) => {
+    const client = clientFor(input);
     if (tool === "discord.listChannels") {
       return client.listChannels(snowflake(input.guildId, "guildId"));
     }
@@ -64,27 +64,6 @@ export function createDiscordAgentTools({ config = {}, approvalStore, fetch = gl
         ...(input.after ? { after: snowflake(input.after, "after") } : {})
       });
     }
-    if (DISCORD_MUTATION_TOOLS.has(tool) && !context.trustedApprovalId) {
-      const summary = discordMutationSummary(tool, input);
-      const approvalId = approvalStore.create({
-        type: "approval.required",
-        tool,
-        runId: context.request?.id,
-        accountId: account.accountId,
-        summary,
-        input: normalizedInput
-      });
-      return { type: "approval.required", approvalId, tool, summary, expiresInSeconds: 300 };
-    }
-    if (DISCORD_MUTATION_TOOLS.has(tool) && !approvalStore.consume(context.trustedApprovalId, {
-      tool,
-      runId: context.trustedApprovalRunId ?? context.request?.id,
-      accountId: account.accountId,
-      input: normalizedInput
-    })) {
-      throw new Error("Discord action approval is missing, expired, already used, or does not match this action");
-    }
-    input = normalizedInput;
     if (tool === "discord.sendMessage") {
       return client.sendMessage(
         snowflake(input.channelId, "channelId"),
@@ -180,14 +159,32 @@ export function createDiscordAgentTools({ config = {}, approvalStore, fetch = gl
     }
     throw new Error(`unsupported Discord tool: ${tool}`);
   };
-  return new Map(DISCORD_AGENT_TOOL_SCHEMAS.filter((schema) => plugin.tools[schema.function.name] !== false).map((schema) => {
-    const name = schema.function.name;
-    return [name, {
-      capability: DISCORD_MUTATION_TOOLS.has(name) ? "discord.write" : "discord.read",
-      description: schema.function.description,
-      execute: (input: Record<string, any>, context: Record<string, any>) => execute(name, input, context)
-    }];
-  }));
+  return new Map(DISCORD_AGENT_TOOL_SCHEMAS
+    .filter((schema) => plugin.tools[schema.function.name] !== false)
+    .map((schema) => {
+      const name = schema.function.name;
+      const definition: ChannelAgentToolDefinition = {
+        description: schema.function.description,
+        inputSchema: schema.function.parameters,
+        resourceBinding: (input: Record<string, unknown>) => discordResourceBinding(name, plugin.accounts, input),
+        ...(DISCORD_MUTATION_TOOLS.has(name) ? {
+          approvalBinding: (input: Record<string, unknown>) => {
+            const account = resolveDiscordAccount(plugin.accounts, input.accountId);
+            const normalizedInput = { ...input };
+            delete normalizedInput.confirmed;
+            delete normalizedInput.approvalId;
+            return {
+              accountId: account.accountId,
+              input: normalizedInput,
+              summary: discordMutationSummary(name, input)
+            };
+          },
+          approvalFailureMessage: "Discord action approval is missing, expired, already used, or does not match this action"
+        } : {}),
+        invoke: (input: Record<string, unknown>) => invoke(name, input)
+      };
+      return [name, definition] as const;
+    }));
 }
 
 function resolveDiscordPluginConfig(config: Record<string, any>) {
@@ -206,6 +203,13 @@ function resolveDiscordPluginConfig(config: Record<string, any>) {
 }
 
 function resolveDiscordAccount(accounts: Record<string, any>, requestedAccountId: unknown) {
+  const account = resolveDiscordAccountIdentity(accounts, requestedAccountId);
+  const token = account.tokenEnv ? process.env[account.tokenEnv] : "";
+  if (!token) throw new Error(`Discord credential is unavailable in ${account.tokenEnv || "the configured token environment variable"}`);
+  return { accountId: account.accountId, token };
+}
+
+function resolveDiscordAccountIdentity(accounts: Record<string, any>, requestedAccountId: unknown) {
   const configured = Object.entries(accounts)
     .filter(([, value]: any) => value?.enabled === true)
     .map(([accountId, value]: any) => ({ accountId, tokenEnv: String(value.tokenEnv ?? "") }));
@@ -217,9 +221,13 @@ function resolveDiscordAccount(accounts: Record<string, any>, requestedAccountId
     if (!configured.length) throw new Error("no enabled Discord account is configured");
     throw new Error(requested ? `Discord account is not configured: ${requested}` : "multiple Discord accounts are configured; accountId is required");
   }
-  const token = account.tokenEnv ? process.env[account.tokenEnv] : "";
-  if (!token) throw new Error(`Discord credential is unavailable in ${account.tokenEnv || "the configured token environment variable"}`);
-  return { accountId: account.accountId, token };
+  return account;
+}
+
+function discordResourceAccountId(accounts: Record<string, any>, requestedAccountId: unknown) {
+  const requested = String(requestedAccountId ?? "").trim();
+  if (requested) return requested;
+  return resolveDiscordAccountIdentity(accounts, undefined).accountId;
 }
 
 function snowflake(value: unknown, field: string) {
@@ -242,7 +250,7 @@ function requiredStringArray(value: unknown, field: string, maximumItems: number
   return value.map((entry, index) => requiredText(entry, `${field}[${index}]`, maximumLength));
 }
 
-function discordMutationSummary(tool: string, input: Record<string, any>) {
+function discordMutationSummary(tool: string, input: Record<string, unknown>) {
   if (tool === "discord.sendMessage") return `Send a message to Discord channel ${String(input.channelId ?? "")}`;
   if (tool === "discord.editMessage") return `Edit Discord message ${String(input.messageId ?? "")}`;
   if (tool === "discord.deleteMessage") return `Delete Discord message ${String(input.messageId ?? "")}`;
@@ -253,4 +261,30 @@ function discordMutationSummary(tool: string, input: Record<string, any>) {
   if (tool === "discord.sendPoll") return `Create Discord poll ${String(input.question ?? "")}`;
   if (tool === "discord.replyThread") return `Reply in Discord thread ${String(input.threadId ?? "")}`;
   return `Create Discord thread ${String(input.name ?? "")} in channel ${String(input.channelId ?? "")}`;
+}
+
+function discordResourceBinding(tool: string, accounts: Record<string, any>, input: Record<string, unknown>) {
+  const resource: Record<string, unknown> = {
+    accountId: discordResourceAccountId(accounts, input.accountId)
+  };
+  const fields = tool === "discord.listChannels" || tool === "discord.listThreads"
+    ? ["guildId"] as const
+    : tool === "discord.replyThread"
+      ? ["threadId", "replyToId"] as const
+      : tool === "discord.searchMessages"
+        ? ["guildId", "channelId"] as const
+        : tool === "discord.sendMessage"
+          ? ["channelId", "replyToId"] as const
+          : tool === "discord.listPins" || tool === "discord.readMessages" || tool === "discord.sendPoll"
+            ? ["channelId"] as const
+            : ["channelId", "messageId"] as const;
+  for (const field of fields) {
+    if (input[field] !== undefined && input[field] !== "") {
+      resource[field] = snowflake(input[field], field);
+    }
+  }
+  if (tool === "discord.addReaction" || tool === "discord.removeReaction" || tool === "discord.listReactions") {
+    resource.emoji = requiredText(input.emoji, "emoji", 128);
+  }
+  return resource;
 }

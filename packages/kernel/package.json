@@ -15,13 +15,15 @@
     "./project-context": "./src/project-context.ts",
     "./provider-capabilities": "./src/provider-capabilities.ts",
     "./session-lanes": "./src/session-lanes.ts",
-    "./skill-disclosure": "./src/skill-disclosure.ts"
+    "./skill-disclosure": "./src/skill-disclosure.ts",
+    "./task-worker-host": "./src/task-worker-host.ts",
+    "./browser-worker-host": "./src/browser-worker-host.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@odinn/channel-discord": "workspace:*",
+    "@odinn/channels": "workspace:*",
     "@odinn/policy": "workspace:*",
     "@odinn/protocol": "workspace:*",
     "@odinn/store-file": "workspace:*",

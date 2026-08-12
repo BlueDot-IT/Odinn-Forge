@@ -6,8 +6,9 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit } from "@odinn/application";
-import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
+import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 import {
   ChannelPluginRegistry,
@@ -747,10 +748,10 @@ export async function createGatewayServer({
     ? createGovernedMcpRuntime({ enabled: true, config: config.mcp, extensionRegistry, extensionExecutor, auditStore, runLedger: runtime.ledger })
     : undefined;
   const writeSelfImprovementConfig = (nextConfig: any, expectedFingerprint: string) => writeEditableConfig(state, { config: nextConfig, fingerprint: expectedFingerprint }, { hosted });
-  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
-  const governedRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
+  const registry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
+  const governedRegistry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const gatewayToken = await loadGatewayToken(state);
-  const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
+  const isolatedTaskExecutor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
   const supervisor = new JobSupervisor({
     store: new SqliteJobStore(runtime.ledger, { legacyPath: join(state, "jobs.json") }),

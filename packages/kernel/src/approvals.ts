@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { redactDurableValue } from "@odinn/protocol";
+import { approvalEffectPolicyForTool } from "@odinn/policy";
 
 type NodeError = Error & { code?: string };
 
@@ -433,18 +434,20 @@ function buildApprovalEffect(tool: string, input: Record<string, unknown>): Appr
       idempotency: "unknown"
     };
   }
-  if (tool.startsWith("discord.")) {
-    const target = boundedEffectText(input.channelId ?? input.threadId ?? input.messageId, "the configured Discord target");
+  const externalEffect = approvalEffectPolicyForTool(tool);
+  if (externalEffect) {
+    const targetValue = externalEffect.targetFields.map((field) => input[field]).find((value) => value !== undefined);
+    const target = boundedEffectText(targetValue, externalEffect.targetFallback);
     return {
       ...base,
-      summary: `Perform one approved Discord mutation on ${target}.`,
-      effectClass: "Discord mutation",
+      summary: `Perform one approved ${externalEffect.summaryAction} on ${target}.`,
+      effectClass: externalEffect.effectClass,
       target,
-      mutation: tool.slice("discord.".length),
+      mutation: externalEffect.mutation,
       payloadDigest: digest,
-      recovery: "An uncertain external mutation requires operator review before retry.",
-      reversible: tool.includes("delete") ? "irreversible" : "uncertain",
-      idempotency: "non-idempotent"
+      recovery: externalEffect.recovery,
+      reversible: externalEffect.reversible,
+      idempotency: externalEffect.idempotency
     };
   }
   if (tool === "skill.lifecycle" || tool === "skill.install") {

@@ -29,12 +29,9 @@ such as `@odinn/gateway` cannot bypass the boundary. Dynamic `import()` and
 `require()` calls in either protected package must use literal module
 specifiers so their dependency direction remains statically enforceable.
 
-The checker has a temporary, occurrence-counted baseline for the one static and
-one dynamic `@odinn/channel-discord` import that currently remain in
-`packages/kernel/src/discord.ts`. It exists only so the dependency-direction
-gate can land before the Discord extraction. Any additional occurrence fails;
-the Discord extraction must remove both imports and the corresponding baseline
-entries.
+The dependency-direction check has no legacy exemptions. Channel transport
+implementations are assembled by `@odinn/runtime`; the kernel accepts only the
+shared channel-tool contract from `@odinn/channels`.
 
 ### Security
 

@@ -14,6 +14,7 @@
     "@odinn/application": "workspace:*",
     "@odinn/gateway": "workspace:*",
     "@odinn/kernel": "workspace:*",
-    "@odinn/policy": "workspace:*"
+    "@odinn/policy": "workspace:*",
+    "@odinn/runtime": "workspace:*"
   }
 }
