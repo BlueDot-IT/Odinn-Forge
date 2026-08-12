@@ -31,6 +31,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   invariant, platform, and package checks.
 - [Release validation](release-validation.md) — evidence expected from a
   release candidate.
+- [1.1 release scope](v1.1-release-scope.md) — active feature freeze,
+  deliverables, experimental exclusions, and stable-release blockers.
 - [BlueDot agent benchmarks](https://github.com/BlueDot-IT/agent-benchmarks) —
   comparative runtime/model evaluation, performance methodology, and reports.
 
@@ -113,6 +115,7 @@ These documents record planning or acceptance work. Read each document's own
 status and date before using it as current product evidence.
 
 - [Stabilization plan](stabilization-plan.md)
+- [1.1 release scope](v1.1-release-scope.md)
 - [v0.4.0 user acceptance record](uat/v0.4.0-uat.md)
 - [UAT findings proof log](uat/logs/uat-findings.md)
 
