@@ -528,30 +528,39 @@ test("Stage 10 contains late dispatch rejection after bounded shutdown closes th
   }
 });
 
-test("Stage 10 renews a live workflow lease for legitimate long-running work", async () => {
+test("Stage 10 renews a live workflow lease for legitimate long-running work", { timeout: 10_000 }, async (t) => {
   const state = await stateRoot("workflow-lease-renewal");
   const ledger = createRunLedger({ stateDir: state });
   const store = new SqliteWorkflowStore(ledger.database);
   const definition = workflowDefinitionFromSteps({ id: "fixture.lease-renewal", name: "Lease renewal fixture", steps: [{ id: "step", actionRef: "remote.long", input: {}, retrySafety: "effectful" }] });
   let renewals = 0;
+  let markDispatchFinished!: () => void;
+  const dispatchFinished = new Promise<void>((resolve) => { markDispatchFinished = resolve; });
   const runtime = new DurableWorkflowRuntime({
     store,
     leaseMs: 40,
     dispatch: async (_context) => {
-      for (let index = 0; index < 4; index += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        assert.equal(_context.renewLease(), true);
-        renewals += 1;
+      try {
+        for (let index = 0; index < 4; index += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          assert.equal(_context.renewLease(), true);
+          renewals += 1;
+        }
+        return { status: "completed", result: {} };
+      } finally {
+        markDispatchFinished();
       }
-      return { status: "completed", result: {} };
     }
   });
+  t.after(async () => {
+    await runtime.shutdown();
+    ledger.close();
+  });
   await runtime.submit({ runId: "workflow-lease-renewal-1", principalId: "test", idempotencyKey: "workflow-lease-renewal-key", definition, input: {} });
+  await dispatchFinished;
   for (let attempt = 0; attempt < 200 && store.get("workflow-lease-renewal-1")?.status !== "completed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(renewals, 4);
   assert.equal(store.get("workflow-lease-renewal-1")?.status, "completed");
-  await runtime.shutdown();
-  ledger.close();
 });
 
 test("Stage 10 gateway dispatch heartbeats its workflow lease until settlement", async () => {
