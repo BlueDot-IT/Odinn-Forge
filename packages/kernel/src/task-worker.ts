@@ -6,6 +6,7 @@ import type { RuntimePolicy } from "@odinn/policy";
 let shuttingDown = false;
 let activeAbortController: AbortController | undefined;
 let active = false;
+const WORKER_STATE_INITIALIZATION_TIMEOUT_MS = 60_000;
 
 interface TaskWorkerMessage {
   type?: "task" | "abort";
@@ -37,6 +38,11 @@ async function executeMessage(rawMessage: unknown) {
       const registryOptions = { workspaceRoot, stateDir, config, approvalStore, auditStore, processExecutor };
       registry = createBuiltInRegistry(registryOptions);
       runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+    }, {
+      // Windows applies owner-only ACLs while each isolated worker opens the
+      // shared state. Concurrent read surfaces can therefore legitimately
+      // serialize longer than the general interactive mutation timeout.
+      timeoutMs: WORKER_STATE_INITIALIZATION_TIMEOUT_MS
     });
     const result = payload.plan
       ? await runPlan({ plan: payload.plan, auditStore, policy, registry, runLedger, actor: payload.actor, signal: controller.signal, durableExecution: payload.durableExecution === true })
