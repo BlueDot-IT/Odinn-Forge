@@ -701,11 +701,12 @@ export class RunLedger {
     });
   }
 
-  resumeExecution({ runId, executionId, inputDigest, principalId }: {
+  resumeExecution({ runId, executionId, inputDigest, principalId, approvalContinuation = false }: {
     runId: string;
     executionId: string;
     inputDigest: string;
     principalId: string;
+    approvalContinuation?: boolean;
   }) {
     return this.database.transaction((db) => {
       const envelopeRow = db.prepare(`SELECT envelope_digest, envelope_json, admitted_at
@@ -740,6 +741,16 @@ export class RunLedger {
           replay: true,
           attempt: {
             id: String(latest.id), runId, attemptNumber: Number(latest.attempt_number), state: "awaiting-approval" as const,
+            createdAt: String(latest.created_at)
+          }
+        };
+      }
+      if (latest?.state === "running" && approvalContinuation) {
+        return {
+          ...persisted,
+          replay: true,
+          attempt: {
+            id: String(latest.id), runId, attemptNumber: Number(latest.attempt_number), state: "running" as const,
             createdAt: String(latest.created_at)
           }
         };

@@ -434,7 +434,6 @@ interface WorkerPayload extends JsonObject {
   actor?: string;
   approvalId?: string;
   approvalRunId?: string;
-  trustedRecovery?: boolean;
   plan?: JsonObject;
   workspaceRoot?: string;
   task?: JsonObject & { tool?: string };
@@ -489,7 +488,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
   const browserExecutor = createPersistentWorkerExecutor({ workerPath: browserWorkerPath, stateDir, workspaceRoot: authoritativeRoot, config, policy });
   const children = new Set<ChildProcess>();
   const execute = ((payload: WorkerPayload, { signal, job }: ExecutorOptions = {}) => {
-    const trustedRecovery = payload.trustedRecovery === true || Number(job?.attempts ?? 0) > 1;
+    const trustedRecovery = Number(job?.attempts ?? 0) > 1;
     const taskWorkspaceRoot = resolve(payload.workspaceRoot || authoritativeRoot);
     if (taskWorkspaceRoot !== authoritativeRoot && !taskWorkspaceRoot.startsWith(`${authoritativeRoot}${sep}`)) {
       return Promise.reject(new Error("task workspaceRoot must remain inside the gateway workspace"));

@@ -38,6 +38,8 @@ export function registerChannelAgentTools(
     const legacyCapability = legacyCapabilitiesForTool(name)[0] ?? capabilitiesForTool(name)[0];
     registry.set(name, {
       capability: legacyCapability,
+      ...(definition.approvalBinding ? { capabilityApprovalContinuation: "required" } : {}),
+      ...(definition.approvalBinding ? { approvalInputNoopKeys: ["confirmed", "approvalId"] } : {}),
       description: definition.description,
       inputSchema: definition.inputSchema,
       resourceForInput: (input: Record<string, unknown>) => definition.resourceBinding(input),
@@ -55,8 +57,10 @@ export function registerChannelAgentTools(
               tool: name,
               runId: context.request?.id,
               accountId: binding.accountId,
+              actor: context.request?.actor,
               summary: binding.summary,
               input,
+              executionInput: input,
             });
             return {
               type: "approval.required",
@@ -70,6 +74,7 @@ export function registerChannelAgentTools(
             tool: name,
             runId: context.trustedApprovalRunId ?? context.request?.id,
             accountId: binding.accountId,
+            actor: context.request?.actor,
             input,
           });
           if (!approved) {

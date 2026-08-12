@@ -423,7 +423,7 @@ export class CapabilityBroker {
     this.ledger.appendEvent({ runId, type: "capability-issued", payload: { ...claims, token: undefined } });
     return { token: `${encoded}.${signature}`, claims };
   }
-  consume(token: string, { runId, toolName, resource = {} }: AnyRecord = {}) {
+  validate(token: string, { runId, toolName, resource = {} }: AnyRecord = {}) {
     requireExperimental(this.featureFlags, "capabilities", this.ledger);
     const [encoded, signature] = String(token ?? "").split("."); const expected = createHmac("sha256", this.key).update(encoded ?? "").digest("base64url");
     if (!encoded || !signature || signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new OdinnRuntimeError("CAPABILITY_DENIED", "invalid capability signature");
@@ -434,6 +434,10 @@ export class CapabilityBroker {
     if (row.uses >= row.max_uses) throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability use limit exceeded");
     if (row.status !== "active") throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability is not active");
     const constraints = parse(row.constraints_json, {}); for (const [key, expectedValue] of Object.entries(constraints)) if (Array.isArray(expectedValue) ? !expectedValue.includes(resource[key]) : resource[key] !== expectedValue) throw new OdinnRuntimeError("CAPABILITY_SCOPE_MISMATCH", `resource constraint mismatch: ${key}`);
+    return claims;
+  }
+  consume(token: string, { runId, toolName, resource = {} }: AnyRecord = {}) {
+    const claims = this.validate(token, { runId, toolName, resource });
     this.ledger.database.transaction((db: any) => {
       const usedAt = now();
       const update = db.prepare("UPDATE capabilities SET uses = uses + 1, status = CASE WHEN uses + 1 >= max_uses THEN 'consumed' ELSE status END WHERE id = ? AND status = 'active' AND uses < max_uses AND expires_at > ?").run(claims.id, usedAt);

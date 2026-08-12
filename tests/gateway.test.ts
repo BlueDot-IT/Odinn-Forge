@@ -958,6 +958,203 @@ test("gateway approval POST restores and executes the exact volatile browser inp
   }
 });
 
+test("gateway durable approval continuation consumes Rune Key and browser approval exactly once", async (t: any) => {
+  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
+  try { await access(chromiumPath); } catch { t.skip(`Chromium not available at ${chromiumPath}`); return; }
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-rune-key-approval-"));
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
+    experimental: { capabilities: true, capsules: false, counterfactual: false },
+    policy: {
+      allowedCapabilities: ["browser.read", "browser.mutate", "network.access"],
+      security: { browser: { allowPrivateNetwork: true } }
+    }
+  }, null, 2)}\n`, { mode: 0o600 });
+  const fixture = createHttpServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(`<!doctype html><title>before</title><input id="rune-key"><script>
+      let mutations = 0;
+      const field = document.querySelector("#rune-key");
+      field.addEventListener("input", () => { mutations += 1; document.title = field.value + ":" + mutations; });
+    </script>`);
+  });
+  await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+  const fixtureAddress = fixture.address();
+  if (!fixtureAddress || typeof fixtureAddress === "string") throw new Error("browser fixture did not bind a TCP port");
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const openRunId = "rune-key-browser-open";
+    const openKey = await postJson(`${base}/capabilities/issue`, {
+      runId: openRunId,
+      stepId: "open",
+      toolName: "browser.open",
+      maxUses: 1
+    });
+    const opened = await postJson(`${base}/run`, {
+      id: openRunId,
+      tool: "browser.open",
+      input: { url: `http://127.0.0.1:${fixtureAddress.port}/`, capabilityToken: openKey.token }
+    });
+    const jobId = "rune-key-browser-job";
+    const mutationKey = await postJson(`${base}/capabilities/issue`, {
+      runId: jobId,
+      stepId: "type",
+      toolName: "browser.type",
+      maxUses: 1
+    });
+    const submitted = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": jobId },
+      body: JSON.stringify({
+        task: {
+          tool: "browser.type",
+          actor: "gateway-browser-test",
+          input: {
+            tabId: opened.output.id,
+            snapshotId: opened.output.snapshotId,
+            expectedUrl: opened.output.url,
+            selector: "#rune-key",
+            value: "approved-once",
+            capabilityToken: mutationKey.token
+          }
+        }
+      })
+    });
+    assert.equal(submitted.status, 202);
+    let job: any;
+    const approvalDeadline = Date.now() + 10_000;
+    while (Date.now() < approvalDeadline) {
+      job = await (await fetch(`${base}/jobs/${jobId}`)).json();
+      if (job.status === "awaiting-approval" || job.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(job.status, "awaiting-approval");
+    const originalAttemptId = job.executionAttemptId;
+    const originalAuditCorrelationId = job.auditCorrelationId;
+    assert.ok(originalAttemptId);
+    assert.ok(originalAuditCorrelationId);
+    const beforeApproval = await getJson(`${base}/capabilities/${jobId}`);
+    assert.equal(beforeApproval[0].uses, 0);
+    assert.equal(beforeApproval[0].status, "active");
+    const approval = (await getJson(`${base}/approvals`)).find((entry: any) => entry.runId === jobId);
+    assert.ok(approval?.id);
+    assert.equal(JSON.stringify(await getJson(`${base}/approvals`)).includes(mutationKey.token), false);
+
+    const approvalRequest = () => fetch(`${base}/approvals/${approval.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    const concurrentApprovals = await Promise.all([approvalRequest(), approvalRequest()]);
+    assert.deepEqual(concurrentApprovals.map((response) => response.status).sort(), [200, 409]);
+    const approvedResponse = concurrentApprovals.find((response) => response.status === 200)!;
+    const approved = await approvedResponse.json();
+    assert.equal(approved.output.title, "approved-once:1");
+
+    const completionDeadline = Date.now() + 10_000;
+    while (Date.now() < completionDeadline) {
+      job = await (await fetch(`${base}/jobs/${jobId}`)).json();
+      if (job.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(job.status, "completed");
+    assert.equal(job.result.output.title, "approved-once:1");
+    assert.equal(job.executionAttemptId, originalAttemptId);
+    assert.equal(job.auditCorrelationId, originalAuditCorrelationId);
+    const afterApproval = await getJson(`${base}/capabilities/${jobId}`);
+    assert.equal(afterApproval[0].uses, 1);
+    assert.equal(afterApproval[0].status, "consumed");
+    assert.equal((await approvalRequest()).status, 404);
+
+    const submitPendingMutation = async (pendingJobId: string, value: string) => {
+      const key = await postJson(`${base}/capabilities/issue`, {
+        runId: pendingJobId,
+        stepId: "type",
+        toolName: "browser.type",
+        maxUses: 1
+      });
+      const response = await fetch(`${base}/jobs`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": pendingJobId },
+        body: JSON.stringify({
+          task: {
+            tool: "browser.type",
+            actor: "gateway-browser-test",
+            input: {
+              tabId: opened.output.id,
+              selector: "#rune-key",
+              value,
+              capabilityToken: key.token
+            }
+          }
+        })
+      });
+      assert.equal(response.status, 202);
+      let pendingJob: any;
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        pendingJob = await (await fetch(`${base}/jobs/${pendingJobId}`)).json();
+        if (pendingJob.status === "awaiting-approval" || pendingJob.status === "failed") break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.equal(pendingJob.status, "awaiting-approval");
+      const pendingApproval = (await getJson(`${base}/approvals`)).find((entry: any) => entry.runId === pendingJobId);
+      assert.ok(pendingApproval?.id);
+      return { key, approvalId: pendingApproval.id };
+    };
+
+    const deniedJobId = "rune-key-browser-denied";
+    const denied = await submitPendingMutation(deniedJobId, "must-not-dispatch-denied");
+    const denialResponse = await fetch(`${base}/approvals/${denied.approvalId}/deny`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(denialResponse.status, 200);
+    assert.equal((await getJson(`${base}/jobs/${deniedJobId}`)).status, "cancelled");
+    const deniedAuthority = await getJson(`${base}/capabilities/${deniedJobId}`);
+    assert.equal(deniedAuthority[0].uses, 0);
+    assert.equal(deniedAuthority[0].status, "active");
+    assert.equal((await fetch(`${base}/approvals/${denied.approvalId}/approve`, { method: "POST" })).status, 404);
+
+    const cancelledJobId = "rune-key-browser-cancelled";
+    const cancelled = await submitPendingMutation(cancelledJobId, "must-not-dispatch-cancelled");
+    const cancellationResponse = await fetch(`${base}/jobs/${cancelledJobId}/cancel`, { method: "POST" });
+    assert.equal(cancellationResponse.status, 200);
+    assert.equal((await cancellationResponse.json()).job.status, "cancelled");
+    const cancelledAuthority = await getJson(`${base}/capabilities/${cancelledJobId}`);
+    assert.equal(cancelledAuthority[0].uses, 0);
+    assert.equal(cancelledAuthority[0].status, "active");
+    assert.equal((await fetch(`${base}/approvals/${cancelled.approvalId}/approve`, { method: "POST" })).status, 404);
+
+    const snapshotRunId = "rune-key-browser-final-snapshot";
+    const snapshotKey = await postJson(`${base}/capabilities/issue`, {
+      runId: snapshotRunId,
+      stepId: "snapshot",
+      toolName: "browser.snapshot",
+      maxUses: 1
+    });
+    const snapshot = await postJson(`${base}/run`, {
+      id: snapshotRunId,
+      tool: "browser.snapshot",
+      input: { tabId: opened.output.id, capabilityToken: snapshotKey.token }
+    });
+    assert.equal(snapshot.output.title, "approved-once:1", "denied and cancelled approvals must not dispatch");
+
+    const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+    try {
+      assert.deepEqual(ledger.listExecutionAttempts(jobId).map((attempt: any) => attempt.state), ["completed"]);
+      assert.equal(ledger.getRun(jobId).events.filter((event: any) => event.type === "capability-consumed").length, 1);
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+    await new Promise((resolve: any) => fixture.close(() => resolve()));
+  }
+});
+
 test("gateway submits MCP invocations as durable approval-gated jobs", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-mcp-job-"));
   await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
