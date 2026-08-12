@@ -19,6 +19,23 @@ Required jobs:
 
 The inference job launches the packaged Gateway, configures a local OpenAI-compatible protocol provider, and verifies a persisted model response through the public API. It is real packaged gateway behavior proof, but it is not proof of production-model quality or a live cloud-provider account.
 
+The quality job also runs `pnpm check:architecture`. This repository-owned
+TypeScript AST check rejects channel-adapter and direct adapter imports from
+`packages/kernel`, and rejects channel-adapter, direct adapter, and application
+transport imports from `packages/application`. Diagnostics name the source
+file, import specifier, and violated rule. Repository workspace package names
+and their subpath exports are resolved as well as relative paths, so aliases
+such as `@odinn/gateway` cannot bypass the boundary. Dynamic `import()` and
+`require()` calls in either protected package must use literal module
+specifiers so their dependency direction remains statically enforceable.
+
+The checker has a temporary, occurrence-counted baseline for the one static and
+one dynamic `@odinn/channel-discord` import that currently remain in
+`packages/kernel/src/discord.ts`. It exists only so the dependency-direction
+gate can land before the Discord extraction. Any additional occurrence fails;
+the Discord extraction must remove both imports and the corresponding baseline
+entries.
+
 ### Security
 
 Runs on pull requests, pushes to `main`, a weekly schedule, and manual dispatch.

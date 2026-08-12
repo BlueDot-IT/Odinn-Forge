@@ -36,6 +36,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm release:preflight
+      - run: pnpm check:architecture
       - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
