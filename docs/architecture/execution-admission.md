@@ -137,7 +137,10 @@ writer, but they do not bypass admission, silently discard a read, or retry an
 effectful operation. Exhausting the window remains an explicit operational
 failure.
 
-`pnpm benchmark:assurance` enforces the 10 ms p95 gate on the atomic execution-envelope ledger transaction. It separately reports complete admission with the authoritative signed audit commit. That second store uses `synchronous=FULL` and remains observational; its durability is not reduced for latency cosmetics.
+Execution-admission correctness is enforced through normal tests covering the
+atomic execution-envelope transaction and the separate authoritative signed
+audit commit. Comparative admission performance belongs in
+[BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).
 
 CI seeds 10,000 mixed job/attempt records, closes and reopens the database,
 performs restart reconciliation, and verifies every job and attempt

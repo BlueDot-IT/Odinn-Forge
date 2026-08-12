@@ -32,7 +32,7 @@ pnpm test:backup
 pnpm test:restore
 pnpm test:uninstall
 pnpm test:compiled-release
-pnpm benchmark:ci
+pnpm test:invariants
 pnpm release:package
 pnpm release:soak
 pnpm release:checksums

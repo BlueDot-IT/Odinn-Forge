@@ -17,6 +17,4 @@ Thumbs.db
 .odinn.migration-*
 
 # Local/archive-only documentation drafts
-/docs/benchmarks.md
-/docs/benchmarks/
 /docs/critical-capability-implementation-plan.md

@@ -84,13 +84,11 @@ Migration does not activate FTS5; the FTS
 candidate remains an opt-in, separate retrieval layer pending parity and
 cross-platform activation proof.
 
-`pnpm benchmark:authoritative-storage` runs 10K, 100K, and 1M mixed event
-corpora by default. It asserts row and scope correctness, exercises current
-session/project/goal lists, message paging, external-ID lookup, memory search,
-and namespace browse, and reports per-operation p50/p95/p99 latency plus sampled
-peak heap and RSS deltas. `BENCHMARK_SIZES`, `BENCHMARK_SAMPLES`, and
-`BENCHMARK_CHUNK_SIZE` provide explicit smoke/soak controls without changing the
-default evidence sizes.
+Authoritative storage correctness remains covered by ordinary tests for durable
+row counts, project/session/goal scoping, message paging, external-ID lookup,
+memory search, namespace isolation, and concurrent idempotency. Comparative
+storage performance evaluation belongs in
+[BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).
 
 ## Parity and activation gates
 
@@ -105,11 +103,9 @@ tie-breaking, or authority policy. Activation requires:
 3. retrieval-quality and contamination parity on representative corpora;
 4. security review of multi-user scope enforcement;
 5. cross-platform FTS5 packaging proof; and
-6. existing inference latency gates plus the synthetic candidate benchmark.
+6. external comparative evaluation of inference and candidate retrieval.
 
-`pnpm benchmark:memory-index` builds a deterministic 20,000-document corpus and
-first proves equivalent result IDs, then reports bounded FTS5 retrieval beside a
-simple full JavaScript scan. Fingerprint and rebuild timing are separate. It is
-diagnostic evidence, not a replacement for `pnpm benchmark:ci`, and does not
-claim a speedup when the observed FTS result is slower, production relevance, or
-semantic-quality parity.
+The product invariant suite builds a deterministic 20,000-document corpus and
+proves exact ordered result-ID parity against an independent in-memory scan.
+Fingerprint, rebuild, corruption, and fallback behavior remain normal
+correctness tests; performance comparisons are external.

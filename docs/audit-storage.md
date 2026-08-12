@@ -45,9 +45,9 @@ uses the SQLite backup API and excludes WAL, SHM, and notification sidecars.
 
 ```sh
 pnpm soak:audit
-pnpm benchmark:audit
 ```
 
-The benchmark defaults to 10K, 100K, and 1M events and reports append p50/p95/p99,
-throughput, memory, and final chain verification. Override sizes for a smoke run
-with `ODINN_AUDIT_BENCHMARK_SIZES=1000`.
+The soak validates concurrent append, cursor persistence, segment rotation,
+archive and retention behavior, restart, and final chain integrity. Comparative
+audit performance evaluation belongs in
+[BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).

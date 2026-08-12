@@ -118,8 +118,8 @@ pnpm lint
 pnpm typecheck
 pnpm test
 pnpm test:integration
+pnpm test:invariants
 pnpm smoke:inference
-pnpm benchmark:ci
 node scripts/ci/audit.ts high
 pnpm build
 pnpm release:package

@@ -35,26 +35,36 @@ test("local package operations have conservative resource limits", async () => {
   assert.match(runner, /--workspace-concurrency=\$\{workspaceConcurrency\}/);
 });
 
-test("CI records assurance hot-path latency without weakening the cold-start gate", async () => {
+test("comparative benchmarking remains outside the product repository", async () => {
   const pkg = JSON.parse(await read("package.json"));
-  const coldBenchmark = await read("scripts/ci/benchmark.ts");
-  const assuranceBenchmark = await read("scripts/ci/assurance-benchmark.ts");
-  const ciDocumentation = await read("docs/ci-cd.md");
+  assert.deepEqual(
+    Object.keys(pkg.scripts).filter((name) => name.startsWith("benchmark:")),
+    [],
+  );
 
-  assert.match(pkg.scripts["benchmark:ci"], /scripts\/ci\/benchmark\.ts/);
-  assert.match(pkg.scripts["benchmark:ci"], /benchmark:assurance/);
-  assert.equal(pkg.scripts["benchmark:assurance"], "node scripts/ci/assurance-benchmark.ts");
-  assert.match(coldBenchmark, /ODINN_BENCHMARK_P95_MAX_MS/);
-  assert.match(coldBenchmark, /parseP95Threshold/);
-  assert.match(coldBenchmark, /release:package/);
-  assert.match(coldBenchmark, /package-stage/);
-  assert.match(coldBenchmark, /benchmark\.json/);
-  assert.match(assuranceBenchmark, /benchmarkToolDispatch\(0\)/);
-  assert.match(assuranceBenchmark, /benchmarkToolDispatch\(10\)/);
-  assert.match(assuranceBenchmark, /executionEnvelopePersistenceP95MaxMs: 10/);
-  assert.match(assuranceBenchmark, /\[100, 1_000, 10_000\]/);
-  assert.match(assuranceBenchmark, /execution envelope persistence gate is enforced/);
-  assert.match(ciDocumentation, /execution-envelope persistence has an enforced 10 ms p95\s+budget/iu);
+  const ciScripts = await readdir(new URL("../scripts/ci/", import.meta.url));
+  assert.deepEqual(
+    ciScripts.filter((name) => name.includes("benchmark")),
+    [],
+  );
+
+  const removedBenchmarkControls =
+    /benchmark:|dist\/benchmark|benchmark-report|ODINN_(?:ASSURANCE_|WORKSPACE_|AUDIT_)?BENCHMARK|BENCHMARK_(?:SIZES|SAMPLES|CHUNK_SIZE)/u;
+  for (const workflow of ["ci.yml", "merge-queue.yml", "nightly.yml", "release.yml"]) {
+    const content = await read(`.github/workflows/${workflow}`);
+    assert.doesNotMatch(content, removedBenchmarkControls);
+    assert.match(content, /pnpm test:invariants/u);
+  }
+  const forgejo = await read(".forgejo/workflows/ci.yml");
+  assert.doesNotMatch(forgejo, removedBenchmarkControls);
+  assert.match(forgejo, /pnpm test:invariants/u);
+  assert.match(await read(".github/workflows/merge-queue.yml"), /pnpm smoke:inference:compiled/u);
+  assert.match(await read(".github/workflows/nightly.yml"), /pnpm smoke:inference:compiled/u);
+  assert.match(forgejo, /pnpm smoke:inference:compiled/u);
+
+  const documentation = await read("docs/README.md");
+  assert.match(documentation, /BlueDot-IT\/agent-benchmarks/u);
+  assert.doesNotMatch(documentation, /\(benchmarks\.md\)/u);
 });
 
 test("required CI/CD workflows exist", async () => {

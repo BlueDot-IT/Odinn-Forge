@@ -173,7 +173,7 @@ The work is not complete until all gates pass:
 - `pnpm smoke:onboarding`
 - `pnpm test:integration`
 - `pnpm smoke:inference`
-- `pnpm benchmark:ci`
+- `pnpm test:invariants`
 - `pnpm release:preflight`
 - `pnpm release:package`
 - `pnpm release:checksums`
