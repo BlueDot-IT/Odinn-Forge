@@ -1,24 +1,10 @@
-const SAFE_APPLICATION_METADATA_KEYS = new Set([
-  "apikeyenv",
-  "authentication",
-  "authorizationdecisionreferences",
-  "authorizationstatus",
-  "authmode",
-  "cookiepolicy",
-  "credentialconfigured",
-  "credentialpresent",
-  "credentialsconfigured",
-  "credentialspresent",
-  "secretreferences",
-  "secretsexcludedfromdiagnostics",
-  "tokenenv"
-]);
-
 const SENSITIVE_METADATA_ATOMS = new Set([
   "accesstoken",
   "apikey",
   "auth",
+  "authentication",
   "authorization",
+  "bearer",
   "botsecret",
   "bottoken",
   "clientsecret",
@@ -27,6 +13,7 @@ const SENSITIVE_METADATA_ATOMS = new Set([
   "credential",
   "credentials",
   "idtoken",
+  "jwt",
   "password",
   "passwordhash",
   "passwords",
@@ -39,76 +26,102 @@ const SENSITIVE_METADATA_ATOMS = new Set([
   "tokens"
 ]);
 
-const SENSITIVE_METADATA_SUFFIXES = [
-  "passwordhash",
-  "privatekey",
-  "clientsecret",
-  "refreshtoken",
-  "accesstoken",
-  "bottoken",
-  "botsecret",
-  "idtoken",
-  "apikey",
-  "auth",
-  "authorization",
-  "credentials",
-  "credential",
-  "passwords",
-  "password",
-  "passwd",
-  "cookies",
-  "cookie",
-  "secrets",
-  "secret",
-  "tokens",
-  "token"
-] as const;
+const SENSITIVE_METADATA_SHORTHANDS = new Set([
+  "cred",
+  "creds",
+  "pwd"
+]);
 
 const SENSITIVE_MATERIAL_QUALIFIERS = [
-  "blob",
-  "bytes",
-  "content",
-  "contents",
+  "base64url",
   "ciphertext",
-  "data",
-  "digest",
-  "encoded",
-  "header",
-  "headers",
-  "hash",
+  "configured",
+  "fingerprint",
+  "plaintext",
+  "references",
+  "signature",
+  "base64",
+  "contents",
+  "encrypted",
+  "encryption",
   "material",
-  "pem",
+  "present",
+  "reference",
+  "sha512",
+  "sha384",
+  "sha256",
+  "sha224",
+  "encoded",
+  "headers",
+  "values",
+  "content",
+  "digest",
+  "header",
+  "policy",
+  "sha1",
   "string",
   "value",
-  "values"
+  "blob",
+  "bytes",
+  "data",
+  "env",
+  "hash",
+  "hex",
+  "md5",
+  "mode",
+  "pem",
+  "raw",
+  "salt",
+  "salted"
 ] as const;
+
+const compactQualifierPattern = new RegExp(
+  `^(?:${SENSITIVE_MATERIAL_QUALIFIERS.join("|")})+$`,
+  "u"
+);
+
+/**
+ * Reject metadata keys whose visual representation and comparison form can
+ * disagree. Application metadata is a machine contract, so ASCII field names
+ * are intentional; user-facing text belongs in field values.
+ */
+export function isAmbiguousApplicationMetadataKey(key: string): boolean {
+  return key.length === 0
+    || key.normalize("NFKC") !== key
+    || !/^[\x20-\x7e]+$/u.test(key);
+}
 
 /**
  * Classify fields that could directly carry credential or secret material.
  *
- * This deliberately recognizes semantic words and compound suffixes rather
- * than arbitrary substrings: `databasePassword` is protected while ordinary
- * words such as `secretary`, `tokenize`, and `monkey` remain usable. Explicit
- * non-secret projection fields are allowlisted because their schemas expose
- * presence, configuration, environment-variable names, or aggregate state —
- * never credential material.
+ * No field is globally exempt here. A known non-secret projection such as an
+ * environment-variable reference or presence boolean must be admitted by its
+ * owning schema at an exact path and with its exact value type. Generic and
+ * plugin-defined metadata therefore fail closed.
  */
 export function isSensitiveApplicationMetadataKey(key: string): boolean {
+  if (isAmbiguousApplicationMetadataKey(key)) return true;
   const normalized = normalizeMetadataKey(key);
-  if (SAFE_APPLICATION_METADATA_KEYS.has(normalized)) return false;
   if (SENSITIVE_METADATA_ATOMS.has(normalized)) return true;
 
   const words = metadataKeyWords(key);
-  if (words.some((word) => SENSITIVE_METADATA_ATOMS.has(word))) return true;
+  if (words.some((word) => SENSITIVE_METADATA_ATOMS.has(word) || SENSITIVE_METADATA_SHORTHANDS.has(word))) {
+    return true;
+  }
   for (let index = 0; index < words.length - 1; index += 1) {
     const pair = `${words[index]}${words[index + 1]}`;
     if (SENSITIVE_METADATA_ATOMS.has(pair)) return true;
   }
 
-  return SENSITIVE_METADATA_SUFFIXES.some((suffix) => (
-    normalized.endsWith(suffix)
-    || SENSITIVE_MATERIAL_QUALIFIERS.some((qualifier) => normalized.endsWith(`${suffix}${qualifier}`))
-  ));
+  for (const atom of SENSITIVE_METADATA_ATOMS) {
+    let offset = normalized.indexOf(atom);
+    while (offset >= 0) {
+      const trailing = normalized.slice(offset + atom.length);
+      if (trailing.length === 0 || compactQualifierPattern.test(trailing)) return true;
+      offset = normalized.indexOf(atom, offset + 1);
+    }
+  }
+  return false;
 }
 
 function normalizeMetadataKey(key: string): string {

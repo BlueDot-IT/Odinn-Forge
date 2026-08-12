@@ -379,7 +379,15 @@ test("normalized errors reject exception internals and secret-like material", ()
     "httpAuthorization",
     "httpAuthorizationHeader",
     "clientSecretValue",
-    "clientsecrethash"
+    "clientsecrethash",
+    "tokendigestsha256",
+    "passwordhashhex",
+    "passwordciphertextbase64",
+    "privatekeyfingerprint",
+    "clientsecretvaluebase64",
+    "oauthcredentialmaterialsha256",
+    "dbPwd",
+    "oauthCred"
   ];
   for (const key of compoundSensitiveKeys) {
     assert.equal(isSensitiveApplicationMetadataKey(key), true, key);
@@ -390,7 +398,7 @@ test("normalized errors reject exception internals and secret-like material", ()
     );
     assert.doesNotThrow(() => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { [key]: "[redacted]" } } }));
   }
-  const safeMetadata = {
+  const genericSensitiveProjectionMetadata = {
     credentialPresent: true,
     credentialConfigured: true,
     tokenEnv: "ODINN_CHANNEL_TOKEN",
@@ -401,7 +409,32 @@ test("normalized errors reject exception internals and secret-like material", ()
     secretReferences: 0,
     authorizationDecisionReferences: ["decision-1"],
     cookiePolicy: "strict",
-    authorizationStatus: "allowed",
+    authorizationStatus: "allowed"
+  };
+  for (const [key, value] of Object.entries(genericSensitiveProjectionMetadata)) {
+    assert.equal(isSensitiveApplicationMetadataKey(key), true, key);
+    assert.throws(
+      () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { nested: [{ [key]: value }] } } }),
+      (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA",
+      key
+    );
+  }
+  const ambiguousKeys = [
+    "passw\u043erd",
+    "t\u043eken",
+    "secr\u0435t",
+    "\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44",
+    "pass\u200bword"
+  ];
+  for (const key of ambiguousKeys) {
+    assert.equal(isSensitiveApplicationMetadataKey(key), true, key);
+    assert.throws(
+      () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { nested: [{ [key]: "ambiguous-secret-sentinel" }] } } }),
+      (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "AMBIGUOUS_APPLICATION_METADATA_KEY",
+      key
+    );
+  }
+  const safeMetadata = {
     secretary: "Alice",
     tokenize: false,
     monkey: 1,
@@ -409,6 +442,35 @@ test("normalized errors reject exception internals and secret-like material", ()
   };
   for (const key of Object.keys(safeMetadata)) assert.equal(isSensitiveApplicationMetadataKey(key), false, key);
   assert.doesNotThrow(() => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: safeMetadata } }));
+  let objectAccessorInvoked = false;
+  const objectAccessor = {};
+  Object.defineProperty(objectAccessor, "authentication", {
+    enumerable: true,
+    get() {
+      objectAccessorInvoked = true;
+      return "ACCESSOR_SECRET_SENTINEL";
+    }
+  });
+  assert.throws(
+    () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: objectAccessor } }),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  assert.equal(objectAccessorInvoked, false);
+  let arrayAccessorInvoked = false;
+  const arrayAccessor: unknown[] = [];
+  Object.defineProperty(arrayAccessor, "0", {
+    enumerable: true,
+    get() {
+      arrayAccessorInvoked = true;
+      return { authentication: "ARRAY_ACCESSOR_SECRET_SENTINEL" };
+    }
+  });
+  arrayAccessor.length = 1;
+  assert.throws(
+    () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { nested: arrayAccessor } } }),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  assert.equal(arrayAccessorInvoked, false);
   for (const message of ["OpenAI key sk-do-not-log-this", "access token actual-secret-value"]) {
     assert.throws(() => validateExecutionResultV1({ ...base, error: { ...base.error, message } }), /secret-like/u);
   }
@@ -731,7 +793,7 @@ test("status output contract rejects missing, extra, mistyped, accessor, and lea
   const cliFixture: any = structuredClone(readContractFixtures.statusCli);
   assert.throws(
     () => validateStatusSnapshotV1({ ...cliFixture, providers: [{ ...cliFixture.providers[0], apiKeyEnv: "opaquecredentialvalue1234" }] }),
-    /credential environment-variable name/u
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
   );
   assert.doesNotThrow(() => validateStatusSnapshotV1({
     ...cliFixture,
@@ -826,7 +888,7 @@ test("application package resolves independently and excludes implementation dep
   const packageRoot = join(import.meta.dirname, "..", "packages", "application");
   const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), []);
-  const source = ["contracts.ts", "validation.ts", "ports.ts", "read-contract-json.ts", "read-output-contracts.ts", "status.ts", "diagnostics.ts", "session-list.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
+  const source = ["contracts.ts", "validation.ts", "ports.ts", "sensitive-metadata.ts", "read-contract-json.ts", "read-output-contracts.ts", "status.ts", "diagnostics.ts", "session-list.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
   assert.doesNotMatch(source, /discord\.js|@slack|telegram|whatsapp|express|playwright|apps\/gateway|apps\/cli|packages\/kernel/u);
   assert.doesNotMatch(readFileSync(join(packageRoot, "src", "contracts.ts"), "utf8"), /\b(?:AbortSignal|Request|Response|Buffer|Readable|Writable)\b/u);
   const probe = spawnSync(process.execPath, ["--input-type=module", "--eval", "const application = await import('@odinn/application'); if (application.APPLICATION_CONTRACT_VERSION !== 1) process.exit(2);"], { cwd: packageRoot, encoding: "utf8" });

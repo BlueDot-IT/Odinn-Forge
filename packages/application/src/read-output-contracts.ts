@@ -435,12 +435,57 @@ export interface SessionPageV1 {
   readonly hasMore?: true;
 }
 
+const providerStatusPath = /^status snapshot\.providers\[\d+\]$/u;
+const providerDiagnosticPath = /^diagnostics report\.providerMode\[\d+\]$/u;
+const cliChannelPath = /^(?:status snapshot|diagnostics report)\.channels\[\d+\]$/u;
+const gatewayChannelPath = /^(?:gateway channel diagnostics|diagnostics report\.channels)\[\d+\]$/u;
+
+/**
+ * Admit sensitive-looking compatibility fields only at their owning schema
+ * location and only with the value type that proves they are projections, not
+ * credential material. Plugin details and approval input never match these
+ * exact paths.
+ */
+function allowKnownReadContractSensitiveField({
+  path,
+  key,
+  value,
+}: {
+  path: string;
+  key: string;
+  value: unknown;
+}): boolean {
+  if (key === "authMode" && (providerStatusPath.test(path) || providerDiagnosticPath.test(path))) {
+    return typeof value === "string" && ["api-key", "oauth", "device", "cli"].includes(value);
+  }
+  if (key === "apiKeyEnv" && providerStatusPath.test(path)) {
+    return isEnvironmentReferenceValue(value);
+  }
+  if ((key === "credentialConfigured" || key === "credentialPresent")
+    && (cliChannelPath.test(path) || gatewayChannelPath.test(path))) {
+    return typeof value === "boolean";
+  }
+  if (key === "tokenEnv" && cliChannelPath.test(path)) {
+    return isEnvironmentReferenceValue(value);
+  }
+  if (key === "secretReferences" && path === "diagnostics report.sandbox.configured") {
+    return Number.isSafeInteger(value) && Number(value) >= 0;
+  }
+  return key === "secretsExcludedFromDiagnostics"
+    && path === "diagnostics report.state"
+    && value === true;
+}
+
 export function parseStatusSnapshotV1(source: string): StatusSnapshotV1 {
-  return assertStatusSnapshotV1(parseReadContractJsonObjectV1(source, "status snapshot"));
+  return assertStatusSnapshotV1(parseReadContractJsonObjectV1(source, "status snapshot", {
+    allowSensitiveField: allowKnownReadContractSensitiveField,
+  }));
 }
 
 export function validateStatusSnapshotV1(input: unknown): StatusSnapshotV1 {
-  return assertStatusSnapshotV1(normalizeReadContractJsonObjectV1(input, "status snapshot"));
+  return assertStatusSnapshotV1(normalizeReadContractJsonObjectV1(input, "status snapshot", {
+    allowSensitiveField: allowKnownReadContractSensitiveField,
+  }));
 }
 
 export function validatePendingApprovalSummariesV1(input: unknown): readonly PendingApprovalSummaryV1[] {
@@ -451,7 +496,9 @@ export function validatePendingApprovalSummariesV1(input: unknown): readonly Pen
 }
 
 export function validateGatewayChannelDiagnosticsV1(input: unknown): readonly GatewayChannelDiagnosticV1[] {
-  const normalized = normalizeReadContractJsonValueV1(input, "gateway channel diagnostics");
+  const normalized = normalizeReadContractJsonValueV1(input, "gateway channel diagnostics", {
+    allowSensitiveField: allowKnownReadContractSensitiveField,
+  });
   if (!Array.isArray(normalized)) fail("gateway channel diagnostics must be an array", "gateway channel diagnostics");
   normalized.forEach((item, index) => validateGatewayChannel(openObject(item, `gateway channel diagnostics[${index}]`), `gateway channel diagnostics[${index}]`));
   return normalized as unknown as readonly GatewayChannelDiagnosticV1[];
@@ -464,11 +511,15 @@ export function validateRuntimeSecuritySummaryV1(input: unknown): RuntimeSecurit
 }
 
 export function parseDiagnosticsReportV1(source: string): DiagnosticsReportV1 {
-  return assertDiagnosticsReportV1(parseReadContractJsonObjectV1(source, "diagnostics report"));
+  return assertDiagnosticsReportV1(parseReadContractJsonObjectV1(source, "diagnostics report", {
+    allowSensitiveField: allowKnownReadContractSensitiveField,
+  }));
 }
 
 export function validateDiagnosticsReportV1(input: unknown): DiagnosticsReportV1 {
-  return assertDiagnosticsReportV1(normalizeReadContractJsonObjectV1(input, "diagnostics report"));
+  return assertDiagnosticsReportV1(normalizeReadContractJsonObjectV1(input, "diagnostics report", {
+    allowSensitiveField: allowKnownReadContractSensitiveField,
+  }));
 }
 
 export function parseSessionPageV1(source: string): SessionPageV1 {
@@ -725,9 +776,15 @@ function optionalText(input: unknown, path: string, allowEmpty = false): void {
 
 function environmentReference(input: unknown, path: string): void {
   text(input, path, true);
-  if (input !== "" && (typeof input !== "string" || !/^[A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|CLIENT_ID|CLIENT_SECRET|APP_ID|TENANT_ID)$/u.test(input))) {
+  if (!isEnvironmentReferenceValue(input)) {
     fail(`${path} must be an empty value or a credential environment-variable name`, path);
   }
+}
+
+function isEnvironmentReferenceValue(input: unknown): boolean {
+  return input === ""
+    || (typeof input === "string"
+      && /^[A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|CLIENT_ID|CLIENT_SECRET|APP_ID|TENANT_ID)$/u.test(input));
 }
 
 function bool(input: unknown, path: string): void {

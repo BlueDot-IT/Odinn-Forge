@@ -213,7 +213,7 @@ test("gateway rejects compound secret fields from channel diagnostics before res
         capabilities,
         async start({ updateStatus }: any) {
           updateDiagnosticStatus = updateStatus;
-          updateStatus({ state: "connected", details: { authentication: "mutual-tls", credentialConfigured: true } });
+          updateStatus({ state: "connected", details: { mode: "mutual-tls", health: "ok" } });
         },
         async stop() {},
         async send() { return { status: "sent", messageIds: [], conversationId: "compound", sentChunks: 0, totalChunks: 0 }; }
@@ -235,16 +235,46 @@ test("gateway rejects compound secret fields from channel diagnostics before res
       await new Promise((resolveWait) => setImmediate(resolveWait));
     }
     assert.ok(updateDiagnosticStatus);
-    assert.equal((await fetch(`${base}/diagnostics`)).status, 200);
-    assert.equal((await fetch(`${base}/channels`)).status, 200);
+    for (const path of ["/diagnostics", "/channels"]) {
+      const response = await fetch(`${base}${path}`);
+      assert.equal(response.status, 200, path);
+      const body = await response.json() as any;
+      const channel = body.channels[0];
+      assert.equal(channel.credentialConfigured, true, path);
+      assert.equal(channel.credentialPresent, true, path);
+      assert.equal(channel.details.mode, "mutual-tls", path);
+    }
 
-    const sentinel = "SENTINEL_COMPOUND_CHANNEL_SECRET_f6d4";
-    updateDiagnosticStatus!({ details: { databasePassword: sentinel } });
+    const maliciousDetails = [
+      ["SENTINEL_CHANNEL_DATABASE_PASSWORD", { databasePassword: "SENTINEL_CHANNEL_DATABASE_PASSWORD" }],
+      ["SENTINEL_CHANNEL_AUTHENTICATION", { authentication: "SENTINEL_CHANNEL_AUTHENTICATION" }],
+      ["SENTINEL_CHANNEL_TOKEN_ENV", { tokenEnv: "SENTINEL_CHANNEL_TOKEN_ENV" }],
+      ["SENTINEL_CHANNEL_API_KEY_ENV", { apiKeyEnv: "SENTINEL_CHANNEL_API_KEY_ENV" }],
+      ["SENTINEL_CHANNEL_PRESENCE", { credentialPresent: "SENTINEL_CHANNEL_PRESENCE" }],
+      ["SENTINEL_CHANNEL_REFERENCE", { authorizationDecisionReferences: ["SENTINEL_CHANNEL_REFERENCE"] }],
+      ["SENTINEL_CHANNEL_NESTED_AUTH", { nested: { authentication: "SENTINEL_CHANNEL_NESTED_AUTH" } }],
+      ["SENTINEL_CHANNEL_ARRAY_TOKEN", { nested: [{ tokenEnv: "SENTINEL_CHANNEL_ARRAY_TOKEN" }] }],
+      ["SENTINEL_CHANNEL_UNICODE_PASSWORD", { ["passw\u043erd"]: "SENTINEL_CHANNEL_UNICODE_PASSWORD" }],
+      ["SENTINEL_CHANNEL_FULLWIDTH_PASSWORD", { ["\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44"]: "SENTINEL_CHANNEL_FULLWIDTH_PASSWORD" }],
+      ["SENTINEL_CHANNEL_COMPACT_TOKEN", { tokendigestsha256: "SENTINEL_CHANNEL_COMPACT_TOKEN" }],
+      ["SENTINEL_CHANNEL_COMPACT_PASSWORD", { passwordciphertextbase64: "SENTINEL_CHANNEL_COMPACT_PASSWORD" }]
+    ] as const;
+    for (const [sentinel, details] of maliciousDetails) {
+      updateDiagnosticStatus!({ details });
+      for (const path of ["/diagnostics", "/channels"]) {
+        const response = await fetch(`${base}${path}`);
+        const body = await response.text();
+        assert.equal(response.status, 400, `${path}: ${sentinel}`);
+        assert.equal(body.includes(sentinel), false, `${path}: ${sentinel}`);
+      }
+    }
+
+    updateDiagnosticStatus!({ details: { mode: "mutual-tls", health: "ok", counters: { reconnects: 0 } } });
     for (const path of ["/diagnostics", "/channels"]) {
       const response = await fetch(`${base}${path}`);
       const body = await response.text();
-      assert.equal(response.status, 400, path);
-      assert.doesNotMatch(body, new RegExp(sentinel), path);
+      assert.equal(response.status, 200, path);
+      assert.equal(body.includes("mutual-tls"), true, path);
     }
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
@@ -257,7 +287,7 @@ test("gateway rejects compound secret fields from pending approval projections",
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-approval-compound-secret-"));
   const approvalPath = join(stateDir, "approvals.json");
   const approvalStore = createApprovalStore({ path: approvalPath });
-  approvalStore.create({ tool: "browser.click", input: { credentialConfigured: true } });
+  approvalStore.create({ tool: "browser.click", input: { selector: "#save", nested: { attempts: 1 } } });
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -265,13 +295,36 @@ test("gateway rejects compound secret fields from pending approval projections",
     assert.equal((await fetch(`${base}/status`)).status, 200);
     assert.equal((await fetch(`${base}/approvals`)).status, 200);
 
-    const sentinel = "SENTINEL_COMPOUND_APPROVAL_SECRET_a129";
-    approvalStore.create({ tool: "browser.click", input: { oauthCredential: sentinel } });
+    const maliciousInputs = [
+      ["SENTINEL_APPROVAL_OAUTH_CREDENTIAL", { oauthCredential: "SENTINEL_APPROVAL_OAUTH_CREDENTIAL" }],
+      ["SENTINEL_APPROVAL_AUTHENTICATION", { authentication: "SENTINEL_APPROVAL_AUTHENTICATION" }],
+      ["SENTINEL_APPROVAL_TOKEN_ENV", { tokenEnv: "SENTINEL_APPROVAL_TOKEN_ENV" }],
+      ["SENTINEL_APPROVAL_API_KEY_ENV", { apiKeyEnv: "SENTINEL_APPROVAL_API_KEY_ENV" }],
+      ["SENTINEL_APPROVAL_PRESENCE", { credentialConfigured: "SENTINEL_APPROVAL_PRESENCE" }],
+      ["SENTINEL_APPROVAL_REFERENCE", { secretReferences: ["SENTINEL_APPROVAL_REFERENCE"] }],
+      ["SENTINEL_APPROVAL_NESTED_AUTH", { nested: { authentication: "SENTINEL_APPROVAL_NESTED_AUTH" } }],
+      ["SENTINEL_APPROVAL_ARRAY_TOKEN", { nested: [{ tokenEnv: "SENTINEL_APPROVAL_ARRAY_TOKEN" }] }],
+      ["SENTINEL_APPROVAL_UNICODE_TOKEN", { ["t\u043eken"]: "SENTINEL_APPROVAL_UNICODE_TOKEN" }],
+      ["SENTINEL_APPROVAL_FULLWIDTH_PASSWORD", { ["\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44"]: "SENTINEL_APPROVAL_FULLWIDTH_PASSWORD" }],
+      ["SENTINEL_APPROVAL_COMPACT_PASSWORD", { passwordhashhex: "SENTINEL_APPROVAL_COMPACT_PASSWORD" }],
+      ["SENTINEL_APPROVAL_COMPACT_PRIVATE_KEY", { privatekeyfingerprint: "SENTINEL_APPROVAL_COMPACT_PRIVATE_KEY" }]
+    ] as const;
+    for (const [sentinel, input] of maliciousInputs) {
+      const approvalId = approvalStore.create({ tool: "browser.click", input });
+      for (const path of ["/status", "/approvals"]) {
+        const response = await fetch(`${base}${path}`);
+        const body = await response.text();
+        assert.equal(response.status, 400, `${path}: ${sentinel}`);
+        assert.equal(body.includes(sentinel), false, `${path}: ${sentinel}`);
+      }
+      assert.equal(approvalStore.revoke(approvalId), true);
+    }
+
     for (const path of ["/status", "/approvals"]) {
       const response = await fetch(`${base}${path}`);
       const body = await response.text();
-      assert.equal(response.status, 400, path);
-      assert.doesNotMatch(body, new RegExp(sentinel), path);
+      assert.equal(response.status, 200, path);
+      assert.equal(body.includes("#save"), true, path);
     }
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));

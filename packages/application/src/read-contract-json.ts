@@ -1,5 +1,8 @@
 import { MAX_APPLICATION_CONTRACT_BYTES, type JsonObject, type JsonValue } from "./contracts.ts";
-import { isSensitiveApplicationMetadataKey } from "./sensitive-metadata.ts";
+import {
+  isAmbiguousApplicationMetadataKey,
+  isSensitiveApplicationMetadataKey
+} from "./sensitive-metadata.ts";
 import { ApplicationContractValidationError } from "./validation.ts";
 
 const MAX_ID_BYTES = 256;
@@ -24,7 +27,21 @@ const SENSITIVE_VALUES = [
   /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u
 ];
 
-export function normalizeReadContractJsonValueV1(input: unknown, name: string): JsonValue {
+interface ReadContractSensitiveFieldContext {
+  readonly path: string;
+  readonly key: string;
+  readonly value: unknown;
+}
+
+interface ReadContractJsonOptions {
+  readonly allowSensitiveField?: (context: ReadContractSensitiveFieldContext) => boolean;
+}
+
+export function normalizeReadContractJsonValueV1(
+  input: unknown,
+  name: string,
+  options: ReadContractJsonOptions = {},
+): JsonValue {
   const seen = new Set<object>();
   let nodes = 0;
   const visit = (current: unknown, path: string, depth: number, arrayItem = false): JsonValue | undefined => {
@@ -56,7 +73,12 @@ export function normalizeReadContractJsonValueV1(input: unknown, name: string): 
       if (keys.length > MAX_LIST_ITEMS) fail(`${path} cannot contain more than ${MAX_LIST_ITEMS} fields`, "INVALID_APPLICATION_READ_CONTRACT", path);
       for (const key of keys) {
         if (Buffer.byteLength(key, "utf8") > MAX_ID_BYTES) fail(`${path} field name exceeds ${MAX_ID_BYTES} bytes`, "INVALID_APPLICATION_READ_CONTRACT", `${path}.${key}`);
-        if (isSensitiveApplicationMetadataKey(key) && value[key] !== "[redacted]") fail(`${path}.${key} is not permitted in a read contract`, "UNREDACTED_APPLICATION_METADATA", `${path}.${key}`);
+        if (isAmbiguousApplicationMetadataKey(key)) fail(`${path} contains an ambiguous metadata field`, "AMBIGUOUS_APPLICATION_METADATA_KEY", path);
+        if (isSensitiveApplicationMetadataKey(key)
+          && value[key] !== "[redacted]"
+          && options.allowSensitiveField?.({ path, key, value: value[key] }) !== true) {
+          fail(`${path}.${key} is not permitted in a read contract`, "UNREDACTED_APPLICATION_METADATA", `${path}.${key}`);
+        }
         const normalized = visit(value[key], `${path}.${key}`, depth + 1);
         if (normalized !== undefined) output[key] = normalized;
       }
@@ -72,13 +94,21 @@ export function normalizeReadContractJsonValueV1(input: unknown, name: string): 
   return deepFreeze(normalized);
 }
 
-export function normalizeReadContractJsonObjectV1(input: unknown, name: string): JsonObject {
-  const normalized = normalizeReadContractJsonValueV1(input, name);
+export function normalizeReadContractJsonObjectV1(
+  input: unknown,
+  name: string,
+  options: ReadContractJsonOptions = {},
+): JsonObject {
+  const normalized = normalizeReadContractJsonValueV1(input, name, options);
   if (!normalized || Array.isArray(normalized) || typeof normalized !== "object") fail(`${name} must be a JSON object`, "INVALID_APPLICATION_READ_CONTRACT", name);
   return normalized as JsonObject;
 }
 
-export function parseReadContractJsonObjectV1(source: string, name: string): JsonObject {
+export function parseReadContractJsonObjectV1(
+  source: string,
+  name: string,
+  options: ReadContractJsonOptions = {},
+): JsonObject {
   if (typeof source !== "string") fail(`${name} source must be a JSON string`, "INVALID_APPLICATION_READ_CONTRACT", name);
   if (Buffer.byteLength(source, "utf8") > MAX_APPLICATION_CONTRACT_BYTES) fail(`${name} exceeds ${MAX_APPLICATION_CONTRACT_BYTES} bytes`, "APPLICATION_CONTRACT_TOO_LARGE", name);
   rejectDuplicateJsonObjectKeys(source);
@@ -88,7 +118,7 @@ export function parseReadContractJsonObjectV1(source: string, name: string): Jso
   } catch (error) {
     fail(`${name} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`, "INVALID_APPLICATION_READ_CONTRACT", name);
   }
-  return normalizeReadContractJsonObjectV1(parsed, name);
+  return normalizeReadContractJsonObjectV1(parsed, name, options);
 }
 
 function plainObject(input: object, path: string): Record<string, unknown> {
