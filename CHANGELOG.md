@@ -20,6 +20,8 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
   active SQLite and review-gated runtime
 * separate routine dependency maintenance from Node and TypeScript major
   toolchain migrations during release-candidate stabilization
+* require Node typings and the packaged Playwright runtime to update in
+  dedicated compatibility and artifact-validation pull requests
 
 ### Release engineering
 

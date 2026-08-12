@@ -15,6 +15,11 @@ updates:
     groups:
       npm-minor-and-patch:
         patterns: ["*"]
+        # Runtime/toolchain dependencies need dedicated compatibility and
+        # packaged-artifact evidence even for direct minor or patch updates.
+        # Separating Node typings also prevents permissive transitive ranges
+        # from refreshing to Node 26 inside an otherwise Node 24 update.
+        exclude-patterns: ["@types/node", "playwright-core"]
         update-types: ["minor", "patch"]
     ignore:
       # Odinn 1.1 targets the Node 24 / TypeScript 5.9 toolchain. These majors
