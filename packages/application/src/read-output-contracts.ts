@@ -1,5 +1,5 @@
 import type { JsonObject } from "./contracts.ts";
-import { normalizeReadContractJsonObjectV1, parseReadContractJsonObjectV1 } from "./read-contract-json.ts";
+import { normalizeReadContractJsonObjectV1, normalizeReadContractJsonValueV1, parseReadContractJsonObjectV1 } from "./read-contract-json.ts";
 import { ApplicationContractValidationError } from "./validation.ts";
 
 export type ExperimentalFeatureV1 = "capabilities" | "capsules" | "counterfactual";
@@ -443,6 +443,19 @@ export function validateStatusSnapshotV1(input: unknown): StatusSnapshotV1 {
   return assertStatusSnapshotV1(normalizeReadContractJsonObjectV1(input, "status snapshot"));
 }
 
+export function validatePendingApprovalSummariesV1(input: unknown): readonly PendingApprovalSummaryV1[] {
+  const normalized = normalizeReadContractJsonValueV1(input, "pending approval summaries");
+  if (!Array.isArray(normalized)) fail("pending approval summaries must be an array", "pending approval summaries");
+  normalized.forEach((item, index) => validatePendingApproval(openObject(item, `pending approval summaries[${index}]`), `pending approval summaries[${index}]`));
+  return normalized as unknown as readonly PendingApprovalSummaryV1[];
+}
+
+export function validateRuntimeSecuritySummaryV1(input: unknown): RuntimeSecuritySummaryV1 {
+  const normalized = normalizeReadContractJsonObjectV1(input, "runtime security summary");
+  validateSecurity(normalized, "runtime security summary");
+  return normalized as unknown as RuntimeSecuritySummaryV1;
+}
+
 export function parseDiagnosticsReportV1(source: string): DiagnosticsReportV1 {
   return assertDiagnosticsReportV1(parseReadContractJsonObjectV1(source, "diagnostics report"));
 }
@@ -559,7 +572,7 @@ function validateProviderStatus(input: Record<string, unknown>, path: string): v
   object(input, path, ["name", "displayName", "supportTier", "locallyTested", "genericCompatibilityMode", "modelAvailability", "type", "baseUrl", "authMode", "apiKeyEnv", "models", "configured"], ["name", "displayName", "supportTier", "locallyTested", "genericCompatibilityMode", "modelAvailability", "type", "authMode", "apiKeyEnv", "models", "configured"]);
   text(input.name, `${path}.name`); text(input.displayName, `${path}.displayName`); oneOf(input.supportTier, `${path}.supportTier`, ["first-class", "compatible", "experimental", "custom"]);
   bool(input.locallyTested, `${path}.locallyTested`); bool(input.genericCompatibilityMode, `${path}.genericCompatibilityMode`); oneOf(input.modelAvailability, `${path}.modelAvailability`, ["local", "provider-dependent"]);
-  text(input.type, `${path}.type`); optionalText(input.baseUrl, `${path}.baseUrl`); oneOf(input.authMode, `${path}.authMode`, ["api-key", "oauth", "device", "cli"]); environmentReference(input.apiKeyEnv, `${path}.apiKeyEnv`); stringList(input.models, `${path}.models`); bool(input.configured, `${path}.configured`);
+  text(input.type, `${path}.type`); oneOf(input.authMode, `${path}.authMode`, ["api-key", "oauth", "device", "cli"]); optionalText(input.baseUrl, `${path}.baseUrl`, input.authMode === "cli"); environmentReference(input.apiKeyEnv, `${path}.apiKeyEnv`); stringList(input.models, `${path}.models`); bool(input.configured, `${path}.configured`);
 }
 
 function validateProviderDiagnostic(input: Record<string, unknown>, path: string): void {

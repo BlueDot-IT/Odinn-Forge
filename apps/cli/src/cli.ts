@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateRuntimeSecuritySummaryV1, type CliStatusSnapshotV1, type DiagnosticsReportV1 } from "@odinn/application";
 import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
@@ -1284,15 +1284,16 @@ async function probeGatewayForState(state: any, options: any) {
   };
 }
 
-async function status(args: any) {
+async function status(args: any): Promise<CliStatusSnapshotV1> {
   const state = stateDir(args);
   await recoverInterruptedOnboardingTransactions(state);
   const config = await readConfig(state);
   const models = listConfiguredModels(normalizeModelConfig(config));
   const policy = createDefaultPolicy(config.policy);
   const registry = createRuntimeRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config });
+  const security = validateRuntimeSecuritySummaryV1(policy.security);
   const statusRead = createStatusReadUseCase({
-    readStatus: async () => ({
+    readStatus: async (): Promise<CliStatusSnapshotV1> => ({
       ok: true,
       state,
       workspaceRoot: invocationRoot(),
@@ -1303,8 +1304,8 @@ async function status(args: any) {
       allowedCapabilities: policy.allowedCapabilities,
       capabilityRegistryVersion: policy.capabilityRegistryVersion,
       capabilityMigration: policy.capabilityMigration,
-      policy,
-      security: policy.security,
+      policy: { ...policy, security },
+      security,
       experimental: {
         flags: normalizeExperimentalFlags(config.experimental),
         warning: experimentalFeatureWarning(config.experimental)
@@ -1330,7 +1331,8 @@ async function status(args: any) {
       },
       operation: { kind: "query", id: "status.read" }
     });
-    return result.output as any;
+    if (!("auditLog" in result.output)) throw new Error("CLI status read returned a gateway status contract");
+    return result.output;
   } finally {
     registry.close();
   }
@@ -1404,10 +1406,10 @@ async function doctor(args: any) {
     },
     operation: { kind: "query", id: "diagnostics.read" }
   });
-  return result.output as any;
+  return result.output;
 }
 
-async function readDoctorDiagnostics(args: any) {
+async function readDoctorDiagnostics(args: any): Promise<DiagnosticsReportV1> {
   const state = stateDir(args);
   await recoverInterruptedOnboardingTransactions(state);
   const config = await readConfig(state);

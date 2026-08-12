@@ -5,7 +5,7 @@ import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as stat
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1 } from "@odinn/application";
 import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
@@ -882,8 +882,9 @@ export async function createGatewayServer({
     ? setInterval(runImprovementCycle, selfImprovement.intervalMs)
     : undefined;
   improvementTimer?.unref?.();
+  const statusSecurity = validateRuntimeSecuritySummaryV1(policy.security);
   const statusRead = createStatusReadUseCase({
-    readStatus: async () => ({
+    readStatus: async (): Promise<GatewayStatusSnapshotV1> => ({
       ok: true,
       version,
       state,
@@ -911,7 +912,7 @@ export async function createGatewayServer({
         eventIngress: { enabled: Boolean(eventIngress) },
         projectContext: { enabled: Boolean(projectContext) }
       },
-      security: policy.security,
+      security: statusSecurity,
       selfImprovement: {
         ...selfImprovement,
         automatic: automaticImprovement,
@@ -919,7 +920,7 @@ export async function createGatewayServer({
           ? { source: "configured-provider", model: normalizeModelConfig(config).defaultModel }
           : { source: "waiting-for-provider", model: "" }
       },
-      pendingApprovals: approvalStore.list()
+      pendingApprovals: validatePendingApprovalSummariesV1(approvalStore.list())
     })
   });
   const diagnosticsRead = createDiagnosticsReadUseCase({
@@ -3306,7 +3307,7 @@ function channelCredentialEnvironments(config: any): string[] {
   ].filter(Boolean);
 }
 
-async function diagnostics({ state, workspaceRoot, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false, sandboxRecoveryStartupError = false }: any) {
+async function diagnostics({ state, workspaceRoot, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false, sandboxRecoveryStartupError = false }: any): Promise<DiagnosticsReportV1> {
   let audit = { valid: true, events: 0, unsigned: 0, failureCount: 0 };
   try {
     const auditPath = join(state, config.auditLog ?? "audit.jsonl");

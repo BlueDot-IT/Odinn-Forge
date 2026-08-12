@@ -27,7 +27,7 @@ const SENSITIVE_VALUES = [
   /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u
 ];
 
-export function normalizeReadContractJsonObjectV1(input: unknown, name: string): JsonObject {
+export function normalizeReadContractJsonValueV1(input: unknown, name: string): JsonValue {
   const seen = new Set<object>();
   let nodes = 0;
   const visit = (current: unknown, path: string, depth: number, arrayItem = false): JsonValue | undefined => {
@@ -50,9 +50,8 @@ export function normalizeReadContractJsonObjectV1(input: unknown, name: string):
     seen.add(current);
     try {
       if (Array.isArray(current)) {
-        assertPlainArray(current, path);
-        if (current.length > MAX_LIST_ITEMS) fail(`${path} cannot contain more than ${MAX_LIST_ITEMS} items`, "INVALID_APPLICATION_READ_CONTRACT", path);
-        return current.map((item, index) => visit(item, `${path}[${index}]`, depth + 1, true) ?? null);
+        const items = plainArrayValues(current, path);
+        return items.map((item, index) => visit(item, `${path}[${index}]`, depth + 1, true) ?? null);
       }
       const value = plainObject(current, path);
       const output: Record<string, JsonValue> = {};
@@ -70,10 +69,16 @@ export function normalizeReadContractJsonObjectV1(input: unknown, name: string):
     }
   };
   const normalized = visit(input, name, 0);
-  if (!normalized || Array.isArray(normalized) || typeof normalized !== "object") fail(`${name} must be a JSON object`, "INVALID_APPLICATION_READ_CONTRACT", name);
+  if (normalized === undefined) fail(`${name} must be a JSON value`, "INVALID_APPLICATION_READ_CONTRACT", name);
   const canonical = canonicalJson(normalized);
   if (Buffer.byteLength(canonical, "utf8") > MAX_APPLICATION_CONTRACT_BYTES) fail(`${name} exceeds ${MAX_APPLICATION_CONTRACT_BYTES} bytes`, "APPLICATION_CONTRACT_TOO_LARGE", name);
-  return deepFreeze(normalized as JsonObject);
+  return deepFreeze(normalized);
+}
+
+export function normalizeReadContractJsonObjectV1(input: unknown, name: string): JsonObject {
+  const normalized = normalizeReadContractJsonValueV1(input, name);
+  if (!normalized || Array.isArray(normalized) || typeof normalized !== "object") fail(`${name} must be a JSON object`, "INVALID_APPLICATION_READ_CONTRACT", name);
+  return normalized as JsonObject;
 }
 
 export function parseReadContractJsonObjectV1(source: string, name: string): JsonObject {
@@ -102,14 +107,35 @@ function plainObject(input: object, path: string): Record<string, unknown> {
   return input as Record<string, unknown>;
 }
 
-function assertPlainArray(input: readonly unknown[], path: string): void {
+function plainArrayValues(input: readonly unknown[], path: string): readonly unknown[] {
   if (Object.getPrototypeOf(input) !== Array.prototype) fail(`${path} must be a plain array`, "NON_PLAIN_APPLICATION_OBJECT", path);
-  const keys = Reflect.ownKeys(input);
-  for (let index = 0; index < input.length; index += 1) {
-    if (!Object.hasOwn(input, index)) fail(`${path} cannot contain sparse entries`, "NON_JSON_APPLICATION_FIELD", `${path}[${index}]`);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(input, "length");
+  if (!lengthDescriptor || !("value" in lengthDescriptor) || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0) {
+    fail(`${path}.length must be a safe data field`, "NON_JSON_APPLICATION_FIELD", `${path}.length`);
   }
-  const extra = keys.find((key) => key !== "length" && (typeof key !== "string" || !/^(0|[1-9]\d*)$/u.test(key)));
-  if (extra !== undefined) fail(`${path} cannot contain extra fields`, "NON_JSON_APPLICATION_FIELD", path);
+  const length = Number(lengthDescriptor.value);
+  if (length > MAX_LIST_ITEMS) fail(`${path} cannot contain more than ${MAX_LIST_ITEMS} items`, "INVALID_APPLICATION_READ_CONTRACT", path);
+  const keys = Reflect.ownKeys(input);
+  for (const key of keys) {
+    if (key === "length") continue;
+    if (typeof key !== "string" || !/^(0|[1-9]\d*)$/u.test(key)) {
+      fail(`${path} cannot contain extra fields`, "NON_JSON_APPLICATION_FIELD", path);
+    }
+    const index = Number(key);
+    if (!Number.isSafeInteger(index) || index >= length) {
+      fail(`${path} cannot contain an out-of-range numeric field`, "NON_JSON_APPLICATION_FIELD", `${path}.${key}`);
+    }
+  }
+  const output = new Array<unknown>(length);
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
+    if (!descriptor) fail(`${path} cannot contain sparse entries`, "NON_JSON_APPLICATION_FIELD", `${path}[${index}]`);
+    if (!descriptor.enumerable || !("value" in descriptor)) {
+      fail(`${path}[${index}] must be an enumerable data field`, "NON_JSON_APPLICATION_FIELD", `${path}[${index}]`);
+    }
+    output[index] = descriptor.value;
+  }
+  return output;
 }
 
 function isSensitiveKey(key: string): boolean {
@@ -151,7 +177,8 @@ function rejectDuplicateJsonObjectKeys(source: string): void {
     }
     fail(`unterminated JSON string at offset ${start}`, "INVALID_APPLICATION_READ_CONTRACT", "source");
   };
-  const readValue = (): void => {
+  const readValue = (depth = 0): void => {
+    if (depth > MAX_JSON_DEPTH) fail(`read contract JSON exceeds depth ${MAX_JSON_DEPTH}`, "APPLICATION_JSON_TOO_DEEP", "source");
     skipWhitespace();
     const character = source[offset];
     if (character === "{") {
@@ -164,7 +191,7 @@ function rejectDuplicateJsonObjectKeys(source: string): void {
         if (keys.has(key)) fail(`duplicate JSON object field: ${key}`, "DUPLICATE_APPLICATION_FIELD", key);
         keys.add(key); skipWhitespace();
         if (source[offset] !== ":") fail(`expected ':' at offset ${offset}`, "INVALID_APPLICATION_READ_CONTRACT", "source");
-        offset += 1; readValue(); skipWhitespace();
+        offset += 1; readValue(depth + 1); skipWhitespace();
         if (source[offset] === "}") { offset += 1; return; }
         if (source[offset] !== ",") fail(`expected ',' at offset ${offset}`, "INVALID_APPLICATION_READ_CONTRACT", "source");
         offset += 1;
@@ -175,7 +202,7 @@ function rejectDuplicateJsonObjectKeys(source: string): void {
       offset += 1; skipWhitespace();
       if (source[offset] === "]") { offset += 1; return; }
       while (offset < source.length) {
-        readValue(); skipWhitespace();
+        readValue(depth + 1); skipWhitespace();
         if (source[offset] === "]") { offset += 1; return; }
         if (source[offset] !== ",") fail(`expected ',' at offset ${offset}`, "INVALID_APPLICATION_READ_CONTRACT", "source");
         offset += 1;

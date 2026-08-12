@@ -679,6 +679,14 @@ test("status output contract rejects missing, extra, mistyped, accessor, and lea
     () => validateStatusSnapshotV1({ ...cliFixture, providers: [{ ...cliFixture.providers[0], apiKeyEnv: "opaquecredentialvalue1234" }] }),
     /credential environment-variable name/u
   );
+  assert.doesNotThrow(() => validateStatusSnapshotV1({
+    ...cliFixture,
+    providers: [{ ...cliFixture.providers[0], authMode: "cli", baseUrl: "" }]
+  }));
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...cliFixture, providers: [{ ...cliFixture.providers[0], authMode: "api-key", baseUrl: "" }] }),
+    /baseUrl must be a non-empty string/u
+  );
   assert.throws(
     () => validateStatusSnapshotV1({ ...fixture, accessToken: "top-secret-value" }),
     (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
@@ -687,6 +695,32 @@ test("status output contract rejects missing, extra, mistyped, accessor, and lea
   Object.defineProperty(accessor, "state", { enumerable: true, get: () => "/stolen" });
   assert.throws(
     () => validateStatusSnapshotV1(accessor),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  const accessorArray: unknown[] = [];
+  let accessorInvoked = false;
+  Object.defineProperty(accessorArray, "0", {
+    enumerable: true,
+    get() {
+      accessorInvoked = true;
+      return "text.echo";
+    }
+  });
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, tools: accessorArray }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  assert.equal(accessorInvoked, false);
+  const nonEnumerableArray = ["text.echo"];
+  Object.defineProperty(nonEnumerableArray, "0", { enumerable: false, value: "text.echo" });
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, tools: nonEnumerableArray }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  const outOfRangeArray = ["text.echo"];
+  Object.defineProperty(outOfRangeArray, "4294967295", { enumerable: true, value: "hidden.kernel.tool" });
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, tools: outOfRangeArray }),
     (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
   );
 });
@@ -716,6 +750,22 @@ test("session page contract rejects projection drift, content leakage, and incon
     (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
   );
   assert.throws(() => parseSessionPageV1('{"sessions":[],"sessions":[]}'), /duplicate JSON object field/u);
+  const deeplyNested = `{"sessions":${"[".repeat(10_000)}null${"]".repeat(10_000)}}`;
+  assert.throws(
+    () => parseSessionPageV1(deeplyNested),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "APPLICATION_JSON_TOO_DEEP"
+  );
+});
+
+test("CLI and gateway producers compile against the explicit read contracts", () => {
+  const repositoryRoot = join(import.meta.dirname, "..");
+  for (const workspace of ["@odinn/gateway", "@odinn/cli"]) {
+    const result = spawnSync("corepack", ["pnpm", "--filter", workspace, "typecheck"], {
+      cwd: repositoryRoot,
+      encoding: "utf8"
+    });
+    assert.equal(result.status, 0, `${workspace} typecheck failed:\n${result.stdout}\n${result.stderr}`);
+  }
 });
 
 test("application package resolves independently and excludes implementation dependencies", () => {

@@ -34,6 +34,8 @@ export {
   parseSessionPageV1,
   parseStatusSnapshotV1,
   validateDiagnosticsReportV1,
+  validatePendingApprovalSummariesV1,
+  validateRuntimeSecuritySummaryV1,
   validateSessionPageV1,
   validateStatusSnapshotV1
 } from "./read-output-contracts.ts";
