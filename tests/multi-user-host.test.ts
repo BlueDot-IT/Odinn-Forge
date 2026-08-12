@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createMultiUserHost, hashPassword } from "../apps/gateway/src/host.ts";
-import { createGatewayDiagnosticsReadRequest, createGatewayStatusReadRequest } from "../apps/gateway/src/server.ts";
+import { createGatewayDiagnosticsReadRequest, createGatewaySessionListPort, createGatewaySessionListRequest, createGatewayStatusReadRequest } from "../apps/gateway/src/server.ts";
 
 function assertLabeledInput(html: string, name: string) {
   const input = new RegExp(`<input\\b[^>]*\\bname=["']${name}["'][^>]*>`, "iu").exec(html)?.[0];
@@ -34,6 +34,40 @@ test("hosted diagnostics application contexts isolate authenticated users", () =
   assert.equal(bob.context.scope.tenantId, "tenant:bob");
   assert.notEqual(alice.context.principal.principalId, bob.context.principal.principalId);
   assert.notEqual(alice.context.scope.tenantId, bob.context.scope.tenantId);
+});
+
+test("hosted session-list application contexts isolate authenticated users", () => {
+  const alice = createGatewaySessionListRequest({ applicationRequestId: "request:sessions-alice", hostedUserId: "alice", authentication: "bearer", limit: 20 });
+  const bob = createGatewaySessionListRequest({ applicationRequestId: "request:sessions-bob", hostedUserId: "bob", authentication: "bearer", limit: 20 });
+  assert.equal(alice.context.principal.principalId, "host-user:alice");
+  assert.equal(alice.context.scope.tenantId, "tenant:alice");
+  assert.equal(bob.context.principal.principalId, "host-user:bob");
+  assert.equal(bob.context.scope.tenantId, "tenant:bob");
+  assert.notEqual(alice.context.principal.principalId, bob.context.principal.principalId);
+  assert.notEqual(alice.context.scope.tenantId, bob.context.scope.tenantId);
+});
+
+test("gateway session-list adapter passes cancellation through executor options", async () => {
+  const controller = new AbortController();
+  let observedSignal: AbortSignal | undefined;
+  const port = createGatewaySessionListPort({
+    execute: async (_request: unknown, options?: { signal?: AbortSignal }) => {
+      observedSignal = options?.signal;
+      await new Promise<void>((_resolve, reject) => options?.signal?.addEventListener("abort", () => {
+        const error = new Error("cancelled");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true }));
+      return { output: { sessions: [] } };
+    },
+    auditStore: {},
+    policy: {},
+    registry: {}
+  });
+  const pending = port.readSessions({ limit: 20 }, {}, { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(() => pending, { name: "AbortError" });
+  assert.equal(observedSignal, controller.signal);
 });
 
 test("multi-user host authenticates and isolates each tenant gateway state", async () => {
@@ -71,6 +105,13 @@ test("multi-user host authenticates and isolates each tenant gateway state", asy
     assert.equal(aliceStatusResponse.headers.get("x-odinn-host-user"), "alice");
     const aliceStatus = await aliceStatusResponse.json();
     assert.equal(aliceStatus.workspaceRoot, aliceRoot);
+    const aliceSessionResponse = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: aliceCookie, origin: publicOrigin },
+      body: JSON.stringify({ title: "Alice private session" })
+    });
+    assert.equal(aliceSessionResponse.status, 200);
+    const aliceSession = await aliceSessionResponse.json();
     const aliceConfig = await (await fetch(`${base}/config`, { headers: { cookie: aliceCookie } })).json();
     const escapedAudit = await fetch(`${base}/config`, {
       method: "PUT",
@@ -93,6 +134,19 @@ test("multi-user host authenticates and isolates each tenant gateway state", asy
     const bobStatus = await (await fetch(`${base}/status`, { headers: { cookie: bobCookie } })).json();
     assert.equal(bobStatus.workspaceRoot, bobRoot);
     assert.notEqual(aliceStatus.state, bobStatus.state);
+    const bobSessionResponse = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: bobCookie, origin: publicOrigin },
+      body: JSON.stringify({ title: "Bob private session" })
+    });
+    assert.equal(bobSessionResponse.status, 200);
+    const bobSession = await bobSessionResponse.json();
+    const aliceSessions = await (await fetch(`${base}/sessions`, { headers: { cookie: aliceCookie } })).json();
+    const bobSessions = await (await fetch(`${base}/sessions`, { headers: { cookie: bobCookie } })).json();
+    assert.deepEqual(aliceSessions.sessions.map((entry: any) => entry.id), [aliceSession.id]);
+    assert.deepEqual(bobSessions.sessions.map((entry: any) => entry.id), [bobSession.id]);
+    assert.equal(aliceSessions.sessions.some((entry: any) => entry.id === bobSession.id), false);
+    assert.equal(bobSessions.sessions.some((entry: any) => entry.id === aliceSession.id), false);
     assert.equal((await fetch(`${base}/auth/logout`, { method: "POST", headers: { cookie: aliceCookie, origin: publicOrigin } })).status, 200);
     assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceCookie } })).status, 401);
   } finally { await new Promise((resolve: any) => server.close(() => resolve())); }

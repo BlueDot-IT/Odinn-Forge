@@ -9,6 +9,7 @@ import {
   assertExecutionResultMatchesRequestV1,
   canonicalizeApplicationContractV1,
   createDiagnosticsReadUseCase,
+  createSessionListUseCase,
   createStatusReadUseCase,
   digestExecutionOperationV1,
   digestExecutionRequestV1,
@@ -27,6 +28,7 @@ import {
   type ExecutionResultV1,
   type InboundEnvelopeV1,
   type OutboundEnvelopeV1,
+  type SessionListRequestV1,
   type StatusReadRequestV1
 } from "../packages/application/src/index.ts";
 
@@ -553,11 +555,94 @@ test("diagnostics.read honors cancellation before invoking its port", async () =
   assert.equal(calls, 0);
 });
 
+test("session.list snapshots authority and query input before asynchronous port work", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let observedContext: any;
+  let observedInput: any;
+  const sessionList = createSessionListUseCase({
+    async readSessions(input, context) {
+      await gate;
+      observedInput = input;
+      observedContext = context;
+      return { sessions: [{ id: "session:001", title: "First" }], omitted: undefined } as any;
+    }
+  });
+  const request: SessionListRequestV1 = {
+    version: 1,
+    kind: "session-list-request",
+    requestId: "request:sessions-alice",
+    context: {
+      principal: { principalId: "principal:alice", actorId: "actor:http", kind: "host-user" },
+      scope: { tenantId: "tenant:alice" },
+      sourceReference: "http:GET:/sessions",
+      correlationId: "correlation:sessions-alice",
+      cancellationControlReference: "cancel:sessions-alice"
+    },
+    operation: { kind: "query", id: "session.list" },
+    input: { limit: 25, projectId: "project:alice" }
+  };
+  const pending = sessionList.execute(request);
+  (request as any).context.principal.principalId = "principal:bob";
+  (request as any).context.scope.tenantId = "tenant:bob";
+  (request as any).context.correlationId = "correlation:sessions-bob";
+  (request as any).input.limit = 200;
+  (request as any).input.projectId = "project:bob";
+  release();
+  const result = await pending;
+  assert.deepEqual(observedInput, { limit: 25, projectId: "project:alice" });
+  assert.equal(observedContext.principal.principalId, "principal:alice");
+  assert.equal(observedContext.scope.tenantId, "tenant:alice");
+  assert.equal(result.correlationId, "correlation:sessions-alice");
+  assert.deepEqual(result.output, { sessions: [{ id: "session:001", title: "First" }] });
+  assert.equal(Object.isFrozen(observedInput), true);
+  assert.equal(Object.isFrozen(observedContext), true);
+  assert.equal(Object.isFrozen(result.output), true);
+  assert.equal(Object.isFrozen((result.output.sessions as any[])[0]), true);
+  await assert.rejects(
+    () => sessionList.execute({ ...request, operation: { kind: "query", id: "status.read" as any } }),
+    /session list operation/u
+  );
+});
+
+test("session.list validates bounded input and cancellation before invocation and publication", async () => {
+  let calls = 0;
+  const controller = new AbortController();
+  const sessionList = createSessionListUseCase({
+    async readSessions() {
+      calls += 1;
+      controller.abort();
+      return { sessions: [] };
+    }
+  });
+  const request: SessionListRequestV1 = {
+    version: 1,
+    kind: "session-list-request",
+    requestId: "request:sessions-cancelled",
+    context: {
+      principal: { principalId: "principal:operator", actorId: "actor:cli", kind: "operator" },
+      scope: { tenantId: "tenant:local" },
+      sourceReference: "cli:session:list",
+      correlationId: "correlation:sessions-cancelled",
+      cancellationControlReference: "cancel:sessions-cancelled"
+    },
+    operation: { kind: "query", id: "session.list" },
+    input: { limit: 20 }
+  };
+  const alreadyCancelled = new AbortController();
+  alreadyCancelled.abort();
+  await assert.rejects(() => sessionList.execute(request, { signal: alreadyCancelled.signal }), { name: "AbortError" });
+  assert.equal(calls, 0);
+  await assert.rejects(() => sessionList.execute(request, { signal: controller.signal }), { name: "AbortError" });
+  assert.equal(calls, 1);
+  await assert.rejects(() => sessionList.execute({ ...request, input: { limit: 201 } }), /integer from 1 to 200/u);
+});
+
 test("application package resolves independently and excludes implementation dependencies", () => {
   const packageRoot = join(import.meta.dirname, "..", "packages", "application");
   const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), []);
-  const source = ["contracts.ts", "validation.ts", "ports.ts", "status.ts", "diagnostics.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
+  const source = ["contracts.ts", "validation.ts", "ports.ts", "status.ts", "diagnostics.ts", "session-list.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
   assert.doesNotMatch(source, /discord\.js|@slack|telegram|whatsapp|express|playwright|apps\/gateway|apps\/cli|packages\/kernel/u);
   assert.doesNotMatch(readFileSync(join(packageRoot, "src", "contracts.ts"), "utf8"), /\b(?:AbortSignal|Request|Response|Buffer|Readable|Writable)\b/u);
   const probe = spawnSync(process.execPath, ["--input-type=module", "--eval", "const application = await import('@odinn/application'); if (application.APPLICATION_CONTRACT_VERSION !== 1) process.exit(2);"], { cwd: packageRoot, encoding: "utf8" });

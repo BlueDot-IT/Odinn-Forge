@@ -368,6 +368,14 @@ test("projects group assigned sessions and project- or session-scoped goals", as
 
     const scopedSessions = await requestJson(`${gateway.base}/sessions?projectId=${encodeURIComponent(project.id)}`);
     assert.deepEqual(scopedSessions.sessions.map((entry: any) => entry.id), [session.id]);
+    for (const externalRequestId of ["session list request with spaces", "r".repeat(257)]) {
+      const compatibleRequest = await fetch(`${gateway.base}/sessions?limit=not-a-number`, {
+        headers: { "x-odinn-request-id": externalRequestId }
+      });
+      assert.equal(compatibleRequest.status, 200);
+      assert.equal(compatibleRequest.headers.get("x-odinn-request-id"), externalRequestId);
+      assert.deepEqual((await compatibleRequest.json()).sessions.map((entry: any) => entry.id), [session.id]);
+    }
     const scopedGoals = await requestJson(`${gateway.base}/goals?projectId=${encodeURIComponent(project.id)}`);
     assert.deepEqual(new Set(scopedGoals.goals.map((goal: any) => goal.id)), new Set([projectGoal.id, sessionGoal.id]));
     assert.equal(scopedGoals.goals.find((goal: any) => goal.id === projectGoal.id)?.title, "Ship the polished project view");
