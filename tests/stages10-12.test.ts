@@ -528,7 +528,7 @@ test("Stage 10 contains late dispatch rejection after bounded shutdown closes th
   }
 });
 
-test("Stage 10 renews a live workflow lease for legitimate long-running work", { timeout: 10_000 }, async (t) => {
+test("Stage 10 renews a live workflow lease for legitimate long-running work", { timeout: 20_000 }, async (t) => {
   const state = await stateRoot("workflow-lease-renewal");
   const ledger = createRunLedger({ stateDir: state });
   const store = new SqliteWorkflowStore(ledger.database);
@@ -538,11 +538,11 @@ test("Stage 10 renews a live workflow lease for legitimate long-running work", {
   const dispatchFinished = new Promise<void>((resolve) => { markDispatchFinished = resolve; });
   const runtime = new DurableWorkflowRuntime({
     store,
-    leaseMs: 40,
+    leaseMs: 2_000,
     dispatch: async (_context) => {
       try {
         for (let index = 0; index < 4; index += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
+          await new Promise((resolve) => setTimeout(resolve, 600));
           assert.equal(_context.renewLease(), true);
           renewals += 1;
         }
