@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -82,6 +83,7 @@ test("run ledger persists content-bound, principal-scoped envelopes and attempt 
   const root = await mkdtemp(join(tmpdir(), "odinn-execution-envelope-"));
   const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
   try {
+    assert.equal((ledger.database.db.prepare("PRAGMA busy_timeout").get() as { timeout: number }).timeout, 30_000);
     ledger.ensureRun({ runId: "run_execution_1", objective: "persist envelope" });
     const admitted = ledger.recordExecutionEnvelope(envelope({ workspaceRoot: root }));
     assert.equal(admitted.replay, false);
@@ -131,6 +133,40 @@ test("run ledger persists content-bound, principal-scoped envelopes and attempt 
     );
   } finally {
     ledger.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime transactions survive a live writer beyond the former contention window", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-contention-"));
+  const databasePath = join(root, "odinn.sqlite");
+  const store = new SqliteStore(databasePath);
+  const child = spawn(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    `import { DatabaseSync } from "node:sqlite";
+     const database = new DatabaseSync(process.argv[1]);
+     database.exec("BEGIN IMMEDIATE");
+     process.stdout.write("locked\\n");
+     setTimeout(() => { database.exec("COMMIT"); database.close(); }, 5_500);`,
+    databasePath
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exit = new Promise<number | null>((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("close", resolveExit);
+  });
+  try {
+    await new Promise<void>((resolveReady, rejectReady) => {
+      child.once("error", rejectReady);
+      child.stdout.once("data", (chunk) => String(chunk).includes("locked") ? resolveReady() : rejectReady(new Error(`unexpected writer output: ${String(chunk)}`)));
+    });
+    assert.equal(store.transaction(() => "acquired"), "acquired");
+    assert.equal(await exit, 0, stderr);
+  } finally {
+    store.close();
     await rm(root, { recursive: true, force: true });
   }
 });

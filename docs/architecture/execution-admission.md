@@ -112,7 +112,9 @@ trusted registry. Unknown identifiers and missing or conflicting declarations
 fail closed. Legacy grants migrate to exact tool scopes with a report and no
 automatic widening. Parent/child agent requests are intersected with trusted
 tool declarations before dispatch; Skill and MCP declarations never grant
-authority.
+authority. Capability consumption binds status, remaining uses, and expiry in
+the same write transaction after any database-lock wait, so contention cannot
+extend an authorization beyond its expiry.
 
 Gatewatch exposes the same capability and invariant decision inputs through
 the CLI, authenticated loopback API, and operator console. Preview is pure and
@@ -128,6 +130,12 @@ truncation state, and digests needed for correlation without turning the
 durable execution record into a copy of inspected workspace data.
 
 Approval execution is correlated back to the originating job and attempt. Claiming an approval atomically moves the original attempt from `awaiting-approval` to `running`; a definitive result settles it, while failure or uncertain interruption becomes `needs-review`. Cancelling before claim revokes the pending approval. Cancelling after claim returns `cancelling` until the in-flight approved action reaches a terminal projection.
+
+Runtime-ledger, authoritative-record, and audit SQLite connections use a
+bounded 30-second busy window. Concurrent isolated workers may wait for a live
+writer, but they do not bypass admission, silently discard a read, or retry an
+effectful operation. Exhausting the window remains an explicit operational
+failure.
 
 `pnpm benchmark:assurance` enforces the 10 ms p95 gate on the atomic execution-envelope ledger transaction. It separately reports complete admission with the authoritative signed audit commit. That second store uses `synchronous=FULL` and remains observational; its durability is not reduced for latency cosmetics.
 
