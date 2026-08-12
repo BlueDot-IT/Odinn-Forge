@@ -27,15 +27,22 @@ must agree. The check validates source imports and every package dependency
 field, requires the canonical package name with exact `workspace:*`, rejects
 local-path and npm aliases, rejects package-to-app and adapter-to-adapter edges,
 and requires source imports to be declared. Package subpaths are evaluated with
-conditional, wildcard, and null `exports` semantics. Relative or
+Node 24 conditional, wildcard, null-exclusion, and array-fallback `exports`
+semantics. A selected export target must remain owned by its declared package,
+so a parent cannot proxy files from a nested workspace. Relative or
 repository-root cross-package source imports are rejected so production code
-cannot depend on private TypeScript files that are not package API.
+cannot depend on private TypeScript files that are not package API. Explicitly
+matched `dist` package roots are included; generated directories must be
+excluded in the workspace globs, while pnpm's `node_modules` and
+`bower_components` exclusions remain intact.
 
 Dynamic `import()`, direct `require()`, and `module.require()` calls in every
 production workspace package must use literal module specifiers. Indirect
-`require`, `createRequire`, package `imports` aliases, and TypeScript `paths`
-aliases fail closed so dependency identities and packaged build inputs remain
-statically enforceable.
+`require`, computed loader properties, `createRequire` re-exports, package
+`imports` aliases, and effective TypeScript `paths` aliases in production
+package config variants and their inherited chains fail closed so dependency
+identities and packaged build inputs remain statically enforceable. Tool-only
+TypeScript configurations are outside this production-package rule.
 
 Diagnostics name the source file or manifest, import/dependency specifier, and
 violated rule. The dependency-direction check has no legacy exemptions.

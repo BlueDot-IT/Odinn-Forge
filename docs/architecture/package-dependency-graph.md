@@ -54,7 +54,11 @@ both source references and package manifests. It enforces all of the following:
    nested workspace packages. Every discovered package is registered in the
    allowed graph, every graph key is discovered, and every graph target names
    a discovered graph package. A nested package is not scanned again as part
-   of its parent package.
+   of its parent package. Pnpm's `node_modules` and `bower_components`
+   exclusions remain in force; other generated directories, including a
+   directory named `dist`, are authoritative workspace roots when matched and
+   must be excluded explicitly in `pnpm-workspace.yaml` when they are not
+   packages.
 2. Workspace entries in `dependencies`, `devDependencies`,
    `optionalDependencies`, and `peerDependencies` use the target's canonical
    package name and the exact `workspace:*` specifier, then follow the allowed
@@ -70,8 +74,12 @@ both source references and package manifests. It enforces all of the following:
    Node-compatible `exports` resolution. Exact entries take precedence over
    patterns, the most-specific wildcard wins, active `import`, `require`,
    `node`, `types`, and `default` conditions are evaluated in declaration
-   order, and a selected `null` target excludes the subpath. Public subpaths such as
-   `@odinn/kernel/browser-worker-host` and
+   order, and a selected exact or wildcard `null` target excludes the subpath.
+   Inside an exports fallback array, `null`, unmatched conditions, and invalid
+   targets may fall through to a later valid target as they do in Node 24.
+   The selected target must remain physically owned by the exporting package;
+   a parent package cannot export files from a separately discovered nested
+   workspace. Public subpaths such as `@odinn/kernel/browser-worker-host` and
    `@odinn/store-sqlite/memory-index` remain valid.
 7. Relative, absolute, or repository-root paths that cross a workspace package
    boundary are rejected. Production code must not reach into another
@@ -79,13 +87,20 @@ both source references and package manifests. It enforces all of the following:
 8. Dynamic `import()`, direct `require()`, and `module.require()` calls in
    production workspace packages use literal specifiers. Indirect `require`
    references and `createRequire` loaders are rejected because the checker
-   cannot soundly bind their later calls to module identities.
+   cannot soundly bind their later calls to module identities. This includes
+   statically computed `require` properties, computed destructuring, and
+   re-exports that expose `createRequire` or its containing module namespace;
+   unrelated string construction remains ordinary source text.
 9. The `@odinn/*` namespace and `workspace:` dependency protocol resolve only
    to packages present in this workspace.
-10. `package.json#imports` aliases and TypeScript `paths` aliases are rejected
-    for production architecture. Cross-package imports must remain visible as
-    exported workspace package specifiers rather than being rewritten by a
-    second resolver.
+10. `package.json#imports` aliases and effective TypeScript `paths` aliases in
+    every `tsconfig*.json` or `jsconfig*.json` owned by a production package are
+    rejected, including package build variants and their inherited options.
+    Cross-package imports must remain visible as exported workspace package
+    specifiers rather than being rewritten by a second resolver. Repository
+    tooling configurations are outside this production graph unless a
+    production package config inherits them; nested workspace configs belong
+    only to their most-specific package.
 
 There are no legacy exemptions.
 

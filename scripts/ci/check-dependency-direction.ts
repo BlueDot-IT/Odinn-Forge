@@ -53,6 +53,7 @@ export type AllowedDependencyGraph = Readonly<Record<string, readonly string[]>>
 
 export const DEPENDENCY_RULES = {
   adapterToAdapter: "adapters cannot depend on another adapter",
+  crossPackageExportTarget: "workspace package exports cannot target another workspace package",
   crossPackageSourcePath: "cross-package imports must use an exported workspace package specifier",
   dependencyAliasSpecifier: "file, link, and npm dependency aliases are unsupported in production workspace packages",
   missingGraphPackage: "allowed dependency graph packages must be discovered from pnpm-workspace.yaml",
@@ -114,7 +115,9 @@ export interface DependencyDirectionResult {
 
 type ImportReference = Omit<DependencyViolation, "rule">;
 type WorkspacePackageKind = "adapter" | "app" | "package";
-type PackageTargetResolution = "blocked" | "invalid" | "resolved" | "unmatched";
+type PackageTargetResolution =
+  | { status: "blocked" | "invalid" | "unmatched" }
+  | { status: "resolved"; target: string };
 
 interface ManifestDependency {
   name: string;
@@ -178,20 +181,32 @@ async function sourceFiles(directory: string, excludedDirectories: ReadonlySet<s
   return files;
 }
 
-async function configurationFiles(directory: string): Promise<string[]> {
+async function configurationFiles(
+  directory: string,
+  excludedDirectories: ReadonlySet<string>,
+): Promise<string[]> {
   const files: string[] = [];
   for (const entry of (await readdir(directory, { withFileTypes: true }))
     .sort((left, right) => left.name.localeCompare(right.name))) {
     const absolutePath = resolve(directory, entry.name);
     if (entry.isDirectory()) {
-      if (entry.name !== "dist" && entry.name !== "node_modules") {
-        files.push(...await configurationFiles(absolutePath));
+      if (entry.name !== "dist" && entry.name !== "node_modules" && !excludedDirectories.has(absolutePath)) {
+        files.push(...await configurationFiles(absolutePath, excludedDirectories));
       }
     } else if (entry.isFile() && /^(?:jsconfig|tsconfig)(?:\.[^.]+)*\.json$/u.test(entry.name)) {
       files.push(absolutePath);
     }
   }
   return files;
+}
+
+async function productionConfigurationFiles(packages: readonly WorkspacePackage[]): Promise<string[]> {
+  const packageDirectories = new Set(packages.map((workspacePackage) => workspacePackage.directory));
+  return (await Promise.all(packages.map((workspacePackage) => configurationFiles(
+    workspacePackage.directory,
+    new Set([...packageDirectories].filter((directory) => directory !== workspacePackage.directory
+      && isPathInside(workspacePackage.directory, directory))),
+  )))).flat().sort((left, right) => left.localeCompare(right));
 }
 
 function yamlScalar(rawValue: string, sourceFile: string, line: number): string {
@@ -245,7 +260,9 @@ async function expandWorkspaceGlob(repositoryRoot: string, pattern: string): Pro
   const manifests = new Set<string>();
   for await (const candidate of glob(`${pattern}/package.json`, { cwd: repositoryRoot })) {
     const normalized = candidate.replaceAll("\\", "/");
-    if (normalized.split("/").some((segment) => segment === "dist" || segment === "node_modules")) continue;
+    if (normalized.split("/").some((segment) => segment === "node_modules" || segment === "bower_components")) {
+      continue;
+    }
     const absolutePath = resolve(repositoryRoot, candidate);
     if (!isPathInside(repositoryRoot, absolutePath)) {
       throw new Error(`workspace package glob escaped repository: ${JSON.stringify(pattern)}`);
@@ -347,10 +364,51 @@ function stringSpecifier(node: ts.Node | undefined): string | undefined {
   return node && ts.isStringLiteralLike(node) ? node.text : undefined;
 }
 
+function staticStringExpression(node: ts.Expression | undefined): string | undefined {
+  if (!node) return undefined;
+  if (ts.isStringLiteralLike(node)) return node.text;
+  if (ts.isParenthesizedExpression(node)) return staticStringExpression(node.expression);
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = staticStringExpression(node.left);
+    const right = staticStringExpression(node.right);
+    return left === undefined || right === undefined ? undefined : `${left}${right}`;
+  }
+  if (ts.isTemplateExpression(node)) {
+    let value = node.head.text;
+    for (const span of node.templateSpans) {
+      const expression = staticStringExpression(span.expression);
+      if (expression === undefined) return undefined;
+      value += expression + span.literal.text;
+    }
+    return value;
+  }
+  return undefined;
+}
+
 function propertyName(node: ts.Expression): string | undefined {
   if (ts.isPropertyAccessExpression(node)) return node.name.text;
-  if (ts.isElementAccessExpression(node)) return stringSpecifier(node.argumentExpression);
+  if (ts.isElementAccessExpression(node)) return staticStringExpression(node.argumentExpression);
   return undefined;
+}
+
+function bindingPropertyName(node: ts.PropertyName | undefined): string | undefined {
+  if (!node) return undefined;
+  if (ts.isComputedPropertyName(node)) return staticStringExpression(node.expression);
+  return node.text;
+}
+
+function nodeModuleSpecifier(node: ts.Node | undefined): boolean {
+  const moduleName = stringSpecifier(node);
+  return moduleName === "node:module" || moduleName === "module";
+}
+
+function exportExposesModuleLoader(node: ts.ExportDeclaration): boolean {
+  if (!nodeModuleSpecifier(node.moduleSpecifier)) return false;
+  if (!node.exportClause || ts.isNamespaceExport(node.exportClause)) return true;
+  return node.exportClause.elements.some((element) => {
+    const exportedName = (element.propertyName ?? element.name).text;
+    return exportedName === "createRequire" || exportedName === "default" || exportedName === "Module";
+  });
 }
 
 function isDirectCallTarget(node: ts.Node): boolean {
@@ -390,8 +448,7 @@ function extractImportReferences(
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node)) {
       record(node, node.moduleSpecifier, "import-declaration");
-      const moduleName = stringSpecifier(node.moduleSpecifier);
-      if (moduleName === "node:module" || moduleName === "module") {
+      if (nodeModuleSpecifier(node.moduleSpecifier)) {
         const bindings = node.importClause?.namedBindings;
         if (bindings && ts.isNamedImports(bindings)) {
           for (const element of bindings.elements) {
@@ -403,6 +460,9 @@ function extractImportReferences(
       }
     } else if (ts.isExportDeclaration(node)) {
       record(node, node.moduleSpecifier, "export-declaration");
+      if (exportExposesModuleLoader(node)) {
+        record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+      }
     } else if (ts.isImportEqualsDeclaration(node)
       && ts.isExternalModuleReference(node.moduleReference)) {
       record(node, node.moduleReference.expression, "import-equals");
@@ -422,8 +482,8 @@ function extractImportReferences(
       && propertyName(node) === "createRequire") {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isBindingElement(node)
-      && ((node.propertyName && ts.isIdentifier(node.propertyName)
-        && (node.propertyName.text === "createRequire" || node.propertyName.text === "require"))
+      && ((bindingPropertyName(node.propertyName) === "createRequire"
+        || bindingPropertyName(node.propertyName) === "require")
         || (ts.isIdentifier(node.name) && node.name.text === "createRequire"))) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isIdentifier(node) && node.text === "require") {
@@ -487,11 +547,13 @@ function workspaceImportTarget(
   return { target, crossesSourceBoundary: true };
 }
 
-function validExportTarget(target: string, patternMatch?: string): boolean {
-  if (!target.startsWith("./")) return false;
+function normalizedExportTarget(target: string, patternMatch?: string): string | undefined {
+  if (!target.startsWith("./")) return undefined;
   const resolved = patternMatch === undefined ? target : target.replaceAll("*", patternMatch);
   const segments = resolved.slice(2).split("/");
-  return segments.every((segment) => segment !== ".." && segment.toLowerCase() !== "node_modules");
+  return segments.every((segment) => segment !== ".." && segment.toLowerCase() !== "node_modules")
+    ? resolved
+    : undefined;
 }
 
 function resolvePackageTarget(
@@ -499,25 +561,29 @@ function resolvePackageTarget(
   conditions: ReadonlySet<string>,
   patternMatch?: string,
 ): PackageTargetResolution {
-  if (target === null) return "blocked";
-  if (typeof target === "string") return validExportTarget(target, patternMatch) ? "resolved" : "invalid";
+  if (target === null) return { status: "blocked" };
+  if (typeof target === "string") {
+    const resolved = normalizedExportTarget(target, patternMatch);
+    return resolved === undefined ? { status: "invalid" } : { status: "resolved", target: resolved };
+  }
   if (Array.isArray(target)) {
-    if (target.length === 0) return "blocked";
+    if (target.length === 0) return { status: "blocked" };
+    let sawInvalid = false;
     for (const candidate of target) {
       const resolution = resolvePackageTarget(candidate, conditions, patternMatch);
-      if (resolution === "invalid" || resolution === "unmatched") continue;
-      return resolution;
+      if (resolution.status === "resolved") return resolution;
+      if (resolution.status === "invalid") sawInvalid = true;
     }
-    return "invalid";
+    return { status: sawInvalid ? "invalid" : "blocked" };
   }
-  if (!target || typeof target !== "object") return "invalid";
+  if (!target || typeof target !== "object") return { status: "invalid" };
   for (const [condition, candidate] of Object.entries(target as Record<string, unknown>)) {
     if (condition === "default" || conditions.has(condition)) {
       const resolution = resolvePackageTarget(candidate, conditions, patternMatch);
-      if (resolution !== "unmatched") return resolution;
+      if (resolution.status !== "unmatched") return resolution;
     }
   }
-  return "unmatched";
+  return { status: "unmatched" };
 }
 
 function conditionsForImport(kind: ImportKind): ReadonlySet<string> {
@@ -545,32 +611,40 @@ function compareExportPatterns(left: string, right: string): number {
   return right.length - left.length;
 }
 
-function exportedSubpath(exportsValue: unknown, subpath: string, kind: ImportKind): boolean {
+function resolveExportedSubpath(
+  exportsValue: unknown,
+  subpath: string,
+  kind: ImportKind,
+): PackageTargetResolution {
   const conditions = conditionsForImport(kind);
   if (typeof exportsValue === "string" || Array.isArray(exportsValue) || exportsValue === null) {
-    return subpath === "." && resolvePackageTarget(exportsValue, conditions) === "resolved";
+    return subpath === "."
+      ? resolvePackageTarget(exportsValue, conditions)
+      : { status: "unmatched" };
   }
-  if (!exportsValue || typeof exportsValue !== "object") return false;
+  if (!exportsValue || typeof exportsValue !== "object") return { status: "invalid" };
   const exportsMap = exportsValue as Record<string, unknown>;
   const keys = Object.keys(exportsMap);
   const subpathKeys = keys.filter((key) => key.startsWith("."));
   if (subpathKeys.length === 0) {
-    return subpath === "." && resolvePackageTarget(exportsMap, conditions) === "resolved";
+    return subpath === "."
+      ? resolvePackageTarget(exportsMap, conditions)
+      : { status: "unmatched" };
   }
-  if (subpathKeys.length !== keys.length) return false;
+  if (subpathKeys.length !== keys.length) return { status: "invalid" };
   if (Object.hasOwn(exportsMap, subpath) && !subpath.includes("*")) {
-    return resolvePackageTarget(exportsMap[subpath], conditions) === "resolved";
+    return resolvePackageTarget(exportsMap[subpath], conditions);
   }
   const patterns = subpathKeys
     .filter((key) => key.includes("*") && matchingExportPattern(key, subpath) !== undefined)
     .sort(compareExportPatterns);
   const selected = patterns[0];
-  if (!selected) return false;
+  if (!selected) return { status: "unmatched" };
   return resolvePackageTarget(
     exportsMap[selected],
     conditions,
     matchingExportPattern(selected, subpath),
-  ) === "resolved";
+  );
 }
 
 function graphRule(
@@ -609,8 +683,20 @@ function sourceViolationRule(
     return unknownWorkspaceTarget(reference.specifier) ? DEPENDENCY_RULES.unknownWorkspaceTarget : undefined;
   }
   if (target.crossesSourceBoundary) return DEPENDENCY_RULES.crossPackageSourcePath;
-  if (target.packageSubpath && !exportedSubpath(target.target.exports, target.packageSubpath, reference.kind)) {
-    return DEPENDENCY_RULES.privateWorkspaceSubpath;
+  if (target.packageSubpath) {
+    const exportResolution = resolveExportedSubpath(
+      target.target.exports,
+      target.packageSubpath,
+      reference.kind,
+    );
+    if (exportResolution.status !== "resolved") return DEPENDENCY_RULES.privateWorkspaceSubpath;
+    const exportOwner = packageForPath(
+      packages,
+      resolve(target.target.directory, exportResolution.target),
+    );
+    if (exportOwner && exportOwner.name !== target.target.name) {
+      return DEPENDENCY_RULES.crossPackageExportTarget;
+    }
   }
   const directionRule = graphRule(sourcePackage, target.target, allowedGraph);
   if (directionRule) return directionRule;
@@ -741,22 +827,18 @@ function graphIntegrityViolations(
   return violations;
 }
 
-async function typescriptPathViolations(repositoryRoot: string): Promise<DependencyViolation[]> {
+async function typescriptPathViolations(
+  repositoryRoot: string,
+  packages: readonly WorkspacePackage[],
+): Promise<DependencyViolation[]> {
   const violations: DependencyViolation[] = [];
-  for (const configPath of await configurationFiles(repositoryRoot)) {
+  for (const configPath of await productionConfigurationFiles(packages)) {
     const content = await readFile(configPath, "utf8");
-    const rawConfig = ts.parseConfigFileTextToJson(configPath, content).config as
-      | { compilerOptions?: { paths?: Record<string, unknown> } }
-      | undefined;
     const parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, {
       ...ts.sys,
       onUnRecoverableConfigFileDiagnostic: () => undefined,
     });
-    const aliases = new Set([
-      ...Object.keys(rawConfig?.compilerOptions?.paths ?? {}),
-      ...Object.keys(parsed?.options.paths ?? {}),
-    ]);
-    for (const alias of [...aliases].sort()) {
+    for (const alias of Object.keys(parsed?.options.paths ?? {}).sort()) {
       const location = manifestStringLocation(content, alias);
       violations.push({
         sourceFile: repositoryPath(repositoryRoot, configPath),
@@ -804,7 +886,7 @@ export async function checkDependencyDirection(
       packagesByName,
       allowedGraph,
     )),
-    ...await typescriptPathViolations(repositoryRoot),
+    ...await typescriptPathViolations(repositoryRoot, packages),
     ...references.flatMap(({ workspacePackage, references: fileReferences }) =>
       fileReferences.flatMap((reference): DependencyViolation[] => {
         const rule = sourceViolationRule(

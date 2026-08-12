@@ -43,6 +43,8 @@ const defaultWorkspace = [
   "",
 ].join("\n");
 
+const crossPackageExportTargetRule = "workspace package exports cannot target another workspace package";
+
 async function repositoryFixture(t: test.TestContext, files: Record<string, string>): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "odinn-dependency-direction-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -270,7 +272,7 @@ test("dependency checker rejects forbidden source and manifest directions", asyn
   ]);
 });
 
-test("exports resolution honors conditions, exact nulls, and most-specific wildcard exclusions", async (t) => {
+test("exports resolution honors Node array fallbacks, conditions, and selected null exclusions", async (t) => {
   const root = await repositoryFixture(t, {
     "packages/kernel/package.json": manifest("@odinn/kernel", {
       exports: {
@@ -281,7 +283,7 @@ test("exports resolution honors conditions, exact nulls, and most-specific wildc
         "./blocked": null,
         "./conditional": { node: { import: "./src/conditional.ts", require: null }, default: null },
         "./fallback": ["invalid-target", "./src/fallback.ts"],
-        "./null-first": [null, "./src/not-reached.ts"],
+        "./null-first": [null, "./src/reached.ts"],
       },
     }),
     "packages/kernel/src/index.ts": "export const kernel = true;\n",
@@ -327,12 +329,42 @@ test("exports resolution honors conditions, exact nulls, and most-specific wildc
       kind: "require-call",
       rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
     },
-    {
-      specifier: "@odinn/kernel/null-first",
-      kind: "import-declaration",
-      rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
-    },
   ]);
+});
+
+test("package exports cannot hide a transition into a nested workspace package", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: {
+        ".": "./src/index.ts",
+        "./owned": "./src/owned.ts",
+        "./nested": "./nested/src/index.ts",
+      },
+    }),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    "packages/host/src/owned.ts": "export const owned = true;\n",
+    "packages/host/nested/package.json": manifest("@odinn/nested"),
+    "packages/host/nested/src/index.ts": "export const nested = true;\n",
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+    }),
+    "packages/consumer/src/index.ts": [
+      'import "@odinn/host/owned";',
+      'import "@odinn/host/nested";',
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/host": [],
+    "@odinn/nested": [],
+  }, []);
+
+  assert.deepEqual(result.violations.map(({ specifier, kind, rule }) => ({ specifier, kind, rule })), [{
+    specifier: "@odinn/host/nested",
+    kind: "import-declaration",
+    rule: crossPackageExportTargetRule,
+  }]);
 });
 
 test("dependency checker rejects source-only paths across package boundaries", async (t) => {
@@ -437,6 +469,11 @@ test("module.require is inspected and indirect require or createRequire loaders 
       'load("@odinn/gateway");',
       'import * as nodeModule from "node:module";',
       "const loadAgain = nodeModule.createRequire(import.meta.url);",
+      'export { createRequire as exportedLoader } from "node:module";',
+      'module["re" + "quire"]("../../../apps/gateway/src/index.ts");',
+      'const computedLoader = module["re" + "quire"];',
+      'const { ["re" + "quire"]: destructuredLoader } = module;',
+      'const harmlessString = "re" + "quire";',
     ].join("\n"),
   });
 
@@ -450,6 +487,30 @@ test("module.require is inspected and indirect require or createRequire loaders 
     { kind: "require-call", rule: DEPENDENCY_RULES.packageToApp },
     { kind: "require-call", rule: DEPENDENCY_RULES.workspaceDynamicImports },
     { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "require-call", rule: DEPENDENCY_RULES.crossPackageSourcePath },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+  ]);
+});
+
+test("node module re-exports cannot relay createRequire or its containing namespace", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/application/package.json": manifest("@odinn/application"),
+    "packages/application/src/index.ts": [
+      'export { builtinModules as safeMetadata } from "node:module";',
+      'export { createRequire as relayedLoader } from "node:module";',
+      'export * as relayedModule from "node:module";',
+      'export * from "node:module";',
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, { "@odinn/application": [] }, []);
+
+  assert.deepEqual(result.violations.map(({ kind, rule }) => ({ kind, rule })), [
     { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
     { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
     { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
@@ -502,9 +563,64 @@ test("TypeScript paths aliases fail closed before cross-package resolution", asy
       kind: "typescript-path-alias",
       rule: DEPENDENCY_RULES.typescriptPathAlias,
     },
+  ]);
+});
+
+test("tooling-only TypeScript paths remain outside the production package graph", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/application/package.json": manifest("@odinn/application"),
+    "packages/application/src/index.ts": "export const application = true;\n",
+    "packages/application/tsconfig.json": JSON.stringify({
+      compilerOptions: { module: "NodeNext", moduleResolution: "NodeNext" },
+      include: ["src/**/*.ts"],
+    }),
+    "scripts/tsconfig.tools.json": JSON.stringify({
+      compilerOptions: {
+        baseUrl: "..",
+        paths: { "tool-only-alias": ["apps/gateway/src/index.ts"] },
+      },
+      include: ["**/*.ts"],
+    }),
+  });
+
+  const result = await checkFixture(root, { "@odinn/application": [] }, []);
+
+  assert.deepEqual(result.violations, []);
+});
+
+test("package-owned TypeScript config variants enforce effective inherited paths", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/application/package.json": manifest("@odinn/application"),
+    "packages/application/src/index.ts": "export const application = true;\n",
+    "packages/application/tsconfig.shared.json": JSON.stringify({
+      compilerOptions: {
+        baseUrl: "../..",
+        paths: { "variant-hidden-gateway": ["apps/gateway/src/index.ts"] },
+      },
+    }),
+    "packages/application/tsconfig.build.json": JSON.stringify({
+      extends: "./tsconfig.shared.json",
+      include: ["src/**/*.ts"],
+    }),
+  });
+
+  const result = await checkFixture(root, { "@odinn/application": [] }, []);
+
+  assert.deepEqual(result.violations.map(({ sourceFile, specifier, kind, rule }) => ({
+    sourceFile,
+    specifier,
+    kind,
+    rule,
+  })), [
     {
-      sourceFile: "tsconfig.base.json",
-      specifier: "hidden-gateway",
+      sourceFile: "packages/application/tsconfig.build.json",
+      specifier: "variant-hidden-gateway",
+      kind: "typescript-path-alias",
+      rule: DEPENDENCY_RULES.typescriptPathAlias,
+    },
+    {
+      sourceFile: "packages/application/tsconfig.shared.json",
+      specifier: "variant-hidden-gateway",
       kind: "typescript-path-alias",
       rule: DEPENDENCY_RULES.typescriptPathAlias,
     },
@@ -554,6 +670,22 @@ test("workspace globs discover nested packages without double-scanning their sou
 
   assert.equal(result.scannedManifestCount, 2);
   assert.equal(result.scannedFileCount, 2);
+  assert.deepEqual(result.violations, []);
+});
+
+test("workspace discovery includes explicitly matched dist packages and keeps pnpm node_modules exclusion", async (t) => {
+  const root = await repositoryFixture(t, {
+    "pnpm-workspace.yaml": "packages:\n  - packages/**\n  - '!packages/generated/**'\n",
+    "packages/dist/feature/package.json": manifest("@odinn/dist-feature"),
+    "packages/dist/feature/src/index.ts": "export const feature = true;\n",
+    "packages/generated/ignored/package.json": manifest("@odinn/generated"),
+    "packages/node_modules/ignored/package.json": manifest("@odinn/node-modules-ignored"),
+  });
+
+  const result = await checkFixture(root, { "@odinn/dist-feature": [] }, []);
+
+  assert.equal(result.scannedManifestCount, 1);
+  assert.equal(result.scannedFileCount, 1);
   assert.deepEqual(result.violations, []);
 });
 

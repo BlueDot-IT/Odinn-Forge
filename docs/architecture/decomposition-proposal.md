@@ -146,10 +146,11 @@ a time while preserving the current kernel exports as a compatibility facade.
    in CI. Workspace roots come from `pnpm-workspace.yaml`; source imports,
    manifest dependency identity and direction, package exports, and unsupported
    alias or loader constructs are checked. Package-to-app, adapter-to-adapter,
-   private deep-import, undeclared workspace dependency, and cross-package
-   source-path violations are rejected while documented composition-root edges
-   and Node-resolvable exported package subpaths remain allowed. See [the
-   package dependency graph](package-dependency-graph.md).
+   private deep-import, undeclared workspace dependency, cross-package source
+   paths, and exports that cross nested workspace ownership are rejected while
+   documented composition-root edges and Node-resolvable exported package
+   subpaths remain allowed. See [the package dependency
+   graph](package-dependency-graph.md).
 
 ## Invariants and stop conditions
 
