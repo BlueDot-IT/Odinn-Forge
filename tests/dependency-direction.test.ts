@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -44,6 +45,38 @@ const defaultWorkspace = [
 ].join("\n");
 
 const crossPackageExportTargetRule = "workspace package exports cannot target another workspace package";
+const physicalExportTargetRule = "workspace exports must resolve to an existing regular file inside their package";
+const productionSymlinkRule = "production workspace packages cannot contain symbolic links";
+
+async function linkRuntimePackage(
+  t: test.TestContext,
+  root: string,
+  packageName: string,
+  packageDirectory: string,
+): Promise<boolean> {
+  const segments = packageName.split("/");
+  const linkPath = join(root, "node_modules", ...segments);
+  await mkdir(dirname(linkPath), { recursive: true });
+  try {
+    await symlink(packageDirectory, linkPath, process.platform === "win32" ? "junction" : "dir");
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES" || code === "ENOSYS") {
+      t.skip(`runtime package links are unavailable on ${process.platform}: ${code}`);
+      return false;
+    }
+    throw error;
+  }
+}
+
+function runNodeProbe(root: string, file: string): string {
+  return execFileSync(process.execPath, [join(root, file)], {
+    cwd: root,
+    encoding: "utf8",
+    windowsHide: true,
+  }).trim();
+}
 
 async function repositoryFixture(t: test.TestContext, files: Record<string, string>): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "odinn-dependency-direction-"));
@@ -287,6 +320,10 @@ test("exports resolution honors Node array fallbacks, conditions, and selected n
       },
     }),
     "packages/kernel/src/index.ts": "export const kernel = true;\n",
+    "packages/kernel/src/conditional.ts": "export const conditional = true;\n",
+    "packages/kernel/src/fallback.ts": "export const fallback = true;\n",
+    "packages/kernel/src/features/public/tool.ts": "export const tool = true;\n",
+    "packages/kernel/src/reached.ts": "export const reached = true;\n",
     "packages/runtime/package.json": manifest("@odinn/runtime", {
       dependencies: { "@odinn/kernel": "workspace:*" },
     }),
@@ -332,6 +369,58 @@ test("exports resolution honors Node array fallbacks, conditions, and selected n
   ]);
 });
 
+test("Node 24 active export conditions and the checker select the same nested workspace targets", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: {
+        ".": { "node-addons": "./nested/src/addons.js", default: "./src/safe.js" },
+        "./sync": { "module-sync": "./nested/src/sync.js", default: "./src/safe.js" },
+      },
+    }),
+    "packages/host/src/safe.js": 'export const selected = "safe";\n',
+    "packages/host/nested/package.json": manifest("@odinn/nested"),
+    "packages/host/nested/src/index.ts": "export const nested = true;\n",
+    "packages/host/nested/src/addons.js": 'export const selected = "node-addons";\n',
+    "packages/host/nested/src/sync.js": 'export const selected = "module-sync";\n',
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+    }),
+    "packages/consumer/src/index.ts": [
+      'import "@odinn/host";',
+      'import "@odinn/host/sync";',
+      'require("@odinn/host");',
+      'require("@odinn/host/sync");',
+    ].join("\n"),
+    "runtime-import-probe.mjs": [
+      'import { selected as addons } from "@odinn/host";',
+      'import { selected as sync } from "@odinn/host/sync";',
+      "console.log(JSON.stringify([addons, sync]));",
+    ].join("\n"),
+    "runtime-require-probe.cjs": [
+      'const { selected: addons } = require("@odinn/host");',
+      'const { selected: sync } = require("@odinn/host/sync");',
+      "console.log(JSON.stringify([addons, sync]));",
+    ].join("\n"),
+  });
+  if (!await linkRuntimePackage(t, root, "@odinn/host", join(root, "packages/host"))) return;
+
+  assert.equal(runNodeProbe(root, "runtime-import-probe.mjs"), '["node-addons","module-sync"]');
+  assert.equal(runNodeProbe(root, "runtime-require-probe.cjs"), '["node-addons","module-sync"]');
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/host": [],
+    "@odinn/nested": [],
+  }, []);
+
+  assert.deepEqual(result.violations.map(({ specifier, kind, rule }) => ({ specifier, kind, rule })), [
+    { specifier: "@odinn/host", kind: "import-declaration", rule: crossPackageExportTargetRule },
+    { specifier: "@odinn/host/sync", kind: "import-declaration", rule: crossPackageExportTargetRule },
+    { specifier: "@odinn/host", kind: "require-call", rule: crossPackageExportTargetRule },
+    { specifier: "@odinn/host/sync", kind: "require-call", rule: crossPackageExportTargetRule },
+  ]);
+});
+
 test("package exports cannot hide a transition into a nested workspace package", async (t) => {
   const root = await repositoryFixture(t, {
     "packages/host/package.json": manifest("@odinn/host", {
@@ -365,6 +454,148 @@ test("package exports cannot hide a transition into a nested workspace package",
     kind: "import-declaration",
     rule: crossPackageExportTargetRule,
   }]);
+});
+
+test("Node-resolved symlink exports cannot cross physical workspace ownership", {
+  skip: process.platform === "win32" ? "unprivileged Windows CI cannot reliably create file symlinks" : false,
+}, async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": "./src/index.js", "./escape": "./src/escape.js" },
+    }),
+    "packages/host/src/index.js": 'export const selected = "host";\n',
+    "packages/host/nested/package.json": manifest("@odinn/nested"),
+    "packages/host/nested/src/index.js": 'export const selected = "nested";\n',
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+    }),
+    "packages/consumer/src/index.ts": 'import "@odinn/host/escape";\n',
+    "runtime-symlink-probe.mjs": [
+      'import { selected } from "@odinn/host/escape";',
+      "console.log(selected);",
+    ].join("\n"),
+  });
+  await symlink("../nested/src/index.js", join(root, "packages/host/src/escape.js"), "file");
+  if (!await linkRuntimePackage(t, root, "@odinn/host", join(root, "packages/host"))) return;
+
+  assert.equal(runNodeProbe(root, "runtime-symlink-probe.mjs"), "nested");
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/host": [],
+    "@odinn/nested": [],
+  }, []);
+
+  assert.deepEqual(result.violations.map(({ sourceFile, specifier, kind, rule }) => ({
+    sourceFile,
+    specifier,
+    kind,
+    rule,
+  })), [
+    {
+      sourceFile: "packages/consumer/src/index.ts",
+      specifier: "@odinn/host/escape",
+      kind: "import-declaration",
+      rule: crossPackageExportTargetRule,
+    },
+    {
+      sourceFile: "packages/host/src/escape.js",
+      specifier: "packages/host/src/escape.js",
+      kind: "workspace-symlink",
+      rule: productionSymlinkRule,
+    },
+  ]);
+});
+
+test("broken and repository-escaping production symlinks fail closed", {
+  skip: process.platform === "win32" ? "unprivileged Windows CI cannot reliably create file symlinks" : false,
+}, async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": "./src/index.js", "./broken": "./src/broken.js", "./outside": "./src/outside.js" },
+    }),
+    "packages/host/src/index.js": "export const host = true;\n",
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+    }),
+    "packages/consumer/src/index.ts": [
+      'import "@odinn/host/broken";',
+      'import "@odinn/host/outside";',
+    ].join("\n"),
+  });
+  const outside = join(dirname(root), `${root.split(/[\\/]/u).at(-1)}-outside.js`);
+  t.after(() => rm(outside, { force: true }));
+  await writeFile(outside, "export const outside = true;\n");
+  await symlink("../missing.js", join(root, "packages/host/src/broken.js"), "file");
+  await symlink(outside, join(root, "packages/host/src/outside.js"), "file");
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/host": [],
+  }, []);
+
+  assert.equal(result.violations.length, 4);
+  assert.deepEqual(
+    result.violations.map(({ rule }) => rule),
+    [
+      physicalExportTargetRule,
+      physicalExportTargetRule,
+      productionSymlinkRule,
+      productionSymlinkRule,
+    ],
+  );
+});
+
+test("production symlinks remain forbidden inside skipped build output", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    "packages/host/dist/placeholder.txt": "generated output\n",
+  });
+  const linkPath = join(root, "packages/host/dist/source-link");
+  try {
+    await symlink(
+      join(root, "packages/host/src"),
+      linkPath,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES" || code === "ENOSYS") {
+      t.skip(`directory links are unavailable on ${process.platform}: ${code}`);
+      return;
+    }
+    throw error;
+  }
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+
+  assert.deepEqual(result.violations.map(({ sourceFile, kind, rule }) => ({
+    sourceFile,
+    kind,
+    rule,
+  })), [{
+    sourceFile: "packages/host/dist/source-link",
+    kind: "workspace-symlink",
+    rule: productionSymlinkRule,
+  }]);
+});
+
+test("workspace package roots cannot traverse symbolic links", {
+  skip: process.platform === "win32" ? "unprivileged Windows CI cannot reliably create directory symlinks" : false,
+}, async (t) => {
+  const root = await repositoryFixture(t, {
+    "pnpm-workspace.yaml": "packages:\n  - packages/host\n",
+    "real-host/package.json": manifest("@odinn/host"),
+    "real-host/src/index.ts": "export const host = true;\n",
+  });
+  await mkdir(join(root, "packages"), { recursive: true });
+  await symlink(join(root, "real-host"), join(root, "packages/host"), "dir");
+
+  await assert.rejects(
+    checkFixture(root, { "@odinn/host": [] }, []),
+    /package root must not traverse symbolic link packages\/host/u,
+  );
 });
 
 test("dependency checker rejects source-only paths across package boundaries", async (t) => {

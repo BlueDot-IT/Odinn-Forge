@@ -54,11 +54,12 @@ both source references and package manifests. It enforces all of the following:
    nested workspace packages. Every discovered package is registered in the
    allowed graph, every graph key is discovered, and every graph target names
    a discovered graph package. A nested package is not scanned again as part
-   of its parent package. Pnpm's `node_modules` and `bower_components`
-   exclusions remain in force; other generated directories, including a
-   directory named `dist`, are authoritative workspace roots when matched and
-   must be excluded explicitly in `pnpm-workspace.yaml` when they are not
-   packages.
+   of its parent package. Repository and package roots are resolved physically;
+   a package root or manifest that traverses a symbolic link fails the check.
+   Pnpm's `node_modules` and `bower_components` exclusions remain in force;
+   other generated directories, including a directory named `dist`, are
+   authoritative workspace roots when matched and must be excluded explicitly
+   in `pnpm-workspace.yaml` when they are not packages.
 2. Workspace entries in `dependencies`, `devDependencies`,
    `optionalDependencies`, and `peerDependencies` use the target's canonical
    package name and the exact `workspace:*` specifier, then follow the allowed
@@ -72,18 +73,26 @@ both source references and package manifests. It enforces all of the following:
 5. One adapter cannot depend on another adapter.
 6. Bare workspace imports may use only the root or subpaths exposed through
    Node-compatible `exports` resolution. Exact entries take precedence over
-   patterns, the most-specific wildcard wins, active `import`, `require`,
-   `node`, `types`, and `default` conditions are evaluated in declaration
-   order, and a selected exact or wildcard `null` target excludes the subpath.
+   patterns, the most-specific wildcard wins, and active conditions are
+   evaluated in declaration order. Runtime imports and requires include Node
+   24's default `node-addons` and `module-sync` conditions in addition to
+   `node`, `import`, or `require`; type imports retain TypeScript's `types`,
+   `node`, and `import` conditions. `default` remains the fallback condition,
+   and a selected exact or wildcard `null` target excludes the subpath.
    Inside an exports fallback array, `null`, unmatched conditions, and invalid
    targets may fall through to a later valid target as they do in Node 24.
-   The selected target must remain physically owned by the exporting package;
-   a parent package cannot export files from a separately discovered nested
-   workspace. Public subpaths such as `@odinn/kernel/browser-worker-host` and
+   The selected target is resolved physically and must be an existing regular
+   file owned by the exporting package. Broken targets, repository escapes,
+   and transitions into a separately discovered nested workspace fail closed.
+   Public subpaths such as `@odinn/kernel/browser-worker-host` and
    `@odinn/store-sqlite/memory-index` remain valid.
 7. Relative, absolute, or repository-root paths that cross a workspace package
    boundary are rejected. Production code must not reach into another
-   package's `src/` tree or depend on files absent as package API.
+   package's `src/` tree or depend on files absent as package API. Every
+   symbolic link or junction beneath a production package is rejected without
+   being followed, including broken links and links whose targets cross package
+   or repository ownership. The release verifier independently rejects
+   symbolic and hard links in extracted production archives.
 8. Dynamic `import()`, direct `require()`, and `module.require()` calls in
    production workspace packages use literal specifiers. Indirect `require`
    references and `createRequire` loaders are rejected because the checker

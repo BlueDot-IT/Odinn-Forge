@@ -1,4 +1,4 @@
-import { glob, readFile, readdir } from "node:fs/promises";
+import { glob, lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
@@ -59,7 +59,9 @@ export const DEPENDENCY_RULES = {
   missingGraphPackage: "allowed dependency graph packages must be discovered from pnpm-workspace.yaml",
   packageImportAlias: "package.json imports aliases are unsupported in production workspace packages",
   packageToApp: "packages and adapters cannot depend on apps",
+  physicalExportTarget: "workspace exports must resolve to an existing regular file inside their package",
   privateWorkspaceSubpath: "workspace imports must use package.json exports",
+  productionSymlink: "production workspace packages cannot contain symbolic links",
   typescriptPathAlias: "TypeScript paths aliases are unsupported for production workspace architecture",
   undeclaredWorkspaceDependency: "workspace source imports must be declared in package.json",
   unknownGraphTarget: "allowed dependency graph targets must name discovered graph packages",
@@ -85,7 +87,8 @@ export type ImportKind =
   | "require-call"
   | "typescript-path-alias"
   | "workspace-graph"
-  | "workspace-package";
+  | "workspace-package"
+  | "workspace-symlink";
 
 export interface DependencyViolation {
   sourceFile: string;
@@ -136,6 +139,7 @@ interface WorkspacePackage {
   name: string;
   kind: WorkspacePackageKind;
   directory: string;
+  physicalDirectory: string;
   repositoryManifestPath: string;
   exports: unknown;
   dependencies: readonly ManifestDependency[];
@@ -147,6 +151,11 @@ interface WorkspaceImportTarget {
   target: WorkspacePackage;
   packageSubpath?: string;
   crossesSourceBoundary: boolean;
+}
+
+interface SourceInventory {
+  files: readonly string[];
+  violations: readonly DependencyViolation[];
 }
 
 const sourceExtensions = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
@@ -165,20 +174,64 @@ function isPathInside(parent: string, candidate: string): boolean {
   return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
 }
 
-async function sourceFiles(directory: string, excludedDirectories: ReadonlySet<string> = new Set()): Promise<string[]> {
+async function physicalPathWithoutLinks(repositoryRoot: string, candidate: string, label: string): Promise<string> {
+  if (!isPathInside(repositoryRoot, candidate)) {
+    throw new Error(`${label} must remain inside the physical repository root`);
+  }
+  const path = relative(repositoryRoot, candidate);
+  let current = repositoryRoot;
+  for (const segment of path.split(sep).filter(Boolean)) {
+    current = resolve(current, segment);
+    if ((await lstat(current)).isSymbolicLink()) {
+      throw new Error(`${label} must not traverse symbolic link ${repositoryPath(repositoryRoot, current)}`);
+    }
+  }
+  const physical = await realpath(candidate);
+  if (!isPathInside(repositoryRoot, physical)) {
+    throw new Error(`${label} resolves outside the physical repository root`);
+  }
+  return physical;
+}
+
+async function sourceInventory(
+  repositoryRoot: string,
+  directory: string,
+  excludedDirectories: ReadonlySet<string> = new Set(),
+  includeSourceFiles = true,
+): Promise<SourceInventory> {
   const files: string[] = [];
+  const violations: DependencyViolation[] = [];
   for (const entry of (await readdir(directory, { withFileTypes: true }))
     .sort((left, right) => left.name.localeCompare(right.name))) {
     const absolutePath = resolve(directory, entry.name);
+    if (entry.name === "node_modules" || entry.name === "bower_components"
+      || excludedDirectories.has(absolutePath)) continue;
+    if (entry.isSymbolicLink()) {
+      const sourceFile = repositoryPath(repositoryRoot, absolutePath);
+      violations.push({
+        sourceFile,
+        line: 1,
+        column: 1,
+        specifier: sourceFile,
+        kind: "workspace-symlink",
+        rule: DEPENDENCY_RULES.productionSymlink,
+      });
+      continue;
+    }
     if (entry.isDirectory()) {
-      if (entry.name !== "dist" && entry.name !== "node_modules" && !excludedDirectories.has(absolutePath)) {
-        files.push(...await sourceFiles(absolutePath, excludedDirectories));
-      }
-    } else if (entry.isFile() && sourceExtensions.has(extname(entry.name).toLowerCase())) {
+      const nested = await sourceInventory(
+        repositoryRoot,
+        absolutePath,
+        excludedDirectories,
+        includeSourceFiles && entry.name !== "dist",
+      );
+      files.push(...nested.files);
+      violations.push(...nested.violations);
+    } else if (includeSourceFiles && entry.isFile() && sourceExtensions.has(extname(entry.name).toLowerCase())) {
       files.push(absolutePath);
     }
   }
-  return files;
+  return { files, violations };
 }
 
 async function configurationFiles(
@@ -329,21 +382,30 @@ function workspacePackageKind(repositoryManifestPath: string): WorkspacePackageK
 async function workspacePackages(repositoryRoot: string): Promise<WorkspacePackage[]> {
   const manifestPaths = await workspaceManifestFiles(repositoryRoot);
   const packages = await Promise.all(manifestPaths.map(async (manifestPath): Promise<WorkspacePackage> => {
+    const repositoryManifestPath = repositoryPath(repositoryRoot, manifestPath);
+    const directory = dirname(manifestPath);
+    const physicalDirectory = await physicalPathWithoutLinks(
+      repositoryRoot,
+      directory,
+      `${repositoryManifestPath} package root`,
+    );
+    await physicalPathWithoutLinks(repositoryRoot, manifestPath, repositoryManifestPath);
     const content = await readFile(manifestPath, "utf8");
     const manifest: unknown = JSON.parse(content);
     if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
-      throw new Error(`${repositoryPath(repositoryRoot, manifestPath)} must contain a JSON object`);
+      throw new Error(`${repositoryManifestPath} must contain a JSON object`);
     }
     const record = manifest as Record<string, unknown>;
     if (typeof record.name !== "string" || record.name.length === 0) {
-      throw new Error(`${repositoryPath(repositoryRoot, manifestPath)} must declare a package name`);
+      throw new Error(`${repositoryManifestPath} must declare a package name`);
     }
     const dependencies = manifestDependencies(content, record);
     return {
       name: record.name,
-      kind: workspacePackageKind(repositoryPath(repositoryRoot, manifestPath)),
-      directory: dirname(manifestPath),
-      repositoryManifestPath: repositoryPath(repositoryRoot, manifestPath),
+      kind: workspacePackageKind(repositoryManifestPath),
+      directory,
+      physicalDirectory,
+      repositoryManifestPath,
       exports: record.exports,
       dependencies,
       dependencyNames: new Set(dependencies.map(({ name }) => name)),
@@ -510,6 +572,15 @@ function packageForPath(packages: readonly WorkspacePackage[], absolutePath: str
     .find((workspacePackage) => isPathInside(workspacePackage.directory, absolutePath));
 }
 
+function packageForPhysicalPath(
+  packages: readonly WorkspacePackage[],
+  physicalPath: string,
+): WorkspacePackage | undefined {
+  return [...packages]
+    .sort((left, right) => right.physicalDirectory.length - left.physicalDirectory.length)
+    .find((workspacePackage) => isPathInside(workspacePackage.physicalDirectory, physicalPath));
+}
+
 function workspaceImportTarget(
   repositoryRoot: string,
   sourcePackage: WorkspacePackage,
@@ -588,10 +659,10 @@ function resolvePackageTarget(
 
 function conditionsForImport(kind: ImportKind): ReadonlySet<string> {
   if (kind === "require-call" || kind === "import-equals") {
-    return new Set(["node", "require"]);
+    return new Set(["node", "node-addons", "module-sync", "require"]);
   }
   if (kind === "import-type") return new Set(["types", "node", "import"]);
-  return new Set(["node", "import"]);
+  return new Set(["node", "node-addons", "module-sync", "import"]);
 }
 
 function matchingExportPattern(key: string, subpath: string): string | undefined {
@@ -662,13 +733,36 @@ function unknownWorkspaceTarget(specifier: string): boolean {
   return normalizedSpecifier(specifier).startsWith("@odinn/");
 }
 
-function sourceViolationRule(
+async function physicalExportViolationRule(
+  repositoryRoot: string,
+  targetPackage: WorkspacePackage,
+  exportTarget: string,
+  packages: readonly WorkspacePackage[],
+): Promise<DependencyRule | undefined> {
+  const lexicalTarget = resolve(targetPackage.directory, exportTarget);
+  let physicalTarget: string;
+  try {
+    physicalTarget = await realpath(lexicalTarget);
+  } catch {
+    return DEPENDENCY_RULES.physicalExportTarget;
+  }
+  if (!isPathInside(repositoryRoot, physicalTarget)) return DEPENDENCY_RULES.physicalExportTarget;
+  const metadata = await lstat(physicalTarget).catch(() => undefined);
+  if (!metadata?.isFile()) return DEPENDENCY_RULES.physicalExportTarget;
+  const owner = packageForPhysicalPath(packages, physicalTarget);
+  if (owner && owner.name !== targetPackage.name) return DEPENDENCY_RULES.crossPackageExportTarget;
+  return owner?.name === targetPackage.name && isPathInside(targetPackage.physicalDirectory, physicalTarget)
+    ? undefined
+    : DEPENDENCY_RULES.physicalExportTarget;
+}
+
+async function sourceViolationRule(
   repositoryRoot: string,
   sourcePackage: WorkspacePackage,
   reference: ImportReference,
   packages: readonly WorkspacePackage[],
   allowedGraph: AllowedDependencyGraph,
-): DependencyRule | undefined {
+): Promise<DependencyRule | undefined> {
   if (reference.kind === "module-loader") return DEPENDENCY_RULES.unsupportedModuleLoader;
   if (reference.specifier === nonLiteralSpecifier) return DEPENDENCY_RULES.workspaceDynamicImports;
   if (reference.specifier.startsWith("#")) return DEPENDENCY_RULES.packageImportAlias;
@@ -690,13 +784,13 @@ function sourceViolationRule(
       reference.kind,
     );
     if (exportResolution.status !== "resolved") return DEPENDENCY_RULES.privateWorkspaceSubpath;
-    const exportOwner = packageForPath(
+    const physicalRule = await physicalExportViolationRule(
+      repositoryRoot,
+      target.target,
+      exportResolution.target,
       packages,
-      resolve(target.target.directory, exportResolution.target),
     );
-    if (exportOwner && exportOwner.name !== target.target.name) {
-      return DEPENDENCY_RULES.crossPackageExportTarget;
-    }
+    if (physicalRule) return physicalRule;
   }
   const directionRule = graphRule(sourcePackage, target.target, allowedGraph);
   if (directionRule) return directionRule;
@@ -862,22 +956,35 @@ export async function checkDependencyDirection(
   baseline: readonly LegacyDependencyBaselineEntry[] = LEGACY_DEPENDENCY_BASELINE,
   allowedGraph: AllowedDependencyGraph = WORKSPACE_DEPENDENCY_GRAPH,
 ): Promise<DependencyDirectionResult> {
+  repositoryRoot = await realpath(repositoryRoot);
   const packages = await workspacePackages(repositoryRoot);
   const packagesByName = new Map(packages.map((workspacePackage) => [workspacePackage.name, workspacePackage]));
   const packageDirectories = new Set(packages.map((workspacePackage) => workspacePackage.directory));
   const packageFiles = await Promise.all(packages.map(async (workspacePackage) => ({
     workspacePackage,
-    files: await sourceFiles(
+    inventory: await sourceInventory(
+      repositoryRoot,
       workspacePackage.directory,
       new Set([...packageDirectories].filter((directory) => directory !== workspacePackage.directory
         && isPathInside(workspacePackage.directory, directory))),
     ),
   })));
-  const references = (await Promise.all(packageFiles.flatMap(({ workspacePackage, files }) =>
-    files.map(async (absolutePath) => ({
+  const references = (await Promise.all(packageFiles.flatMap(({ workspacePackage, inventory }) =>
+    inventory.files.map(async (absolutePath) => ({
       workspacePackage,
       references: extractImportReferences(repositoryRoot, absolutePath, await readFile(absolutePath, "utf8")),
     }))))).flat();
+  const sourceViolations = (await Promise.all(references.flatMap(({ workspacePackage, references: fileReferences }) =>
+    fileReferences.map(async (reference): Promise<DependencyViolation[]> => {
+      const rule = await sourceViolationRule(
+        repositoryRoot,
+        workspacePackage,
+        reference,
+        packages,
+        allowedGraph,
+      );
+      return rule ? [{ ...reference, rule }] : [];
+    })))).flat();
   const candidates = [
     ...graphIntegrityViolations(packages, allowedGraph),
     ...packages.flatMap((workspacePackage) => manifestViolations(
@@ -887,17 +994,8 @@ export async function checkDependencyDirection(
       allowedGraph,
     )),
     ...await typescriptPathViolations(repositoryRoot, packages),
-    ...references.flatMap(({ workspacePackage, references: fileReferences }) =>
-      fileReferences.flatMap((reference): DependencyViolation[] => {
-        const rule = sourceViolationRule(
-          repositoryRoot,
-          workspacePackage,
-          reference,
-          packages,
-          allowedGraph,
-        );
-        return rule ? [{ ...reference, rule }] : [];
-      })),
+    ...packageFiles.flatMap(({ inventory }) => inventory.violations),
+    ...sourceViolations,
   ].sort((left, right) => left.sourceFile.localeCompare(right.sourceFile)
     || left.line - right.line
     || left.column - right.column
@@ -928,7 +1026,7 @@ export async function checkDependencyDirection(
   }
 
   return {
-    scannedFileCount: packageFiles.reduce((count, { files }) => count + files.length, 0),
+    scannedFileCount: packageFiles.reduce((count, { inventory }) => count + inventory.files.length, 0),
     scannedManifestCount: packages.length,
     violations: candidates.filter((candidate) => !accepted.has(candidate)),
     baselineErrors,
@@ -944,7 +1042,9 @@ export function formatDependencyViolation(violation: DependencyViolation): strin
     ? "dependency"
     : violation.kind === "module-loader" || violation.kind === "typescript-path-alias"
       ? "construct"
-      : "import";
+      : violation.kind === "workspace-symlink"
+        ? "path"
+        : "import";
   return `${violation.sourceFile}:${violation.line}:${violation.column}: forbidden ${subject} ${JSON.stringify(violation.specifier)} [rule: ${violation.rule}]`;
 }
 

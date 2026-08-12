@@ -28,13 +28,18 @@ field, requires the canonical package name with exact `workspace:*`, rejects
 local-path and npm aliases, rejects package-to-app and adapter-to-adapter edges,
 and requires source imports to be declared. Package subpaths are evaluated with
 Node 24 conditional, wildcard, null-exclusion, and array-fallback `exports`
-semantics. A selected export target must remain owned by its declared package,
-so a parent cannot proxy files from a nested workspace. Relative or
+semantics, including the default `node-addons` and `module-sync` runtime
+conditions. A selected export target is physically resolved to an existing
+regular file that must remain owned by its declared package, so a parent cannot
+proxy files from a nested workspace or through a symlink. Relative or
 repository-root cross-package source imports are rejected so production code
 cannot depend on private TypeScript files that are not package API. Explicitly
 matched `dist` package roots are included; generated directories must be
 excluded in the workspace globs, while pnpm's `node_modules` and
-`bower_components` exclusions remain intact.
+`bower_components` exclusions remain intact. Production package roots,
+manifests, and descendants cannot traverse symbolic links or junctions;
+broken links and repository escapes fail closed. Archive verification retains
+an independent no-symbolic-link and no-hard-link boundary.
 
 Dynamic `import()`, direct `require()`, and `module.require()` calls in every
 production workspace package must use literal module specifiers. Indirect
