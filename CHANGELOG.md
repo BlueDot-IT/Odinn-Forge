@@ -22,6 +22,8 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
   toolchain migrations during release-candidate stabilization
 * require Node typings and the packaged Playwright runtime to update in
   dedicated compatibility and artifact-validation pull requests
+* separate the write-capable security-remediation control plane from routine
+  GitHub Actions dependency groups so its exact pinned revision is reviewed
 
 ### Release engineering
 
