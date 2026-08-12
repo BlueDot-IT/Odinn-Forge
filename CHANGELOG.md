@@ -18,6 +18,8 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
   credential redaction
 * move audit state metadata and self-improvement defaults in line with the
   active SQLite and review-gated runtime
+* separate routine dependency maintenance from Node and TypeScript major
+  toolchain migrations during release-candidate stabilization
 
 ### Release engineering
 

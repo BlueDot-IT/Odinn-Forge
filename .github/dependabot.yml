@@ -13,8 +13,17 @@ updates:
       prefix: chore
       include: scope
     groups:
-      npm-dependencies:
+      npm-minor-and-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # Odinn 1.1 targets the Node 24 / TypeScript 5.9 toolchain. These majors
+      # require explicit migration branches and must not enter RC maintenance
+      # through a routine dependency group.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
