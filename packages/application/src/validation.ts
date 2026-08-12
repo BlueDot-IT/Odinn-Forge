@@ -18,6 +18,7 @@ import {
   type NormalizedExecutionErrorV1,
   type OutboundEnvelopeV1
 } from "./contracts.ts";
+import { isSensitiveApplicationMetadataKey } from "./sensitive-metadata.ts";
 
 const MAX_ID_BYTES = 256;
 const MAX_REFERENCE_BYTES = 2_048;
@@ -27,10 +28,6 @@ const MAX_JSON_DEPTH = 32;
 const MAX_JSON_NODES = 8_192;
 const MAX_RETRY_AFTER_MS = 86_400_000;
 const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const SENSITIVE_KEY_WORDS = new Set([
-  "apikey", "authorization", "bottoken", "clientsecret", "cookie", "credential", "credentials", "idtoken",
-  "password", "passwordhash", "passwd", "privatekey", "refreshtoken", "secret", "token", "accesstoken"
-]);
 const SENSITIVE_VALUES = [
   /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|capability(?:[_-]?token)?|token|authorization|cookie|credentials?|password(?:[_-]?hash)?|passwd|secret|client[_-]?secret|bot[_-]?(?:secret|token)|private[_-]?key)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/iu,
   /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/iu,
@@ -537,7 +534,7 @@ function jsonValue(input: unknown, name: string, options: { rejectSensitive?: bo
       for (const key of keys) {
         if (RESERVED_KEYS.has(key)) throw invalid(`${path} contains reserved field ${key}`, "RESERVED_APPLICATION_FIELD", `${path}.${key}`);
         if (Buffer.byteLength(key, "utf8") > MAX_ID_BYTES) throw invalid(`${path} field name exceeds ${MAX_ID_BYTES} bytes`, undefined, `${path}.${key}`);
-        if (options.rejectSensitive && isSensitiveKey(key) && value[key] !== "[redacted]") {
+        if (options.rejectSensitive && isSensitiveApplicationMetadataKey(key) && value[key] !== "[redacted]") {
           throw invalid(`${path}.${key} is not permitted in redacted metadata`, "UNREDACTED_APPLICATION_METADATA", `${path}.${key}`);
         }
         output[key] = visit(value[key], `${path}.${key}`, depth + 1);
@@ -634,11 +631,6 @@ function safeString(input: unknown, name: string, maxBytes: number): string {
   const value = boundedString(input, name, maxBytes);
   if (SENSITIVE_VALUES.some((pattern) => pattern.test(value))) throw invalid(`${name} contains secret-like material`, "UNREDACTED_APPLICATION_ERROR", name);
   return value;
-}
-
-function isSensitiveKey(key: string): boolean {
-  const normalized = key.replace(/[^a-z0-9]/giu, "").toLowerCase();
-  return SENSITIVE_KEY_WORDS.has(normalized) || normalized.endsWith("token") || normalized.endsWith("secret") || normalized.endsWith("apikey");
 }
 
 function nonnegativeInteger(input: unknown, name: string, maximum: number): number {

@@ -1,4 +1,5 @@
 import { MAX_APPLICATION_CONTRACT_BYTES, type JsonObject, type JsonValue } from "./contracts.ts";
+import { isSensitiveApplicationMetadataKey } from "./sensitive-metadata.ts";
 import { ApplicationContractValidationError } from "./validation.ts";
 
 const MAX_ID_BYTES = 256;
@@ -7,10 +8,6 @@ const MAX_LIST_ITEMS = 512;
 const MAX_JSON_DEPTH = 32;
 const MAX_JSON_NODES = 8_192;
 const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const SENSITIVE_KEY_WORDS = new Set([
-  "apikey", "authorization", "bottoken", "clientsecret", "cookie", "credential", "credentials", "idtoken",
-  "password", "passwordhash", "passwd", "privatekey", "refreshtoken", "secret", "token", "accesstoken"
-]);
 const SENSITIVE_VALUES = [
   /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|capability(?:[_-]?token)?|token|authorization|cookie|credentials?|password(?:[_-]?hash)?|passwd|secret|client[_-]?secret|bot[_-]?(?:secret|token)|private[_-]?key)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/iu,
   /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/iu,
@@ -59,7 +56,7 @@ export function normalizeReadContractJsonValueV1(input: unknown, name: string): 
       if (keys.length > MAX_LIST_ITEMS) fail(`${path} cannot contain more than ${MAX_LIST_ITEMS} fields`, "INVALID_APPLICATION_READ_CONTRACT", path);
       for (const key of keys) {
         if (Buffer.byteLength(key, "utf8") > MAX_ID_BYTES) fail(`${path} field name exceeds ${MAX_ID_BYTES} bytes`, "INVALID_APPLICATION_READ_CONTRACT", `${path}.${key}`);
-        if (isSensitiveKey(key) && value[key] !== "[redacted]") fail(`${path}.${key} is not permitted in a read contract`, "UNREDACTED_APPLICATION_METADATA", `${path}.${key}`);
+        if (isSensitiveApplicationMetadataKey(key) && value[key] !== "[redacted]") fail(`${path}.${key} is not permitted in a read contract`, "UNREDACTED_APPLICATION_METADATA", `${path}.${key}`);
         const normalized = visit(value[key], `${path}.${key}`, depth + 1);
         if (normalized !== undefined) output[key] = normalized;
       }
@@ -136,11 +133,6 @@ function plainArrayValues(input: readonly unknown[], path: string): readonly unk
     output[index] = descriptor.value;
   }
   return output;
-}
-
-function isSensitiveKey(key: string): boolean {
-  const normalized = key.replace(/[^a-z0-9]/giu, "").toLowerCase();
-  return SENSITIVE_KEY_WORDS.has(normalized) || normalized.endsWith("token") || normalized.endsWith("secret") || normalized.endsWith("apikey");
 }
 
 function canonicalJson(input: unknown): string {

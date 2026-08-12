@@ -450,6 +450,13 @@ export function validatePendingApprovalSummariesV1(input: unknown): readonly Pen
   return normalized as unknown as readonly PendingApprovalSummaryV1[];
 }
 
+export function validateGatewayChannelDiagnosticsV1(input: unknown): readonly GatewayChannelDiagnosticV1[] {
+  const normalized = normalizeReadContractJsonValueV1(input, "gateway channel diagnostics");
+  if (!Array.isArray(normalized)) fail("gateway channel diagnostics must be an array", "gateway channel diagnostics");
+  normalized.forEach((item, index) => validateGatewayChannel(openObject(item, `gateway channel diagnostics[${index}]`), `gateway channel diagnostics[${index}]`));
+  return normalized as unknown as readonly GatewayChannelDiagnosticV1[];
+}
+
 export function validateRuntimeSecuritySummaryV1(input: unknown): RuntimeSecuritySummaryV1 {
   const normalized = normalizeReadContractJsonObjectV1(input, "runtime security summary");
   validateSecurity(normalized, "runtime security summary");

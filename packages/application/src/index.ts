@@ -34,11 +34,13 @@ export {
   parseSessionPageV1,
   parseStatusSnapshotV1,
   validateDiagnosticsReportV1,
+  validateGatewayChannelDiagnosticsV1,
   validatePendingApprovalSummariesV1,
   validateRuntimeSecuritySummaryV1,
   validateSessionPageV1,
   validateStatusSnapshotV1
 } from "./read-output-contracts.ts";
+export { isSensitiveApplicationMetadataKey } from "./sensitive-metadata.ts";
 export type {
   ApprovalEffectSummaryV1,
   ApprovalTotalsV1,

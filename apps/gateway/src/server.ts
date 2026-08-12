@@ -5,7 +5,7 @@ import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as stat
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1 } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateGatewayChannelDiagnosticsV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1 } from "@odinn/application";
 import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
@@ -1985,7 +1985,7 @@ export async function createGatewayServer({
         return json(response, 200, { ok: true, subscriber, sequence: await auditStore.getCursor(subscriber) });
       }
       if (request.method === "GET" && url.pathname === "/approvals") {
-        return json(response, 200, approvalStore.list());
+        return json(response, 200, validatePendingApprovalSummariesV1(approvalStore.list()));
       }
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/approve")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/approve".length));
@@ -3145,7 +3145,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
   let started = false;
   return {
     status() {
-      return configured.map((channel) => ({
+      return validateGatewayChannelDiagnosticsV1(configured.map((channel) => ({
         name: channel.name,
         type: channel.type,
         enabled: channel.config.enabled,
@@ -3161,7 +3161,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
         reconnectAttempts: channel.status.reconnectAttempts,
         latencyMs: channel.status.latencyMs,
         details: channel.status.details
-      }));
+      })));
     },
     async handleWebhook(request: any, response: any, url: URL) {
       const webhook = webhooks.get(url.pathname);

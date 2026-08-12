@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/teams/src/index.ts";
-import { createRunLedger } from "../packages/kernel/src/index.ts";
+import { createApprovalStore, createRunLedger } from "../packages/kernel/src/index.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
@@ -174,6 +174,105 @@ test("gateway diagnostics expose safe state and errors carry correlation metadat
     assert.equal(error.category, "validation");
     assert.equal(error.requestId, "diagnostics-error-request");
     assert.match(error.nextAction, /doctor/);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway rejects compound secret fields from channel diagnostics before response", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-channel-diagnostic-secret-"));
+  const credentialEnvironment = "ODINN_TEST_COMPOUND_CHANNEL_TOKEN";
+  const previousCredential = process.env[credentialEnvironment];
+  process.env[credentialEnvironment] = "test-channel-credential";
+  await writeFile(join(stateDir, "config.json"), JSON.stringify({
+    version: 1,
+    channels: {
+      compound: {
+        type: "telegram",
+        enabled: true,
+        tokenEnv: credentialEnvironment,
+        allowlist: ["compound:user"]
+      }
+    }
+  }));
+  let updateDiagnosticStatus: ((status: Record<string, unknown>) => void) | undefined;
+  const capabilities = { chatTypes: ["direct"] } as any;
+  const plugin: any = {
+    id: "telegram",
+    displayName: "Compound field test",
+    capabilities,
+    normalizeAccountConfig(_accountId: string, value: any) {
+      return { enabled: value.enabled === true, tokenEnv: value.tokenEnv, allowlist: value.allowlist ?? [] };
+    },
+    validateAccountConfig() { return []; },
+    createAdapter({ accountId }: any) {
+      return {
+        id: `compound-test:${accountId}`,
+        channel: "telegram",
+        accountId,
+        capabilities,
+        async start({ updateStatus }: any) {
+          updateDiagnosticStatus = updateStatus;
+          updateStatus({ state: "connected", details: { authentication: "mutual-tls", credentialConfigured: true } });
+        },
+        async stop() {},
+        async send() { return { status: "sent", messageIds: [], conversationId: "compound", sentChunks: 0, totalChunks: 0 }; }
+      };
+    }
+  };
+  const server = await createGatewayServer({
+    stateDir,
+    workspaceRoot: root,
+    async channelPluginLoader(type: string) {
+      assert.equal(type, "telegram");
+      return plugin;
+    }
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (let attempts = 0; attempts < 20 && !updateDiagnosticStatus; attempts += 1) {
+      await new Promise((resolveWait) => setImmediate(resolveWait));
+    }
+    assert.ok(updateDiagnosticStatus);
+    assert.equal((await fetch(`${base}/diagnostics`)).status, 200);
+    assert.equal((await fetch(`${base}/channels`)).status, 200);
+
+    const sentinel = "SENTINEL_COMPOUND_CHANNEL_SECRET_f6d4";
+    updateDiagnosticStatus!({ details: { databasePassword: sentinel } });
+    for (const path of ["/diagnostics", "/channels"]) {
+      const response = await fetch(`${base}${path}`);
+      const body = await response.text();
+      assert.equal(response.status, 400, path);
+      assert.doesNotMatch(body, new RegExp(sentinel), path);
+    }
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+    if (previousCredential === undefined) delete process.env[credentialEnvironment];
+    else process.env[credentialEnvironment] = previousCredential;
+  }
+});
+
+test("gateway rejects compound secret fields from pending approval projections", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-approval-compound-secret-"));
+  const approvalPath = join(stateDir, "approvals.json");
+  const approvalStore = createApprovalStore({ path: approvalPath });
+  approvalStore.create({ tool: "browser.click", input: { credentialConfigured: true } });
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    assert.equal((await fetch(`${base}/status`)).status, 200);
+    assert.equal((await fetch(`${base}/approvals`)).status, 200);
+
+    const sentinel = "SENTINEL_COMPOUND_APPROVAL_SECRET_a129";
+    approvalStore.create({ tool: "browser.click", input: { oauthCredential: sentinel } });
+    for (const path of ["/status", "/approvals"]) {
+      const response = await fetch(`${base}${path}`);
+      const body = await response.text();
+      assert.equal(response.status, 400, path);
+      assert.doesNotMatch(body, new RegExp(sentinel), path);
+    }
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

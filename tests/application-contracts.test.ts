@@ -14,6 +14,7 @@ import {
   digestExecutionOperationV1,
   digestExecutionRequestV1,
   digestOutboundEnvelopeV1,
+  isSensitiveApplicationMetadataKey,
   parseApplicationEnvelopeV1,
   parseDiagnosticsReportV1,
   parseSessionPageV1,
@@ -355,6 +356,59 @@ test("normalized errors reject exception internals and secret-like material", ()
   for (const key of ["accessToken", "refreshToken", "clientSecret", "credentials"]) {
     assert.throws(() => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { [key]: "visible" } } }), /not permitted in redacted metadata/u);
   }
+  const compoundSensitiveKeys = [
+    "databasePassword",
+    "database_password",
+    "DATABASEPASSWORD",
+    "databasePasswordValue",
+    "databasePasswordDigest",
+    "databasepassworddigest",
+    "passwordCiphertext",
+    "passwordencoded",
+    "sessionCookie",
+    "session-cookie",
+    "sessionCookieHeader",
+    "oauthCredential",
+    "oauth_credential",
+    "oauthCredentialMaterial",
+    "authHeader",
+    "authToken",
+    "servicePrivateKey",
+    "service_private_key",
+    "servicePrivateKeyPem",
+    "httpAuthorization",
+    "httpAuthorizationHeader",
+    "clientSecretValue",
+    "clientsecrethash"
+  ];
+  for (const key of compoundSensitiveKeys) {
+    assert.equal(isSensitiveApplicationMetadataKey(key), true, key);
+    assert.throws(
+      () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { [key]: "compound-secret-sentinel" } } }),
+      (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA",
+      key
+    );
+    assert.doesNotThrow(() => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { [key]: "[redacted]" } } }));
+  }
+  const safeMetadata = {
+    credentialPresent: true,
+    credentialConfigured: true,
+    tokenEnv: "ODINN_CHANNEL_TOKEN",
+    apiKeyEnv: "ODINN_PROVIDER_API_KEY",
+    authMode: "oauth",
+    authentication: "mutual-tls",
+    secretsExcludedFromDiagnostics: true,
+    secretReferences: 0,
+    authorizationDecisionReferences: ["decision-1"],
+    cookiePolicy: "strict",
+    authorizationStatus: "allowed",
+    secretary: "Alice",
+    tokenize: false,
+    monkey: 1,
+    privateNetworkAccess: false
+  };
+  for (const key of Object.keys(safeMetadata)) assert.equal(isSensitiveApplicationMetadataKey(key), false, key);
+  assert.doesNotThrow(() => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: safeMetadata } }));
   for (const message of ["OpenAI key sk-do-not-log-this", "access token actual-secret-value"]) {
     assert.throws(() => validateExecutionResultV1({ ...base, error: { ...base.error, message } }), /secret-like/u);
   }
