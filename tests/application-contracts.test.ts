@@ -15,12 +15,19 @@ import {
   digestExecutionRequestV1,
   digestOutboundEnvelopeV1,
   parseApplicationEnvelopeV1,
+  parseDiagnosticsReportV1,
+  parseSessionPageV1,
+  parseStatusSnapshotV1,
   validateChannelDeliveryReceiptV1,
+  validateDiagnosticsReportV1,
   validateExecutionRequestV1,
   validateExecutionResultV1,
   validateInboundEnvelopeV1,
   validateOutboundEnvelopeV1,
+  validateSessionPageV1,
+  validateStatusSnapshotV1,
   type ChannelPort,
+  type DiagnosticsReportV1,
   type DiagnosticsReadRequestV1,
   type ExecutionPort,
   type ExecutionReceiptV1,
@@ -28,13 +35,21 @@ import {
   type ExecutionResultV1,
   type InboundEnvelopeV1,
   type OutboundEnvelopeV1,
+  type SessionPageV1,
   type SessionListRequestV1,
+  type StatusSnapshotV1,
   type StatusReadRequestV1
 } from "../packages/application/src/index.ts";
 
 const timestamp = "2026-08-11T12:00:00.000Z";
 const digestA = "a".repeat(64);
 const digestB = "b".repeat(64);
+const readContractFixtures = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", "application-read-contracts-v1.json"), "utf8")) as {
+  statusCli: StatusSnapshotV1;
+  statusGateway: StatusSnapshotV1;
+  diagnostics: DiagnosticsReportV1;
+  sessionPage: SessionPageV1;
+};
 
 function inbound(overrides: Partial<InboundEnvelopeV1> = {}): InboundEnvelopeV1 {
   return {
@@ -417,14 +432,14 @@ test("status.read preserves authenticated principal scope and normalizes transpo
   const statusRead = createStatusReadUseCase({
     async readStatus(context) {
       observedContext = context;
-      return { ok: true, tools: ["text.echo"], nested: { omitted: undefined } } as any;
+      return { ...structuredClone(readContractFixtures.statusCli), omitted: undefined } as any;
     }
   });
   const result = await statusRead.execute(request);
   assert.equal(result.requestId, request.requestId);
   assert.equal(result.correlationId, request.context.correlationId);
   assert.deepEqual(observedContext, request.context);
-  assert.deepEqual(result.output, { nested: {}, ok: true, tools: ["text.echo"] });
+  assert.deepEqual(result.output, readContractFixtures.statusCli);
   assert.equal(Object.isFrozen(result.output), true);
   assert.equal(Object.isFrozen(result), true);
   await assert.rejects(
@@ -462,7 +477,7 @@ test("status.read snapshots authenticated authority before asynchronous port wor
     async readStatus(context) {
       await gate;
       observedContext = context;
-      return { ok: true };
+      return structuredClone(readContractFixtures.statusGateway);
     }
   });
   const request: any = {
@@ -500,7 +515,7 @@ test("diagnostics.read snapshots authority, normalizes output, and rejects opera
     async readDiagnostics(context) {
       await gate;
       observedContext = context;
-      return { ok: true, state: { safe: true, omitted: undefined } } as any;
+      return { ...structuredClone(readContractFixtures.diagnostics), omitted: undefined } as any;
     }
   });
   const request: DiagnosticsReadRequestV1 = {
@@ -525,7 +540,7 @@ test("diagnostics.read snapshots authority, normalizes output, and rejects opera
   assert.equal(observedContext.principal.principalId, "principal:alice");
   assert.equal(observedContext.scope.tenantId, "tenant:alice");
   assert.equal(result.correlationId, "correlation:diagnostics-alice");
-  assert.deepEqual(result.output, { ok: true, state: { safe: true } });
+  assert.deepEqual(result.output, readContractFixtures.diagnostics);
   assert.equal(Object.isFrozen(observedContext), true);
   assert.equal(Object.isFrozen(result.output), true);
   await assert.rejects(
@@ -565,7 +580,7 @@ test("session.list snapshots authority and query input before asynchronous port 
       await gate;
       observedInput = input;
       observedContext = context;
-      return { sessions: [{ id: "session:001", title: "First" }], omitted: undefined } as any;
+      return { ...structuredClone(readContractFixtures.sessionPage), omitted: undefined } as any;
     }
   });
   const request: SessionListRequestV1 = {
@@ -594,11 +609,11 @@ test("session.list snapshots authority and query input before asynchronous port 
   assert.equal(observedContext.principal.principalId, "principal:alice");
   assert.equal(observedContext.scope.tenantId, "tenant:alice");
   assert.equal(result.correlationId, "correlation:sessions-alice");
-  assert.deepEqual(result.output, { sessions: [{ id: "session:001", title: "First" }] });
+  assert.deepEqual(result.output, readContractFixtures.sessionPage);
   assert.equal(Object.isFrozen(observedInput), true);
   assert.equal(Object.isFrozen(observedContext), true);
   assert.equal(Object.isFrozen(result.output), true);
-  assert.equal(Object.isFrozen((result.output.sessions as any[])[0]), true);
+  assert.equal(Object.isFrozen(result.output.sessions[0]), true);
   await assert.rejects(
     () => sessionList.execute({ ...request, operation: { kind: "query", id: "status.read" as any } }),
     /session list operation/u
@@ -638,11 +653,76 @@ test("session.list validates bounded input and cancellation before invocation an
   await assert.rejects(() => sessionList.execute({ ...request, input: { limit: 201 } }), /integer from 1 to 200/u);
 });
 
+test("versioned read-model golden fixtures retain CLI and gateway compatibility shapes", () => {
+  const statusCli = parseStatusSnapshotV1(JSON.stringify(readContractFixtures.statusCli));
+  const statusGateway = parseStatusSnapshotV1(JSON.stringify(readContractFixtures.statusGateway));
+  const diagnostics = parseDiagnosticsReportV1(JSON.stringify(readContractFixtures.diagnostics));
+  const sessionPage = parseSessionPageV1(JSON.stringify(readContractFixtures.sessionPage));
+  assert.deepEqual(statusCli, readContractFixtures.statusCli);
+  assert.deepEqual(statusGateway, readContractFixtures.statusGateway);
+  assert.deepEqual(diagnostics, readContractFixtures.diagnostics);
+  assert.deepEqual(sessionPage, readContractFixtures.sessionPage);
+  assert.equal(Object.isFrozen(statusCli), true);
+  assert.equal(Object.isFrozen((statusGateway as any).toolDetails[0]), true);
+  assert.equal(Object.isFrozen(diagnostics.sandbox.configured), true);
+  assert.equal(Object.isFrozen(sessionPage.sessions[0]), true);
+});
+
+test("status output contract rejects missing, extra, mistyped, accessor, and leaking fields", () => {
+  const fixture: any = structuredClone(readContractFixtures.statusGateway);
+  const { allowedTools: _missing, ...missing } = fixture;
+  assert.throws(() => validateStatusSnapshotV1(missing), /missing required field: allowedTools/u);
+  assert.throws(() => validateStatusSnapshotV1({ ...fixture, kernelRegistry: {} }), /unknown field: kernelRegistry/u);
+  assert.throws(() => validateStatusSnapshotV1({ ...fixture, ok: "yes" }), /status snapshot\.ok must be true/u);
+  const cliFixture: any = structuredClone(readContractFixtures.statusCli);
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...cliFixture, providers: [{ ...cliFixture.providers[0], apiKeyEnv: "opaquecredentialvalue1234" }] }),
+    /credential environment-variable name/u
+  );
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, accessToken: "top-secret-value" }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
+  );
+  const accessor = structuredClone(fixture);
+  Object.defineProperty(accessor, "state", { enumerable: true, get: () => "/stolen" });
+  assert.throws(
+    () => validateStatusSnapshotV1(accessor),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+});
+
+test("diagnostics output contract rejects unstable fields and unredacted material", () => {
+  const fixture: any = structuredClone(readContractFixtures.diagnostics);
+  const { state: _missing, ...missing } = fixture;
+  assert.throws(() => validateDiagnosticsReportV1(missing), /missing required field: state/u);
+  assert.throws(() => validateDiagnosticsReportV1({ ...fixture, stateDirectory: "/private/state" }), /unknown field: stateDirectory/u);
+  assert.throws(() => validateDiagnosticsReportV1({ ...fixture, jobs: { ...fixture.jobs, failed: "0" } }), /jobs\.failed must be a non-negative safe integer/u);
+  assert.throws(
+    () => validateDiagnosticsReportV1({ ...fixture, privateKey: "-----BEGIN PRIVATE KEY-----" }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
+  );
+});
+
+test("session page contract rejects projection drift, content leakage, and inconsistent cursors", () => {
+  const fixture: any = structuredClone(readContractFixtures.sessionPage);
+  const [session] = fixture.sessions;
+  const { title: _missing, ...missingSession } = session;
+  assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [missingSession] }), /missing required field: title/u);
+  assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [{ ...session, messages: [{ content: "not part of summary" }] }] }), /unknown field: messages/u);
+  assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [{ ...session, messageCount: -1 }] }), /messageCount must be a non-negative safe integer/u);
+  assert.throws(() => validateSessionPageV1({ sessions: fixture.sessions, nextCursor: fixture.nextCursor }), /cursor and hasMore must appear together/u);
+  assert.throws(
+    () => validateSessionPageV1({ ...fixture, authToken: "Bearer abcdefghijklmnop" }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
+  );
+  assert.throws(() => parseSessionPageV1('{"sessions":[],"sessions":[]}'), /duplicate JSON object field/u);
+});
+
 test("application package resolves independently and excludes implementation dependencies", () => {
   const packageRoot = join(import.meta.dirname, "..", "packages", "application");
   const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), []);
-  const source = ["contracts.ts", "validation.ts", "ports.ts", "status.ts", "diagnostics.ts", "session-list.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
+  const source = ["contracts.ts", "validation.ts", "ports.ts", "read-contract-json.ts", "read-output-contracts.ts", "status.ts", "diagnostics.ts", "session-list.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
   assert.doesNotMatch(source, /discord\.js|@slack|telegram|whatsapp|express|playwright|apps\/gateway|apps\/cli|packages\/kernel/u);
   assert.doesNotMatch(readFileSync(join(packageRoot, "src", "contracts.ts"), "utf8"), /\b(?:AbortSignal|Request|Response|Buffer|Readable|Writable)\b/u);
   const probe = spawnSync(process.execPath, ["--input-type=module", "--eval", "const application = await import('@odinn/application'); if (application.APPLICATION_CONTRACT_VERSION !== 1) process.exit(2);"], { cwd: packageRoot, encoding: "utf8" });

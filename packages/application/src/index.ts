@@ -29,6 +29,46 @@ export type {
   OutboundEnvelopeV1,
   PrincipalKindV1
 } from "./contracts.ts";
+export {
+  parseDiagnosticsReportV1,
+  parseSessionPageV1,
+  parseStatusSnapshotV1,
+  validateDiagnosticsReportV1,
+  validateSessionPageV1,
+  validateStatusSnapshotV1
+} from "./read-output-contracts.ts";
+export type {
+  ApprovalEffectSummaryV1,
+  ApprovalTotalsV1,
+  AuditDiagnosticV1,
+  BrowserRecoveryDiagnosticV1,
+  ChannelCapabilitiesSummaryV1,
+  ChannelDiagnosticV1,
+  CliChannelSummaryV1,
+  CliStatusSnapshotV1,
+  CoreAdvancedFeatureV1,
+  DiagnosticStateSummaryV1,
+  DiagnosticsReportV1,
+  ExperimentalFeatureV1,
+  ExperimentalFlagsV1,
+  GatewayChannelDiagnosticV1,
+  GatewayStatusSnapshotV1,
+  JobTotalsV1,
+  PendingApprovalSummaryV1,
+  PlatformSummaryV1,
+  ProcessRecoveryDiagnosticV1,
+  ProviderDiagnosticSummaryV1,
+  ProviderStatusSummaryV1,
+  RuntimePolicySummaryV1,
+  RuntimeSecuritySummaryV1,
+  SandboxBackendDiagnosticV1,
+  SandboxDiagnosticV1,
+  SandboxRiskSummaryV1,
+  SessionPageV1,
+  SessionSummaryV1,
+  StatusSnapshotV1,
+  ToolSummaryV1
+} from "./read-output-contracts.ts";
 export type { ApplicationInvocationOptions, ChannelPort, ExecutionPort } from "./ports.ts";
 export {
   DIAGNOSTICS_READ_OPERATION_ID,

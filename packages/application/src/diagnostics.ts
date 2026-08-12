@@ -1,9 +1,10 @@
 import type { ApplicationInvocationOptions } from "./ports.ts";
 import {
   APPLICATION_CONTRACT_VERSION,
-  type ExecutionContextV1,
-  type JsonObject
+  type ExecutionContextV1
 } from "./contracts.ts";
+import type { DiagnosticsReportV1 } from "./read-output-contracts.ts";
+import { validateDiagnosticsReportV1 } from "./read-output-contracts.ts";
 import { validateExecutionRequestV1 } from "./validation.ts";
 
 export const DIAGNOSTICS_READ_OPERATION_ID = "diagnostics.read" as const;
@@ -21,11 +22,11 @@ export interface DiagnosticsReadResultV1 {
   readonly kind: "diagnostics-read-result";
   readonly requestId: string;
   readonly correlationId: string;
-  readonly output: JsonObject;
+  readonly output: DiagnosticsReportV1;
 }
 
 export interface DiagnosticsReadPort {
-  readDiagnostics(context: ExecutionContextV1, options?: ApplicationInvocationOptions): Promise<unknown>;
+  readDiagnostics(context: ExecutionContextV1, options?: ApplicationInvocationOptions): Promise<DiagnosticsReportV1>;
 }
 
 export interface DiagnosticsReadUseCase {
@@ -38,7 +39,7 @@ export function createDiagnosticsReadUseCase(port: DiagnosticsReadPort): Diagnos
     async execute(request: DiagnosticsReadRequestV1, options: ApplicationInvocationOptions = {}) {
       const validated = validateDiagnosticsReadRequestV1(request);
       throwIfCancelled(options.signal);
-      const output = normalizeDiagnosticsOutput(await port.readDiagnostics(validated.context, options));
+      const output = validateDiagnosticsReportV1(await port.readDiagnostics(validated.context, options));
       throwIfCancelled(options.signal);
       return Object.freeze({
         version: APPLICATION_CONTRACT_VERSION,
@@ -72,26 +73,6 @@ export function validateDiagnosticsReadRequestV1(request: DiagnosticsReadRequest
     context: validated.context,
     operation: Object.freeze({ kind: "query" as const, id: DIAGNOSTICS_READ_OPERATION_ID })
   });
-}
-
-function normalizeDiagnosticsOutput(value: unknown): JsonObject {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) throw new Error("diagnostics read output must be a JSON object");
-  const normalized = JSON.parse(serialized);
-  if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) {
-    throw new Error("diagnostics read output must be a JSON object");
-  }
-  return freezeJson(normalized) as JsonObject;
-}
-
-function freezeJson(value: unknown): unknown {
-  if (!value || typeof value !== "object") return value;
-  if (Array.isArray(value)) {
-    for (const item of value) freezeJson(item);
-  } else {
-    for (const item of Object.values(value)) freezeJson(item);
-  }
-  return Object.freeze(value);
 }
 
 function throwIfCancelled(signal: AbortSignal | undefined): void {

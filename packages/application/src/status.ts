@@ -1,9 +1,10 @@
 import type { ApplicationInvocationOptions } from "./ports.ts";
 import {
   APPLICATION_CONTRACT_VERSION,
-  type ExecutionContextV1,
-  type JsonObject
+  type ExecutionContextV1
 } from "./contracts.ts";
+import type { StatusSnapshotV1 } from "./read-output-contracts.ts";
+import { validateStatusSnapshotV1 } from "./read-output-contracts.ts";
 import { validateExecutionRequestV1 } from "./validation.ts";
 
 export const STATUS_READ_OPERATION_ID = "status.read" as const;
@@ -21,11 +22,11 @@ export interface StatusReadResultV1 {
   readonly kind: "status-read-result";
   readonly requestId: string;
   readonly correlationId: string;
-  readonly output: JsonObject;
+  readonly output: StatusSnapshotV1;
 }
 
 export interface StatusReadPort {
-  readStatus(context: ExecutionContextV1, options?: ApplicationInvocationOptions): Promise<unknown>;
+  readStatus(context: ExecutionContextV1, options?: ApplicationInvocationOptions): Promise<StatusSnapshotV1>;
 }
 
 export interface StatusReadUseCase {
@@ -38,7 +39,7 @@ export function createStatusReadUseCase(port: StatusReadPort): StatusReadUseCase
     async execute(request: StatusReadRequestV1, options: ApplicationInvocationOptions = {}) {
       const validated = validateStatusReadRequestV1(request);
       throwIfCancelled(options.signal);
-      const output = normalizeStatusOutput(await port.readStatus(validated.context, options));
+      const output = validateStatusSnapshotV1(await port.readStatus(validated.context, options));
       throwIfCancelled(options.signal);
       return Object.freeze({
         version: APPLICATION_CONTRACT_VERSION,
@@ -72,26 +73,6 @@ export function validateStatusReadRequestV1(request: StatusReadRequestV1): Statu
     context: validated.context,
     operation: Object.freeze({ kind: "query" as const, id: STATUS_READ_OPERATION_ID })
   });
-}
-
-function normalizeStatusOutput(value: unknown): JsonObject {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) throw new Error("status read output must be a JSON object");
-  const normalized = JSON.parse(serialized);
-  if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) {
-    throw new Error("status read output must be a JSON object");
-  }
-  return freezeJson(normalized) as JsonObject;
-}
-
-function freezeJson(value: unknown): unknown {
-  if (!value || typeof value !== "object") return value;
-  if (Array.isArray(value)) {
-    for (const item of value) freezeJson(item);
-  } else {
-    for (const item of Object.values(value)) freezeJson(item);
-  }
-  return Object.freeze(value);
 }
 
 function throwIfCancelled(signal: AbortSignal | undefined): void {
