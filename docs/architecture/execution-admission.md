@@ -131,4 +131,8 @@ Approval execution is correlated back to the originating job and attempt. Claimi
 
 `pnpm benchmark:assurance` enforces the 10 ms p95 gate on the atomic execution-envelope ledger transaction. It separately reports complete admission with the authoritative signed audit commit. That second store uses `synchronous=FULL` and remains observational; its durability is not reduced for latency cosmetics.
 
-`pnpm benchmark:recovery` seeds 10,000 mixed job/attempt records, closes and reopens the database, performs the indexed reconciliation transaction, verifies exact classification counts, and enforces a five-second cold-start gate.
+CI seeds 10,000 mixed job/attempt records, closes and reopens the database,
+performs restart reconciliation, and verifies every job and attempt
+classification beyond operator listing windows. This is a durable
+recovery correctness invariant; comparative recovery timing belongs outside the
+product repository.
