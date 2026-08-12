@@ -3,10 +3,14 @@ import {
   CAPABILITY_REGISTRY_VERSION,
   DEFAULT_ALLOWED_CAPABILITIES,
   CapabilityRegistryError,
+  approvalEffectPolicyForTool,
+  approvalRequirementForTool,
   assertCapabilityIds,
   capabilitiesForTool,
   isCapabilityId,
+  legacyCapabilitiesForTool,
   migrateLegacyCapabilityPolicy,
+  safetyPolicyForTool,
   type CapabilityGrant,
   type CapabilityId,
   type CapabilityMigrationReport
@@ -19,13 +23,17 @@ export {
   DEFAULT_ALLOWED_CAPABILITIES,
   TOOL_CAPABILITY_REGISTRY,
   CapabilityRegistryError,
+  approvalEffectPolicyForTool,
+  approvalRequirementForTool,
   assertCapabilityIds,
   capabilitiesForTool,
   intersectChildCapabilities,
   isCapabilityId,
-  migrateLegacyCapabilityPolicy
+  legacyCapabilitiesForTool,
+  migrateLegacyCapabilityPolicy,
+  safetyPolicyForTool
 } from "./capabilities.ts";
-export type { CapabilityGrant, CapabilityId, CapabilityMigrationEntry, CapabilityMigrationReport } from "./capabilities.ts";
+export type { CapabilityGrant, CapabilityId, CapabilityMigrationEntry, CapabilityMigrationReport, TrustedApprovalEffectPolicy, TrustedToolSafetyPolicy } from "./capabilities.ts";
 
 export type SecuritySurface = {
   enabled: boolean;

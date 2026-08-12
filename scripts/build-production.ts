@@ -31,8 +31,8 @@ await build({
     "cli/index": "apps/cli/src/cli.ts",
     "gateway/server": "apps/gateway/src/server.ts",
     "gateway/host": "apps/gateway/src/host.ts",
-    "workers/task-worker": "packages/kernel/src/task-worker.ts",
-    "workers/browser-worker": "packages/kernel/src/browser-worker.ts",
+    "workers/task-worker": "packages/runtime/src/task-worker.ts",
+    "workers/browser-worker": "packages/runtime/src/browser-worker.ts",
     "install/install": "scripts/install.ts"
   },
   external: ["playwright-core"],

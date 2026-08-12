@@ -25,7 +25,7 @@ import { browserAction, browserOpen, browserRecoveryResolve, browserRecoveryStat
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
-import { createDiscordAgentTools, DISCORD_AGENT_TOOL_SCHEMAS } from "./discord.ts";
+import { registerChannelAgentTools } from "./channel-agent-tools.ts";
 import { readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 import { AGENT_GRAPH_TOOL, executeAgentGraph, type AgentGraphTaskInput } from "./agent-graph-runtime.ts";
 import { ProgressiveSkillDisclosure } from "./skill-disclosure.ts";
@@ -119,7 +119,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, discordFetch = globalThis.fetch, processExecutor, skillDisclosure, mcpRuntime, writeConfig }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -875,10 +875,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       recordStore.close();
     }
   });
-  const discordSchemas = new Map(DISCORD_AGENT_TOOL_SCHEMAS.map((schema: any) => [schema.function.name, schema.function.parameters]));
-  for (const [name, tool] of createDiscordAgentTools({ config, approvalStore, fetch: discordFetch })) {
-    registry.set(name, { ...tool, inputSchema: discordSchemas.get(name) });
-  }
+  registerChannelAgentTools(registry, channelAgentTools, approvalStore);
   for (const [name, tool] of registry) {
     const capabilities = capabilitiesForTool(name);
     registry.set(name, {
@@ -1335,8 +1332,15 @@ function mcpApprovalBinding(input: any): Record<string, unknown> {
   return result;
 }
 
-function executionResourceForRequest(toolName: string, input: AnyRecord = {}) {
+function executionResourceForRequest(toolName: string, input: AnyRecord = {}, tool?: AnyRecord) {
   const pick = (entries: Array<[string, unknown]>) => Object.fromEntries(entries.filter(([, value]) => value !== undefined));
+  if (typeof tool?.resourceForInput === "function") {
+    const resource = tool.resourceForInput(input);
+    if (!resource || typeof resource !== "object" || Array.isArray(resource)) {
+      throw new Error(`trusted tool resource binding returned an invalid value: ${toolName}`);
+    }
+    return resource;
+  }
   if (toolName === "process.exec") {
     return pick([
       ["commandDigest", createHash("sha256").update(String(input.command ?? ""), "utf8").digest("hex")],
@@ -1729,7 +1733,7 @@ async function executeTaskThroughAdmission({
       capabilityClaims = new CapabilityBroker({ ledger: runLedger, stateDir: runLedger.stateDir, featureFlags: runLedger.featureFlags }).consume(token, {
         runId: request.id,
         toolName: request.tool,
-        resource: executionResourceForRequest(request.tool, request.input)
+        resource: executionResourceForRequest(request.tool, request.input, tool)
       });
     }
   } catch (error) {

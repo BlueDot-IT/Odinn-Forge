@@ -161,7 +161,7 @@ test("dependency direction checker fails closed on non-literal dynamic module lo
   ]);
 });
 
-test("legacy Discord baseline accepts exactly two known occurrences and rejects a third", async (t) => {
+test("default architecture check has no legacy dependency exemptions", async (t) => {
   const root = await repositoryFixture(t, {
     "packages/kernel/src/discord.ts": [
       'import type { DiscordRestClient } from "@odinn/channel-discord";',
@@ -169,39 +169,10 @@ test("legacy Discord baseline accepts exactly two known occurrences and rejects 
     ].join("\n"),
   });
 
-  const baselineResult = await checkDependencyDirection(root, LEGACY_DEPENDENCY_BASELINE);
-  assert.deepEqual(baselineResult.violations, []);
-  assert.deepEqual(baselineResult.baselineErrors, []);
-  assert.equal(baselineResult.acceptedLegacyOccurrences, 2);
-
-  await writeFile(join(root, "packages/kernel/src/discord.ts"), [
-    'import type { DiscordRestClient } from "@odinn/channel-discord";',
-    'const client = import("@odinn/channel-discord");',
-    'const secondClient = import("@odinn/channel-discord");',
-  ].join("\n"));
-  const extraResult = await checkDependencyDirection(root, LEGACY_DEPENDENCY_BASELINE);
-  assert.equal(extraResult.violations.length, 1);
-  assert.equal(extraResult.violations[0]?.line, 3);
-  assert.equal(extraResult.violations[0]?.specifier, "@odinn/channel-discord");
-  assert.deepEqual(extraResult.baselineErrors, []);
-
-  await writeFile(
-    join(root, "packages/kernel/src/other.ts"),
-    'import type { DiscordRestClient } from "@odinn/channel-discord";\n',
-  );
-  const otherFileResult = await checkDependencyDirection(root, LEGACY_DEPENDENCY_BASELINE);
-  assert.ok(otherFileResult.violations.some(({ sourceFile }) => sourceFile === "packages/kernel/src/other.ts"));
-});
-
-test("legacy baseline fails closed when a migration removes an expected occurrence", async (t) => {
-  const root = await repositoryFixture(t, {
-    "packages/kernel/src/discord.ts": 'import type { DiscordRestClient } from "@odinn/channel-discord";\n',
-  });
-
   const result = await checkDependencyDirection(root, LEGACY_DEPENDENCY_BASELINE);
 
-  assert.deepEqual(result.violations, []);
-  assert.equal(result.baselineErrors.length, 1);
-  assert.match(result.baselineErrors[0]!, /stale legacy dependency baseline/u);
-  assert.match(result.baselineErrors[0]!, /architecture cleanup PR 2/u);
+  assert.deepEqual(LEGACY_DEPENDENCY_BASELINE, []);
+  assert.equal(result.violations.length, 2);
+  assert.deepEqual(result.baselineErrors, []);
+  assert.equal(result.acceptedLegacyOccurrences, 0);
 });

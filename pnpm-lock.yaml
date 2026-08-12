@@ -96,6 +96,9 @@ importers:
       '@odinn/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@odinn/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
 
   apps/gateway:
     dependencies:
@@ -126,6 +129,9 @@ importers:
       '@odinn/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@odinn/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
       '@odinn/store-file':
         specifier: workspace:*
         version: link:../../packages/store-file
@@ -140,9 +146,9 @@ importers:
 
   packages/kernel:
     dependencies:
-      '@odinn/channel-discord':
+      '@odinn/channels':
         specifier: workspace:*
-        version: link:../../adapters/channels/discord
+        version: link:../channels
       '@odinn/policy':
         specifier: workspace:*
         version: link:../policy
@@ -165,6 +171,15 @@ importers:
   packages/policy: {}
 
   packages/protocol: {}
+
+  packages/runtime:
+    dependencies:
+      '@odinn/channel-discord':
+        specifier: workspace:*
+        version: link:../../adapters/channels/discord
+      '@odinn/kernel':
+        specifier: workspace:*
+        version: link:../kernel
 
   packages/store-file:
     dependencies:

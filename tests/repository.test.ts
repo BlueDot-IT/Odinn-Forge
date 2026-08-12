@@ -9,6 +9,15 @@ import { assertReleaseCommit, expectedReleaseCommit } from "../scripts/release/c
 
 const read = (path: any) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
+async function sourceFilesUnder(path: string): Promise<string[]> {
+  const entries = await readdir(new URL(`../${path}/`, import.meta.url), { withFileTypes: true });
+  const nested = await Promise.all(entries.map(async (entry) => {
+    const child = `${path}/${entry.name}`;
+    return entry.isDirectory() ? sourceFilesUnder(child) : [child];
+  }));
+  return nested.flat().filter((file) => file.endsWith(".ts"));
+}
+
 test("package metadata names Odinn Forge and pins the toolchain", async () => {
   const pkg = JSON.parse(await read("package.json"));
   assert.equal(pkg.name, "odinn");
@@ -81,6 +90,35 @@ test("CI enforces application and kernel dependency direction", async () => {
   assert.match(pkg.scripts.check, /pnpm check:architecture/u);
   assert.match(await read(".github/workflows/ci.yml"), /pnpm check:architecture/u);
   assert.match(await read(".forgejo/workflows/ci.yml"), /pnpm check:architecture/u);
+});
+
+test("kernel manifests and sources remain free of channel adapters", async () => {
+  const kernel = JSON.parse(await read("packages/kernel/package.json"));
+  const application = JSON.parse(await read("packages/application/package.json"));
+  const runtime = JSON.parse(await read("packages/runtime/package.json"));
+  const dependencyNames = Object.keys({
+    ...kernel.dependencies,
+    ...kernel.devDependencies,
+    ...kernel.optionalDependencies,
+    ...kernel.peerDependencies,
+  });
+
+  assert.deepEqual(dependencyNames.filter((name) => name.startsWith("@odinn/channel-")), []);
+  assert.deepEqual(
+    Object.keys({
+      ...application.dependencies,
+      ...application.devDependencies,
+      ...application.optionalDependencies,
+      ...application.peerDependencies,
+    }).filter((name) => name.startsWith("@odinn/channel-")),
+    []
+  );
+  assert.equal(kernel.dependencies["@odinn/channels"], "workspace:*");
+  assert.equal(runtime.dependencies["@odinn/channel-discord"], "workspace:*");
+
+  for (const file of await sourceFilesUnder("packages/kernel/src")) {
+    assert.doesNotMatch(await read(file), /discord/iu, `${file} must remain transport-neutral`);
+  }
 });
 
 test("draft GitHub releases hand npm publication to the protected workflow", async () => {
@@ -512,8 +550,8 @@ test("release packaging removes stale assets before creating a version", async (
   for (const entrypoint of [
     "apps/cli/src/cli.ts",
     "apps/gateway/src/server.ts",
-    "packages/kernel/src/task-worker.ts",
-    "packages/kernel/src/browser-worker.ts"
+    "packages/runtime/src/task-worker.ts",
+    "packages/runtime/src/browser-worker.ts"
   ]) assert.match(build, new RegExp(entrypoint.replaceAll("/", "\\/")));
   assert.match(build, /createRequire as __odinnCreateRequire/);
   assert.match(build, /sourcemap: "external"/);

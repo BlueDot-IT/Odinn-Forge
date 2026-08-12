@@ -58,30 +58,7 @@ interface RepositoryDependencyTargets {
 const sourceExtensions = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
 const nonLiteralSpecifier = "<non-literal module specifier>";
 
-/**
- * Temporary migration baseline. It is deliberately occurrence- and syntax-kind-aware:
- * it accepts exactly the two Discord references that predate this checker, not every
- * reference in this file. PR 2 (the Discord extraction) must delete both the imports
- * and these entries. A third occurrence or an occurrence in another file still fails.
- */
-export const LEGACY_DEPENDENCY_BASELINE: readonly LegacyDependencyBaselineEntry[] = [
-  {
-    sourceFile: "packages/kernel/src/discord.ts",
-    specifier: "@odinn/channel-discord",
-    kind: "import-declaration",
-    rule: DEPENDENCY_RULES.kernelChannels,
-    expectedOccurrences: 1,
-    removal: "Remove with the kernel Discord extraction in architecture cleanup PR 2.",
-  },
-  {
-    sourceFile: "packages/kernel/src/discord.ts",
-    specifier: "@odinn/channel-discord",
-    kind: "dynamic-import",
-    rule: DEPENDENCY_RULES.kernelChannels,
-    expectedOccurrences: 1,
-    removal: "Remove with the kernel Discord extraction in architecture cleanup PR 2.",
-  },
-];
+export const LEGACY_DEPENDENCY_BASELINE: readonly LegacyDependencyBaselineEntry[] = [];
 
 function repositoryPath(repositoryRoot: string, absolutePath: string): string {
   return relative(repositoryRoot, absolutePath).split(sep).join("/");

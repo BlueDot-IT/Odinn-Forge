@@ -4,7 +4,9 @@ _Status: incremental migration in progress. Gateway authentication, process
 bootstrap, and the embedded console have been extracted into separately
 auditable modules. Transport-neutral application contracts now exist; runtime
 use-case migration has begun with the read-only `status.read`,
-`diagnostics.read`, and `session.list` paths._
+`diagnostics.read`, and `session.list` paths. Discord agent-tool definitions and
+REST behavior now live in the Discord adapter and are composed outside the
+kernel._
 
 ## Evidence from the current tree
 
@@ -18,10 +20,15 @@ use-case migration has begun with the read-only `status.read`,
   other commands still call the kernel directly.
 - `packages/kernel/src/index.ts` exports the runtime service surface, including
   policy, approvals, jobs, memory, providers, state, extensions, and task
-  execution.
-- `packages/channels/src/index.ts` and `adapters/channels/*` provide external
-  channel/provider adapters, but the current gateway and CLI composition roots
-  still import the kernel directly.
+  execution. It accepts transport-neutral channel-tool definitions and keeps
+  policy, capability, approval, audit, and uncertainty enforcement authoritative.
+- `packages/channels/src/index.ts` and `packages/channels/src/plugin.ts` define
+  shared channel contracts. `adapters/channels/*` own network concepts, schemas,
+  validation, and protocol clients.
+- `packages/runtime` composes the Discord adapter with the neutral kernel
+  registry and provides the worker entrypoints used by both the gateway and
+  CLI. The gateway and CLI still import the kernel directly for application
+  paths that have not yet migrated.
 
 This is a boundary problem, not evidence that the current runtime is unsafe:
 transport, presentation, orchestration, and domain services are colocated in a
@@ -30,15 +37,16 @@ small product and can still be tested independently.
 ## Proposed target shape
 
 ```text
-channel adapters / HTTP / CLI
+HTTP / CLI / channel ingress
           |
-          v
-@odinn/application (composition-neutral use cases and receipts)
+          +--> @odinn/application (migrated use cases and receipts)
           |
-          v
-@odinn/kernel (policy, state, task execution, audit, providers)
-          |
-          +--> stores, provider ports, approval ports
+          +--> @odinn/runtime (host-owned adapter composition)
+                         |
+                         v
+              @odinn/kernel (policy, state, task execution, audit)
+                         |
+                         +--> stores, providers, approval ports
 ```
 
 ### 1. Channel-neutral application boundary
@@ -66,7 +74,8 @@ becoming generic bypasses.
 
 The kernel should accept and return these boundary types only. Discord,
 Telegram, Slack, HTTP request/response objects, and terminal streams stay in
-adapters or composition roots.
+adapters or composition roots. During migration, compatibility kernel calls
+remain for operations that do not yet have an application use case.
 
 ### 2. Gateway decomposition
 
@@ -126,13 +135,17 @@ a time while preserving the current kernel exports as a compatibility facade.
    surfaces are pending.
 4. Move model execution and approval-bearing task execution with identical
    audit and failure semantics.
-5. Migrate channel adapters to the same inbound/outbound envelopes.
-6. Deprecate direct transport imports from kernel modules after import-graph
-   checks prove the dependency direction.
+5. **In progress:** migrate channel adapters to the same inbound/outbound
+   envelopes. Discord agent tools are adapter-owned and host-composed; inbound
+   channel routing remains on the existing shared channel contracts.
+6. **Complete for protected packages:** enforce dependency direction in CI.
+   `packages/kernel` and `packages/application` have no channel-adapter or
+   direct-adapter imports; application-to-app imports are also rejected.
 
 ## Invariants and stop conditions
 
-- No channel SDK type crosses into `packages/kernel`.
+- No channel SDK type or channel-adapter dependency crosses into
+  `packages/kernel`.
 - Approval, audit, persistence, and uncertainty semantics remain unchanged.
 - Every external side effect remains behind an explicit port and existing
   authorization gate.

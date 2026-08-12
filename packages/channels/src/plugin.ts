@@ -34,6 +34,33 @@ export interface ChannelPlugin<Config extends ChannelAccountConfig = ChannelAcco
   webhookRequestMode?: "buffer" | "raw-stream";
 }
 
+/**
+ * Transport-owned definition for an agent-visible channel tool. The kernel is
+ * responsible for turning these definitions into governed runtime tools; an
+ * adapter only describes the external operation and how to invoke it.
+ */
+export interface ChannelAgentToolApprovalBinding {
+  accountId?: string;
+  input: Record<string, unknown>;
+  summary: string;
+}
+
+export interface ChannelAgentToolDefinition {
+  description: string;
+  inputSchema?: Record<string, unknown>;
+  /**
+   * Runs before resource-scoped capability admission. It must be deterministic,
+   * side-effect free, and credential free, and may return only identifiers the
+   * selected external operation actually consumes as authority-bearing targets.
+   */
+  resourceBinding(input: Record<string, unknown>): Record<string, unknown>;
+  approvalBinding?(input: Record<string, unknown>): ChannelAgentToolApprovalBinding;
+  approvalFailureMessage?: string;
+  invoke(input: Record<string, unknown>): Promise<unknown>;
+}
+
+export type ChannelAgentToolDefinitions = ReadonlyMap<string, ChannelAgentToolDefinition>;
+
 export interface ChannelAccountSnapshot {
   name: string;
   type: string;
