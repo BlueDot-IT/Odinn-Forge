@@ -23,6 +23,9 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 * prepare the post-`v1.0.0` development line as `1.1.0-rc.1`
 * require draft-release verification before immutable publication
+* freeze the 1.1 candidate around boundary completion, defect repair,
+  decomposition, and exact-artifact validation without promoting experimental
+  interfaces
 
 ## [1.0.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.0.0-rc.1...v1.0.0) (2026-07-25)
 
