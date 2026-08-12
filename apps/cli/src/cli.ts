@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { APPLICATION_CONTRACT_VERSION, createStatusReadUseCase } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createStatusReadUseCase } from "@odinn/application";
 import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, buildOperatorSnapshot, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
@@ -1386,6 +1386,27 @@ async function readRuntimeJobs(state: string) {
 }
 
 async function doctor(args: any) {
+  const diagnosticsRead = createDiagnosticsReadUseCase({
+    readDiagnostics: async () => readDoctorDiagnostics(args)
+  });
+  const requestId = randomUUID();
+  const result = await diagnosticsRead.execute({
+    version: APPLICATION_CONTRACT_VERSION,
+    kind: "diagnostics-read-request",
+    requestId,
+    context: {
+      principal: { principalId: "local-operator", actorId: "cli", kind: "operator" },
+      scope: { tenantId: "local" },
+      sourceReference: "cli:doctor",
+      correlationId: requestId,
+      cancellationControlReference: `cli:doctor:${requestId}`
+    },
+    operation: { kind: "query", id: "diagnostics.read" }
+  });
+  return result.output as any;
+}
+
+async function readDoctorDiagnostics(args: any) {
   const state = stateDir(args);
   await recoverInterruptedOnboardingTransactions(state);
   const config = await readConfig(state);

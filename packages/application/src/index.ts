@@ -31,6 +31,17 @@ export type {
 } from "./contracts.ts";
 export type { ApplicationInvocationOptions, ChannelPort, ExecutionPort } from "./ports.ts";
 export {
+  DIAGNOSTICS_READ_OPERATION_ID,
+  createDiagnosticsReadUseCase,
+  validateDiagnosticsReadRequestV1
+} from "./diagnostics.ts";
+export type {
+  DiagnosticsReadPort,
+  DiagnosticsReadRequestV1,
+  DiagnosticsReadResultV1,
+  DiagnosticsReadUseCase
+} from "./diagnostics.ts";
+export {
   STATUS_READ_OPERATION_ID,
   createStatusReadUseCase,
   validateStatusReadRequestV1

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createMultiUserHost, hashPassword } from "../apps/gateway/src/host.ts";
-import { createGatewayStatusReadRequest } from "../apps/gateway/src/server.ts";
+import { createGatewayDiagnosticsReadRequest, createGatewayStatusReadRequest } from "../apps/gateway/src/server.ts";
 
 function assertLabeledInput(html: string, name: string) {
   const input = new RegExp(`<input\\b[^>]*\\bname=["']${name}["'][^>]*>`, "iu").exec(html)?.[0];
@@ -17,6 +17,17 @@ function assertLabeledInput(html: string, name: string) {
 test("hosted status application contexts isolate authenticated users", () => {
   const alice = createGatewayStatusReadRequest({ applicationRequestId: "request:alice", hostedUserId: "alice", authentication: "bearer" });
   const bob = createGatewayStatusReadRequest({ applicationRequestId: "request:bob", hostedUserId: "bob", authentication: "bearer" });
+  assert.equal(alice.context.principal.principalId, "host-user:alice");
+  assert.equal(alice.context.scope.tenantId, "tenant:alice");
+  assert.equal(bob.context.principal.principalId, "host-user:bob");
+  assert.equal(bob.context.scope.tenantId, "tenant:bob");
+  assert.notEqual(alice.context.principal.principalId, bob.context.principal.principalId);
+  assert.notEqual(alice.context.scope.tenantId, bob.context.scope.tenantId);
+});
+
+test("hosted diagnostics application contexts isolate authenticated users", () => {
+  const alice = createGatewayDiagnosticsReadRequest({ applicationRequestId: "request:diagnostics-alice", hostedUserId: "alice", authentication: "bearer" });
+  const bob = createGatewayDiagnosticsReadRequest({ applicationRequestId: "request:diagnostics-bob", hostedUserId: "bob", authentication: "bearer" });
   assert.equal(alice.context.principal.principalId, "host-user:alice");
   assert.equal(alice.context.scope.tenantId, "tenant:alice");
   assert.equal(bob.context.principal.principalId, "host-user:bob");

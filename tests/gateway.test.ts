@@ -153,6 +153,14 @@ test("gateway diagnostics expose safe state and errors carry correlation metadat
     assert.equal(diagnostics.state.runtimeStateOutsideSourceCheckout, true);
     assert.equal(diagnostics.state.secretsExcludedFromDiagnostics, true);
     assert.equal(JSON.stringify(diagnostics).includes(stateDir), false);
+    assert.equal("requestId" in diagnostics, false);
+    assert.equal("correlationId" in diagnostics, false);
+    for (const externalRequestId of ["diagnostics with spaces", "d".repeat(257)]) {
+      const compatible = await fetch(`${base}/diagnostics`, { headers: { "x-odinn-request-id": externalRequestId } });
+      assert.equal(compatible.status, 200);
+      assert.equal(compatible.headers.get("x-odinn-request-id"), externalRequestId);
+      assert.deepEqual(await compatible.json(), diagnostics);
+    }
 
     const invalid = await fetch(`${base}/run`, {
       method: "POST",

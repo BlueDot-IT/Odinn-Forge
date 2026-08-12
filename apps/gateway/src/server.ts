@@ -5,7 +5,7 @@ import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as stat
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { APPLICATION_CONTRACT_VERSION, createStatusReadUseCase } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createStatusReadUseCase } from "@odinn/application";
 import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -921,6 +921,9 @@ export async function createGatewayServer({
       pendingApprovals: approvalStore.list()
     })
   });
+  const diagnosticsRead = createDiagnosticsReadUseCase({
+    readDiagnostics: async () => diagnostics({ state, workspaceRoot: root, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError, sandboxRecoveryStartupError })
+  });
 
   const approveGatewayApproval = async (id: string) => {
     const preview = approvalStore.list().find((approval: any) => approval.id === id);
@@ -1305,7 +1308,13 @@ export async function createGatewayServer({
         return json(response, 200, result.output);
       }
       if (request.method === "GET" && url.pathname === "/diagnostics") {
-        return json(response, 200, await diagnostics({ state, workspaceRoot: root, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError, sandboxRecoveryStartupError }));
+        const applicationRequestId = randomUUID();
+        const result = await diagnosticsRead.execute(createGatewayDiagnosticsReadRequest({
+          applicationRequestId,
+          hostedUserId: trustedHostedUserId,
+          authentication
+        }));
+        return json(response, 200, result.output);
       }
       if (request.method === "GET" && (url.pathname === "/operator" || url.pathname === "/operator/snapshot")) {
         const requestedSurface = String(url.searchParams.get("surface") || "http");
@@ -2383,6 +2392,35 @@ export function createGatewayStatusReadRequest({
       cancellationControlReference: `http:request:${applicationRequestId}`
     },
     operation: { kind: "query" as const, id: "status.read" as const }
+  };
+}
+
+export function createGatewayDiagnosticsReadRequest({
+  applicationRequestId,
+  hostedUserId,
+  authentication
+}: {
+  applicationRequestId: string;
+  hostedUserId?: string;
+  authentication: string;
+}) {
+  return {
+    version: APPLICATION_CONTRACT_VERSION,
+    kind: "diagnostics-read-request" as const,
+    requestId: applicationRequestId,
+    context: {
+      principal: {
+        principalId: hostedUserId ? `host-user:${normalizeHostedUserId(hostedUserId)}` : "local-gateway-user",
+        actorId: "gateway",
+        kind: "host-user" as const,
+        authenticationReference: authentication === "disabled" ? "gateway:auth-disabled" : `gateway:${authentication}`
+      },
+      scope: { tenantId: hostedUserId ? `tenant:${normalizeHostedUserId(hostedUserId)}` : "local" },
+      sourceReference: "http:GET:/diagnostics",
+      correlationId: applicationRequestId,
+      cancellationControlReference: `http:request:${applicationRequestId}`
+    },
+    operation: { kind: "query" as const, id: "diagnostics.read" as const }
   };
 }
 
