@@ -124,6 +124,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/store-file
 
+  packages/application: {}
+
   packages/channels:
     dependencies:
       '@odinn/store-file':

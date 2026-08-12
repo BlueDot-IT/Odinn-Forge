@@ -2,7 +2,8 @@
 
 _Status: incremental migration in progress. Gateway authentication, process
 bootstrap, and the embedded console have been extracted into separately
-auditable modules; route and runtime-service decomposition remains._
+auditable modules. Transport-neutral application contracts now exist; runtime
+use cases have not yet migrated to them._
 
 ## Evidence from the current tree
 
@@ -38,20 +39,28 @@ channel adapters / HTTP / CLI
           +--> stores, provider ports, approval ports
 ```
 
-### 1. Channel-neutral kernel boundary
+### 1. Channel-neutral application boundary
 
-Introduce a small, serializable application boundary with these concepts:
+`packages/application` now defines a small, serializable application boundary
+with these concepts:
 
 - `InboundEnvelope`: source, conversation/tenant scope, event id, timestamp,
   text or structured payload, and redacted metadata.
-- `ExecutionRequest`: normalized objective, input, principal namespace, source
-  correlation id, and requested response mode.
-- `ExecutionResult`: output reference, terminal status, audit reference,
-  correlation id, and uncertainty/approval state.
+- `ExecutionRequest`: normalized operation and input, a trusted effective
+  principal/scope context, source correlation, and requested response mode.
+- `ExecutionResult` and `ExecutionReceipt`: output evidence, terminal status,
+  authorization and audit references, correlation, and uncertainty/approval
+  state.
 - `ChannelPort`: delivery capability that accepts an outbound envelope; it must
   not expose channel SDK objects to the kernel.
-- `ProviderPort` and `StorePort`: narrow ports for model calls and persistence;
-  implementations remain outside the domain policy code.
+
+Inbound identity and scope values are explicitly claims. They confer no
+authority. A trusted transport/authentication mapper must construct the
+effective `ExecutionContext`; required capabilities, policy decisions,
+approval validity, retry safety, and recovery semantics remain authoritative
+kernel concerns. Provider and store ports will be introduced only alongside a
+concrete use case so they remain capability- and scope-specific rather than
+becoming generic bypasses.
 
 The kernel should accept and return these boundary types only. Discord,
 Telegram, Slack, HTTP request/response objects, and terminal streams stay in
@@ -93,13 +102,15 @@ Within `packages/kernel`, separate by capability rather than by transport:
   workers, and migration code;
 - `plugins`: optional capabilities with explicit activation and permissions.
 
-This is an incremental target. The first extraction should be types and ports,
-then one use case at a time, with the current kernel exports preserved as a
-compatibility facade during migration.
+This is an incremental target. Types and transport-facing ports now exist;
+runtime code still uses the current paths. Each later pull request will move
+one use case at a time while preserving the current kernel exports as a
+compatibility facade.
 
 ## Migration sequence
 
-1. Add boundary types and contract tests without moving runtime code.
+1. **Complete:** add boundary types and contract tests without moving runtime
+   code.
 2. Add gateway and CLI mapping modules that use the boundary types.
 3. Move one read-only status/diagnostics use case through the boundary.
 4. Move model execution and approval-bearing task execution with identical
