@@ -31,6 +31,17 @@ export type {
 } from "./contracts.ts";
 export type { ApplicationInvocationOptions, ChannelPort, ExecutionPort } from "./ports.ts";
 export {
+  STATUS_READ_OPERATION_ID,
+  createStatusReadUseCase,
+  validateStatusReadRequestV1
+} from "./status.ts";
+export type {
+  StatusReadPort,
+  StatusReadRequestV1,
+  StatusReadResultV1,
+  StatusReadUseCase
+} from "./status.ts";
+export {
   ApplicationContractValidationError,
   assertChannelDeliveryReceiptMatchesEnvelopeV1,
   assertExecutionResultMatchesRequestV1,

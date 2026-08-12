@@ -3,7 +3,7 @@
 _Status: incremental migration in progress. Gateway authentication, process
 bootstrap, and the embedded console have been extracted into separately
 auditable modules. Transport-neutral application contracts now exist; runtime
-use cases have not yet migrated to them._
+use-case migration has begun with the read-only `status.read` path._
 
 ## Evidence from the current tree
 
@@ -12,8 +12,9 @@ use cases have not yet migrated to them._
   binding rules live in `security.ts`, process startup and state selection live
   in `bootstrap.ts`, and the large console document lives under `src/public/`.
 - `apps/cli/src/cli.ts` is the command composition root. It owns command
-  parsing, terminal-oriented output, onboarding, and lifecycle commands while
-  calling the kernel directly.
+  parsing, terminal-oriented output, onboarding, and lifecycle commands. The
+  status command now crosses `@odinn/application`; other commands still call
+  the kernel directly.
 - `packages/kernel/src/index.ts` exports the runtime service surface, including
   policy, approvals, jobs, memory, providers, state, extensions, and task
   execution.
@@ -78,7 +79,11 @@ behind explicit modules:
 3. `gateway/runtime`: process startup, worker supervision, shutdown, and state
    directory setup.
 
-The gateway should depend on application ports, not on channel adapter details.
+The authenticated `GET /status` route now constructs a trusted principal and
+scope, invokes the transport-neutral `status.read` use case, and maps only its
+output to the stable HTTP response. Other routes remain incremental migration
+targets. The gateway should depend on application ports, not on channel adapter
+details.
 
 ### 3. CLI decomposition
 
@@ -102,17 +107,19 @@ Within `packages/kernel`, separate by capability rather than by transport:
   workers, and migration code;
 - `plugins`: optional capabilities with explicit activation and permissions.
 
-This is an incremental target. Types and transport-facing ports now exist;
-runtime code still uses the current paths. Each later pull request will move
-one use case at a time while preserving the current kernel exports as a
-compatibility facade.
+This is an incremental target. Types, transport-facing ports, and the first
+read-only use case now exist. Each later pull request will move one use case at
+a time while preserving the current kernel exports as a compatibility facade.
 
 ## Migration sequence
 
 1. **Complete:** add boundary types and contract tests without moving runtime
    code.
-2. Add gateway and CLI mapping modules that use the boundary types.
-3. Move one read-only status/diagnostics use case through the boundary.
+2. **In progress:** add gateway and CLI mapping modules that use the boundary
+   types; both transports now map `status.read` with authenticated server-side
+   principal and scope.
+3. **In progress:** move read-only use cases through the boundary. Status is
+   complete; diagnostics and the remaining inspection surfaces are pending.
 4. Move model execution and approval-bearing task execution with identical
    audit and failure semantics.
 5. Migrate channel adapters to the same inbound/outbound envelopes.

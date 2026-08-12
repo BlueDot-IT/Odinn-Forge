@@ -51,6 +51,19 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.ok(status.toolDetails.some((tool: any) => tool.name === "text.echo" && tool.capability === "workspace.inspect" && tool.capabilities.includes("workspace.inspect")));
     assert.ok(status.allowedTools.includes("agent.run"));
     assert.equal(status.capabilityMigration.automaticWidening, false);
+    const correlatedResponse = await fetch(`${base}/status`, { headers: { "x-odinn-request-id": "status-contract-001" } });
+    assert.equal(correlatedResponse.status, 200);
+    assert.equal(correlatedResponse.headers.get("x-odinn-request-id"), "status-contract-001");
+    const correlatedStatus = await correlatedResponse.json() as any;
+    assert.deepEqual(correlatedStatus, status);
+    assert.equal("requestId" in correlatedStatus, false);
+    assert.equal("correlationId" in correlatedStatus, false);
+    for (const externalRequestId of ["contains spaces", "x".repeat(257)]) {
+      const compatibleResponse = await fetch(`${base}/status`, { headers: { "x-odinn-request-id": externalRequestId } });
+      assert.equal(compatibleResponse.status, 200);
+      assert.equal(compatibleResponse.headers.get("x-odinn-request-id"), externalRequestId);
+      assert.deepEqual(await compatibleResponse.json(), status);
+    }
 
     const runsBeforePreview = await getJson(`${base}/runs`);
     const preview = await postJson(`${base}/gatewatch/preview`, {

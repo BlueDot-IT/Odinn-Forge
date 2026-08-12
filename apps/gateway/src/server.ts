@@ -5,6 +5,7 @@ import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as stat
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { APPLICATION_CONTRACT_VERSION, createStatusReadUseCase } from "@odinn/application";
 import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createGovernedMcpRuntime, createIsolatedTaskExecutor, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -17,7 +18,7 @@ import {
   createAllowlistPolicy,
   type ChannelExecutionStateEvent
 } from "@odinn/channels";
-import { authenticationMode, authorizedRequest, isMutatingMethod, permitsGatewayTokenBootstrap, validHostHeader, validMutationOrigin } from "./security.ts";
+import { authenticationMode, isMutatingMethod, permitsGatewayTokenBootstrap, validHostHeader, validMutationOrigin } from "./security.ts";
 import { runGatewayEntrypoint } from "./bootstrap.ts";
 import { renderConsoleHtml } from "./public/console.ts";
 import { runWithWorkflowLeaseHeartbeat } from "./workflow.ts";
@@ -700,8 +701,10 @@ export async function createGatewayServer({
   requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
   quotas = {},
   hosted = false,
+  hostedUserId,
   channelPluginLoader = loadChannelPlugin
 }: any = {}) {
+  const trustedHostedUserId = hosted ? normalizeHostedUserId(hostedUserId) : undefined;
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
   const version = await productVersion();
@@ -878,6 +881,46 @@ export async function createGatewayServer({
     ? setInterval(runImprovementCycle, selfImprovement.intervalMs)
     : undefined;
   improvementTimer?.unref?.();
+  const statusRead = createStatusReadUseCase({
+    readStatus: async () => ({
+      ok: true,
+      version,
+      state,
+      workspaceRoot: root,
+      tools: Array.from(registry.keys()),
+      toolDetails: Array.from(registry.entries()).map(([name, tool]: any) => ({
+        name,
+        capability: tool.capability,
+        capabilities: tool.capabilities,
+        description: tool.description
+      })),
+      capabilityRegistryVersion: CAPABILITY_REGISTRY_VERSION,
+      capabilityRegistry: CAPABILITY_REGISTRY,
+      capabilityMigration: policy.capabilityMigration,
+      allowedCapabilities: policy.allowedCapabilities,
+      allowedTools: Array.from(registry.entries()).filter(([name, tool]: any) => evaluateTaskPolicy({ policy, request: { tool: name, input: {} }, tool }).allowed).map(([name]) => name),
+      defaultModel: normalizeModelConfig(config).defaultModel,
+      models: listConfiguredModels(normalizeModelConfig(config)),
+      providers: await summarizeProviders(config, state),
+      coreAdvanced: CORE_ADVANCED_FEATURES,
+      pluginModules: [...runtime.plugins.values()].map(({ id, displayName, configKey, enabled }: any) => ({ id, displayName, configKey, enabled })),
+      experimental: featureFlags,
+      runtimeSurfaces: {
+        durableWorkflows: { enabled: Boolean(workflowRuntime) },
+        eventIngress: { enabled: Boolean(eventIngress) },
+        projectContext: { enabled: Boolean(projectContext) }
+      },
+      security: policy.security,
+      selfImprovement: {
+        ...selfImprovement,
+        automatic: automaticImprovement,
+        advisor: normalizeModelConfig(config).defaultModel
+          ? { source: "configured-provider", model: normalizeModelConfig(config).defaultModel }
+          : { source: "waiting-for-provider", model: "" }
+      },
+      pendingApprovals: approvalStore.list()
+    })
+  });
 
   const approveGatewayApproval = async (id: string) => {
     const preview = approvalStore.list().find((approval: any) => approval.id === id);
@@ -1228,10 +1271,10 @@ export async function createGatewayServer({
         if (await channelSupervisor.handleWebhook(request, response, url)) return;
         return json(response, 404, { ok: false, error: "channel webhook not found" });
       }
-      if (process.env.ODINN_GATEWAY_AUTH !== "off" && !authorizedRequest(request, gatewayToken)) {
+      const authentication = process.env.ODINN_GATEWAY_AUTH === "off" ? "disabled" : authenticationMode(request, gatewayToken);
+      if (!authentication) {
         return json(response, 401, { ok: false, error: "gateway authentication required" });
       }
-      const authentication = process.env.ODINN_GATEWAY_AUTH === "off" ? "disabled" : authenticationMode(request, gatewayToken);
       if (isMutatingMethod(request.method) && !validMutationOrigin(request, authentication)) {
         return json(response, 403, { ok: false, error: "origin rejected for control-plane mutation" });
       }
@@ -1253,44 +1296,13 @@ export async function createGatewayServer({
         });
       }
       if (request.method === "GET" && url.pathname === "/status") {
-        return json(response, 200, {
-          ok: true,
-          version,
-          state,
-          workspaceRoot: root,
-          tools: Array.from(registry.keys()),
-          toolDetails: Array.from(registry.entries()).map(([name, tool]: any) => ({
-            name,
-            capability: tool.capability,
-            capabilities: tool.capabilities,
-            description: tool.description
-          })),
-          capabilityRegistryVersion: CAPABILITY_REGISTRY_VERSION,
-          capabilityRegistry: CAPABILITY_REGISTRY,
-          capabilityMigration: policy.capabilityMigration,
-          allowedCapabilities: policy.allowedCapabilities,
-          allowedTools: Array.from(registry.entries()).filter(([name, tool]: any) => evaluateTaskPolicy({ policy, request: { tool: name, input: {} }, tool }).allowed).map(([name]) => name),
-          defaultModel: normalizeModelConfig(config).defaultModel,
-          models: listConfiguredModels(normalizeModelConfig(config)),
-          providers: await summarizeProviders(config, state),
-          coreAdvanced: CORE_ADVANCED_FEATURES,
-          pluginModules: [...runtime.plugins.values()].map(({ id, displayName, configKey, enabled }: any) => ({ id, displayName, configKey, enabled })),
-          experimental: featureFlags,
-          runtimeSurfaces: {
-            durableWorkflows: { enabled: Boolean(workflowRuntime) },
-            eventIngress: { enabled: Boolean(eventIngress) },
-            projectContext: { enabled: Boolean(projectContext) }
-          },
-          security: policy.security,
-          selfImprovement: {
-            ...selfImprovement,
-            automatic: automaticImprovement,
-            advisor: normalizeModelConfig(config).defaultModel
-              ? { source: "configured-provider", model: normalizeModelConfig(config).defaultModel }
-              : { source: "waiting-for-provider", model: "" }
-          },
-          pendingApprovals: approvalStore.list()
-        });
+        const applicationRequestId = randomUUID();
+        const result = await statusRead.execute(createGatewayStatusReadRequest({
+          applicationRequestId,
+          hostedUserId: trustedHostedUserId,
+          authentication
+        }));
+        return json(response, 200, result.output);
       }
       if (request.method === "GET" && url.pathname === "/diagnostics") {
         return json(response, 200, await diagnostics({ state, workspaceRoot: root, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError, sandboxRecoveryStartupError }));
@@ -2335,6 +2347,43 @@ export async function createGatewayServer({
   });
   server.odinnAuthToken = gatewayToken;
   return server;
+}
+
+function normalizeHostedUserId(value: unknown): string {
+  const normalized = String(value ?? "");
+  if (!/^[a-z0-9][a-z0-9_-]{1,63}$/u.test(normalized)) {
+    throw new Error("hosted gateway requires a canonical host user identity");
+  }
+  return normalized;
+}
+
+export function createGatewayStatusReadRequest({
+  applicationRequestId,
+  hostedUserId,
+  authentication
+}: {
+  applicationRequestId: string;
+  hostedUserId?: string;
+  authentication: string;
+}) {
+  return {
+    version: APPLICATION_CONTRACT_VERSION,
+    kind: "status-read-request" as const,
+    requestId: applicationRequestId,
+    context: {
+      principal: {
+        principalId: hostedUserId ? `host-user:${normalizeHostedUserId(hostedUserId)}` : "local-gateway-user",
+        actorId: "gateway",
+        kind: "host-user" as const,
+        authenticationReference: authentication === "disabled" ? "gateway:auth-disabled" : `gateway:${authentication}`
+      },
+      scope: { tenantId: hostedUserId ? `tenant:${normalizeHostedUserId(hostedUserId)}` : "local" },
+      sourceReference: "http:GET:/status",
+      correlationId: applicationRequestId,
+      cancellationControlReference: `http:request:${applicationRequestId}`
+    },
+    operation: { kind: "query" as const, id: "status.read" as const }
+  };
 }
 
 async function loadGatewayToken(state: any) {
