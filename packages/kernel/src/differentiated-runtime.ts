@@ -435,9 +435,14 @@ export class CapabilityBroker {
     if (row.status !== "active") throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability is not active");
     const constraints = parse(row.constraints_json, {}); for (const [key, expectedValue] of Object.entries(constraints)) if (Array.isArray(expectedValue) ? !expectedValue.includes(resource[key]) : resource[key] !== expectedValue) throw new OdinnRuntimeError("CAPABILITY_SCOPE_MISMATCH", `resource constraint mismatch: ${key}`);
     this.ledger.database.transaction((db: any) => {
-      const update = db.prepare("UPDATE capabilities SET uses = uses + 1, status = CASE WHEN uses + 1 >= max_uses THEN 'consumed' ELSE status END WHERE id = ? AND status = 'active' AND uses < max_uses").run(claims.id);
-      if (Number(update.changes ?? 0) !== 1) throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability was already consumed or revoked");
-      db.prepare("INSERT INTO capability_uses(id, capability_id, run_id, tool_name, resource_json, used_at, ok) VALUES (?, ?, ?, ?, ?, ?, 1)").run(randomUUID(), claims.id, runId, toolName, json(redact(resource)), now());
+      const usedAt = now();
+      const update = db.prepare("UPDATE capabilities SET uses = uses + 1, status = CASE WHEN uses + 1 >= max_uses THEN 'consumed' ELSE status END WHERE id = ? AND status = 'active' AND uses < max_uses AND expires_at > ?").run(claims.id, usedAt);
+      if (Number(update.changes ?? 0) !== 1) {
+        const current = db.prepare("SELECT expires_at FROM capabilities WHERE id = ?").get(claims.id);
+        if (current && Date.parse(current.expires_at) <= Date.parse(usedAt)) throw new OdinnRuntimeError("CAPABILITY_EXPIRED", "capability expired");
+        throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability was already consumed or revoked");
+      }
+      db.prepare("INSERT INTO capability_uses(id, capability_id, run_id, tool_name, resource_json, used_at, ok) VALUES (?, ?, ?, ?, ?, ?, 1)").run(randomUUID(), claims.id, runId, toolName, json(redact(resource)), usedAt);
     });
     this.ledger.appendEvent({ runId, type: "capability-consumed", payload: { capabilityId: claims.id, toolName, resource: redact(resource) } });
     return claims;

@@ -149,7 +149,7 @@ function openDatabase(path: string): DatabaseSync {
   const resolved = resolve(path);
   ensureParent(resolved);
   const database = new DatabaseSync(resolved);
-  database.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
+  database.exec("PRAGMA busy_timeout = 30000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
   database.exec(`
     CREATE TABLE IF NOT EXISTS record_events (
       sequence INTEGER PRIMARY KEY,

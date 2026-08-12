@@ -520,7 +520,7 @@ export class SqliteStore {
     }
     mkdirSync(dirname(this.path), { recursive: true });
     this.db = new DatabaseSync(this.path);
-    this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA busy_timeout = 30000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
     this.migrate(targetVersion);
     this.ensureRuntimeJobIndexes();
@@ -591,6 +591,7 @@ export function inspectExistingSqliteSchema(path: string): number {
   if (!existsSync(resolved)) return 0;
   const database = new DatabaseSync(resolved, { readOnly: true });
   try {
+    database.exec("PRAGMA busy_timeout = 30000");
     const table = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'").get();
     if (!table) return 0;
     const row = database.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get() as SqlRow;

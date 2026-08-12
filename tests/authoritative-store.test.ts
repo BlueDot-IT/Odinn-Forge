@@ -27,6 +27,7 @@ test("record queries use stable keyset cursors and preserve deterministic order"
   const state = await root();
   const store = new SqliteRecordStore(join(state, "records.sqlite"));
   try {
+    assert.equal((store.db.prepare("PRAGMA busy_timeout").get() as { timeout: number }).timeout, 30_000);
     for (let index = 0; index < 7; index += 1) {
       await store.append({ id: `record-${index}`, type: "memory", at: index === 5 ? "2020-01-01T00:00:00.000Z" : `2026-08-01T00:00:0${index}.000Z`, status: "active", namespace: "project/demo", text: `value-${index}` });
     }
@@ -85,6 +86,41 @@ test("external message IDs are unique and idempotent across concurrent processes
     verify.close();
   } finally {
     try { setup.close(); } catch {}
+  }
+});
+
+test("authoritative writes survive a live writer beyond the former contention window", { timeout: 30_000 }, async () => {
+  const state = await root();
+  const databasePath = join(state, "records.sqlite");
+  const store = new SqliteRecordStore(databasePath);
+  const child = spawn(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    `import { DatabaseSync } from "node:sqlite";
+     const database = new DatabaseSync(process.argv[1]);
+     database.exec("BEGIN IMMEDIATE");
+     process.stdout.write("locked\\n");
+     setTimeout(() => { database.exec("COMMIT"); database.close(); }, 5_500);`,
+    databasePath
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exit = new Promise<number | null>((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("close", resolveExit);
+  });
+  try {
+    await new Promise<void>((resolveReady, rejectReady) => {
+      child.once("error", rejectReady);
+      child.stdout.once("data", (chunk) => String(chunk).includes("locked") ? resolveReady() : rejectReady(new Error(`unexpected writer output: ${String(chunk)}`)));
+    });
+    const record = await store.append({ id: "after-contention", type: "memory", status: "active", namespace: "tests/contention", text: "durable" });
+    assert.equal(record.id, "after-contention");
+    assert.equal(await exit, 0, stderr);
+    assert.equal((await store.findById("after-contention"))?.text, "durable");
+  } finally {
+    store.close();
   }
 });
 

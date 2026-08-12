@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,6 +103,47 @@ test("capabilities are scoped and consumed exactly once", async () => {
     assert.throws(() => runtime.capabilities.consume(issued.token, { runId: "run-other", toolName: "github.create", resource: { repository: "owner/repo" } }), /not valid/);
     assert.throws(() => runtime.capabilities.issue({ runId: "run-cap", stepId: "step-2", toolName: "github.create", expiresInMs: 0 }), /expiresInMs/);
     assert.throws(() => runtime.capabilities.issue({ runId: "run-cap", stepId: "step-3", toolName: "github.create", maxUses: 101 }), /maxUses/);
+  } finally { runtime.ledger.close(); }
+});
+
+test("capability expiry is rechecked after waiting for the SQLite writer", async () => {
+  const { runtime } = await fixture();
+  try {
+    runtime.ledger.ensureRun({ runId: "run-cap-expiry", objective: "contention expiry test" });
+    const issued = runtime.capabilities.issue({
+      runId: "run-cap-expiry",
+      stepId: "step-expiry",
+      toolName: "github.create",
+      expiresInMs: 1_000
+    });
+    const child = spawn(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      `import { DatabaseSync } from "node:sqlite";
+       const database = new DatabaseSync(process.argv[1]);
+       database.exec("BEGIN IMMEDIATE");
+       process.stdout.write("locked\\n");
+       setTimeout(() => { database.exec("COMMIT"); database.close(); }, 1_800);`,
+      runtime.ledger.database.path
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exit = new Promise<number | null>((resolveExit, rejectExit) => {
+      child.once("error", rejectExit);
+      child.once("close", resolveExit);
+    });
+    await new Promise<void>((resolveReady, rejectReady) => {
+      child.once("error", rejectReady);
+      child.stdout.once("data", (chunk) => String(chunk).includes("locked") ? resolveReady() : rejectReady(new Error(`unexpected writer output: ${String(chunk)}`)));
+    });
+    assert.throws(
+      () => runtime.capabilities.consume(issued.token, { runId: "run-cap-expiry", toolName: "github.create" }),
+      (error: any) => error instanceof OdinnRuntimeError && error.code === "CAPABILITY_EXPIRED"
+    );
+    assert.equal(await exit, 0, stderr);
+    assert.equal(runtime.ledger.database.db.prepare("SELECT uses FROM capabilities WHERE id = ?").get(issued.claims.id).uses, 0);
+    assert.equal(runtime.ledger.database.db.prepare("SELECT COUNT(*) AS count FROM capability_uses WHERE capability_id = ?").get(issued.claims.id).count, 0);
   } finally { runtime.ledger.close(); }
 });
 
