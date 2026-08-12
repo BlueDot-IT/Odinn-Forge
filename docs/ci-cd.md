@@ -21,16 +21,21 @@ The inference job launches the packaged Gateway, configures a local OpenAI-compa
 
 The quality job also runs `pnpm check:architecture`. This repository-owned
 TypeScript AST and manifest check enforces the [complete production workspace
-package graph](architecture/package-dependency-graph.md) across `apps/`,
-`packages/`, and `adapters/`. It validates source imports and every package
-dependency field, rejects package-to-app and adapter-to-adapter edges, requires
-source imports to be declared, and permits only package roots and subpaths
-listed in the target package's `exports` map. Relative or repository-root
-cross-package source imports are rejected so production code cannot depend on
-private TypeScript files that are not package API. Dynamic `import()` and
-`require()` calls in every production workspace package must use literal module
-specifiers so dependency direction and packaged build inputs remain statically
-enforceable.
+package graph](architecture/package-dependency-graph.md). Package roots come
+from `pnpm-workspace.yaml`; discovered packages, graph keys, and graph targets
+must agree. The check validates source imports and every package dependency
+field, requires the canonical package name with exact `workspace:*`, rejects
+local-path and npm aliases, rejects package-to-app and adapter-to-adapter edges,
+and requires source imports to be declared. Package subpaths are evaluated with
+conditional, wildcard, and null `exports` semantics. Relative or
+repository-root cross-package source imports are rejected so production code
+cannot depend on private TypeScript files that are not package API.
+
+Dynamic `import()`, direct `require()`, and `module.require()` calls in every
+production workspace package must use literal module specifiers. Indirect
+`require`, `createRequire`, package `imports` aliases, and TypeScript `paths`
+aliases fail closed so dependency identities and packaged build inputs remain
+statically enforceable.
 
 Diagnostics name the source file or manifest, import/dependency specifier, and
 violated rule. The dependency-direction check has no legacy exemptions.

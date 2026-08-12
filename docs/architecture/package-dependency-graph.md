@@ -50,27 +50,42 @@ would encode the dependency in the wrong direction for the current tree.
 `pnpm check:architecture` parses TypeScript and JavaScript syntax and validates
 both source references and package manifests. It enforces all of the following:
 
-1. Every package under `apps/`, `packages/`, or `adapters/` is registered in
-   the allowed graph.
+1. Package roots are derived from the globs in `pnpm-workspace.yaml`, including
+   nested workspace packages. Every discovered package is registered in the
+   allowed graph, every graph key is discovered, and every graph target names
+   a discovered graph package. A nested package is not scanned again as part
+   of its parent package.
 2. Workspace entries in `dependencies`, `devDependencies`,
-   `optionalDependencies`, and `peerDependencies` follow the allowed graph.
+   `optionalDependencies`, and `peerDependencies` use the target's canonical
+   package name and the exact `workspace:*` specifier, then follow the allowed
+   graph. Internal semver references and workspace aliases/redirections cannot
+   substitute a different package identity. `file:`, `link:`, and npm alias
+   specifiers are rejected outright in production workspace manifests.
 3. Every workspace package imported by source is declared in the importing
    package's manifest.
 4. Packages and adapters cannot depend on an app. The intentional
    CLI-to-Gateway app composition edge remains allowed.
 5. One adapter cannot depend on another adapter.
-6. Bare workspace imports may use only the root or subpaths explicitly exposed
-   through the target package's `exports` map. Public subpaths such as
+6. Bare workspace imports may use only the root or subpaths exposed through
+   Node-compatible `exports` resolution. Exact entries take precedence over
+   patterns, the most-specific wildcard wins, active `import`, `require`,
+   `node`, `types`, and `default` conditions are evaluated in declaration
+   order, and a selected `null` target excludes the subpath. Public subpaths such as
    `@odinn/kernel/browser-worker-host` and
    `@odinn/store-sqlite/memory-index` remain valid.
 7. Relative, absolute, or repository-root paths that cross a workspace package
    boundary are rejected. Production code must not reach into another
    package's `src/` tree or depend on files absent as package API.
-8. Dynamic `import()` and `require()` calls in production workspace packages
-   use literal specifiers, so dependency direction and packaged build inputs
-   remain statically inspectable.
+8. Dynamic `import()`, direct `require()`, and `module.require()` calls in
+   production workspace packages use literal specifiers. Indirect `require`
+   references and `createRequire` loaders are rejected because the checker
+   cannot soundly bind their later calls to module identities.
 9. The `@odinn/*` namespace and `workspace:` dependency protocol resolve only
    to packages present in this workspace.
+10. `package.json#imports` aliases and TypeScript `paths` aliases are rejected
+    for production architecture. Cross-package imports must remain visible as
+    exported workspace package specifiers rather than being rewritten by a
+    second resolver.
 
 There are no legacy exemptions.
 

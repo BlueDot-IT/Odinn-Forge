@@ -9,31 +9,58 @@ import {
   WORKSPACE_DEPENDENCY_GRAPH,
   checkDependencyDirection,
   formatDependencyViolation,
+  type AllowedDependencyGraph,
 } from "../scripts/ci/check-dependency-direction.ts";
 
-function manifest(
-  name: string,
-  dependencies: Record<string, string> = {},
-  exportsValue: unknown = { ".": "./src/index.ts" },
-): string {
+interface ManifestOptions {
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+  exports?: unknown;
+  imports?: unknown;
+  optionalDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+}
+
+function manifest(name: string, options: ManifestOptions = {}): string {
   return `${JSON.stringify({
     name,
     private: true,
     type: "module",
-    exports: exportsValue,
-    dependencies,
+    exports: options.exports === undefined ? { ".": "./src/index.ts" } : options.exports,
+    ...(options.imports === undefined ? {} : { imports: options.imports }),
+    ...(options.dependencies ? { dependencies: options.dependencies } : {}),
+    ...(options.devDependencies ? { devDependencies: options.devDependencies } : {}),
+    ...(options.optionalDependencies ? { optionalDependencies: options.optionalDependencies } : {}),
+    ...(options.peerDependencies ? { peerDependencies: options.peerDependencies } : {}),
   }, null, 2)}\n`;
 }
+
+const defaultWorkspace = [
+  "packages:",
+  "  - apps/**",
+  "  - packages/**",
+  "  - adapters/**",
+  "",
+].join("\n");
 
 async function repositoryFixture(t: test.TestContext, files: Record<string, string>): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "odinn-dependency-direction-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  await Promise.all(Object.entries(files).map(async ([path, content]) => {
+  const fixtureFiles = { "pnpm-workspace.yaml": defaultWorkspace, ...files };
+  await Promise.all(Object.entries(fixtureFiles).map(async ([path, content]) => {
     const absolutePath = join(root, path);
     await mkdir(dirname(absolutePath), { recursive: true });
     await writeFile(absolutePath, content);
   }));
   return root;
+}
+
+function checkFixture(
+  root: string,
+  allowedGraph: AllowedDependencyGraph,
+  baseline = LEGACY_DEPENDENCY_BASELINE,
+) {
+  return checkDependencyDirection(root, baseline, allowedGraph);
 }
 
 test("allowed workspace dependency graph is explicit and pinned", () => {
@@ -80,7 +107,7 @@ test("allowed workspace dependency graph is explicit and pinned", () => {
   });
 });
 
-test("dependency checker permits the current package graph and exported subpaths", async (t) => {
+test("dependency checker permits the current graph, canonical manifests, and public subpaths", async (t) => {
   const root = await repositoryFixture(t, {
     "packages/application/package.json": manifest("@odinn/application"),
     "packages/application/src/index.ts": 'import type { PathLike } from "node:fs"; export type Example = PathLike;\n',
@@ -88,30 +115,34 @@ test("dependency checker permits the current package graph and exported subpaths
     "packages/protocol/src/index.ts": "export interface Protocol {}\n",
     "packages/policy/package.json": manifest("@odinn/policy"),
     "packages/policy/src/index.ts": "export interface Policy {}\n",
-    "packages/store-file/package.json": manifest("@odinn/store-file", { "@odinn/protocol": "workspace:*" }),
+    "packages/store-file/package.json": manifest("@odinn/store-file", {
+      dependencies: { "@odinn/protocol": "workspace:*" },
+    }),
     "packages/store-file/src/index.ts": 'export type { Protocol } from "@odinn/protocol";\n',
-    "packages/store-sqlite/package.json": manifest(
-      "@odinn/store-sqlite",
-      { "@odinn/protocol": "workspace:*" },
-      { ".": "./src/index.ts", "./memory-index": "./src/memory-index.ts" },
-    ),
+    "packages/store-sqlite/package.json": manifest("@odinn/store-sqlite", {
+      dependencies: { "@odinn/protocol": "workspace:*" },
+      exports: { ".": "./src/index.ts", "./memory-index": "./src/memory-index.ts" },
+    }),
     "packages/store-sqlite/src/index.ts": 'export type { Protocol } from "@odinn/protocol";\n',
     "packages/store-sqlite/src/memory-index.ts": "export class MemoryIndex {}\n",
-    "packages/channels/package.json": manifest("@odinn/channels", { "@odinn/store-file": "workspace:*" }),
+    "packages/channels/package.json": manifest("@odinn/channels", {
+      dependencies: { "@odinn/store-file": "workspace:*" },
+    }),
     "packages/channels/src/index.ts": 'export { store } from "@odinn/store-file";\n',
-    "adapters/channels/discord/package.json": manifest("@odinn/channel-discord", { "@odinn/channels": "workspace:*" }),
+    "adapters/channels/discord/package.json": manifest("@odinn/channel-discord", {
+      dependencies: { "@odinn/channels": "workspace:*" },
+    }),
     "adapters/channels/discord/src/index.ts": 'export type { Channel } from "@odinn/channels";\n',
-    "packages/kernel/package.json": manifest(
-      "@odinn/kernel",
-      {
+    "packages/kernel/package.json": manifest("@odinn/kernel", {
+      dependencies: {
         "@odinn/channels": "workspace:*",
         "@odinn/policy": "workspace:*",
         "@odinn/protocol": "workspace:*",
         "@odinn/store-file": "workspace:*",
         "@odinn/store-sqlite": "workspace:*",
       },
-      { ".": "./src/index.ts", "./browser-worker-host": "./src/browser-worker-host.ts" },
-    ),
+      exports: { ".": "./src/index.ts", "./browser-worker-host": "./src/browser-worker-host.ts" },
+    }),
     "packages/kernel/src/index.ts": [
       'import type { Channel } from "@odinn/channels";',
       'import { MemoryIndex } from "@odinn/store-sqlite/memory-index";',
@@ -119,28 +150,54 @@ test("dependency checker permits the current package graph and exported subpaths
     ].join("\n"),
     "packages/kernel/src/browser-worker-host.ts": "export function installBrowserWorker() {}\n",
     "packages/runtime/package.json": manifest("@odinn/runtime", {
-      "@odinn/channel-discord": "workspace:*",
-      "@odinn/kernel": "workspace:*",
+      dependencies: {
+        "@odinn/channel-discord": "workspace:*",
+        "@odinn/kernel": "workspace:*",
+      },
     }),
     "packages/runtime/src/index.ts": [
       'import "@odinn/channel-discord";',
       'export { installBrowserWorker } from "@odinn/kernel/browser-worker-host";',
     ].join("\n"),
     "apps/gateway/package.json": manifest("@odinn/gateway", {
-      "@odinn/application": "workspace:*",
-      "@odinn/channel-discord": "workspace:*",
-      "@odinn/kernel": "workspace:*",
+      dependencies: {
+        "@odinn/application": "workspace:*",
+        "@odinn/channel-discord": "workspace:*",
+        "@odinn/kernel": "workspace:*",
+      },
     }),
     "apps/gateway/src/index.ts": [
       'import "@odinn/application";',
       'import "@odinn/kernel";',
       'void import("@odinn/channel-discord");',
     ].join("\n"),
-    "apps/cli/package.json": manifest("@odinn/cli", { "@odinn/gateway": "workspace:*" }, undefined),
+    "apps/cli/package.json": manifest("@odinn/cli", {
+      dependencies: { "@odinn/gateway": "workspace:*" },
+      exports: undefined,
+    }),
     "apps/cli/src/index.ts": 'void import("@odinn/gateway");\n',
   });
+  const graph = {
+    "@odinn/application": [],
+    "@odinn/protocol": [],
+    "@odinn/policy": [],
+    "@odinn/store-file": ["@odinn/protocol"],
+    "@odinn/store-sqlite": ["@odinn/protocol"],
+    "@odinn/channels": ["@odinn/store-file"],
+    "@odinn/channel-discord": ["@odinn/channels"],
+    "@odinn/kernel": [
+      "@odinn/channels",
+      "@odinn/policy",
+      "@odinn/protocol",
+      "@odinn/store-file",
+      "@odinn/store-sqlite",
+    ],
+    "@odinn/runtime": ["@odinn/channel-discord", "@odinn/kernel"],
+    "@odinn/gateway": ["@odinn/application", "@odinn/channel-discord", "@odinn/kernel"],
+    "@odinn/cli": ["@odinn/gateway"],
+  };
 
-  const result = await checkDependencyDirection(root, []);
+  const result = await checkFixture(root, graph, []);
 
   assert.equal(result.scannedManifestCount, 11);
   assert.deepEqual(result.violations, []);
@@ -151,19 +208,33 @@ test("dependency checker rejects forbidden source and manifest directions", asyn
   const root = await repositoryFixture(t, {
     "apps/gateway/package.json": manifest("@odinn/gateway"),
     "apps/gateway/src/index.ts": "export const gateway = true;\n",
-    "packages/application/package.json": manifest("@odinn/application", { "@odinn/gateway": "workspace:*" }),
+    "packages/application/package.json": manifest("@odinn/application", {
+      dependencies: { "@odinn/gateway": "workspace:*" },
+    }),
     "packages/application/src/index.ts": 'import "@odinn/gateway";\n',
-    "adapters/channels/discord/package.json": manifest("@odinn/channel-discord", { "@odinn/channel-slack": "workspace:*" }),
+    "adapters/channels/discord/package.json": manifest("@odinn/channel-discord", {
+      dependencies: { "@odinn/channel-slack": "workspace:*" },
+    }),
     "adapters/channels/discord/src/index.ts": 'export * from "@odinn/channel-slack";\n',
     "adapters/channels/slack/package.json": manifest("@odinn/channel-slack"),
     "adapters/channels/slack/src/index.ts": "export const slack = true;\n",
     "packages/kernel/package.json": manifest("@odinn/kernel"),
     "packages/kernel/src/index.ts": "export const kernel = true;\n",
-    "packages/protocol/package.json": manifest("@odinn/protocol", { "@odinn/kernel": "workspace:*" }),
+    "packages/protocol/package.json": manifest("@odinn/protocol", {
+      dependencies: { "@odinn/kernel": "workspace:*" },
+    }),
     "packages/protocol/src/index.ts": 'const kernel = require("@odinn/kernel"); export { kernel };\n',
   });
+  const graph = {
+    "@odinn/gateway": [],
+    "@odinn/application": [],
+    "@odinn/channel-discord": [],
+    "@odinn/channel-slack": [],
+    "@odinn/kernel": [],
+    "@odinn/protocol": [],
+  };
 
-  const result = await checkDependencyDirection(root, []);
+  const result = await checkFixture(root, graph, []);
 
   assert.deepEqual(result.violations.map(({ sourceFile, kind, rule }) => ({ sourceFile, kind, rule })), [
     {
@@ -199,46 +270,118 @@ test("dependency checker rejects forbidden source and manifest directions", asyn
   ]);
 });
 
-test("dependency checker permits public exports and rejects private deep imports", async (t) => {
+test("exports resolution honors conditions, exact nulls, and most-specific wildcard exclusions", async (t) => {
   const root = await repositoryFixture(t, {
-    "packages/kernel/package.json": manifest(
-      "@odinn/kernel",
-      {},
-      { ".": "./src/index.ts", "./browser-worker-host": "./src/browser-worker-host.ts" },
-    ),
+    "packages/kernel/package.json": manifest("@odinn/kernel", {
+      exports: {
+        ".": { import: "./src/index.ts", require: null },
+        "./features/*": "./src/features/*.ts",
+        "./features/private/*": null,
+        "./*": "./src/*.ts",
+        "./blocked": null,
+        "./conditional": { node: { import: "./src/conditional.ts", require: null }, default: null },
+        "./fallback": ["invalid-target", "./src/fallback.ts"],
+        "./null-first": [null, "./src/not-reached.ts"],
+      },
+    }),
     "packages/kernel/src/index.ts": "export const kernel = true;\n",
-    "packages/kernel/src/browser-worker-host.ts": "export const host = true;\n",
-    "packages/runtime/package.json": manifest("@odinn/runtime", { "@odinn/kernel": "workspace:*" }),
+    "packages/runtime/package.json": manifest("@odinn/runtime", {
+      dependencies: { "@odinn/kernel": "workspace:*" },
+    }),
     "packages/runtime/src/index.ts": [
-      'import "@odinn/kernel/browser-worker-host";',
-      'import "@odinn/kernel/src/private.ts";',
+      'import "@odinn/kernel";',
+      'require("@odinn/kernel");',
+      'import "@odinn/kernel/features/public/tool";',
+      'import "@odinn/kernel/features/private/tool";',
+      'import "@odinn/kernel/blocked";',
+      'import "@odinn/kernel/conditional";',
+      'require("@odinn/kernel/conditional");',
+      'import "@odinn/kernel/fallback";',
+      'import "@odinn/kernel/null-first";',
     ].join("\n"),
   });
 
-  const result = await checkDependencyDirection(root, []);
+  const result = await checkFixture(root, {
+    "@odinn/kernel": [],
+    "@odinn/runtime": ["@odinn/kernel"],
+  }, []);
 
-  assert.deepEqual(result.violations.map(({ specifier, rule }) => ({ specifier, rule })), [{
-    specifier: "@odinn/kernel/src/private.ts",
-    rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
-  }]);
+  assert.deepEqual(result.violations.map(({ specifier, kind, rule }) => ({ specifier, kind, rule })), [
+    {
+      specifier: "@odinn/kernel",
+      kind: "require-call",
+      rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
+    },
+    {
+      specifier: "@odinn/kernel/features/private/tool",
+      kind: "import-declaration",
+      rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
+    },
+    {
+      specifier: "@odinn/kernel/blocked",
+      kind: "import-declaration",
+      rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
+    },
+    {
+      specifier: "@odinn/kernel/conditional",
+      kind: "require-call",
+      rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
+    },
+    {
+      specifier: "@odinn/kernel/null-first",
+      kind: "import-declaration",
+      rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
+    },
+  ]);
 });
 
 test("dependency checker rejects source-only paths across package boundaries", async (t) => {
   const root = await repositoryFixture(t, {
     "packages/kernel/package.json": manifest("@odinn/kernel"),
     "packages/kernel/src/index.ts": "export const kernel = true;\n",
-    "packages/runtime/package.json": manifest("@odinn/runtime", { "@odinn/kernel": "workspace:*" }),
+    "packages/runtime/package.json": manifest("@odinn/runtime", {
+      dependencies: { "@odinn/kernel": "workspace:*" },
+    }),
     "packages/runtime/src/index.ts": [
       'import "../../kernel/src/index.ts";',
       'import "packages/kernel/src/index.ts";',
     ].join("\n"),
   });
 
-  const result = await checkDependencyDirection(root, []);
+  const result = await checkFixture(root, {
+    "@odinn/kernel": [],
+    "@odinn/runtime": ["@odinn/kernel"],
+  }, []);
 
   assert.deepEqual(result.violations.map(({ specifier, rule }) => ({ specifier, rule })), [
     { specifier: "../../kernel/src/index.ts", rule: DEPENDENCY_RULES.crossPackageSourcePath },
     { specifier: "packages/kernel/src/index.ts", rule: DEPENDENCY_RULES.crossPackageSourcePath },
+  ]);
+});
+
+test("all dependency fields require canonical names and exact workspace protocol identity", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/kernel/package.json": manifest("@odinn/kernel"),
+    "packages/kernel/src/index.ts": "export const kernel = true;\n",
+    "packages/runtime/package.json": manifest("@odinn/runtime", {
+      dependencies: { "@odinn/kernel": "^1.1.0" },
+      devDependencies: { "kernel-file-alias": "file:../kernel" },
+      optionalDependencies: { "kernel-npm-alias": "npm:@odinn/kernel@1.1.0" },
+      peerDependencies: { "kernel-workspace-alias": "workspace:@odinn/kernel@*" },
+    }),
+    "packages/runtime/src/index.ts": "export const runtime = true;\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/kernel": [],
+    "@odinn/runtime": ["@odinn/kernel"],
+  }, []);
+
+  assert.deepEqual(result.violations.map(({ specifier, rule }) => ({ specifier, rule })), [
+    { specifier: "@odinn/kernel", rule: DEPENDENCY_RULES.workspaceDependencyIdentity },
+    { specifier: "kernel-file-alias", rule: DEPENDENCY_RULES.dependencyAliasSpecifier },
+    { specifier: "kernel-npm-alias", rule: DEPENDENCY_RULES.dependencyAliasSpecifier },
+    { specifier: "kernel-workspace-alias", rule: DEPENDENCY_RULES.workspaceDependencyIdentity },
   ]);
 });
 
@@ -250,7 +393,10 @@ test("dependency checker rejects allowed imports omitted from the source manifes
     "packages/runtime/src/index.ts": 'import "@odinn/kernel";\n',
   });
 
-  const result = await checkDependencyDirection(root, []);
+  const result = await checkFixture(root, {
+    "@odinn/kernel": [],
+    "@odinn/runtime": ["@odinn/kernel"],
+  }, []);
 
   assert.deepEqual(result.violations.map(({ specifier, rule }) => ({ specifier, rule })), [{
     specifier: "@odinn/kernel",
@@ -260,15 +406,108 @@ test("dependency checker rejects allowed imports omitted from the source manifes
 
 test("dependency checker rejects unresolved workspace names in manifests and source", async (t) => {
   const root = await repositoryFixture(t, {
-    "packages/application/package.json": manifest("@odinn/application", { "@odinn/not-installed": "workspace:*" }),
+    "packages/application/package.json": manifest("@odinn/application", {
+      dependencies: { "@odinn/not-installed": "workspace:*" },
+    }),
     "packages/application/src/index.ts": 'import "@odinn/not-installed/private";\n',
   });
 
-  const result = await checkDependencyDirection(root, []);
+  const result = await checkFixture(root, { "@odinn/application": [] }, []);
 
   assert.deepEqual(result.violations.map(({ kind, rule }) => ({ kind, rule })), [
     { kind: "manifest-dependency", rule: DEPENDENCY_RULES.unknownWorkspaceTarget },
     { kind: "import-declaration", rule: DEPENDENCY_RULES.unknownWorkspaceTarget },
+  ]);
+});
+
+test("module.require is inspected and indirect require or createRequire loaders fail closed", async (t) => {
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway"),
+    "apps/gateway/src/index.ts": "export const gateway = true;\n",
+    "packages/application/package.json": manifest("@odinn/application", {
+      dependencies: { "@odinn/gateway": "workspace:*" },
+    }),
+    "packages/application/src/index.ts": [
+      'module.require("@odinn/gateway");',
+      "module.require(moduleName);",
+      "const indirect = module.require;",
+      "const { require: loadRequired } = module;",
+      'import { createRequire as makeRequire } from "node:module";',
+      "const load = makeRequire(import.meta.url);",
+      'load("@odinn/gateway");',
+      'import * as nodeModule from "node:module";',
+      "const loadAgain = nodeModule.createRequire(import.meta.url);",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/application": [],
+  }, []);
+
+  assert.deepEqual(result.violations.map(({ kind, rule }) => ({ kind, rule })), [
+    { kind: "manifest-dependency", rule: DEPENDENCY_RULES.packageToApp },
+    { kind: "require-call", rule: DEPENDENCY_RULES.packageToApp },
+    { kind: "require-call", rule: DEPENDENCY_RULES.workspaceDynamicImports },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
+  ]);
+});
+
+test("package imports aliases are rejected in both manifest and source", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/application/package.json": manifest("@odinn/application", {
+      imports: { "#gateway": "@odinn/gateway" },
+    }),
+    "packages/application/src/index.ts": 'import "#gateway";\n',
+  });
+
+  const result = await checkFixture(root, { "@odinn/application": [] }, []);
+
+  assert.deepEqual(result.violations.map(({ kind, rule }) => ({ kind, rule })), [
+    { kind: "package-import-alias", rule: DEPENDENCY_RULES.packageImportAlias },
+    { kind: "import-declaration", rule: DEPENDENCY_RULES.packageImportAlias },
+  ]);
+});
+
+test("TypeScript paths aliases fail closed before cross-package resolution", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/application/package.json": manifest("@odinn/application"),
+    "packages/application/src/index.ts": 'import "hidden-gateway";\n',
+    "tsconfig.base.json": JSON.stringify({
+      compilerOptions: {
+        baseUrl: ".",
+        paths: { "hidden-gateway": ["apps/gateway/src/index.ts"] },
+      },
+    }),
+    "packages/application/tsconfig.json": JSON.stringify({
+      extends: "../../tsconfig.base.json",
+      include: ["src/**/*.ts"],
+    }),
+  });
+
+  const result = await checkFixture(root, { "@odinn/application": [] }, []);
+
+  assert.deepEqual(result.violations.map(({ sourceFile, specifier, kind, rule }) => ({
+    sourceFile,
+    specifier,
+    kind,
+    rule,
+  })), [
+    {
+      sourceFile: "packages/application/tsconfig.json",
+      specifier: "hidden-gateway",
+      kind: "typescript-path-alias",
+      rule: DEPENDENCY_RULES.typescriptPathAlias,
+    },
+    {
+      sourceFile: "tsconfig.base.json",
+      specifier: "hidden-gateway",
+      kind: "typescript-path-alias",
+      rule: DEPENDENCY_RULES.typescriptPathAlias,
+    },
   ]);
 });
 
@@ -280,7 +519,10 @@ test("dependency checker fails closed on non-literal module loads in every works
     "adapters/channels/discord/src/index.ts": "require(moduleName);\n",
   });
 
-  const result = await checkDependencyDirection(root, []);
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/channel-discord": [],
+  }, []);
 
   assert.deepEqual(result.violations.map(({ sourceFile, kind, rule }) => ({ sourceFile, kind, rule })), [
     {
@@ -296,13 +538,57 @@ test("dependency checker fails closed on non-literal module loads in every works
   ]);
 });
 
+test("workspace globs discover nested packages without double-scanning their source", async (t) => {
+  const root = await repositoryFixture(t, {
+    "pnpm-workspace.yaml": "packages:\n  - apps/**\n",
+    "apps/gateway/package.json": manifest("@odinn/gateway"),
+    "apps/gateway/src/index.ts": "export const gateway = true;\n",
+    "apps/gateway/console/package.json": manifest("@odinn/console"),
+    "apps/gateway/console/src/index.ts": "export const consoleApp = true;\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/console": [],
+  }, []);
+
+  assert.equal(result.scannedManifestCount, 2);
+  assert.equal(result.scannedFileCount, 2);
+  assert.deepEqual(result.violations, []);
+});
+
+test("workspace discovery and graph keys and targets must agree bidirectionally", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/application/package.json": manifest("@odinn/application"),
+    "packages/application/src/index.ts": "export const application = true;\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/application": ["@odinn/ghost-target"],
+    "@odinn/stale-package": [],
+  }, []);
+
+  assert.deepEqual(result.violations.map(({ specifier, kind, rule }) => ({ specifier, kind, rule })), [
+    {
+      specifier: "@odinn/application -> @odinn/ghost-target",
+      kind: "workspace-graph",
+      rule: DEPENDENCY_RULES.unknownGraphTarget,
+    },
+    {
+      specifier: "@odinn/stale-package",
+      kind: "workspace-graph",
+      rule: DEPENDENCY_RULES.missingGraphPackage,
+    },
+  ]);
+});
+
 test("dependency checker rejects new packages until the graph is deliberately updated", async (t) => {
   const root = await repositoryFixture(t, {
     "packages/feature/package.json": manifest("@odinn/feature"),
     "packages/feature/src/index.ts": "export const feature = true;\n",
   });
 
-  const result = await checkDependencyDirection(root, []);
+  const result = await checkFixture(root, {}, []);
 
   assert.deepEqual(result.violations.map(({ specifier, kind, rule }) => ({ specifier, kind, rule })), [{
     specifier: "@odinn/feature",
@@ -317,7 +603,7 @@ test("default architecture check has no legacy dependency exemptions", async (t)
     "packages/application/src/index.ts": 'import "@odinn/not-installed";\n',
   });
 
-  const result = await checkDependencyDirection(root, LEGACY_DEPENDENCY_BASELINE);
+  const result = await checkFixture(root, { "@odinn/application": [] });
 
   assert.deepEqual(LEGACY_DEPENDENCY_BASELINE, []);
   assert.equal(result.violations.length, 1);

@@ -143,12 +143,13 @@ a time while preserving the current kernel exports as a compatibility facade.
    envelopes. Discord agent tools are adapter-owned and host-composed; inbound
    channel routing remains on the existing shared channel contracts.
 6. **Complete for the production workspace:** enforce the exact package graph
-   in CI. Source imports and package manifest dependencies across `apps/`,
-   `packages/`, and `adapters/` are checked. Package-to-app,
-   adapter-to-adapter, private deep-import, undeclared workspace dependency,
-   and cross-package source-path violations are rejected while documented
-   composition-root edges and exported package subpaths remain allowed. See
-   [the package dependency graph](package-dependency-graph.md).
+   in CI. Workspace roots come from `pnpm-workspace.yaml`; source imports,
+   manifest dependency identity and direction, package exports, and unsupported
+   alias or loader constructs are checked. Package-to-app, adapter-to-adapter,
+   private deep-import, undeclared workspace dependency, and cross-package
+   source-path violations are rejected while documented composition-root edges
+   and Node-resolvable exported package subpaths remain allowed. See [the
+   package dependency graph](package-dependency-graph.md).
 
 ## Invariants and stop conditions
 
