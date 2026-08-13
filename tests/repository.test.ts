@@ -152,6 +152,16 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
     release,
     /^  source-package:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- verify/m
   );
+  assert.match(
+    release,
+    /^  stage-release-assets:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- source-package/m
+  );
+  assert.match(
+    release,
+    /^  validate-downloaded-release:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- stage-release-assets/m
+  );
+  assert.match(release, /matrix:\s*\n\s+os:\s*\n\s+- ubuntu-latest\s*\n\s+- macos-latest\s*\n\s+- windows-latest/u);
+  assert.match(release, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
   assert.doesNotMatch(release.match(/^  source-package:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /id-token: write/);
   assert.match(
     release,
@@ -578,6 +588,13 @@ test("release packaging removes stale assets before creating a version", async (
   assert.match(installSmoke, /odinn-gateway/);
   assert.match(installSmoke, /"--version"/);
   assert.match(installSmoke, /\/diagnostics/);
+});
+
+test("release soak uses a valid provider credential name and direct Node execution", async () => {
+  const soak = await read("scripts/release/soak.ts");
+  assert.match(soak, /providerCredentialEnv = "ODINN_SOAK_API_KEY"/u);
+  assert.doesNotMatch(soak, /ODINN_SOAK_KEY/u);
+  assert.match(soak, /shell: false/u);
 });
 
 test("release packaging trusts the checked-out tag declaration over ambient GitHub SHA", () => {
