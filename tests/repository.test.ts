@@ -145,6 +145,16 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/);
   assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}contents: read/m);
   assert.match(release, /\.tag_name == \$tag and \.draft == true and \.prerelease == \$expectedPrerelease/);
+  assert.equal(
+    (release.match(/gh api --paginate --slurp "repos\/\$\{GITHUB_REPOSITORY\}\/releases\?per_page=100"/g) ?? []).length,
+    3,
+    "all release gates must find draft releases through the list API"
+  );
+  assert.equal(
+    (release.match(/test -n "\$release"/g) ?? []).length,
+    3,
+    "all release gates must fail closed when the draft release is absent"
+  );
   assert.match(release, /persist-credentials: false/);
   assert.doesNotMatch(release.match(/^  release-policy:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /^\s+needs:/m);
   assert.match(release, /^  verify:\s*[\s\S]*?^    needs: release-policy/m);

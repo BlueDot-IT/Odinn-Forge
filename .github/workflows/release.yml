@@ -73,7 +73,8 @@ jobs:
           test -n "$TAG"
           tag_commit="$(git rev-list -n 1 "refs/tags/$TAG")"
           test "$tag_commit" = "$(git rev-parse HEAD)"
-          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          release="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -c --arg tag "$TAG" 'add | map(select(.tag_name == $tag)) | first // empty')"
+          test -n "$release"
           expected_prerelease=false
           [[ "$TAG" == *-* ]] && expected_prerelease=true
           jq -e --arg tag "$TAG" \
@@ -173,7 +174,8 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
-          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          release="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -c --arg tag "$TAG" 'add | map(select(.tag_name == $tag)) | first // empty')"
+          test -n "$release"
           expected_prerelease=false
           [[ "$TAG" == *-* ]] && expected_prerelease=true
           jq -e --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
@@ -278,7 +280,8 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
-          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          release="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -c --arg tag "$TAG" 'add | map(select(.tag_name == $tag)) | first // empty')"
+          test -n "$release"
           expected_prerelease=false
           [[ "$TAG" == *-* ]] && expected_prerelease=true
           jq -e --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
