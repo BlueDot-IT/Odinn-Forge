@@ -11,6 +11,7 @@ const releaseDir = join(root, "dist", "release");
 const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const manifest = JSON.parse(await readFile(join(releaseDir, "release-manifest.json"), "utf8"));
 const archive = join(releaseDir, `odinn-v${pkg.version}.tar.gz`);
+const providerCredentialEnv = "ODINN_SOAK_API_KEY";
 const startedAt = Date.now();
 const steps: any[] = [];
 const soakReleaseA = { commit: "a".repeat(40), artifactSha256: "a".repeat(64) };
@@ -21,7 +22,7 @@ async function run(command: string, args: string[], cwd: string, extraEnv: Recor
     const child = spawn(command, args, {
       cwd,
       env: { ...process.env, ...extraEnv },
-      shell: process.platform === "win32",
+      shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
@@ -171,22 +172,22 @@ await writeFile(planPath, `${JSON.stringify({
 await run(process.execPath, [cliEntry, "init", "--state", state], workspace, { INIT_CWD: workspace });
 
 try {
-  await record("fresh-onboarding-local-provider", () => run(process.execPath, [cliEntry, "onboard", "--provider", "ci", "--auth", "api-key", "--base-url", providerUrl, "--model", "odinn-soak-model", "--api-key-env", "ODINN_SOAK_KEY", "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" }));
-  await record("onboarding-provider-verification", () => run(process.execPath, [cliEntry, "onboard", "--verify", "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" }));
+  await record("fresh-onboarding-local-provider", () => run(process.execPath, [cliEntry, "onboard", "--provider", "ci", "--auth", "api-key", "--base-url", providerUrl, "--model", "odinn-soak-model", "--api-key-env", providerCredentialEnv, "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" }));
+  await record("onboarding-provider-verification", () => run(process.execPath, [cliEntry, "onboard", "--verify", "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" }));
   await record("deterministic-tool", () => run(process.execPath, [cliEntry, "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_SOAK_TOOL" }), "--state", state], workspace, { INIT_CWD: workspace }));
   await record("multi-step-plan", () => run(process.execPath, [cliEntry, "plan", "--file", planPath, "--state", state], workspace, { INIT_CWD: workspace }));
 
   providerMode = "fail-once";
   providerRequests = 0;
   await record("provider-failure-retry-recovery", async () => {
-    const output = await run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ retries: 1, messages: [{ role: "user", content: "retry" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" });
+    const output = await run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ retries: 1, messages: [{ role: "user", content: "retry" }] }), "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" });
     if (!output.includes("ODINN_SOAK_PROVIDER_OK") || providerRequests < 2) throw new Error("provider retry did not recover after a transient failure");
     return { providerAttempts: providerRequests };
   });
   providerMode = "timeout";
   await record("provider-timeout", async () => {
     try {
-      await run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ timeoutMs: 1_000, retries: 0, messages: [{ role: "user", content: "timeout" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" });
+      await run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ timeoutMs: 1_000, retries: 0, messages: [{ role: "user", content: "timeout" }] }), "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" });
       throw new Error("provider timeout did not fail safely");
     } catch (error: any) {
       if (!/timed out|timeout/i.test(error.message)) throw error;
@@ -194,9 +195,9 @@ try {
     return { recovered: true };
   });
   providerMode = "normal";
-  await record("provider-post-timeout-recovery", () => run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ messages: [{ role: "user", content: "recover" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" }));
+  await record("provider-post-timeout-recovery", () => run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ messages: [{ role: "user", content: "recover" }] }), "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" }));
 
-  let gateway = await record("gateway-start", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
+  let gateway = await record("gateway-start", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
   await record("gateway-status", async () => { const result = await gatewayRequest(gateway, "/status"); if (!result.response.ok) throw new Error("gateway status failed"); return { status: "healthy" }; });
   const gatewayRun = await record("gateway-provider-run", async () => {
     const result = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: "soak-gateway-run", tool: "model.chat", input: { messages: [{ role: "user", content: "gateway" }] } }) });
@@ -204,7 +205,7 @@ try {
     return { runId: result.body.id };
   });
   await stopGateway(gateway);
-  gateway = await record("gateway-restart", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
+  gateway = await record("gateway-restart", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
   await record("persisted-output-after-restart", async () => {
     const result = await gatewayRequest(gateway, `/runs/${encodeURIComponent(gatewayRun.runId)}`);
     if (!result.response.ok || !result.body.events?.some((event: any) => event.type === "task.completed")) throw new Error("gateway restart lost persisted output");
@@ -224,7 +225,7 @@ try {
   });
   await stopGateway(gateway);
   providerMode = "normal";
-  gateway = await record("queue-stop-restart-recovery", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
+  gateway = await record("queue-stop-restart-recovery", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
   await record("recovered-job-state", async () => {
     for (let attempt = 0; attempt < 50; attempt += 1) {
       const result = await gatewayRequest(gateway, `/jobs/${encodeURIComponent(queuedJob.jobId)}`);
@@ -234,11 +235,16 @@ try {
     throw new Error("interrupted job did not enter needs-review after restart");
   });
 
-  await writeFile(join(state, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, id: "soak-browser-transaction", status: "unknown" })}\n`);
+  await writeFile(join(state, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, id: "soak-browser-transaction", status: "unknown" })}\n`, { mode: 0o600 });
   await record("browser-interruption-recovery-block", async () => {
     const status = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.recovery.status", input: {} }) });
     if (status.body.output?.recovery?.status !== "unknown") throw new Error("browser recovery journal was not observed");
-    const blocked = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.press", input: { key: "Escape", confirmed: true } }) });
+    const requested = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.press", input: { key: "Escape", confirmed: true } }) });
+    const approvalId = requested.body.output?.approvalId;
+    if (requested.response.status !== 200 || requested.body.output?.type !== "approval.required" || typeof approvalId !== "string") {
+      throw new Error("browser mutation did not enter explicit approval while recovery was unresolved");
+    }
+    const blocked = await gatewayRequest(gateway, `/approvals/${encodeURIComponent(approvalId)}/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     if (blocked.response.status !== 400 || blocked.body.category !== "browser-recovery") throw new Error("browser mutation was not blocked by unresolved recovery");
     const resolved = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.recovery.resolve", input: { outcome: "not-applied" } }) });
     if (!resolved.response.ok || resolved.body.output?.recovery?.status !== "resolved") throw new Error("browser recovery could not be resolved");
@@ -247,12 +253,20 @@ try {
   await stopGateway(gateway);
 
   const configPath = join(state, "config.json");
-  const config = JSON.parse(await readFile(configPath, "utf8"));
-  config.experimental = { ...(config.experimental ?? {}), rewind: true };
-  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
   const rewindRun = JSON.parse(await run(process.execPath, [cliEntry, "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_SOAK_REWIND" }), "--state", state], workspace, { INIT_CWD: workspace }));
-  const checkpoint = JSON.parse(await run(process.execPath, [cliEntry, "experimental", "rewind", "checkpoint", "create", rewindRun.id, "--path", "soak-output.txt", "--state", state], workspace, { INIT_CWD: workspace }));
-  await record("rewind-dry-run", async () => { const preview = JSON.parse(await run(process.execPath, [cliEntry, "experimental", "rewind", "restore", checkpoint.snapshotId, "--state", state], workspace, { INIT_CWD: workspace })); if (preview.applied !== false) throw new Error("rewind dry-run applied a restore"); return { applied: false }; });
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.experimental = { ...(config.experimental ?? {}), capabilities: true };
+  config.policy = {
+    ...(config.policy ?? {}),
+    allowedCapabilities: [...new Set([...(config.policy?.allowedCapabilities ?? []), "restore.create", "restore.apply"])]
+  };
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  const checkpointTaskId = `soak-checkpoint-${rewindRun.id}`;
+  const checkpointToken = JSON.parse(await run(process.execPath, [cliEntry, "capability", "issue", "--run", checkpointTaskId, "--step", "checkpoint-create", "--tool", "snapshot.create", "--show-token", "--state", state], workspace, { INIT_CWD: workspace }));
+  const checkpoint = JSON.parse(await run(process.execPath, [cliEntry, "checkpoint", "create", rewindRun.id, "--path", "soak-output.txt", "--task-run", checkpointTaskId, "--capability-token", checkpointToken.token, "--state", state], workspace, { INIT_CWD: workspace }));
+  const rewindPreviewRunId = `soak-rewind-preview-${rewindRun.id}`;
+  const rewindPreviewToken = JSON.parse(await run(process.execPath, [cliEntry, "capability", "issue", "--run", rewindPreviewRunId, "--step", "rewind-preview", "--tool", "snapshot.restore", "--constraints", JSON.stringify({ snapshotId: checkpoint.snapshotId }), "--show-token", "--state", state], workspace, { INIT_CWD: workspace }));
+  await record("rewind-dry-run", async () => { const preview = JSON.parse(await run(process.execPath, [cliEntry, "rewind", checkpoint.snapshotId, "--run", rewindPreviewRunId, "--capability-token", rewindPreviewToken.token, "--state", state], workspace, { INIT_CWD: workspace })); if (preview.applied !== false) throw new Error("rewind dry-run applied a restore"); return { applied: false }; });
   await record("audit-integrity-and-persisted-output", async () => { const verification = JSON.parse(await run(process.execPath, [cliEntry, "audit", "verify", "--state", state], workspace, { INIT_CWD: workspace })); if (!verification.valid) throw new Error("audit verification failed"); await run(process.execPath, [cliEntry, "run", "show", rewindRun.id, "--state", state], workspace, { INIT_CWD: workspace }); return { auditVerification: true }; });
 
   await record("installer-upgrade-rollback", async () => {
