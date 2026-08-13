@@ -69,6 +69,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm check:architecture
       - run: pnpm test:platform
       - run: pnpm smoke:onboarding
       - run: pnpm typecheck

@@ -53,6 +53,7 @@ export type AllowedDependencyGraph = Readonly<Record<string, readonly string[]>>
 
 export const DEPENDENCY_RULES = {
   adapterToAdapter: "adapters cannot depend on another adapter",
+  ambiguousModuleSpecifier: "backslashes and CommonJS query or fragment suffixes are unsupported in production module specifiers",
   crossPackageExportTarget: "workspace package exports cannot target another workspace package",
   crossPackageSourcePath: "cross-package imports must use an exported workspace package specifier",
   dependencyAliasSpecifier: "file, link, and npm dependency aliases are unsupported in production workspace packages",
@@ -431,13 +432,16 @@ function manifestExportTargets(content: string, exportsValue: unknown): Manifest
   while (pending.length > 0) {
     const candidate = pending.pop();
     if (typeof candidate === "string") {
-      if (normalizedExportTarget(candidate) !== undefined) {
-        targets.push({ target: candidate, ...manifestStringLocation(content, candidate) });
-      }
+      targets.push({ target: candidate, ...manifestStringLocation(content, candidate) });
     } else if (Array.isArray(candidate)) {
       pending.push(...candidate);
     } else if (candidate && typeof candidate === "object") {
       pending.push(...Object.values(candidate as Record<string, unknown>));
+    } else if (candidate !== null && candidate !== undefined) {
+      targets.push({
+        target: "<invalid export target>",
+        ...manifestStringLocation(content, "exports"),
+      });
     }
   }
   return targets.sort((left, right) => left.line - right.line
@@ -525,6 +529,17 @@ interface NodeModulesLink {
   path: string;
 }
 
+async function physicalPackageName(directory: string): Promise<string | undefined> {
+  try {
+    const content: unknown = JSON.parse(await readFile(resolve(directory, "package.json"), "utf8"));
+    if (!content || typeof content !== "object" || Array.isArray(content)) return undefined;
+    const name = (content as Record<string, unknown>).name;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function unmanagedNodeModulesViolation(
   repositoryRoot: string,
   moduleName: string,
@@ -556,7 +571,7 @@ async function packageNodeModulesLinks(
 
   for (const entry of (await readdir(nodeModules, { withFileTypes: true }))
     .sort((left, right) => left.name.localeCompare(right.name))) {
-    if (entry.name.startsWith(".")) continue;
+    if (entry.name === ".bin" || entry.name === ".pnpm") continue;
     const entryPath = resolve(nodeModules, entry.name);
     if (entry.name.startsWith("@")) {
       if (entry.isSymbolicLink() || !entry.isDirectory()) {
@@ -596,13 +611,82 @@ async function nodeModulesLinkViolations(
     const targetPackage = physical
       ? packages.find((candidate) => candidate.physicalDirectory === physical)
       : undefined;
+    const targetName = physical ? await physicalPackageName(physical) : undefined;
     const declared = workspacePackage.dependencyNames.has(link.moduleName);
-    const canonicalWorkspaceLink = declared && targetPackage?.name === link.moduleName;
-    const packageManagerLink = declared && physical !== undefined && isPathInside(packageManagerStore, physical);
+    const canonicalWorkspaceLink = declared
+      && targetPackage?.name === link.moduleName
+      && targetName === link.moduleName;
+    const packageManagerLink = declared
+      && physical !== undefined
+      && isPathInside(packageManagerStore, physical)
+      && targetName === link.moduleName;
     if (canonicalWorkspaceLink || packageManagerLink) continue;
     violations.push(unmanagedNodeModulesViolation(repositoryRoot, link.moduleName, link.path));
   }
   return violations;
+}
+
+function barePackageName(specifier: string): string | undefined {
+  if (specifier.includes("\\")) return undefined;
+  const normalized = normalizedSpecifier(specifier);
+  if (!normalized || relativeModuleSpecifier(normalized) || normalized.startsWith("/")
+    || normalized.startsWith("#") || /^[A-Za-z]:\//u.test(normalized)
+    || normalized.startsWith("node:") || normalized.includes(":")) return undefined;
+  const segments = normalized.split("/");
+  if (normalized.startsWith("@")) {
+    return segments.length >= 2 ? `${segments[0]}/${segments[1]}` : undefined;
+  }
+  return segments[0];
+}
+
+async function firstResolverVisiblePackage(
+  repositoryRoot: string,
+  sourceFile: string,
+  moduleName: string,
+): Promise<string | undefined> {
+  const moduleSegments = moduleName.split("/");
+  let current = dirname(resolve(repositoryRoot, sourceFile));
+  while (isPathInside(repositoryRoot, current)) {
+    const candidate = resolve(current, "node_modules", ...moduleSegments);
+    if (await lstat(candidate).then(() => true).catch(() => false)) return candidate;
+    if (current === repositoryRoot) break;
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return undefined;
+}
+
+async function resolverVisibleNodeModulesViolations(
+  repositoryRoot: string,
+  references: readonly { workspacePackage: WorkspacePackage; references: readonly ImportReference[] }[],
+  packages: readonly WorkspacePackage[],
+): Promise<DependencyViolation[]> {
+  const packageManagerStore = resolve(repositoryRoot, nodeModuleStoreDirectory);
+  const violations = new Map<string, DependencyViolation>();
+  for (const { workspacePackage, references: fileReferences } of references) {
+    for (const reference of fileReferences) {
+      const moduleName = barePackageName(reference.specifier);
+      if (!moduleName) continue;
+      const visible = await firstResolverVisiblePackage(repositoryRoot, reference.sourceFile, moduleName);
+      if (!visible) continue;
+      const physical = await realpath(visible).catch(() => undefined);
+      const expectedWorkspace = packages.find((candidate) => candidate.name === moduleName);
+      const targetName = physical ? await physicalPackageName(physical) : undefined;
+      const validWorkspace = expectedWorkspace !== undefined
+        && physical === expectedWorkspace.physicalDirectory
+        && targetName === moduleName;
+      const validExternal = expectedWorkspace === undefined
+        && workspacePackage.dependencyNames.has(moduleName)
+        && physical !== undefined
+        && isPathInside(packageManagerStore, physical)
+        && targetName === moduleName;
+      if (validWorkspace || validExternal) continue;
+      const violation = unmanagedNodeModulesViolation(repositoryRoot, moduleName, visible);
+      violations.set(`${violation.sourceFile}\0${moduleName}`, violation);
+    }
+  }
+  return [...violations.values()];
 }
 
 function stringSpecifier(node: ts.Node | undefined): string | undefined {
@@ -628,6 +712,15 @@ function staticStringExpression(node: ts.Expression | undefined): string | undef
     return value;
   }
   return undefined;
+}
+
+function staticArrayIndex(node: ts.Expression | undefined): number | undefined {
+  if (!node) return undefined;
+  node = unwrapExpression(node);
+  const text = ts.isNumericLiteral(node) ? node.text : staticStringExpression(node);
+  if (text === undefined || !/^(?:0|[1-9]\d*)$/u.test(text)) return undefined;
+  const value = Number(text);
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function propertyName(node: ts.Expression): string | undefined {
@@ -713,13 +806,110 @@ function unwrapExpression(node: ts.Expression): ts.Expression {
     || ts.isNonNullExpression(node)
     || ts.isSatisfiesExpression(node)
     || ts.isAwaitExpression(node)) return unwrapExpression(node.expression);
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return unwrapExpression(node.right);
+  }
   return node;
 }
 
-function callTargetNamed(node: ts.CallExpression, object: string, method: string): boolean {
+interface LexicalBinding {
+  name: string;
+  start: number;
+  end: number;
+}
+
+type LexicalBindings = ReadonlyMap<string, readonly LexicalBinding[]>;
+
+function nearestRuntimeScope(node: ts.Node, functionScoped = false): ts.Node {
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (ts.isSourceFile(current) || ts.isFunctionLike(current)) return current;
+    if (!functionScoped && (ts.isBlock(current) || ts.isCaseBlock(current)
+      || ts.isForStatement(current) || ts.isForInStatement(current)
+      || ts.isForOfStatement(current) || ts.isCatchClause(current))) return current;
+  }
+  return node.getSourceFile();
+}
+
+function bindingIdentifiers(name: ts.BindingName): ts.Identifier[] {
+  if (ts.isIdentifier(name)) return [name];
+  return name.elements.flatMap((element) => ts.isOmittedExpression(element)
+    ? []
+    : bindingIdentifiers(element.name));
+}
+
+function runtimeLexicalBindings(source: ts.SourceFile): LexicalBindings {
+  const bindings = new Map<string, LexicalBinding[]>();
+  const record = (identifier: ts.Identifier, scope: ts.Node): void => {
+    const entries = bindings.get(identifier.text) ?? [];
+    entries.push({ name: identifier.text, start: scope.getFullStart(), end: scope.getEnd() });
+    bindings.set(identifier.text, entries);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.canHaveModifiers(node)
+      && ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword)) return;
+    if (ts.isVariableDeclaration(node)) {
+      const declarationList = node.parent;
+      const functionScoped = ts.isVariableDeclarationList(declarationList)
+        && (declarationList.flags & ts.NodeFlags.BlockScoped) === 0;
+      const scope = nearestRuntimeScope(node, functionScoped);
+      for (const identifier of bindingIdentifiers(node.name)) record(identifier, scope);
+    } else if (ts.isParameter(node)) {
+      const scope = nearestRuntimeScope(node);
+      for (const identifier of bindingIdentifiers(node.name)) record(identifier, scope);
+    } else if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isEnumDeclaration(node))
+      && node.name) {
+      record(node.name, nearestRuntimeScope(node));
+    } else if ((ts.isFunctionExpression(node) || ts.isClassExpression(node)) && node.name) {
+      record(node.name, node);
+    } else if (ts.isImportClause(node) && node.name && !node.isTypeOnly) {
+      record(node.name, source);
+    } else if (ts.isNamespaceImport(node)
+      && !ts.findAncestor(node, ts.isImportClause)?.isTypeOnly) {
+      record(node.name, source);
+    } else if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly) {
+      record(node.name, source);
+    } else if (ts.isImportSpecifier(node)
+      && !node.isTypeOnly
+      && !ts.findAncestor(node, ts.isImportClause)?.isTypeOnly) {
+      record(node.name, source);
+    } else if (ts.isCatchClause(node) && node.variableDeclaration) {
+      for (const identifier of bindingIdentifiers(node.variableDeclaration.name)) record(identifier, node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return bindings;
+}
+
+function unshadowedAmbientIdentifier(
+  node: ts.Expression,
+  name: string,
+  bindings: LexicalBindings,
+): node is ts.Identifier {
+  if (!ts.isIdentifier(node) || node.text !== name) return false;
+  const position = node.getStart(node.getSourceFile());
+  return !(bindings.get(name) ?? []).some((binding) =>
+    binding.start <= position && position < binding.end);
+}
+
+function scopedIdentifierKey(identifier: ts.Identifier, bindings: LexicalBindings): string {
+  const position = identifier.getStart(identifier.getSourceFile());
+  const binding = [...(bindings.get(identifier.text) ?? [])]
+    .filter((candidate) => candidate.start <= position && position < candidate.end)
+    .sort((left, right) => (left.end - left.start) - (right.end - right.start))[0];
+  return binding
+    ? `${identifier.text}\0${binding.start}\0${binding.end}`
+    : `${identifier.text}\0<ambient>`;
+}
+
+function callTargetNamed(
+  node: ts.CallExpression,
+  object: string,
+  method: string,
+  bindings: LexicalBindings,
+): boolean {
   return (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
-    && ts.isIdentifier(node.expression.expression)
-    && node.expression.expression.text === object
+    && unshadowedAmbientIdentifier(unwrapExpression(node.expression.expression), object, bindings)
     && propertyName(node.expression) === method;
 }
 
@@ -733,10 +923,14 @@ function moduleLoaderAuthorityName(name: string | undefined): boolean {
     || name === "require";
 }
 
-function bindingExposesModuleLoader(node: ts.BindingElement, roots: ReadonlySet<string>): boolean {
+interface ModuleLoaderRoots {
+  aliases: Set<string>;
+  bindings: LexicalBindings;
+}
+
+function bindingExposesModuleLoader(node: ts.BindingElement, roots: ModuleLoaderRoots): boolean {
   const name = bindingPropertyName(node.propertyName)
     ?? (ts.isIdentifier(node.name) ? node.name.text : undefined);
-  if (name === "createRequire" || name === "register" || name === "registerHooks" || name === "require") return true;
   const pattern = node.parent;
   const declaration = ts.isObjectBindingPattern(pattern) ? pattern.parent : undefined;
   return name !== undefined
@@ -746,25 +940,52 @@ function bindingExposesModuleLoader(node: ts.BindingElement, roots: ReadonlySet<
     && moduleLoaderAuthorityName(name);
 }
 
-function isModuleLoaderObject(node: ts.Expression, roots: ReadonlySet<string>): boolean {
+function isModuleLoaderObject(node: ts.Expression, roots: ModuleLoaderRoots): boolean {
   node = unwrapExpression(node);
-  if (ts.isIdentifier(node)) return roots.has(node.text);
+  if (ts.isIdentifier(node)) {
+    return roots.aliases.has(scopedIdentifierKey(node, roots.bindings))
+      || unshadowedAmbientIdentifier(node, "module", roots.bindings);
+  }
   if (ts.isNewExpression(node)) return isModuleLoaderObject(node.expression, roots);
+  if (ts.isElementAccessExpression(node)
+    && ts.isArrayLiteralExpression(unwrapExpression(node.expression))) {
+    const array = unwrapExpression(node.expression) as ts.ArrayLiteralExpression;
+    const index = staticArrayIndex(node.argumentExpression);
+    return index !== undefined
+      && index < array.elements.length
+      && !ts.isSpreadElement(array.elements[index]!)
+      && isModuleLoaderObject(array.elements[index]! as ts.Expression, roots);
+  }
+  if (ts.isConditionalExpression(node)) {
+    return isModuleLoaderObject(node.whenTrue, roots) || isModuleLoaderObject(node.whenFalse, roots);
+  }
+  if (ts.isBinaryExpression(node)
+    && (node.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      || node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+      || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) {
+    return isModuleLoaderObject(node.left, roots) || isModuleLoaderObject(node.right, roots);
+  }
   if (ts.isClassExpression(node)) {
     return node.heritageClauses?.some((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword
       && clause.types.some((type) => isModuleLoaderObject(type.expression, roots))) ?? false;
   }
   if (ts.isCallExpression(node)) {
     if (node.expression.kind === ts.SyntaxKind.ImportKeyword) return nodeModuleSpecifier(node.arguments[0]);
-    if (((ts.isIdentifier(node.expression) && node.expression.text === "require")
-      || propertyName(node.expression) === "require") && nodeModuleSpecifier(node.arguments[0])) return true;
-    if (propertyName(node.expression) === "getBuiltinModule") {
+    if ((unshadowedAmbientIdentifier(unwrapExpression(node.expression), "require", roots.bindings)
+      || ((ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+        && propertyName(node.expression) === "require"
+        && isModuleLoaderObject(node.expression.expression, roots)))
+      && nodeModuleSpecifier(node.arguments[0])) return true;
+    if ((ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+      && propertyName(node.expression) === "getBuiltinModule"
+      && unshadowedAmbientIdentifier(unwrapExpression(node.expression.expression), "process", roots.bindings)) {
       return nodeModuleSpecifier(node.arguments[0]);
     }
-    if ((callTargetNamed(node, "Object", "create") || callTargetNamed(node, "Reflect", "construct"))
+    if ((callTargetNamed(node, "Object", "create", roots.bindings)
+      || callTargetNamed(node, "Reflect", "construct", roots.bindings))
       && node.arguments[0]
       && isModuleLoaderObject(node.arguments[0], roots)) return true;
-    if (callTargetNamed(node, "Reflect", "get")
+    if (callTargetNamed(node, "Reflect", "get", roots.bindings)
       && node.arguments[0]
       && isModuleLoaderObject(node.arguments[0], roots)) {
       const name = staticStringExpression(node.arguments[1]);
@@ -773,14 +994,15 @@ function isModuleLoaderObject(node: ts.Expression, roots: ReadonlySet<string>): 
   }
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = propertyName(node);
-    if (name === "mainModule" && ts.isIdentifier(node.expression) && node.expression.text === "process") return true;
+    if (name === "mainModule"
+      && unshadowedAmbientIdentifier(unwrapExpression(node.expression), "process", roots.bindings)) return true;
     return (name === "Module" || name === "constructor" || name === "default" || name === "prototype")
       && isModuleLoaderObject(node.expression, roots);
   }
   return false;
 }
 
-function moduleLoaderCapability(node: ts.Expression, roots: ReadonlySet<string>): boolean {
+function moduleLoaderCapability(node: ts.Expression, roots: ModuleLoaderRoots): boolean {
   node = unwrapExpression(node);
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = propertyName(node);
@@ -788,7 +1010,7 @@ function moduleLoaderCapability(node: ts.Expression, roots: ReadonlySet<string>)
       && moduleLoaderCapability(node.expression, roots)) return true;
     return moduleLoaderAuthorityName(name) && isModuleLoaderObject(node.expression, roots);
   }
-  if (ts.isCallExpression(node) && callTargetNamed(node, "Reflect", "get")
+  if (ts.isCallExpression(node) && callTargetNamed(node, "Reflect", "get", roots.bindings)
     && node.arguments[0]
     && isModuleLoaderObject(node.arguments[0], roots)) {
     return moduleLoaderAuthorityName(staticStringExpression(node.arguments[1]));
@@ -796,22 +1018,29 @@ function moduleLoaderCapability(node: ts.Expression, roots: ReadonlySet<string>)
   return false;
 }
 
-function moduleLoaderRoots(source: ts.SourceFile): ReadonlySet<string> {
-  const roots = new Set(["module", "Module"]);
+function moduleLoaderRoots(source: ts.SourceFile, bindings: LexicalBindings): ModuleLoaderRoots {
+  const aliases = new Set<string>();
+  const roots: ModuleLoaderRoots = { aliases, bindings };
   for (const statement of source.statements) {
     if (ts.isImportDeclaration(statement) && nodeModuleSpecifier(statement.moduleSpecifier)) {
-      if (statement.importClause?.name) roots.add(statement.importClause.name.text);
-      const bindings = statement.importClause?.namedBindings;
-      if (bindings && ts.isNamespaceImport(bindings)) roots.add(bindings.name.text);
-      if (bindings && ts.isNamedImports(bindings)) {
-        for (const element of bindings.elements) {
-          if ((element.propertyName ?? element.name).text === "Module") roots.add(element.name.text);
+      if (statement.importClause?.name) {
+        aliases.add(scopedIdentifierKey(statement.importClause.name, bindings));
+      }
+      const namedBindings = statement.importClause?.namedBindings;
+      if (namedBindings && ts.isNamespaceImport(namedBindings)) {
+        aliases.add(scopedIdentifierKey(namedBindings.name, bindings));
+      }
+      if (namedBindings && ts.isNamedImports(namedBindings)) {
+        for (const element of namedBindings.elements) {
+          if ((element.propertyName ?? element.name).text === "Module") {
+            aliases.add(scopedIdentifierKey(element.name, bindings));
+          }
         }
       }
     } else if (ts.isImportEqualsDeclaration(statement)
       && ts.isExternalModuleReference(statement.moduleReference)
       && nodeModuleSpecifier(statement.moduleReference.expression)) {
-      roots.add(statement.name.text);
+      aliases.add(scopedIdentifierKey(statement.name, bindings));
     }
   }
 
@@ -819,35 +1048,42 @@ function moduleLoaderRoots(source: ts.SourceFile): ReadonlySet<string> {
   while (changed) {
     changed = false;
     const collectAliases = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer
-        && isModuleLoaderObject(node.initializer, roots) && !roots.has(node.name.text)) {
-        roots.add(node.name.text);
-        changed = true;
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        const key = scopedIdentifierKey(node.name, bindings);
+        if (isModuleLoaderObject(node.initializer, roots) && !aliases.has(key)) {
+          aliases.add(key);
+          changed = true;
+        }
       } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
         && isModuleLoaderObject(node.initializer, roots)) {
         for (const element of node.name.elements) {
           const property = bindingPropertyName(element.propertyName)
             ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
-          if ((property === "Module" || property === "default")
-            && ts.isIdentifier(element.name)
-            && !roots.has(element.name.text)) {
-            roots.add(element.name.text);
-            changed = true;
+          if ((property === "Module" || property === "default") && ts.isIdentifier(element.name)) {
+            const key = scopedIdentifierKey(element.name, bindings);
+            if (!aliases.has(key)) {
+              aliases.add(key);
+              changed = true;
+            }
           }
         }
       } else if ((ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name
         && node.heritageClauses?.some((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword
-          && clause.types.some((type) => isModuleLoaderObject(type.expression, roots)))
-        && !roots.has(node.name.text)) {
-        roots.add(node.name.text);
-        changed = true;
+          && clause.types.some((type) => isModuleLoaderObject(type.expression, roots)))) {
+        const key = scopedIdentifierKey(node.name, bindings);
+        if (!aliases.has(key)) {
+          aliases.add(key);
+          changed = true;
+        }
       } else if (ts.isBinaryExpression(node)
         && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
         && ts.isIdentifier(node.left)
-        && isModuleLoaderObject(node.right, roots)
-        && !roots.has(node.left.text)) {
-        roots.add(node.left.text);
-        changed = true;
+        && isModuleLoaderObject(node.right, roots)) {
+        const key = scopedIdentifierKey(node.left, bindings);
+        if (!aliases.has(key)) {
+          aliases.add(key);
+          changed = true;
+        }
       }
       ts.forEachChild(node, collectAliases);
     };
@@ -857,42 +1093,125 @@ function moduleLoaderRoots(source: ts.SourceFile): ReadonlySet<string> {
 }
 
 interface DynamicCodeRoots {
-  evaluators: ReadonlySet<string>;
-  globals: ReadonlySet<string>;
-  proxies: ReadonlySet<string>;
+  evaluators: Set<string>;
+  globals: Set<string>;
+  proxies: Set<string>;
+  processes: Set<string>;
+  reflectGets: Set<string>;
+  descriptorGets: Set<string>;
+  descriptorMaps: Set<string>;
+  ordinaryConstructors: Set<string>;
+  bindings: LexicalBindings;
 }
 
 const dynamicEvaluatorNames = new Set(["eval", "Function"]);
-const reflectiveAuthorityMethods = new Map([
-  ["Object", new Set(["create", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors", "setPrototypeOf"])],
-  ["Reflect", new Set(["apply", "construct", "get", "getPrototypeOf", "setPrototypeOf"])],
-]);
+
+function ambientOrAliasTarget(
+  node: ts.Expression,
+  aliases: ReadonlySet<string>,
+  ambientNames: ReadonlySet<string>,
+  bindings: LexicalBindings,
+): boolean {
+  node = unwrapExpression(node);
+  if (!ts.isIdentifier(node)) return false;
+  return aliases.has(scopedIdentifierKey(node, bindings))
+    || (ambientNames.has(node.text) && unshadowedAmbientIdentifier(node, node.text, bindings));
+}
+
+function methodAliasTarget(
+  node: ts.Expression,
+  object: string,
+  method: string,
+  aliases: ReadonlySet<string>,
+  roots: DynamicCodeRoots,
+): boolean {
+  node = unwrapExpression(node);
+  if (ts.isIdentifier(node)) return aliases.has(scopedIdentifierKey(node, roots.bindings));
+  if (ts.isCallExpression(node)
+    && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+    && propertyName(node.expression) === "bind") {
+    return methodAliasTarget(node.expression.expression, object, method, aliases, roots);
+  }
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  if (propertyName(node) === "bind") {
+    return methodAliasTarget(node.expression, object, method, aliases, roots);
+  }
+  return unshadowedAmbientIdentifier(unwrapExpression(node.expression), object, roots.bindings)
+    && propertyName(node) === method;
+}
+
+function methodCallArguments(
+  node: ts.CallExpression,
+  object: string,
+  method: string,
+  aliases: ReadonlySet<string>,
+  roots: DynamicCodeRoots,
+): readonly ts.Expression[] | undefined {
+  const target = unwrapExpression(node.expression);
+  if ((ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target))
+    && (propertyName(target) === "call" || propertyName(target) === "apply")
+    && methodAliasTarget(target.expression, object, method, aliases, roots)) {
+    if (propertyName(target) === "call") return node.arguments.slice(1);
+    const values = unwrapExpression(node.arguments[1] ?? ts.factory.createArrayLiteralExpression());
+    return ts.isArrayLiteralExpression(values) && values.elements.every((element) => !ts.isSpreadElement(element))
+      ? values.elements as readonly ts.Expression[]
+      : [];
+  }
+  return methodAliasTarget(target, object, method, aliases, roots) ? node.arguments : undefined;
+}
 
 function proxyTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
   node = unwrapExpression(node);
-  if (ts.isIdentifier(node)) return roots.proxies.has(node.text);
+  if (ambientOrAliasTarget(node, roots.proxies, new Set(["Proxy"]), roots.bindings)) return true;
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = propertyName(node);
     if (name === "value") return proxyTarget(node.expression, roots);
     return name === "Proxy" && globalObjectTarget(node.expression, roots);
   }
-  if (ts.isCallExpression(node) && callTargetNamed(node, "Object", "getOwnPropertyDescriptor")
-    && node.arguments[0]
-    && globalObjectTarget(node.arguments[0], roots)) {
-    return staticStringExpression(node.arguments[1]) === "Proxy";
+  if (ts.isCallExpression(node)) {
+    const args = methodCallArguments(node, "Object", "getOwnPropertyDescriptor", roots.descriptorGets, roots);
+    if (args?.[0] && globalObjectTarget(args[0], roots)) {
+      return staticStringExpression(args[1]) === "Proxy";
+    }
   }
   return false;
 }
 
 function globalObjectTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
   node = unwrapExpression(node);
-  if (ts.isIdentifier(node)) return roots.globals.has(node.text);
+  if (ambientOrAliasTarget(
+    node,
+    roots.globals,
+    new Set(["global", "globalThis", "self", "window"]),
+    roots.bindings,
+  )) return true;
+  if (ts.isElementAccessExpression(node)
+    && ts.isArrayLiteralExpression(unwrapExpression(node.expression))) {
+    const array = unwrapExpression(node.expression) as ts.ArrayLiteralExpression;
+    const index = staticArrayIndex(node.argumentExpression);
+    return index !== undefined
+      && index < array.elements.length
+      && !ts.isSpreadElement(array.elements[index]!)
+      && globalObjectTarget(array.elements[index]! as ts.Expression, roots);
+  }
+  if (ts.isConditionalExpression(node)) {
+    return globalObjectTarget(node.whenTrue, roots) || globalObjectTarget(node.whenFalse, roots);
+  }
+  if (ts.isBinaryExpression(node)
+    && (node.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      || node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+      || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) {
+    return globalObjectTarget(node.left, roots) || globalObjectTarget(node.right, roots);
+  }
   if ((ts.isCallExpression(node) || ts.isNewExpression(node))
     && proxyTarget(node.expression, roots)
     && Boolean(node.arguments?.[0] && globalObjectTarget(node.arguments[0], roots))) return true;
   if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  const name = propertyName(node);
+  if ((name === "global" || name === "globalThis" || name === "self" || name === "window")
+    && globalObjectTarget(node.expression, roots)) return true;
   const revocableCall = unwrapExpression(node.expression);
-  return propertyName(node) === "proxy"
+  return name === "proxy"
     && ts.isCallExpression(revocableCall)
     && propertyName(revocableCall.expression) === "revocable"
     && (ts.isPropertyAccessExpression(revocableCall.expression)
@@ -902,35 +1221,131 @@ function globalObjectTarget(node: ts.Expression, roots: DynamicCodeRoots): boole
       && globalObjectTarget(revocableCall.arguments[0], roots));
 }
 
+function processObjectTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
+  node = unwrapExpression(node);
+  if (ambientOrAliasTarget(node, roots.processes, new Set(["process"]), roots.bindings)) return true;
+  if (ts.isElementAccessExpression(node)
+    && ts.isArrayLiteralExpression(unwrapExpression(node.expression))) {
+    const array = unwrapExpression(node.expression) as ts.ArrayLiteralExpression;
+    const index = staticArrayIndex(node.argumentExpression);
+    return index !== undefined
+      && index < array.elements.length
+      && !ts.isSpreadElement(array.elements[index]!)
+      && processObjectTarget(array.elements[index]! as ts.Expression, roots);
+  }
+  if (ts.isConditionalExpression(node)) {
+    return processObjectTarget(node.whenTrue, roots) || processObjectTarget(node.whenFalse, roots);
+  }
+  if (ts.isBinaryExpression(node)
+    && (node.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      || node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+      || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) {
+    return processObjectTarget(node.left, roots) || processObjectTarget(node.right, roots);
+  }
+  return (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
+    && propertyName(node) === "process"
+    && globalObjectTarget(node.expression, roots);
+}
+
+function objectAssignmentBinding(
+  node: ts.BinaryExpression,
+  target: (expression: ts.Expression) => boolean,
+  acceptedProperties: ReadonlySet<string>,
+): boolean {
+  if (node.operatorToken.kind !== ts.SyntaxKind.EqualsToken
+    || !ts.isObjectLiteralExpression(unwrapExpression(node.left))
+    || !target(node.right)) return false;
+  const pattern = unwrapExpression(node.left) as ts.ObjectLiteralExpression;
+  return pattern.properties.some((property) => {
+    if (ts.isShorthandPropertyAssignment(property)) return acceptedProperties.has(property.name.text);
+    return ts.isPropertyAssignment(property)
+      && (bindingPropertyName(property.name) === undefined
+        || acceptedProperties.has(bindingPropertyName(property.name)!));
+  });
+}
+
+function ordinaryConstructorMethod(node: ts.Expression, roots: DynamicCodeRoots): boolean {
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  const target = unwrapExpression(node.expression);
+  return propertyName(node) === "constructor"
+    && ts.isIdentifier(target)
+    && roots.ordinaryConstructors.has(scopedIdentifierKey(target, roots.bindings));
+}
+
+function callableTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
+  node = unwrapExpression(node);
+  return ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isClassExpression(node);
+}
+
 function dynamicCodeTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
-  if (ts.isParenthesizedExpression(node)
-    || ts.isAsExpression(node)
-    || ts.isNonNullExpression(node)
-    || ts.isSatisfiesExpression(node)) return dynamicCodeTarget(node.expression, roots);
-  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-    return dynamicCodeTarget(node.right, roots);
+  node = unwrapExpression(node);
+  if (ambientOrAliasTarget(node, roots.evaluators, dynamicEvaluatorNames, roots.bindings)) return true;
+  if (ts.isElementAccessExpression(node)
+    && ts.isArrayLiteralExpression(unwrapExpression(node.expression))) {
+    const array = unwrapExpression(node.expression) as ts.ArrayLiteralExpression;
+    const index = staticArrayIndex(node.argumentExpression);
+    return index !== undefined
+      && index < array.elements.length
+      && !ts.isSpreadElement(array.elements[index]!)
+      && dynamicCodeTarget(array.elements[index]! as ts.Expression, roots);
   }
-  if (ts.isIdentifier(node)) return roots.evaluators.has(node.text);
-  if (ts.isCallExpression(node) && callTargetNamed(node, "Object", "getOwnPropertyDescriptor")
-    && node.arguments[0]
-    && globalObjectTarget(node.arguments[0], roots)) {
-    const name = staticStringExpression(node.arguments[1]);
-    return name === undefined || dynamicEvaluatorNames.has(name);
+  if (ts.isConditionalExpression(node)) {
+    return dynamicCodeTarget(node.whenTrue, roots) || dynamicCodeTarget(node.whenFalse, roots);
   }
-  if (ts.isCallExpression(node) && callTargetNamed(node, "Object", "getOwnPropertyDescriptors")
-    && node.arguments[0]
-    && globalObjectTarget(node.arguments[0], roots)) return true;
-  if (ts.isCallExpression(node) && callTargetNamed(node, "Reflect", "get")
-    && node.arguments[0]
-    && globalObjectTarget(node.arguments[0], roots)) {
-    const name = staticStringExpression(node.arguments[1]);
-    return name === undefined || dynamicEvaluatorNames.has(name);
+  if (ts.isBinaryExpression(node)
+    && (node.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      || node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+      || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) {
+    return dynamicCodeTarget(node.left, roots) || dynamicCodeTarget(node.right, roots);
+  }
+  if (ts.isCallExpression(node)) {
+    const descriptorArgs = methodCallArguments(
+      node,
+      "Object",
+      "getOwnPropertyDescriptor",
+      roots.descriptorGets,
+      roots,
+    );
+    if (descriptorArgs) {
+      if (!descriptorArgs[0]) return true;
+      const name = staticStringExpression(descriptorArgs[1]);
+      if (name === "constructor") return true;
+      return globalObjectTarget(descriptorArgs[0], roots)
+        && (name === undefined || dynamicEvaluatorNames.has(name));
+    }
+    const descriptorMapArgs = methodCallArguments(
+      node,
+      "Object",
+      "getOwnPropertyDescriptors",
+      roots.descriptorMaps,
+      roots,
+    );
+    if (descriptorMapArgs) {
+      return !descriptorMapArgs[0] || globalObjectTarget(descriptorMapArgs[0], roots);
+    }
+    const reflectArgs = methodCallArguments(node, "Reflect", "get", roots.reflectGets, roots);
+    if (reflectArgs) {
+      if (!reflectArgs[0]) return true;
+      const name = staticStringExpression(reflectArgs[1]);
+      if (name === undefined || name === "constructor") return true;
+      return globalObjectTarget(reflectArgs[0], roots) && dynamicEvaluatorNames.has(name);
+    }
   }
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = propertyName(node);
     if ((name === undefined || (name !== undefined && dynamicEvaluatorNames.has(name)))
       && globalObjectTarget(node.expression, roots)) return true;
-    if (name === "constructor") return true;
+    if (name === "constructor" && !ordinaryConstructorMethod(node, roots)) return true;
+    if (name === undefined && callableTarget(node.expression, roots)) return true;
+    if (name === undefined && isDirectCallTarget(node)) return true;
+    if (name === undefined && ts.isCallExpression(unwrapExpression(node.expression))
+      && methodCallArguments(
+        unwrapExpression(node.expression) as ts.CallExpression,
+        "Object",
+        "getOwnPropertyDescriptors",
+        roots.descriptorMaps,
+        roots,
+      )) return true;
     if (name === "call" || name === "apply" || name === "bind" || name === "prototype"
       || name === "value" || (name !== undefined && dynamicEvaluatorNames.has(name))) {
       return dynamicCodeTarget(node.expression, roots);
@@ -939,24 +1354,75 @@ function dynamicCodeTarget(node: ts.Expression, roots: DynamicCodeRoots): boolea
   return false;
 }
 
-function dynamicCodeRoots(source: ts.SourceFile): DynamicCodeRoots {
-  const evaluators = new Set(dynamicEvaluatorNames);
-  const globals = new Set(["global", "globalThis", "self", "window"]);
-  const proxies = new Set(["Proxy"]);
-  const roots: DynamicCodeRoots = { evaluators, globals, proxies };
+function dynamicCodeRoots(source: ts.SourceFile, bindings: LexicalBindings): DynamicCodeRoots {
+  const roots: DynamicCodeRoots = {
+    evaluators: new Set(),
+    globals: new Set(),
+    proxies: new Set(),
+    processes: new Set(),
+    reflectGets: new Set(),
+    descriptorGets: new Set(),
+    descriptorMaps: new Set(),
+    ordinaryConstructors: new Set(),
+    bindings,
+  };
+  const { descriptorGets, descriptorMaps, evaluators, globals, ordinaryConstructors, processes,
+    proxies, reflectGets } = roots;
+  const collectOrdinaryConstructors = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const initializer = unwrapExpression(node.initializer);
+      if (ts.isObjectLiteralExpression(initializer)
+        && initializer.properties.some((property) => bindingPropertyName(property.name) === "constructor")) {
+        ordinaryConstructors.add(scopedIdentifierKey(node.name, bindings));
+      }
+    }
+    ts.forEachChild(node, collectOrdinaryConstructors);
+  };
+  collectOrdinaryConstructors(source);
   let changed = true;
   while (changed) {
     changed = false;
     const collectAliases = (node: ts.Node): void => {
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-        if (globalObjectTarget(node.initializer, roots) && !globals.has(node.name.text)) {
-          globals.add(node.name.text);
+        const key = scopedIdentifierKey(node.name, bindings);
+        if (globalObjectTarget(node.initializer, roots) && !globals.has(key)) {
+          globals.add(key);
           changed = true;
-        } else if (dynamicCodeTarget(node.initializer, roots) && !evaluators.has(node.name.text)) {
-          evaluators.add(node.name.text);
+        } else if (dynamicCodeTarget(node.initializer, roots) && !evaluators.has(key)) {
+          evaluators.add(key);
           changed = true;
-        } else if (proxyTarget(node.initializer, roots) && !proxies.has(node.name.text)) {
-          proxies.add(node.name.text);
+        } else if (proxyTarget(node.initializer, roots) && !proxies.has(key)) {
+          proxies.add(key);
+          changed = true;
+        } else if (processObjectTarget(node.initializer, roots) && !processes.has(key)) {
+          processes.add(key);
+          changed = true;
+        } else if (methodAliasTarget(
+          node.initializer,
+          "Reflect",
+          "get",
+          reflectGets,
+          roots,
+        ) && !reflectGets.has(key)) {
+          reflectGets.add(key);
+          changed = true;
+        } else if (methodAliasTarget(
+          node.initializer,
+          "Object",
+          "getOwnPropertyDescriptor",
+          descriptorGets,
+          roots,
+        ) && !descriptorGets.has(key)) {
+          descriptorGets.add(key);
+          changed = true;
+        } else if (methodAliasTarget(
+          node.initializer,
+          "Object",
+          "getOwnPropertyDescriptors",
+          descriptorMaps,
+          roots,
+        ) && !descriptorMaps.has(key)) {
+          descriptorMaps.add(key);
           changed = true;
         }
       } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
@@ -965,14 +1431,42 @@ function dynamicCodeRoots(source: ts.SourceFile): DynamicCodeRoots {
           const property = bindingPropertyName(element.propertyName)
             ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
           if (ts.isIdentifier(element.name)) {
+            const key = scopedIdentifierKey(element.name, bindings);
             if (property !== undefined && dynamicEvaluatorNames.has(property)
-              && !evaluators.has(element.name.text)) {
-              evaluators.add(element.name.text);
+              && !evaluators.has(key)) {
+              evaluators.add(key);
               changed = true;
-            } else if (property === "Proxy" && !proxies.has(element.name.text)) {
-              proxies.add(element.name.text);
+            } else if (property === "Proxy" && !proxies.has(key)) {
+              proxies.add(key);
               changed = true;
             }
+          }
+        }
+      } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
+        && unshadowedAmbientIdentifier(unwrapExpression(node.initializer), "Reflect", bindings)) {
+        for (const element of node.name.elements) {
+          const property = bindingPropertyName(element.propertyName)
+            ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
+          if (property === "get" && ts.isIdentifier(element.name)) {
+            const key = scopedIdentifierKey(element.name, bindings);
+            if (!reflectGets.has(key)) {
+              reflectGets.add(key);
+              changed = true;
+            }
+          }
+        }
+      } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
+        && unshadowedAmbientIdentifier(unwrapExpression(node.initializer), "Object", bindings)) {
+        for (const element of node.name.elements) {
+          const property = bindingPropertyName(element.propertyName)
+            ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
+          const key = ts.isIdentifier(element.name) ? scopedIdentifierKey(element.name, bindings) : undefined;
+          if (property === "getOwnPropertyDescriptor" && key && !descriptorGets.has(key)) {
+            descriptorGets.add(key);
+            changed = true;
+          } else if (property === "getOwnPropertyDescriptors" && key && !descriptorMaps.has(key)) {
+            descriptorMaps.add(key);
+            changed = true;
           }
         }
       } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
@@ -986,23 +1480,30 @@ function dynamicCodeRoots(source: ts.SourceFile): DynamicCodeRoots {
           for (const element of node.name.elements) {
             const property = bindingPropertyName(element.propertyName)
               ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
-            if (property === "proxy" && ts.isIdentifier(element.name) && !globals.has(element.name.text)) {
-              globals.add(element.name.text);
-              changed = true;
+            if (property === "proxy" && ts.isIdentifier(element.name)) {
+              const key = scopedIdentifierKey(element.name, bindings);
+              if (!globals.has(key)) {
+                globals.add(key);
+                changed = true;
+              }
             }
           }
         }
       } else if (ts.isBinaryExpression(node)
         && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
         && ts.isIdentifier(node.left)) {
-        if (globalObjectTarget(node.right, roots) && !globals.has(node.left.text)) {
-          globals.add(node.left.text);
+        const key = scopedIdentifierKey(node.left, bindings);
+        if (globalObjectTarget(node.right, roots) && !globals.has(key)) {
+          globals.add(key);
           changed = true;
-        } else if (dynamicCodeTarget(node.right, roots) && !evaluators.has(node.left.text)) {
-          evaluators.add(node.left.text);
+        } else if (dynamicCodeTarget(node.right, roots) && !evaluators.has(key)) {
+          evaluators.add(key);
           changed = true;
-        } else if (proxyTarget(node.right, roots) && !proxies.has(node.left.text)) {
-          proxies.add(node.left.text);
+        } else if (proxyTarget(node.right, roots) && !proxies.has(key)) {
+          proxies.add(key);
+          changed = true;
+        } else if (processObjectTarget(node.right, roots) && !processes.has(key)) {
+          processes.add(key);
           changed = true;
         }
       }
@@ -1019,39 +1520,52 @@ function isDynamicCodeCall(node: ts.CallExpression | ts.NewExpression, roots: Dy
     && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
     ? proxyTarget(node.expression.expression, roots)
     : proxyTarget(node.expression, roots);
-  if (proxyCall && node.arguments[0] && globalObjectTarget(node.arguments[0], roots)) return true;
+  const firstArgument = node.arguments?.[0];
+  if (proxyCall && firstArgument && globalObjectTarget(firstArgument, roots)) return true;
   if (ts.isCallExpression(node)
-    && ts.isPropertyAccessExpression(node.expression)
-    && ts.isIdentifier(node.expression.expression)
-    && node.expression.expression.text === "Reflect"
-    && (node.expression.name.text === "apply" || node.expression.name.text === "construct")) {
+    && (callTargetNamed(node, "Reflect", "apply", roots.bindings)
+      || callTargetNamed(node, "Reflect", "construct", roots.bindings))) {
     return Boolean(node.arguments[0] && dynamicCodeTarget(node.arguments[0], roots));
   }
-  return propertyName(node.expression) === "constructor";
+  return propertyName(node.expression) === "constructor"
+    && !ordinaryConstructorMethod(node.expression, roots);
 }
 
-function reflectiveAuthorityExtraction(node: ts.Expression): boolean {
+function processAuthorityCapability(node: ts.Expression, roots: DynamicCodeRoots): boolean {
+  node = unwrapExpression(node);
   if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
-  const target = unwrapExpression(node.expression);
   const name = propertyName(node);
-  return ts.isIdentifier(target)
-    && name !== undefined
-    && Boolean(reflectiveAuthorityMethods.get(target.text)?.has(name))
-    && !isDirectCallTarget(node);
+  return processObjectTarget(node.expression, roots)
+    && (name === undefined || name === "getBuiltinModule" || name === "dlopen");
 }
 
-function runtimeBuiltinLoaderExtraction(node: ts.CallExpression): boolean {
-  if ((callTargetNamed(node, "Reflect", "get")
-    || callTargetNamed(node, "Object", "getOwnPropertyDescriptor"))
-    && staticStringExpression(node.arguments[1]) === "getBuiltinModule") return true;
-  return callTargetNamed(node, "Object", "getOwnPropertyDescriptors")
-    && Boolean(node.parent
+function runtimeBuiltinLoaderExtraction(node: ts.CallExpression, roots: DynamicCodeRoots): boolean {
+  const reflected = methodCallArguments(node, "Reflect", "get", roots.reflectGets, roots)
+    ?? methodCallArguments(node, "Object", "getOwnPropertyDescriptor", roots.descriptorGets, roots);
+  if (reflected) {
+    if (!reflected[0]) return true;
+    if (!processObjectTarget(reflected[0], roots)) return false;
+    const name = staticStringExpression(reflected[1]);
+    return name === undefined || name === "getBuiltinModule" || name === "dlopen";
+  }
+  const descriptorMap = methodCallArguments(
+    node,
+    "Object",
+    "getOwnPropertyDescriptors",
+    roots.descriptorMaps,
+    roots,
+  );
+  return descriptorMap !== undefined
+    && Boolean((!descriptorMap[0] || processObjectTarget(descriptorMap[0], roots))
+      && node.parent
       && (ts.isPropertyAccessExpression(node.parent) || ts.isElementAccessExpression(node.parent))
-      && propertyName(node.parent) === "getBuiltinModule");
+      && (propertyName(node.parent) === undefined
+        || propertyName(node.parent) === "getBuiltinModule"
+        || propertyName(node.parent) === "dlopen"));
 }
 
 function evaluatorIdentifierEscapes(node: ts.Identifier, roots: DynamicCodeRoots): boolean {
-  if (!roots.evaluators.has(node.text)) return false;
+  if (!ambientOrAliasTarget(node, roots.evaluators, dynamicEvaluatorNames, roots.bindings)) return false;
   const parent = node.parent;
   if ((ts.isPropertyAccessExpression(parent) && parent.name === node)
     || (ts.isBindingElement(parent) && (parent.name === node || parent.propertyName === node))
@@ -1078,6 +1592,47 @@ function evaluatorIdentifierEscapes(node: ts.Identifier, roots: DynamicCodeRoots
       && parent.right === node);
 }
 
+function ambientModuleAuthorityUse(node: ts.Identifier, roots: ModuleLoaderRoots): boolean {
+  if (!unshadowedAmbientIdentifier(node, "module", roots.bindings)) return false;
+  const parent = node.parent;
+  if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent))
+    && parent.expression === node
+    && propertyName(parent) === "exports") return false;
+  if ((ts.isPropertyAccessExpression(parent) && parent.name === node)
+    || (ts.isBindingElement(parent) && parent.propertyName === node)) return false;
+  for (let ancestor: ts.Node | undefined = parent; ancestor && !ts.isStatement(ancestor); ancestor = ancestor.parent) {
+    if (ts.isTypeNode(ancestor)) return false;
+    if ((ts.isPropertyAccessExpression(ancestor) || ts.isElementAccessExpression(ancestor))
+      && moduleLoaderCapability(ancestor, roots)) return false;
+    if (ts.isCallExpression(ancestor)
+      && (moduleLoaderCapability(ancestor, roots)
+        || moduleLoaderCapability(ancestor.expression, roots))) return false;
+    if (ts.isVariableDeclaration(ancestor) && ts.isObjectBindingPattern(ancestor.name)
+      && ancestor.name.elements.some((element) => bindingExposesModuleLoader(element, roots))) return false;
+  }
+  return true;
+}
+
+function commonJsWrapperArgumentsUse(
+  node: ts.Identifier,
+  bindings: LexicalBindings,
+  commonJsSource: boolean,
+): boolean {
+  if (!commonJsSource || !unshadowedAmbientIdentifier(node, "arguments", bindings)) return false;
+  const parent = node.parent;
+  if ((ts.isPropertyAccessExpression(parent) && parent.name === node)
+    || ((ts.isPropertyAssignment(parent) || ts.isMethodDeclaration(parent)
+      || ts.isPropertyDeclaration(parent) || ts.isMethodSignature(parent)
+      || ts.isPropertySignature(parent)) && parent.name === node)
+    || (ts.isBindingElement(parent) && parent.propertyName === node)) return false;
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (ts.isTypeNode(current)) return false;
+    if (ts.isSourceFile(current)) return true;
+    if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) return false;
+  }
+  return false;
+}
+
 function extractImportReferences(
   repositoryRoot: string,
   absolutePath: string,
@@ -1085,8 +1640,10 @@ function extractImportReferences(
   moduleType: WorkspacePackage["moduleType"],
 ): ImportReference[] {
   const source = ts.createSourceFile(absolutePath, content, ts.ScriptTarget.Latest, true);
-  const loaderRoots = moduleLoaderRoots(source);
-  const evaluatorRoots = dynamicCodeRoots(source);
+  const lexicalBindings = runtimeLexicalBindings(source);
+  const loaderRoots = moduleLoaderRoots(source, lexicalBindings);
+  const evaluatorRoots = dynamicCodeRoots(source, lexicalBindings);
+  const commonJsSource = sourceResolutionMode(absolutePath, moduleType) === "require";
   const sourceFile = repositoryPath(repositoryRoot, absolutePath);
   const references: ImportReference[] = [];
 
@@ -1176,8 +1733,8 @@ function extractImportReferences(
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       } else if (dynamicCodeTarget(node, evaluatorRoots)) {
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
-      } else if (propertyName(node.expression) === "getBuiltinModule"
-        || runtimeBuiltinLoaderExtraction(node)) {
+      } else if (processAuthorityCapability(node.expression, evaluatorRoots)
+        || runtimeBuiltinLoaderExtraction(node, evaluatorRoots)) {
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       } else if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
         if (runtimeAuthorityModuleSpecifier(node.arguments[0])) {
@@ -1185,8 +1742,20 @@ function extractImportReferences(
         } else {
           record(node, node.arguments[0], "dynamic-import", false);
         }
-      } else if ((ts.isIdentifier(node.expression) && node.expression.text === "require")
-        || propertyName(node.expression) === "require") {
+      } else if ((ts.isPropertyAccessExpression(node.expression)
+        || ts.isElementAccessExpression(node.expression))
+        && propertyName(node.expression) === "require"
+        && isModuleLoaderObject(node.expression.expression, loaderRoots)
+        && !unshadowedAmbientIdentifier(
+          unwrapExpression(node.expression.expression),
+          "module",
+          lexicalBindings,
+        )) {
+        record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+      } else if ((unshadowedAmbientIdentifier(unwrapExpression(node.expression), "require", lexicalBindings))
+        || ((ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+          && propertyName(node.expression) === "require"
+          && isModuleLoaderObject(node.expression.expression, loaderRoots))) {
         if (runtimeAuthorityModuleSpecifier(node.arguments[0])) {
           record(node, undefined, "module-loader", true, unsupportedModuleLoader);
         } else {
@@ -1199,13 +1768,12 @@ function extractImportReferences(
     } else if (ts.isNewExpression(node) && isDynamicCodeCall(node, evaluatorRoots)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
-      && reflectiveAuthorityExtraction(node)) {
+      && processAuthorityCapability(node, evaluatorRoots) && !isDirectCallTarget(node)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
-      && propertyName(node) === "getBuiltinModule" && !isDirectCallTarget(node)) {
-      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
-    } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
-      && propertyName(node) === "require" && !isDirectCallTarget(node)) {
+      && propertyName(node) === "require"
+      && isModuleLoaderObject(node.expression, loaderRoots)
+      && !isDirectCallTarget(node)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isElementAccessExpression(node)
       && isModuleLoaderObject(node.expression, loaderRoots)
@@ -1228,8 +1796,25 @@ function extractImportReferences(
       && bindingExposesModuleLoader(node, loaderRoots)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isBindingElement(node)
-      && (bindingPropertyName(node.propertyName)
-        ?? (ts.isIdentifier(node.name) ? node.name.text : undefined)) === "getBuiltinModule") {
+      && ts.isObjectBindingPattern(node.parent)
+      && ts.isVariableDeclaration(node.parent.parent)
+      && Boolean(node.parent.parent.initializer
+        && processObjectTarget(node.parent.parent.initializer, evaluatorRoots))
+      && (() => {
+        const name = bindingPropertyName(node.propertyName)
+          ?? (ts.isIdentifier(node.name) ? node.name.text : undefined);
+        return name === undefined || name === "getBuiltinModule" || name === "dlopen";
+      })()) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isBindingElement(node)
+      && (bindingPropertyName(node.propertyName) === "constructor"
+        || (node.propertyName !== undefined
+          && ts.isComputedPropertyName(node.propertyName)
+          && staticStringExpression(node.propertyName.expression) === undefined))
+      && ts.isObjectBindingPattern(node.parent)
+      && ts.isVariableDeclaration(node.parent.parent)
+      && Boolean(node.parent.parent.initializer
+        && !ts.isObjectLiteralExpression(unwrapExpression(node.parent.parent.initializer)))) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isVariableDeclaration(node) && node.initializer
       && dynamicCodeTarget(node.initializer, evaluatorRoots)) {
@@ -1246,6 +1831,21 @@ function extractImportReferences(
       && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
       && dynamicCodeTarget(node.right, evaluatorRoots)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isBinaryExpression(node)
+      && (objectAssignmentBinding(
+        node,
+        (expression) => processObjectTarget(expression, evaluatorRoots),
+        new Set(["getBuiltinModule", "dlopen"]),
+      ) || objectAssignmentBinding(
+        node,
+        (expression) => unshadowedAmbientIdentifier(unwrapExpression(expression), "Reflect", lexicalBindings),
+        new Set(["get"]),
+      ) || objectAssignmentBinding(
+        node,
+        (expression) => unshadowedAmbientIdentifier(unwrapExpression(expression), "Object", lexicalBindings),
+        new Set(["getOwnPropertyDescriptor", "getOwnPropertyDescriptors"]),
+      ))) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
       && dynamicCodeTarget(node, evaluatorRoots)
       && !isDirectCallTarget(node)
@@ -1254,9 +1854,19 @@ function extractImportReferences(
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isIdentifier(node) && evaluatorIdentifierEscapes(node, evaluatorRoots)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
-    } else if (ts.isIdentifier(node) && node.text === "require") {
+    } else if (ts.isIdentifier(node)
+      && commonJsWrapperArgumentsUse(node, lexicalBindings, commonJsSource)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isIdentifier(node) && ambientModuleAuthorityUse(node, loaderRoots)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isIdentifier(node)
+      && unshadowedAmbientIdentifier(node, "require", lexicalBindings)) {
       const directRequire = node.parent && ts.isCallExpression(node.parent) && node.parent.expression === node;
-      const propertyNameIdentifier = node.parent && ts.isPropertyAccessExpression(node.parent) && node.parent.name === node;
+      const propertyNameIdentifier = node.parent
+        && ((ts.isPropertyAccessExpression(node.parent) && node.parent.name === node)
+          || ((ts.isPropertyAssignment(node.parent) || ts.isMethodDeclaration(node.parent)
+            || ts.isPropertyDeclaration(node.parent) || ts.isMethodSignature(node.parent)
+            || ts.isPropertySignature(node.parent)) && node.parent.name === node));
       const bindingPropertyIdentifier = node.parent && ts.isBindingElement(node.parent) && node.parent.propertyName === node;
       if (!directRequire && !propertyNameIdentifier && !bindingPropertyIdentifier) {
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
@@ -1272,15 +1882,22 @@ function normalizedSpecifier(specifier: string): string {
   return specifier.replaceAll("\\", "/").split(/[?#]/u, 1)[0] ?? "";
 }
 
-function localSourceViolationRule(
+function relativeModuleSpecifier(specifier: string): boolean {
+  return specifier === "."
+    || specifier === ".."
+    || specifier.startsWith("./")
+    || specifier.startsWith("../");
+}
+
+async function localSourceViolationRule(
   repositoryRoot: string,
   sourcePackage: WorkspacePackage,
   reference: ImportReference,
-): DependencyRule | undefined {
+): Promise<DependencyRule | undefined> {
   const normalized = normalizedSpecifier(reference.specifier);
   const repositoryRootSpecifier = /^(?:adapters|apps|packages)\//u.test(normalized);
   const absoluteSpecifier = isAbsolute(normalized) || /^[A-Za-z]:\//u.test(normalized) || normalized.startsWith("//");
-  const relativeSpecifier = reference.filesystemReference || normalized.startsWith(".");
+  const relativeSpecifier = reference.filesystemReference || relativeModuleSpecifier(normalized);
   if (!repositoryRootSpecifier && !absoluteSpecifier && !relativeSpecifier) return undefined;
   if (repositoryRootSpecifier || absoluteSpecifier) return DEPENDENCY_RULES.crossPackageSourcePath;
 
@@ -1290,7 +1907,23 @@ function localSourceViolationRule(
   if (segments.some((segment) => unscannedPackageDirectories.has(segment))) {
     return DEPENDENCY_RULES.unscannedSourcePath;
   }
-  return isAuditableExportTarget(absoluteTarget) ? undefined : DEPENDENCY_RULES.unscannedSourcePath;
+  if (extname(absoluteTarget) === "" || !isAuditableExportTarget(absoluteTarget)) {
+    return DEPENDENCY_RULES.unscannedSourcePath;
+  }
+  try {
+    const physicalTarget = await physicalPathWithoutLinks(
+      repositoryRoot,
+      absoluteTarget,
+      `${reference.sourceFile} local source target`,
+    );
+    const metadata = await lstat(physicalTarget);
+    if (!metadata.isFile() || !isPathInside(sourcePackage.physicalDirectory, physicalTarget)) {
+      return DEPENDENCY_RULES.unscannedSourcePath;
+    }
+  } catch {
+    return DEPENDENCY_RULES.unscannedSourcePath;
+  }
+  return undefined;
 }
 
 function packageForPath(packages: readonly WorkspacePackage[], absolutePath: string): WorkspacePackage | undefined {
@@ -1346,7 +1979,7 @@ function workspaceImportTarget(
 }
 
 function normalizedExportTarget(target: string, patternMatch?: string): string | undefined {
-  if (!target.startsWith("./")) return undefined;
+  if (!target.startsWith("./") || target.includes("%") || target.includes("\\")) return undefined;
   const resolved = patternMatch === undefined ? target : target.replaceAll("*", patternMatch);
   const segments = resolved.slice(2).split("/");
   return segments.every((segment) => segment !== ".." && segment.toLowerCase() !== "node_modules")
@@ -1540,12 +2173,16 @@ async function sourceViolationRule(
 ): Promise<DependencyRule | undefined> {
   if (reference.kind === "module-loader") return DEPENDENCY_RULES.unsupportedModuleLoader;
   if (reference.specifier === nonLiteralSpecifier) return DEPENDENCY_RULES.workspaceDynamicImports;
+  if (reference.specifier.includes("\\")
+    || (reference.kind === "require-call" && /[?#]/u.test(reference.specifier))) {
+    return DEPENDENCY_RULES.ambiguousModuleSpecifier;
+  }
   if (/^[a-z][a-z\d+.-]*:/iu.test(reference.specifier) && !reference.specifier.startsWith("node:")) {
     return DEPENDENCY_RULES.urlModuleSpecifier;
   }
   if (reference.specifier.includes("%")) return DEPENDENCY_RULES.encodedModuleSpecifier;
   if (reference.specifier.startsWith("#")) return DEPENDENCY_RULES.packageImportAlias;
-  const localRule = localSourceViolationRule(repositoryRoot, sourcePackage, reference);
+  const localRule = await localSourceViolationRule(repositoryRoot, sourcePackage, reference);
   if (localRule) return localRule;
   const target = workspaceImportTarget(
     repositoryRoot,
@@ -1785,6 +2422,17 @@ function baselineKey(entry: Pick<LegacyDependencyBaselineEntry, "sourceFile" | "
   return JSON.stringify([entry.sourceFile, entry.specifier, entry.kind, entry.rule]);
 }
 
+function violationKey(entry: DependencyViolation): string {
+  return JSON.stringify([
+    entry.sourceFile,
+    entry.line,
+    entry.column,
+    entry.specifier,
+    entry.kind,
+    entry.rule,
+  ]);
+}
+
 export async function checkDependencyDirection(
   repositoryRoot: string,
   baseline: readonly LegacyDependencyBaselineEntry[] = LEGACY_DEPENDENCY_BASELINE,
@@ -1841,10 +2489,16 @@ export async function checkDependencyDirection(
   )))).flat();
   const packageNodeModulesViolations = (await Promise.all(packages.map((workspacePackage) =>
     nodeModulesLinkViolations(repositoryRoot, workspacePackage, packages)))).flat();
-  const candidates = [
+  const resolverNodeModulesViolations = await resolverVisibleNodeModulesViolations(
+    repositoryRoot,
+    references,
+    packages,
+  );
+  const sortedCandidates = [
     ...graphIntegrityViolations(packages, allowedGraph),
     ...packageManifestViolations,
     ...packageNodeModulesViolations,
+    ...resolverNodeModulesViolations,
     ...await typescriptPathViolations(repositoryRoot, packages),
     ...[...exportAudits.values()].flatMap(({ violations }) => violations),
     ...packageFiles.flatMap(({ inventory }) => inventory.violations),
@@ -1854,6 +2508,10 @@ export async function checkDependencyDirection(
     || left.column - right.column
     || left.specifier.localeCompare(right.specifier)
     || left.rule.localeCompare(right.rule));
+  const candidates = [...new Map(sortedCandidates.map((candidate) => [
+    violationKey(candidate),
+    candidate,
+  ])).values()];
 
   const baselineErrors: string[] = [];
   const baselineKeys = new Set<string>();

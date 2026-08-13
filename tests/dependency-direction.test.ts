@@ -349,6 +349,11 @@ test("exports resolution honors Node array fallbacks, conditions, and selected n
 
   assert.deepEqual(result.violations.map(({ specifier, kind, rule }) => ({ specifier, kind, rule })), [
     {
+      specifier: "invalid-target",
+      kind: "manifest-export",
+      rule: DEPENDENCY_RULES.physicalExportTarget,
+    },
+    {
       specifier: "@odinn/kernel",
       kind: "require-call",
       rule: DEPENDENCY_RULES.privateWorkspaceSubpath,
@@ -567,6 +572,134 @@ test("encoded traversal, build-output, repository-tool, and outside-file referen
   ]);
 });
 
+test("relative runtime loads name existing regular auditable files explicitly", async (t) => {
+  const root = await repositoryFixture(t, {
+    "pnpm-workspace.yaml": "packages:\n  - apps/*\n  - packages/*\n",
+    "apps/gateway/package.json": manifest("@odinn/gateway", {
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "apps/gateway/src/index.cjs": "module.exports = { gateway: true };\n",
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": "./src/public.cjs" },
+    }),
+    "packages/host/src/public.cjs": "module.exports = { host: true };\n",
+    "packages/host/src/index.cjs": [
+      "require('./shim');",
+      "require('..');",
+      "require('./native');",
+      "require('./safe.cjs');",
+      "require('./data.json');",
+    ].join("\n"),
+    "packages/host/src/safe.cjs": "module.exports = { safe: true };\n",
+    "packages/host/src/data.json": "{}\n",
+    "packages/host/src/native.node": "not-a-real-native-addon\n",
+    "packages/host/src/shim/package.json": `${JSON.stringify({
+      private: true,
+      main: "../../../../apps/gateway/src/index.cjs",
+    })}\n`,
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/host": [],
+  }, []);
+
+  assert.deepEqual(result.violations.filter(({ sourceFile }) => sourceFile === "packages/host/src/index.cjs")
+    .map(({ line, rule }) => ({ line, rule })), [
+    { line: 1, rule: DEPENDENCY_RULES.unscannedSourcePath },
+    { line: 2, rule: DEPENDENCY_RULES.unscannedSourcePath },
+    { line: 3, rule: DEPENDENCY_RULES.unscannedSourcePath },
+  ]);
+});
+
+test("dot-prefixed bare packages cannot hide behind same-named local source files", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "packages/host/src/index.cjs": [
+      "console.log(JSON.stringify([require('.hidden.js'), require('.bin'), require('.pnpm')]));",
+    ].join("\n"),
+    "packages/host/src/.hidden.js": "module.exports = 'local-decoy';\n",
+    "packages/host/node_modules/.hidden.js/package.json": `${JSON.stringify({
+      name: ".hidden.js",
+      version: "1.0.0",
+      main: "index.cjs",
+    })}\n`,
+    "packages/host/node_modules/.hidden.js/index.cjs": "module.exports = 'node-modules-payload';\n",
+    "packages/host/node_modules/.bin/package.json": `${JSON.stringify({
+      name: ".bin",
+      version: "1.0.0",
+      main: "index.cjs",
+    })}\n`,
+    "packages/host/node_modules/.bin/index.cjs": "module.exports = 'bin-payload';\n",
+    "packages/host/node_modules/.pnpm/package.json": `${JSON.stringify({
+      name: ".pnpm",
+      version: "1.0.0",
+      main: "index.cjs",
+    })}\n`,
+    "packages/host/node_modules/.pnpm/index.cjs": "module.exports = 'pnpm-payload';\n",
+  });
+
+  assert.equal(
+    runNodeProbe(root, "packages/host/src/index.cjs"),
+    '["node-modules-payload","bin-payload","pnpm-payload"]',
+  );
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+
+  assert.deepEqual(result.violations
+    .filter(({ rule }) => rule === DEPENDENCY_RULES.unmanagedNodeModulesLink)
+    .map(({ sourceFile, specifier }) => ({ sourceFile, specifier })), [
+    { sourceFile: "packages/host/node_modules/.bin", specifier: ".bin" },
+    { sourceFile: "packages/host/node_modules/.hidden.js", specifier: ".hidden.js" },
+    { sourceFile: "packages/host/node_modules/.pnpm", specifier: ".pnpm" },
+  ]);
+});
+
+test("CommonJS literal filename semantics cannot diverge through query, fragment, or backslash spelling", async (t) => {
+  const runtimeFiles = process.platform === "win32" ? {} : {
+    "packages/host/src/safe.cjs?hidden": "module.exports = 'query-payload';\n",
+    "packages/host/src/safe.cjs#hidden": "module.exports = 'fragment-payload';\n",
+    "packages/host/node_modules/safe\\payload/package.json": `${JSON.stringify({
+      name: "safe\\payload",
+      version: "1.0.0",
+      main: "index.cjs",
+    })}\n`,
+    "packages/host/node_modules/safe\\payload/index.cjs": "module.exports = 'backslash-payload';\n",
+  };
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      dependencies: { safe: "1.0.0" },
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "packages/host/src/index.cjs": [
+      "const query = require('./safe.cjs?hidden');",
+      "const fragment = require('./safe.cjs#hidden');",
+      "const backslash = require('safe\\\\payload');",
+      "console.log(JSON.stringify([query, fragment, backslash]));",
+    ].join("\n"),
+    "packages/host/src/safe.cjs": "module.exports = 'local-decoy';\n",
+    ...runtimeFiles,
+  });
+
+  if (process.platform !== "win32") {
+    assert.equal(
+      runNodeProbe(root, "packages/host/src/index.cjs"),
+      '["query-payload","fragment-payload","backslash-payload"]',
+    );
+  }
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  assert.deepEqual(result.violations
+    .filter(({ sourceFile }) => sourceFile === "packages/host/src/index.cjs")
+    .map(({ line, rule }) => ({ line, rule })), [
+    { line: 1, rule: DEPENDENCY_RULES.ambiguousModuleSpecifier },
+    { line: 2, rule: DEPENDENCY_RULES.ambiguousModuleSpecifier },
+    { line: 3, rule: DEPENDENCY_RULES.ambiguousModuleSpecifier },
+  ]);
+});
+
 test("workspace exports reject text and native executable targets while preserving inert JSON", async (t) => {
   const root = await repositoryFixture(t, {
     "packages/host/package.json": manifest("@odinn/host", {
@@ -710,11 +843,11 @@ test("dynamic evaluators and createRequire aliases fail closed at their capabili
   });
 
   const result = await checkFixture(root, { "@odinn/host": [] }, []);
-  const loaderLines = result.violations
+  const loaderLines = [...new Set(result.violations
     .filter(({ sourceFile, kind, rule }) => sourceFile === "packages/host/src/index.ts"
       && kind === "module-loader"
       && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
-    .map(({ line }) => line);
+    .map(({ line }) => line))];
 
   assert.deepEqual(loaderLines, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13]);
 });
@@ -883,6 +1016,24 @@ test("descriptor, Reflect.apply, constructor alias, and global Proxy evaluators 
       "const get = Reflect.get.bind(Reflect);",
       "get(globalThis, 'eval')('import(\\\"@odinn/gateway\\\")');",
     ].join("\n"),
+    "reflect-get-call.ts": "Reflect.get.call(Reflect, () => undefined, 'constructor')('return 42')();",
+    "reflect-get-apply.ts": "Reflect.get.apply(Reflect, [() => undefined, 'constructor'])('return 42')();",
+    "reflect-get-destructured.ts": [
+      "const { get } = Reflect;",
+      "get(() => undefined, 'constructor')('return 42')();",
+    ].join("\n"),
+    "reflect-get-assignment.ts": [
+      "let get;",
+      "({ get } = Reflect);",
+      "get(() => undefined, 'constructor')('return 42')();",
+    ].join("\n"),
+    "descriptor-destructured.ts": [
+      "const { getOwnPropertyDescriptor: descriptor } = Object;",
+      "descriptor(globalThis, 'eval')!.value('42');",
+    ].join("\n"),
+    "array-global.ts": "[globalThis][0].eval('42');",
+    "conditional-global.ts": "(true ? globalThis : globalThis).eval('42');",
+    "logical-global.ts": "(globalThis || globalThis).eval('42');",
   };
   const root = await repositoryFixture(t, {
     "packages/host/package.json": manifest("@odinn/host"),
@@ -922,6 +1073,256 @@ test("metadata-only node:module and ordinary reflection, Proxy, and lookalikes r
 
   const result = await checkFixture(root, { "@odinn/host": [] }, []);
   assert.deepEqual(result.violations, []);
+});
+
+test("evaluator authority stays rejected across comma, global, reflection, and constructor transforms", async (t) => {
+  const hostileSources: Record<string, string> = {
+    "comma-global-function.ts": "(0, globalThis).Function('return 42')();",
+    "nested-global-function.ts": "globalThis.globalThis.Function('return 42')();",
+    "reflect-function-constructor.ts": "Reflect.get(() => undefined, 'constructor')('return 42')();",
+    "reflect-computed-constructor.ts": [
+      "const key = ['con', 'structor'].join('');",
+      "Reflect.get(() => undefined, key)('return 42')();",
+    ].join("\n"),
+    "computed-function-constructor.ts": [
+      "const key = ['con', 'structor'].join('');",
+      "(() => undefined)[key]('return 42')();",
+    ].join("\n"),
+    "destructured-function-constructor.ts": [
+      "const { constructor: HiddenEvaluator } = (() => undefined);",
+      "HiddenEvaluator('return 42')();",
+    ].join("\n"),
+    "computed-destructured-constructor.ts": [
+      "const key = ['con', 'structor'].join('');",
+      "const { [key]: HiddenEvaluator } = (() => undefined);",
+      "HiddenEvaluator('return 42')();",
+    ].join("\n"),
+    "comma-global-reflect-get.ts": "Reflect.get((0, globalThis), 'Function')('return 42')();",
+    "declared-eval.ts": [
+      "declare const eval: (source: string) => unknown;",
+      "eval('return 42');",
+    ].join("\n"),
+    "comma-proxy-global-eval.ts": [
+      "const HiddenProxy = (0, Proxy);",
+      "const realm = new HiddenProxy((0, globalThis), {});",
+      "realm.eval('42');",
+    ].join("\n"),
+  };
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    ...Object.fromEntries(Object.entries(hostileSources)
+      .map(([name, source]) => [`packages/host/src/${name}`, `${source}\n`])),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  const rejectedFiles = new Set(result.violations
+    .filter(({ kind, rule }) => kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
+    .map(({ sourceFile }) => sourceFile.replace("packages/host/src/", "")));
+
+  assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
+});
+
+test("ordinary reflection aliases and shadowed authority lookalikes remain compatible", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": [
+      "const get = Reflect.get;",
+      "const descriptor = Object.getOwnPropertyDescriptor;",
+      "const create = Object.create;",
+      "const input = { value: 7 };",
+      "const module = { require: () => 1 };",
+      "const localRequire = module.require;",
+      "class Module { load() { return 2; } }",
+      "const registry = { getBuiltinModule() { return 3; } };",
+      "const localFunction = { constructor() { return 4; } };",
+      "function reflectedGlobal() { const realm = globalThis; return realm.Math; }",
+      "function shadowedRealm(realm: { eval(): boolean }) { return realm.eval(); }",
+      "function reflectedValue() { const get = Reflect.get; return get(input, 'value'); }",
+      "function shadowedGet(get: () => number) { return get(); }",
+      "const { get: destructuredGet } = Reflect;",
+      "const calledGet = Reflect.get.call(Reflect, input, 'value');",
+      "const appliedGet = Reflect.get.apply(Reflect, [input, 'value']);",
+      "console.log(get(input, 'value'), descriptor(input, 'value')?.value, create(null));",
+      "console.log(localRequire(), new Module().load(), registry.getBuiltinModule(), localFunction.constructor());",
+      "console.log(reflectedGlobal(), shadowedRealm({ eval: () => true }), reflectedValue(), shadowedGet(() => 8));",
+      "console.log(destructuredGet(input, 'value'), calledGet, appliedGet);",
+    ].join("\n"),
+    "packages/host/src/arguments-lookalike.cjs": [
+      "function nested() { return arguments['1']; }",
+      "module.exports = nested('left', 'right');",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  assert.deepEqual(result.violations, []);
+});
+
+test("ambient module and process authority reject transformed loaders and direct dlopen", async (t) => {
+  const hostileSources: Record<string, string> = {
+    "comma-module.cjs": "(0, module)._compile('module.exports = 1', __filename);",
+    "declared-module.cts": [
+      "declare const module: { _compile(source: string, filename: string): void };",
+      "module._compile('module.exports = 1', __filename);",
+    ].join("\n"),
+    "computed-module.cjs": [
+      "const key = ['re', 'quire'].join('');",
+      "const { [key]: hiddenLoad } = module;",
+      "hiddenLoad.call(module, '@odinn/gateway');",
+    ].join("\n"),
+    "computed-process.cjs": [
+      "const key = ['getBuiltin', 'Module'].join('');",
+      "(0, process)[key]('module');",
+    ].join("\n"),
+    "computed-process-alias.cjs": [
+      "const runtime = process;",
+      "const key = ['getBuiltin', 'Module'].join('');",
+      "runtime[key]('module');",
+    ].join("\n"),
+    "process-dlopen.cjs": "process.dlopen(module, '/tmp/native.node');",
+    "global-process.cjs": "globalThis.process.getBuiltinModule('module');",
+    "assignment-process.cjs": [
+      "let hiddenBuiltin;",
+      "({ getBuiltinModule: hiddenBuiltin } = process);",
+      "hiddenBuiltin('module');",
+    ].join("\n"),
+    "array-module.cjs": "[process.mainModule][0].require('@odinn/gateway');",
+    "conditional-module.cjs": "(true ? process.mainModule : module).require('@odinn/gateway');",
+    "logical-module.cjs": "(process.mainModule || module).require('@odinn/gateway');",
+    "wrapper-arguments.cjs": "arguments['1']('@odinn/gateway');",
+    "wrapper-module-arguments.cjs": "arguments['2'].require('@odinn/gateway');",
+  };
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "packages/host/src/index.cjs": "module.exports = { host: true };\n",
+    ...Object.fromEntries(Object.entries(hostileSources)
+      .map(([name, source]) => [`packages/host/src/${name}`, `${source}\n`])),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  const rejectedFiles = new Set(result.violations
+    .filter(({ kind, rule }) => kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
+    .map(({ sourceFile }) => sourceFile.replace("packages/host/src/", "")));
+
+  assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
+});
+
+test("runtime authority wrappers and transparent transforms cannot load forbidden code", async (t) => {
+  const hostileSources: Record<string, { output: string; source: string }> = {
+    "array-global.mjs": {
+      output: "gateway-esm",
+      source: [
+        'import { resolve } from "node:path";',
+        'import { pathToFileURL } from "node:url";',
+        "const target = pathToFileURL(resolve(process.cwd(), 'apps/gateway/src/index.mjs')).href;",
+        "const realm = [globalThis][0];",
+        "const loaded = await realm.eval(`import(${JSON.stringify(target)})`);",
+        "console.log(loaded.default);",
+      ].join("\n"),
+    },
+    "array-module.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const runtimeModule = [process.mainModule][0];",
+        "console.log(runtimeModule.require(resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
+      ].join("\n"),
+    },
+    "assignment-process.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "let hiddenBuiltin;",
+        "({ getBuiltinModule: hiddenBuiltin } = process);",
+        "const RuntimeModule = hiddenBuiltin('module').Module;",
+        "console.log(RuntimeModule._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "destructured-reflect.mjs": {
+      output: "gateway-esm",
+      source: [
+        'import { resolve } from "node:path";',
+        'import { pathToFileURL } from "node:url";',
+        "const target = pathToFileURL(resolve(process.cwd(), 'apps/gateway/src/index.mjs')).href;",
+        "const { get } = Reflect;",
+        "const HiddenFunction = get(() => undefined, 'constructor');",
+        "const loaded = await HiddenFunction(`return import(${JSON.stringify(target)})`)();",
+        "console.log(loaded.default);",
+      ].join("\n"),
+    },
+    "global-process.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const RuntimeModule = globalThis.process.getBuiltinModule('module').Module;",
+        "console.log(RuntimeModule._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "reflect-call.mjs": {
+      output: "gateway-esm",
+      source: [
+        'import { resolve } from "node:path";',
+        'import { pathToFileURL } from "node:url";',
+        "const target = pathToFileURL(resolve(process.cwd(), 'apps/gateway/src/index.mjs')).href;",
+        "const HiddenFunction = Reflect.get.call(Reflect, () => undefined, 'constructor');",
+        "const loaded = await HiddenFunction(`return import(${JSON.stringify(target)})`)();",
+        "console.log(loaded.default);",
+      ].join("\n"),
+    },
+    "reflect-apply.mjs": {
+      output: "gateway-esm",
+      source: [
+        'import { resolve } from "node:path";',
+        'import { pathToFileURL } from "node:url";',
+        "const target = pathToFileURL(resolve(process.cwd(), 'apps/gateway/src/index.mjs')).href;",
+        "const HiddenFunction = Reflect.get.apply(Reflect, [() => undefined, 'constructor']);",
+        "const loaded = await HiddenFunction(`return import(${JSON.stringify(target)})`)();",
+        "console.log(loaded.default);",
+      ].join("\n"),
+    },
+    "wrapper-arguments.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "console.log(arguments['1'](resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
+      ].join("\n"),
+    },
+    "wrapper-module-arguments.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "console.log(arguments['2'].require(resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
+      ].join("\n"),
+    },
+  };
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway", {
+      exports: { ".": "./src/index.mjs" },
+    }),
+    "apps/gateway/src/index.cjs": "module.exports = 'gateway-cjs';\n",
+    "apps/gateway/src/index.mjs": "export default 'gateway-esm';\n",
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "packages/host/src/index.cjs": "module.exports = { host: true };\n",
+    ...Object.fromEntries(Object.entries(hostileSources)
+      .map(([name, { source }]) => [`packages/host/src/${name}`, `${source}\n`])),
+  });
+
+  for (const [name, { output }] of Object.entries(hostileSources)) {
+    assert.equal(runNodeProbe(root, `packages/host/src/${name}`), output, name);
+  }
+
+  const result = await checkFixture(root, { "@odinn/gateway": [], "@odinn/host": [] }, []);
+  const rejectedFiles = new Set(result.violations
+    .filter(({ kind, rule }) => kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
+    .map(({ sourceFile }) => sourceFile.replace("packages/host/src/", "")));
+  assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
 });
 
 test("package-local node_modules redirects fail while canonical dependency links remain compatible", async (t) => {
@@ -1006,6 +1407,74 @@ test("package-local node_modules redirects fail while canonical dependency links
     kind: "workspace-symlink" as const,
     rule: DEPENDENCY_RULES.unmanagedNodeModulesLink,
   })));
+});
+
+test("resolver-visible ancestor links preserve canonical workspace and external identities", async (t) => {
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway", {
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "apps/gateway/src/index.cjs": "module.exports = { gateway: true };\n",
+    "packages/protocol/package.json": manifest("@odinn/protocol", {
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "packages/protocol/src/index.cjs": "module.exports = { protocol: true };\n",
+    "packages/host/package.json": manifest("@odinn/host", {
+      dependencies: { "@odinn/protocol": "workspace:*", declared: "1.0.0" },
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "packages/host/src/index.cjs": [
+      "require('@odinn/protocol');",
+      "require('declared');",
+    ].join("\n"),
+    "node_modules/.pnpm/other@1.0.0/node_modules/other/package.json": `${JSON.stringify({
+      name: "other",
+      version: "1.0.0",
+      main: "index.cjs",
+    })}\n`,
+    "node_modules/.pnpm/other@1.0.0/node_modules/other/index.cjs": "module.exports = 'other';\n",
+  });
+
+  try {
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    const rootWorkspaceLink = join(root, "node_modules/@odinn/protocol");
+    const localExternalLink = join(root, "packages/host/node_modules/declared");
+    await mkdir(dirname(rootWorkspaceLink), { recursive: true });
+    await mkdir(dirname(localExternalLink), { recursive: true });
+    await symlink(join(root, "apps/gateway"), rootWorkspaceLink, linkType);
+    await symlink(
+      join(root, "node_modules/.pnpm/other@1.0.0/node_modules/other"),
+      localExternalLink,
+      linkType,
+    );
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES" || code === "ENOSYS") {
+      t.skip(`package links and junctions are unavailable on ${process.platform}: ${code}`);
+      return;
+    }
+    throw error;
+  }
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/host": ["@odinn/protocol"],
+    "@odinn/protocol": [],
+  }, []);
+
+  assert.deepEqual(result.violations
+    .filter(({ kind, rule }) => kind === "workspace-symlink"
+      && rule === DEPENDENCY_RULES.unmanagedNodeModulesLink)
+    .map(({ sourceFile, specifier }) => ({ sourceFile, specifier })), [
+    {
+      sourceFile: "node_modules/@odinn/protocol",
+      specifier: "@odinn/protocol",
+    },
+    {
+      sourceFile: "packages/host/node_modules/declared",
+      specifier: "declared",
+    },
+  ]);
 });
 
 test("production package scripts use only closed-form audited entrypoints and typechecks", async (t) => {
@@ -1128,6 +1597,31 @@ test("unreferenced conditional export targets cannot redirect into a nested work
   assert(result.violations.some(({ sourceFile, rule }) =>
     sourceFile === "packages/host/package.json" && rule === crossPackageExportTargetRule),
   JSON.stringify(result.violations));
+});
+
+test("every invalid export target is rejected even when no source imports it", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: {
+        ".": "./src/index.ts",
+        "./escape": "../gateway/src/index.ts",
+        "./percent": "./%2e%2e/gateway/src/index.ts",
+        "./backslash": "./..\\gateway/src/index.ts",
+        "./non-string": 42,
+      },
+    }),
+    "packages/host/src/index.ts": "export const host = true;\n",
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  assert.deepEqual(result.violations
+    .filter(({ sourceFile, kind }) => sourceFile === "packages/host/package.json" && kind === "manifest-export")
+    .map(({ specifier, rule }) => ({ specifier, rule })), [
+    { specifier: "<invalid export target>", rule: DEPENDENCY_RULES.physicalExportTarget },
+    { specifier: "../gateway/src/index.ts", rule: DEPENDENCY_RULES.physicalExportTarget },
+    { specifier: "./%2e%2e/gateway/src/index.ts", rule: DEPENDENCY_RULES.physicalExportTarget },
+    { specifier: "./..\\gateway/src/index.ts", rule: DEPENDENCY_RULES.physicalExportTarget },
+  ]);
 });
 
 test("package exports cannot hide a transition into a nested workspace package", async (t) => {
