@@ -11,7 +11,6 @@ export type OperatorActionName =
   | "approve"
   | "deny-approval"
   | "cancel-workflow"
-  | "resume-workflow"
   | "verify-audit";
 
 export type OperatorPage = {
@@ -106,7 +105,6 @@ const ACTIONS: OperatorActionDescriptor[] = [
   { action: "approve", label: "Approve once", mutation: true, requiresTarget: true, confirmation: true },
   { action: "deny-approval", label: "Deny approval", mutation: true, requiresTarget: true, confirmation: true },
   { action: "cancel-workflow", label: "Cancel workflow", mutation: true, requiresTarget: true, confirmation: true },
-  { action: "resume-workflow", label: "Resume workflow", mutation: true, requiresTarget: true, confirmation: true },
   { action: "verify-audit", label: "Verify audit", mutation: false, requiresTarget: false, confirmation: false }
 ];
 

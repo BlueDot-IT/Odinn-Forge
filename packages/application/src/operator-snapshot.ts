@@ -8,6 +8,7 @@ import {
   OPERATOR_SNAPSHOT_MAX_PAGE_SIZE,
   OPERATOR_SNAPSHOT_SECTION_NAMES,
   defaultOperatorSnapshotActionsV1,
+  validateOperatorIdentifierV1,
   validateOperatorSnapshotV1,
   type OperatorApprovalItemV1,
   type OperatorAuditItemV1,
@@ -43,9 +44,12 @@ import {
   type ApprovalEffectSummaryV1,
   type PendingApprovalSummaryV1,
 } from "./read-output-contracts.ts";
-import { ApplicationContractValidationError, validateExecutionRequestV1 } from "./validation.ts";
+import { containsSensitiveApplicationValue } from "./sensitive-metadata.ts";
+import { ApplicationContractValidationError } from "./validation/errors.ts";
+import { validateExecutionRequestV1 } from "./validation/execution-request.ts";
 
 export const OPERATOR_SNAPSHOT_READ_OPERATION_ID = "operator.snapshot.read" as const;
+export const OPERATOR_SNAPSHOT_CHANGED_CODE = "OPERATOR_SNAPSHOT_CHANGED" as const;
 
 export interface OperatorSnapshotReadInputV1 {
   readonly surface?: OperatorSurfaceV1;
@@ -93,6 +97,8 @@ export interface OperatorSnapshotSourcePageV1<T> {
   readonly items: readonly T[];
   readonly total: number;
   readonly attention: number;
+  /** Optional source-native generation used to detect cross-read drift. */
+  readonly generation?: string;
 }
 
 export interface OperatorJobSourceV1 {
@@ -180,7 +186,7 @@ export interface OperatorEnvironmentSourceV1 {
     readonly commit?: string;
   };
   readonly runtime: {
-    readonly gateway: "running" | "available";
+    readonly gateway: "running" | "available" | "degraded";
     readonly mcp: boolean;
     readonly workflows: boolean;
     readonly eventIngress: boolean;
@@ -198,13 +204,8 @@ export interface OperatorAuditSourceV1 {
     readonly valid: boolean;
     readonly checked: boolean;
     readonly unsigned: number;
-    readonly failures: readonly OperatorAuditFailureSourceV1[];
+    readonly failureCount: number;
   };
-}
-
-export interface OperatorAuditFailureSourceV1 {
-  readonly code?: string;
-  readonly message?: string;
 }
 
 export interface OperatorBrowserRecoverySourceV1 {
@@ -250,12 +251,9 @@ type WorkSourceItem = { readonly item: OperatorJobItemV1 | OperatorRunItemV1; re
 
 const SOURCE_ITEM_LIMIT = 512;
 const SOURCE_TEXT_BYTES = 2_048;
-const SECRET_TEXT = [
-  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|cookie|credentials?|password|passwd|secret|client[_-]?secret|private[_-]?key)\s*[:=]\s*[^\s,;]+/iu,
-  /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/iu,
-  /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/iu,
-  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u,
-];
+const OPERATOR_SNAPSHOT_READ_ATTEMPTS = 2;
+export const OPERATOR_SCHEDULE_SCHEMA_VERSION = 2 as const;
+export const OPERATOR_SCHEDULE_MAX_ITEMS = 500;
 const ATTEMPT_STATES = new Set<OperatorExecutionAttemptStateV1>([
   "proposed", "admitted", "queued", "running", "awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review",
 ]);
@@ -267,7 +265,10 @@ export function createOperatorSnapshotReadUseCase(port: OperatorSnapshotReadPort
     async execute(request: OperatorSnapshotReadRequestV1, invocation: ApplicationInvocationOptions = {}) {
       const validated = validateOperatorSnapshotReadRequestV1(request);
       const input = normalizeOperatorSnapshotReadInputV1(validated.input);
-      throwIfCancelled(invocation.signal);
+      let snapshotChanged: ApplicationContractValidationError | undefined;
+      for (let readAttempt = 0; readAttempt < OPERATOR_SNAPSHOT_READ_ATTEMPTS; readAttempt += 1) {
+        try {
+          throwIfCancelled(invocation.signal);
 
       const sourceQuery = { offset: 0, limit: 0, query: input.query, status: input.status } as const;
       const globalQuery = { offset: 0, limit: 0, query: "", status: "" } as const;
@@ -322,24 +323,32 @@ export function createOperatorSnapshotReadUseCase(port: OperatorSnapshotReadPort
       const globalWorkflows = sourcePage(globalWorkflowsSource, "operator global workflows");
       const globalWatches = sourcePage(globalWatchesSource, "operator global event watches");
       const allApprovals = projectApprovals(approvalsSource);
+      assertUniqueStaticIdentifiers(allApprovals, "operator approvals");
       const approvals = allApprovals.filter((item) => matches(item, input));
       const allSchedules = sourceArray<OperatorScheduleSourceV1>(schedulesSource, "operator schedules")
-        .map((item, index) => projectSchedule(item, `operator schedules[${index}]`));
+        .map((item, index) => projectSchedule(item, `operator schedules[${index}]`))
+        .sort((left, right) => lexicalCompare(left.label, right.label) || lexicalCompare(left.id, right.id));
+      assertUniqueStaticIdentifiers(allSchedules, "operator schedules");
       const schedules = allSchedules.filter((item) => matches(item, input));
       const recoveryItems = projectRecovery(recoverySource);
       const audit = projectAudit(auditSource);
-
       const workPagination = pagination(filteredJobs.total + filteredRuns.total, pageFor(input, "work"), input.pageSize);
       const projectedWork = await selectCombinedPage<WorkSourceItem>(workPagination, [
         {
           total: filteredJobs.total,
-          fetch: async (offset, limit) => sourcePage(await port.queryJobs({ ...sourceQuery, offset, limit }, validated.context, invocation), "operator jobs page").items
-            .map((item, index) => projectJob(item, `operator jobs page[${offset + index}]`)),
+          fetch: async (offset, limit) => stableSourcePage(
+            await port.queryJobs({ ...sourceQuery, offset, limit }, validated.context, invocation),
+            "operator jobs page",
+            filteredJobs,
+          ).items.map((item, index) => projectJob(item, `operator jobs page[${offset + index}]`)),
         },
         {
           total: filteredRuns.total,
-          fetch: async (offset, limit) => sourcePage(await port.queryRuns({ ...sourceQuery, offset, limit }, validated.context, invocation), "operator runs page").items
-            .map((item, index) => projectRun(item, `operator runs page[${offset + index}]`)),
+          fetch: async (offset, limit) => stableSourcePage(
+            await port.queryRuns({ ...sourceQuery, offset, limit }, validated.context, invocation),
+            "operator runs page",
+            filteredRuns,
+          ).items.map((item, index) => projectRun(item, `operator runs page[${offset + index}]`)),
         },
       ], invocation.signal);
       throwIfCancelled(invocation.signal);
@@ -352,29 +361,46 @@ export function createOperatorSnapshotReadUseCase(port: OperatorSnapshotReadPort
       const workItems = projectedWork.map(({ item, attemptRunId }) => {
         const latestAttempt = attemptRunId ? latestAttempts.get(attemptRunId) : undefined;
         if (!latestAttempt) return item;
-        if (item.kind === "job") {
-          return Object.freeze({ ...item, details: Object.freeze({ ...item.details, latestAttempt }) } satisfies OperatorJobItemV1);
+        const reconciledItem = reconcileAttemptState(item, latestAttempt.state);
+        if (reconciledItem.kind === "job") {
+          return Object.freeze({ ...reconciledItem, details: Object.freeze({ ...reconciledItem.details, latestAttempt }) } satisfies OperatorJobItemV1);
         }
-        return Object.freeze({ ...item, details: Object.freeze({ ...item.details, latestAttempt }) } satisfies OperatorRunItemV1);
+        return Object.freeze({ ...reconciledItem, details: Object.freeze({ ...reconciledItem.details, latestAttempt }) } satisfies OperatorRunItemV1);
       });
+      // Latest-attempt reconciliation can make a stale source row require
+      // attention even when the source's denormalized status count has not
+      // caught up yet. Keep the visible projection and section counts
+      // internally consistent while the durable writer settles.
+      const sourceWorkAttention = filteredJobs.attention + filteredRuns.attention;
+      const workAttention = Math.max(sourceWorkAttention, workItems.filter(isAttention).length);
 
       const automationPagination = pagination(filteredWorkflows.total + filteredWatches.total + schedules.length, pageFor(input, "automation"), input.pageSize);
       const automationItems = await selectCombinedPage<OperatorWorkflowItemV1 | OperatorEventWatchItemV1 | OperatorScheduleItemV1>(automationPagination, [
         {
           total: filteredWorkflows.total,
-          fetch: async (offset, limit) => sourcePage(await port.queryWorkflows({ ...sourceQuery, offset, limit }, validated.context, invocation), "operator workflows page").items
-            .map((item, index) => projectWorkflow(item, `operator workflows page[${offset + index}]`)),
+          fetch: async (offset, limit) => stableSourcePage(
+            await port.queryWorkflows({ ...sourceQuery, offset, limit }, validated.context, invocation),
+            "operator workflows page",
+            filteredWorkflows,
+          ).items.map((item, index) => projectWorkflow(item, `operator workflows page[${offset + index}]`)),
         },
         {
           total: filteredWatches.total,
-          fetch: async (offset, limit) => sourcePage(await port.queryEventWatches({ ...sourceQuery, offset, limit }, validated.context, invocation), "operator event watches page").items
-            .map((item, index) => projectWatch(item, `operator event watches page[${offset + index}]`)),
+          fetch: async (offset, limit) => stableSourcePage(
+            await port.queryEventWatches({ ...sourceQuery, offset, limit }, validated.context, invocation),
+            "operator event watches page",
+            filteredWatches,
+          ).items.map((item, index) => projectWatch(item, `operator event watches page[${offset + index}]`)),
         },
         { total: schedules.length, fetch: async (offset, limit) => schedules.slice(offset, offset + limit) },
       ], invocation.signal);
       throwIfCancelled(invocation.signal);
+      const availableAutomationItems = automationItems.map((item) => item.kind === "workflow" && !environment.runtime.workflows && item.controls
+        ? Object.freeze(Object.fromEntries(Object.entries(item).filter(([key]) => key !== "controls")) as unknown as OperatorWorkflowItemV1)
+        : item);
 
-      const runtimeItems = runtimeSourceItems(environment).filter((item) => matches(item, input));
+      const allRuntimeItems = runtimeSourceItems(environment);
+      const runtimeItems = allRuntimeItems.filter((item) => matches(item, input));
       const allContextItems: OperatorContextItemV1[] = [{
         id: "project-context",
         kind: "context",
@@ -393,15 +419,20 @@ export function createOperatorSnapshotReadUseCase(port: OperatorSnapshotReadPort
           total: workPagination.total,
           jobs: filteredJobs.total,
           runs: filteredRuns.total,
-          attention: filteredJobs.attention + filteredRuns.attention,
+          attention: workAttention,
         } satisfies OperatorWorkCountsV1),
         approvals: staticCountedSection(
           approvals,
           pageFor(input, "approvals"),
           input.pageSize,
-          (total, attention) => ({ total, pending: total, attention } satisfies OperatorApprovalCountsV1),
+          (total, attention) => ({
+            total,
+            pending: approvals.filter((item) => item.status === "pending").length,
+            claimed: approvals.filter((item) => item.status === "claimed").length,
+            attention,
+          } satisfies OperatorApprovalCountsV1),
         ),
-        automation: queriedSection(automationItems, automationPagination, {
+        automation: queriedSection(availableAutomationItems, automationPagination, {
           total: automationPagination.total,
           workflows: filteredWorkflows.total,
           watches: filteredWatches.total,
@@ -425,8 +456,10 @@ export function createOperatorSnapshotReadUseCase(port: OperatorSnapshotReadPort
         + globalWorkflows.attention
         + globalWatches.attention
         + allSchedules.filter(isAttention).length
+        + allRuntimeItems.filter(isAttention).length
         + recoveryItems.filter(isAttention).length
-        + (audit.item.attention ? 1 : 0);
+        + (audit.item.attention ? 1 : 0)
+        + Math.max(0, workAttention - sourceWorkAttention);
       const healthStatus: OperatorHealthV1 = globalAttention ? "attention" : "healthy";
       const generatedAt = canonicalDate(now(), "operator snapshot generatedAt");
       const output = validateOperatorSnapshotV1({
@@ -451,6 +484,13 @@ export function createOperatorSnapshotReadUseCase(port: OperatorSnapshotReadPort
         correlationId: validated.context.correlationId,
         output,
       });
+        } catch (error) {
+          if (!(error instanceof ApplicationContractValidationError)
+            || error.code !== OPERATOR_SNAPSHOT_CHANGED_CODE) throw error;
+          snapshotChanged = error;
+        }
+      }
+      throw snapshotChanged ?? operatorSnapshotChanged();
     },
   });
 }
@@ -515,6 +555,49 @@ export function normalizeOperatorSnapshotReadInputV1(input: unknown): Normalized
   return Object.freeze({ surface, page, pageSize, query, status, pages: Object.freeze(pages) });
 }
 
+/**
+ * Project the shared durable cron envelope into the narrow operator schedule
+ * source contract. Both local and Gateway composition roots use this exact
+ * parser so invalid state cannot disappear as an empty, healthy section.
+ */
+export function projectOperatorScheduleEnvelopeV1(input: unknown): readonly OperatorScheduleSourceV1[] {
+  const envelope = exactSourceRecord(input, "operator schedule envelope");
+  const unknown = Object.keys(envelope).find((key) => key !== "schemaVersion" && key !== "jobs");
+  if (unknown) sourceFail(`operator schedule envelope contains unknown field: ${unknown}`, `operator schedule envelope.${unknown}`, "UNKNOWN_APPLICATION_FIELD");
+  const schemaVersion = dataField(envelope, "schemaVersion", "operator schedule envelope");
+  if (schemaVersion !== 1 && schemaVersion !== OPERATOR_SCHEDULE_SCHEMA_VERSION) {
+    sourceFail("operator schedule envelope has an unsupported schema version", "operator schedule envelope.schemaVersion");
+  }
+  const jobs = sourceArray<unknown>(dataField(envelope, "jobs", "operator schedule envelope"), "operator schedule envelope.jobs");
+  if (jobs.length > OPERATOR_SCHEDULE_MAX_ITEMS) {
+    sourceFail(`operator schedule envelope cannot contain more than ${OPERATOR_SCHEDULE_MAX_ITEMS} jobs`, "operator schedule envelope.jobs");
+  }
+  return Object.freeze(jobs.map((inputJob, index) => {
+    const path = `operator schedule envelope.jobs[${index}]`;
+    const job = exactSourceRecord(inputJob, path);
+    const id = requiredSourceIdentifier(dataField(job, "id", path), `${path}.id`);
+    const enabledValue = dataField(job, "enabled", path);
+    const enabled = enabledValue === undefined ? true : sourceBoolean(enabledValue, `${path}.enabled`);
+    const lastStatusValue = dataField(job, "lastStatus", path);
+    const lastStatus = lastStatusValue === undefined
+      ? undefined
+      : sourceEnum(lastStatusValue, `${path}.lastStatus`, ["ok", "error"] as const);
+    const nameValue = dataField(job, "name", path);
+    const updatedAtValue = dataField(job, "updatedAt", path);
+    const nextRunAtValue = dataField(job, "nextRunAt", path);
+    return Object.freeze({
+      id,
+      enabled,
+      ...(nameValue === undefined ? {} : { name: sourceText(nameValue, id, `${path}.name`) }),
+      ...(lastStatus === undefined ? {} : { lastStatus }),
+      ...(updatedAtValue === undefined ? {} : { updatedAt: canonicalTimestamp(updatedAtValue, `${path}.updatedAt`) }),
+      ...(nextRunAtValue === undefined ? {} : {
+        nextRunAt: nextRunAtValue === null ? null : canonicalTimestamp(nextRunAtValue, `${path}.nextRunAt`),
+      }),
+    } satisfies OperatorScheduleSourceV1);
+  }));
+}
+
 function assertPort(port: OperatorSnapshotReadPort): void {
   const methods: readonly (keyof OperatorSnapshotReadPort)[] = [
     "readEnvironment", "queryJobs", "queryRuns", "readLatestAttempts", "readApprovals", "queryWorkflows", "queryEventWatches", "readSchedules", "readRecovery", "readAudit",
@@ -527,9 +610,21 @@ function sourcePage<T>(input: OperatorSnapshotSourcePageV1<T>, path: string): Op
   const items = sourceArray<T>(dataField(value, "items", path), `${path}.items`);
   const total = sourceCount(dataField(value, "total", path), `${path}.total`);
   const attention = sourceCount(dataField(value, "attention", path), `${path}.attention`);
+  const generation = optionalSourceGeneration(value, path);
   if (attention > total) sourceFail(`${path}.attention cannot exceed total`, `${path}.attention`);
   if (items.length > total) sourceFail(`${path}.items cannot exceed total`, `${path}.items`);
-  return Object.freeze({ items, total, attention });
+  return Object.freeze({ items, total, attention, ...(generation ? { generation } : {}) });
+}
+
+function stableSourcePage<T>(
+  input: OperatorSnapshotSourcePageV1<T>,
+  path: string,
+  expected: Pick<OperatorSnapshotSourcePageV1<T>, "total" | "attention" | "generation">,
+): OperatorSnapshotSourcePageV1<T> {
+  const page = sourcePage(input, path);
+  if (page.total !== expected.total || page.attention !== expected.attention
+    || (expected.generation !== undefined && page.generation !== expected.generation)) throw operatorSnapshotChanged();
+  return page;
 }
 
 function projectEnvironment(input: OperatorEnvironmentSourceV1): OperatorEnvironmentSourceV1 {
@@ -544,7 +639,7 @@ function projectEnvironment(input: OperatorEnvironmentSourceV1): OperatorEnviron
       ...optionalProjectedText(identity, "commit", "operator environment.identity"),
     }),
     runtime: Object.freeze({
-      gateway: sourceEnum(dataField(runtime, "gateway", "operator environment.runtime"), "operator environment.runtime.gateway", ["running", "available"] as const),
+      gateway: sourceEnum(dataField(runtime, "gateway", "operator environment.runtime"), "operator environment.runtime.gateway", ["running", "available", "degraded"] as const),
       mcp: sourceBoolean(dataField(runtime, "mcp", "operator environment.runtime"), "operator environment.runtime.mcp"),
       workflows: sourceBoolean(dataField(runtime, "workflows", "operator environment.runtime"), "operator environment.runtime.workflows"),
       eventIngress: sourceBoolean(dataField(runtime, "eventIngress", "operator environment.runtime"), "operator environment.runtime.eventIngress"),
@@ -567,14 +662,14 @@ function runtimeSourceItems(environment: OperatorEnvironmentSourceV1): OperatorR
 function projectJob(input: OperatorJobSourceV1, path: string): WorkSourceItem {
   const value = exactSourceRecord(input, path);
   const status = sourceEnum(dataField(value, "status", path), `${path}.status`, ["queued", "running", "awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review"] as const);
-  const executionRunId = optionalSourceText(value, "executionRunId", path);
+  const executionRunId = optionalSourceIdentifier(value, "executionRunId", path);
   const envelopeDigest = optionalSourceDigest(value, "envelopeDigest", path);
-  const auditCorrelationId = optionalSourceText(value, "auditCorrelationId", path);
+  const auditCorrelationId = optionalSourceIdentifier(value, "auditCorrelationId", path);
   const attempts = sourceCount(dataField(value, "attempts", path), `${path}.attempts`);
   const retrySafe = sourceBoolean(dataField(value, "retrySafe", path), `${path}.retrySafe`);
   const attention = status === "failed" || status === "needs-review";
   const item: OperatorJobItemV1 = {
-    id: requiredSourceText(dataField(value, "id", path), `${path}.id`),
+    id: requiredSourceIdentifier(dataField(value, "id", path), `${path}.id`),
     kind: "job",
     label: requiredSourceText(dataField(value, "tool", path), `${path}.tool`),
     status,
@@ -596,8 +691,8 @@ function projectJob(input: OperatorJobSourceV1, path: string): WorkSourceItem {
 function projectRun(input: OperatorRunSourceV1, path: string): WorkSourceItem {
   const value = exactSourceRecord(input, path);
   const status = sourceEnum(dataField(value, "status", path, "unknown"), `${path}.status`, ["unknown", "running", "awaiting_approval", "completed", "failed", "blocked", "cancelled", "denied", "needs-review"] as const);
-  const id = requiredSourceText(dataField(value, "id", path), `${path}.id`);
-  const attention = ["failed", "blocked", "needs-review"].includes(status);
+  const id = requiredSourceIdentifier(dataField(value, "id", path), `${path}.id`);
+  const attention = ["unknown", "failed", "blocked", "needs-review"].includes(status);
   const item: OperatorRunItemV1 = {
     id,
     kind: "run",
@@ -622,16 +717,16 @@ function projectApprovals(input: readonly OperatorApprovalSourceV1[]): OperatorA
 function projectApproval(approval: PendingApprovalSummaryV1, path: string): OperatorApprovalItemV1 {
   const status = sourceEnum(approval.status, `${path}.status`, ["pending", "claimed"] as const);
   return Object.freeze({
-    id: requiredSourceText(approval.id, `${path}.id`),
+    id: requiredSourceIdentifier(approval.id, `${path}.id`),
     kind: "approval" as const,
     label: requiredSourceText(approval.tool, `${path}.tool`),
     status,
     summary: sourceText(approval.effect?.summary || approval.summary, "Review the bounded effect details before deciding.", `${path}.summary`),
     updatedAt: canonicalTimestamp(approval.createdAt, `${path}.createdAt`),
     attention: true as const,
-    controls: ["approve", "deny-approval"] as const,
+    ...(status === "pending" ? { controls: ["approve", "deny-approval"] as const } : {}),
     details: Object.freeze({
-      ...(approval.runId ? { runId: sourceText(approval.runId, "", `${path}.runId`) } : {}),
+      ...(approval.runId ? { runId: requiredSourceIdentifier(approval.runId, `${path}.runId`) } : {}),
       expiresAt: sourceCount(approval.expiresAt, `${path}.expiresAt`),
       ...(approval.effect ? { effect: approval.effect } : {}),
     }),
@@ -643,10 +738,9 @@ function projectWorkflow(input: OperatorWorkflowSourceV1, path: string): Operato
   const status = sourceEnum(dataField(value, "status", path), `${path}.status`, ["queued", "running", "awaiting-approval", "stopping", "cancelling", "completed", "failed", "cancelled", "needs-review"] as const);
   const attention = ["failed", "needs-review", "awaiting-approval"].includes(status);
   const controls = ["queued", "running", "awaiting-approval", "stopping", "cancelling"].includes(status)
-    ? ["cancel-workflow"] as const
-    : status === "needs-review" ? ["resume-workflow"] as const : undefined;
+    ? ["cancel-workflow"] as const : undefined;
   return Object.freeze({
-    id: requiredSourceText(dataField(value, "runId", path), `${path}.runId`),
+    id: requiredSourceIdentifier(dataField(value, "runId", path), `${path}.runId`),
     kind: "workflow" as const,
     label: requiredSourceText(dataField(value, "definitionDigest", path), `${path}.definitionDigest`),
     status,
@@ -661,7 +755,7 @@ function projectWatch(input: OperatorEventWatchSourceV1, path: string): Operator
   const value = exactSourceRecord(input, path);
   const enabled = sourceBoolean(dataField(value, "enabled", path), `${path}.enabled`);
   return Object.freeze({
-    id: requiredSourceText(dataField(value, "watchId", path), `${path}.watchId`),
+    id: requiredSourceIdentifier(dataField(value, "watchId", path), `${path}.watchId`),
     kind: "event-watch" as const,
     label: "Event watch",
     status: enabled ? "enabled" as const : "disabled" as const,
@@ -680,7 +774,7 @@ function projectSchedule(input: OperatorScheduleSourceV1, path: string): Operato
   const nextRunAtValue = dataField(value, "nextRunAt", path, null);
   const nextRunAt = nextRunAtValue === null || nextRunAtValue === undefined ? null : canonicalTimestamp(nextRunAtValue, `${path}.nextRunAt`);
   return Object.freeze({
-    id: requiredSourceText(dataField(value, "id", path), `${path}.id`),
+    id: requiredSourceIdentifier(dataField(value, "id", path), `${path}.id`),
     kind: "schedule" as const,
     label: sourceText(dataField(value, "name", path, dataField(value, "id", path, "schedule")), "schedule", `${path}.name`),
     status,
@@ -699,12 +793,12 @@ function projectLatestAttempts(input: readonly OperatorExecutionAttemptSourceV1[
   values.forEach((entry, index) => {
     const path = `operator latest attempts[${index}]`;
     const value = exactSourceRecord(entry, path);
-    const runId = sourceText(dataField(value, "runId", path), "", `${path}.runId`);
+    const runId = requiredSourceIdentifier(dataField(value, "runId", path), `${path}.runId`);
     if (!requested.has(runId)) sourceFail(`${path}.runId was not requested`, `${path}.runId`);
     if (attempts.has(runId)) sourceFail(`operator latest attempts contains duplicate runId: ${runId}`, `${path}.runId`);
     const state = sourceEnum(dataField(value, "state", path), `${path}.state`, [...ATTEMPT_STATES] as OperatorExecutionAttemptStateV1[]);
     const attempt = Object.freeze({
-      id: sourceText(dataField(value, "id", path), "", `${path}.id`),
+      id: requiredSourceIdentifier(dataField(value, "id", path), `${path}.id`),
       runId,
       attemptNumber: positiveSourceCount(dataField(value, "attemptNumber", path), `${path}.attemptNumber`),
       state,
@@ -717,6 +811,40 @@ function projectLatestAttempts(input: readonly OperatorExecutionAttemptSourceV1[
     attempts.set(runId, attempt);
   });
   return attempts;
+}
+
+function reconcileAttemptState(
+  item: OperatorJobItemV1 | OperatorRunItemV1,
+  state: OperatorExecutionAttemptStateV1,
+): OperatorJobItemV1 | OperatorRunItemV1 {
+  if (state !== "needs-review" || item.status === "needs-review") return item;
+  // The execution attempt is authoritative for uncertainty. Reconcile a
+  // stale job/run projection instead of returning a misleading terminal state
+  // or rejecting an otherwise useful read during normal settlement lag.
+  if (item.kind === "job") {
+    const { controls: _controls, ...withoutControls } = item;
+    return Object.freeze({
+      ...withoutControls,
+      status: "needs-review" as const,
+      summary: "Execution needs operator attention.",
+      attention: true as const,
+    });
+  }
+  return Object.freeze({
+    ...item,
+    status: "needs-review" as const,
+    summary: "Execution needs operator attention.",
+    attention: true as const,
+  });
+}
+
+function assertUniqueStaticIdentifiers(items: readonly OperatorItemV1[], path: string): void {
+  const seen = new Set<string>();
+  items.forEach((item, index) => {
+    const identity = JSON.stringify([item.kind, item.id]);
+    if (seen.has(identity)) sourceFail(`${path} contains a duplicate public identity`, `${path}[${index}].id`);
+    seen.add(identity);
+  });
 }
 
 function projectRecovery(input: OperatorRecoverySourceV1): OperatorRecoveryItemV1[] {
@@ -799,7 +927,7 @@ function isBrowserRecoveryStatus(value: string): value is Exclude<OperatorBrowse
   return new Set<string>(["clear", "executing", "unknown", "resolved", "completed"]).has(value);
 }
 
-function projectAudit(input: OperatorAuditSourceV1): { readonly item: OperatorAuditItemV1; readonly events: number; readonly runs: number } {
+function projectAudit(input: OperatorAuditSourceV1): { readonly item: OperatorAuditItemV1; readonly events: number; readonly runs: number; readonly attentionRuns: number } {
   const value = exactSourceRecord(input, "operator audit");
   const summary = exactSourceRecord(dataField(value, "summary", "operator audit"), "operator audit.summary");
   const integrity = exactSourceRecord(dataField(value, "integrity", "operator audit"), "operator audit.integrity");
@@ -809,10 +937,10 @@ function projectAudit(input: OperatorAuditSourceV1): { readonly item: OperatorAu
   if (attentionRuns > runs) sourceFail("operator audit.summary.attentionRuns cannot exceed runs", "operator audit.summary.attentionRuns");
   const valid = sourceBoolean(dataField(integrity, "valid", "operator audit.integrity"), "operator audit.integrity.valid");
   const checked = sourceBoolean(dataField(integrity, "checked", "operator audit.integrity"), "operator audit.integrity.checked");
-  const failures = sourceArray<OperatorAuditFailureSourceV1>(
-    dataField(integrity, "failures", "operator audit.integrity"),
-    "operator audit.integrity.failures",
-  ).length;
+  const failures = sourceCount(
+    dataField(integrity, "failureCount", "operator audit.integrity"),
+    "operator audit.integrity.failureCount",
+  );
   const unsigned = sourceCount(dataField(integrity, "unsigned", "operator audit.integrity"), "operator audit.integrity.unsigned");
   const attention = !valid || !checked;
   const item: OperatorAuditItemV1 = {
@@ -822,9 +950,10 @@ function projectAudit(input: OperatorAuditSourceV1): { readonly item: OperatorAu
     status: !valid ? "needs-review" : !checked ? "unknown" : "verified",
     summary: !valid ? "Audit integrity needs attention." : !checked ? "Audit integrity has not been explicitly verified in this process." : "Hash-chain verification passed.",
     ...(attention ? { attention: true as const } : {}),
+    ...(attention ? { controls: ["verify-audit"] as const } : {}),
     details: { events, runs, unsigned, failures, checked },
   };
-  return Object.freeze({ item: Object.freeze(item), events, runs });
+  return Object.freeze({ item: Object.freeze(item), events, runs, attentionRuns });
 }
 
 function operatorSurfaceItems(): OperatorSurfaceItemV1[] {
@@ -877,7 +1006,7 @@ async function selectCombinedPage<T>(page: OperatorPaginationV1, categories: rea
     if (limit > 0) {
       const values = await category.fetch(skip, limit);
       throwIfCancelled(signal);
-      if (!Array.isArray(values) || values.length !== limit) sourceFail("operator source page did not match its authoritative count", "operator source page");
+      if (!Array.isArray(values) || values.length !== limit) throw operatorSnapshotChanged();
       selected.push(...values);
     }
     remaining -= limit;
@@ -887,6 +1016,14 @@ async function selectCombinedPage<T>(page: OperatorPaginationV1, categories: rea
   return selected;
 }
 
+function operatorSnapshotChanged(): ApplicationContractValidationError {
+  return new ApplicationContractValidationError(
+    "operator snapshot changed while it was being read; retry the request",
+    OPERATOR_SNAPSHOT_CHANGED_CODE,
+    "operator snapshot",
+  );
+}
+
 function matches(item: OperatorItemV1, input: NormalizedOperatorSnapshotReadInputV1): boolean {
   const queryMatch = !input.query || [item.id, item.label, item.status, item.summary, item.kind].some((value) => String(value ?? "").toLowerCase().includes(input.query));
   return queryMatch && (!input.status || item.status === input.status);
@@ -894,6 +1031,10 @@ function matches(item: OperatorItemV1, input: NormalizedOperatorSnapshotReadInpu
 
 function isAttention(item: OperatorItemV1): boolean {
   return item.attention === true || ["failed", "needs-review", "blocked", "degraded", "unknown"].includes(item.status);
+}
+
+function lexicalCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function pageFor(input: NormalizedOperatorSnapshotReadInputV1, section: OperatorSnapshotSectionNameV1): number {
@@ -943,7 +1084,7 @@ function sourceText(input: unknown, fallback: string, path: string): string {
   if (typeof input !== "string") sourceFail(`${path} must be a string`, path);
   const normalized = input.replace(/\s+/gu, " ").trim();
   if (!normalized) return fallback;
-  if (SECRET_TEXT.some((pattern) => pattern.test(normalized))) return "[redacted]";
+  if (containsSensitiveApplicationValue(normalized)) return "[redacted]";
   if (Buffer.byteLength(normalized, "utf8") <= SOURCE_TEXT_BYTES) return normalized;
   let output = normalized;
   while (output && Buffer.byteLength(`${output}...`, "utf8") > SOURCE_TEXT_BYTES) output = output.slice(0, -1);
@@ -954,6 +1095,10 @@ function requiredSourceText(input: unknown, path: string): string {
   const value = sourceText(input, "", path);
   if (!value) sourceFail(`${path} must not be empty`, path);
   return value;
+}
+
+function requiredSourceIdentifier(input: unknown, path: string): string {
+  return validateOperatorIdentifierV1(input, path);
 }
 
 function inputText(input: unknown, path: string): string {
@@ -974,10 +1119,24 @@ function optionalSourceText(value: Record<string, unknown>, key: string, path: s
   return input === undefined || input === null || input === "" ? undefined : sourceText(input, "", `${path}.${key}`);
 }
 
+function optionalSourceIdentifier(value: Record<string, unknown>, key: string, path: string): string | undefined {
+  const input = dataField(value, key, path, undefined);
+  return input === undefined || input === null || input === "" ? undefined : requiredSourceIdentifier(input, `${path}.${key}`);
+}
+
 function optionalSourceDigest(value: Record<string, unknown>, key: string, path: string): string | undefined {
   const input = dataField(value, key, path, undefined);
   if (input === undefined || input === null || input === "") return undefined;
   if (typeof input !== "string" || !/^[a-f0-9]{64}$/u.test(input)) sourceFail(`${path}.${key} must be a lowercase SHA-256 digest`, `${path}.${key}`);
+  return input;
+}
+
+function optionalSourceGeneration(value: Record<string, unknown>, path: string): string | undefined {
+  const input = dataField(value, "generation", path, undefined);
+  if (input === undefined || input === null || input === "") return undefined;
+  if (typeof input !== "string" || !/^sqlite:data-version:\d+$/u.test(input)) {
+    sourceFail(`${path}.generation must be a bounded SQLite data-version token`, `${path}.generation`);
+  }
   return input;
 }
 

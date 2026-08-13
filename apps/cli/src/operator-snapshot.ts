@@ -1,19 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { stat, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
   APPLICATION_CONTRACT_VERSION,
   createOperatorSnapshotReadUseCase,
+  OPERATOR_SCHEDULE_SCHEMA_VERSION,
+  projectOperatorScheduleEnvelopeV1,
   type OperatorSnapshotReadInputV1,
   type OperatorSnapshotV1,
   type OperatorSurfaceV1,
-  type OperatorBrowserRecoverySourceV1,
   type OperatorJobSourceV1,
-  type OperatorPendingRecoverySourceV1,
   type OperatorScheduleSourceV1,
   type OperatorSnapshotSourceQueryV1,
 } from "@odinn/application";
-import { readApprovalSummaries, SqliteOperatorReadStore } from "@odinn/kernel";
+import { createAuditStore, inspectOperatorRecovery, readApprovalSummaries, SqliteOperatorReadStore } from "@odinn/kernel";
 
 type RuntimeConfiguration = {
   readonly enableMcp?: boolean;
@@ -34,7 +35,6 @@ export interface LocalOperatorSnapshotOptions {
 
 const MAX_OPERATOR_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_LEGACY_JOBS_BYTES = 64 * 1024 * 1024;
-const MAX_SCHEDULES = 500;
 const OPERATOR_JOB_STATUSES = new Set<OperatorJobSourceV1["status"]>(["queued", "running", "awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review"]);
 export const OPERATOR_SECTION_PAGE_OPTIONS = ["runtime", "work", "approvals", "automation", "context", "recovery", "audit", "surfaces"] as const;
 
@@ -97,28 +97,6 @@ async function readBoundedJson(path: string, fallback: unknown, maxBytes = MAX_O
   }
 }
 
-async function readBrowserRecoverySource(path: string): Promise<OperatorBrowserRecoverySourceV1> {
-  try {
-    const value = await readBoundedJson(path, { status: "clear" });
-    if (!value || typeof value !== "object" || Array.isArray(value)) return { invalid: true };
-    const status = (value as Record<string, unknown>).status;
-    return typeof status === "string" && status ? { invalid: false, status } : { invalid: true };
-  } catch {
-    return { invalid: true };
-  }
-}
-
-async function readPendingRecoverySource(path: string): Promise<OperatorPendingRecoverySourceV1> {
-  try {
-    const value = await readBoundedJson(path, { pending: [] });
-    if (!value || typeof value !== "object" || Array.isArray(value)) return { invalid: true };
-    const pending = (value as Record<string, unknown>).pending;
-    return Array.isArray(pending) ? { invalid: false, pendingCount: pending.length } : { invalid: true };
-  } catch {
-    return { invalid: true };
-  }
-}
-
 function legacyJobProjection(id: string, input: unknown): OperatorJobSourceV1 {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`legacy runtime job ${id} must be an object`);
   const value = input as Record<string, unknown>;
@@ -176,29 +154,10 @@ function queryLegacyJobs(items: readonly ReturnType<typeof legacyJobProjection>[
 }
 
 async function readSchedules(stateDir: string): Promise<readonly OperatorScheduleSourceV1[]> {
-  const source = await readBoundedJson(join(stateDir, "cron-jobs.json"), { jobs: [] });
-  if (!source || typeof source !== "object" || Array.isArray(source) || !Array.isArray((source as Record<string, unknown>).jobs)) {
-    throw new Error("operator schedule state must contain a jobs array");
-  }
-  const jobs = (source as Record<string, unknown>).jobs as unknown[];
-  if (jobs.length > MAX_SCHEDULES) throw new Error(`operator schedule state exceeds ${MAX_SCHEDULES} records`);
-  return jobs.map((input, index) => {
-    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`operator schedule ${index} must be an object`);
-    const value = input as Record<string, unknown>;
-    if (typeof value.id !== "string" || !value.id || typeof value.enabled !== "boolean") throw new Error(`operator schedule ${index} is missing its public identity`);
-    if (value.nextRunAt !== undefined && value.nextRunAt !== null && typeof value.nextRunAt !== "string") throw new Error(`operator schedule ${index} has an invalid next run time`);
-    for (const key of ["name", "lastStatus", "updatedAt"] as const) {
-      if (value[key] !== undefined && typeof value[key] !== "string") throw new Error(`operator schedule ${index}.${key} must be a string`);
-    }
-    return {
-      id: value.id,
-      enabled: value.enabled,
-      ...(typeof value.name === "string" ? { name: value.name } : {}),
-      ...(typeof value.lastStatus === "string" ? { lastStatus: value.lastStatus } : {}),
-      ...(typeof value.updatedAt === "string" ? { updatedAt: value.updatedAt } : {}),
-      ...(value.nextRunAt === null || typeof value.nextRunAt === "string" ? { nextRunAt: value.nextRunAt } : {}),
-    } satisfies OperatorScheduleSourceV1;
-  });
+  return projectOperatorScheduleEnvelopeV1(await readBoundedJson(
+    join(stateDir, "cron-jobs.json"),
+    { schemaVersion: OPERATOR_SCHEDULE_SCHEMA_VERSION, jobs: [] },
+  ));
 }
 
 export function createCliOperatorSnapshotReadRequest({
@@ -258,12 +217,33 @@ export async function readLocalOperatorSnapshot(options: LocalOperatorSnapshotOp
       queryWorkflows: async (query) => store.queryWorkflows(query),
       queryEventWatches: async (query) => store.queryEventWatches(query),
       readSchedules: async () => readSchedules(options.stateDir),
-      readRecovery: async () => ({
-        browser: await readBrowserRecoverySource(join(options.stateDir, "browser-recovery.json")),
-        sandbox: await readPendingRecoverySource(join(options.stateDir, "sandbox-recovery.json")),
-        process: await readPendingRecoverySource(join(options.stateDir, "process-recovery.json"))
-      }),
-      readAudit: async () => store.readAudit()
+      readRecovery: async () => inspectOperatorRecovery(options.stateDir),
+      readAudit: async () => {
+        // Do not create or migrate audit state during a read. Normal v1
+        // state has an initialized SQLite journal; an absent journal keeps
+        // the conservative unchecked result from the read-only adapter.
+        if (!existsSync(auditDatabasePath) || !existsSync(`${legacyAuditPath}.keys.json`) || !existsSync(`${auditDatabasePath}.notify`)) {
+          return store.readAudit();
+        }
+        const auditStore = createAuditStore(legacyAuditPath);
+        try {
+          const [summary, integrity] = await Promise.all([
+            auditStore.readSummary(),
+            auditStore.verifyIntegrity({ allowUnsigned: true }),
+          ]);
+          return {
+            summary,
+            integrity: {
+              valid: integrity.valid,
+              checked: true,
+              unsigned: integrity.unsigned,
+              failureCount: integrity.failures.length,
+            },
+          };
+        } finally {
+          auditStore.close();
+        }
+      }
     });
     const result = await useCase.execute(createCliOperatorSnapshotReadRequest({
       applicationRequestId: randomUUID(),

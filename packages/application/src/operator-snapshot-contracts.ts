@@ -3,7 +3,8 @@ import {
   normalizeReadContractJsonObjectV1,
   parseReadContractJsonObjectV1,
 } from "./read-contract-json.ts";
-import { ApplicationContractValidationError } from "./validation.ts";
+import { containsSensitiveApplicationValue } from "./sensitive-metadata.ts";
+import { ApplicationContractValidationError } from "./validation/errors.ts";
 import type { ApprovalEffectSummaryV1 } from "./read-output-contracts.ts";
 
 export const OPERATOR_SNAPSHOT_SCHEMA_VERSION = 1 as const;
@@ -29,7 +30,6 @@ export type OperatorActionNameV1 =
   | "approve"
   | "deny-approval"
   | "cancel-workflow"
-  | "resume-workflow"
   | "verify-audit";
 
 export type OperatorExecutionAttemptStateV1 =
@@ -97,7 +97,7 @@ export interface OperatorRunItemV1 extends OperatorItemBaseV1 {
 export interface OperatorApprovalItemV1 extends OperatorItemBaseV1 {
   readonly kind: "approval";
   readonly status: "pending" | "claimed";
-  readonly controls: readonly ("approve" | "deny-approval")[];
+  readonly controls?: readonly ("approve" | "deny-approval")[];
   readonly details: {
     readonly runId?: string;
     readonly expiresAt?: number;
@@ -108,7 +108,7 @@ export interface OperatorApprovalItemV1 extends OperatorItemBaseV1 {
 export interface OperatorWorkflowItemV1 extends OperatorItemBaseV1 {
   readonly kind: "workflow";
   readonly status: "queued" | "running" | "awaiting-approval" | "stopping" | "cancelling" | "completed" | "failed" | "cancelled" | "needs-review";
-  readonly controls?: readonly ("cancel-workflow" | "resume-workflow")[];
+  readonly controls?: readonly "cancel-workflow"[];
 }
 
 export interface OperatorEventWatchItemV1 extends OperatorItemBaseV1 {
@@ -207,6 +207,7 @@ export interface OperatorWorkCountsV1 extends OperatorBaseCountsV1 {
 
 export interface OperatorApprovalCountsV1 extends OperatorBaseCountsV1 {
   readonly pending: number;
+  readonly claimed: number;
 }
 
 export interface OperatorAutomationCountsV1 extends OperatorBaseCountsV1 {
@@ -268,6 +269,8 @@ export type OperatorSnapshotResponseV1 = OperatorSnapshotV1 & { readonly ok: tru
 
 const SNAPSHOT_KEYS = ["schemaVersion", "generatedAt", "surface", "identity", "health", "sections", "actions"] as const;
 const ITEM_BASE_KEYS = ["id", "kind", "label", "status", "summary", "updatedAt", "attention"] as const;
+const OPERATOR_IDENTIFIER_MAX_BYTES = 512;
+const OPERATOR_IDENTIFIER_CONTROL_PATTERN = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 const ATTEMPT_STATES: readonly OperatorExecutionAttemptStateV1[] = [
   "proposed", "admitted", "queued", "running", "awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review",
 ];
@@ -276,12 +279,31 @@ const ACTIONS: Readonly<Record<OperatorActionNameV1, Omit<OperatorActionDescript
   approve: { label: "Approve once", mutation: true, requiresTarget: true, confirmation: true },
   "deny-approval": { label: "Deny approval", mutation: true, requiresTarget: true, confirmation: true },
   "cancel-workflow": { label: "Cancel workflow", mutation: true, requiresTarget: true, confirmation: true },
-  "resume-workflow": { label: "Resume workflow", mutation: true, requiresTarget: true, confirmation: true },
   "verify-audit": { label: "Verify audit", mutation: false, requiresTarget: false, confirmation: false },
 });
 
 export function defaultOperatorSnapshotActionsV1(): readonly OperatorActionDescriptorV1[] {
   return Object.freeze((Object.entries(ACTIONS) as Array<[OperatorActionNameV1, Omit<OperatorActionDescriptorV1, "action">]>).map(([action, descriptor]) => Object.freeze({ action, ...descriptor })));
+}
+
+/**
+ * Validate an opaque identity used to join operator records or target a
+ * governed action. These values must remain byte-for-byte stable: unlike
+ * presentation text, they are never trimmed, whitespace-normalized,
+ * truncated, or redacted into a potentially colliding value.
+ */
+export function validateOperatorIdentifierV1(input: unknown, path = "operator identifier"): string {
+  if (typeof input !== "string" || input.length === 0) fail(`${path} must be a non-empty string`, path);
+  if (Buffer.byteLength(input, "utf8") > OPERATOR_IDENTIFIER_MAX_BYTES) {
+    fail(`${path} exceeds ${OPERATOR_IDENTIFIER_MAX_BYTES} bytes`, path);
+  }
+  if (OPERATOR_IDENTIFIER_CONTROL_PATTERN.test(input)) fail(`${path} contains control characters`, path);
+  if (input.normalize("NFC") !== input) fail(`${path} must use canonical NFC normalization`, path);
+  if (input.replace(/\s+/gu, " ").trim() !== input) fail(`${path} is not a canonical operator identifier`, path);
+  if (containsSensitiveApplicationValue(input)) {
+    fail(`${path} contains secret-like material`, path, "UNREDACTED_APPLICATION_METADATA");
+  }
+  return input;
 }
 
 export function parseOperatorSnapshotV1(source: string): OperatorSnapshotV1 {
@@ -323,14 +345,23 @@ function assertOperatorSnapshotV1(input: JsonObject, path: string, response: boo
   const sections = object(input.sections, `${path}.sections`, OPERATOR_SNAPSHOT_SECTION_NAMES);
   validateSection(sections.runtime, `${path}.sections.runtime`, "runtime", ["total", "attention"]);
   validateSection(sections.work, `${path}.sections.work`, "work", ["total", "jobs", "runs", "attention"]);
-  validateSection(sections.approvals, `${path}.sections.approvals`, "approvals", ["total", "pending", "attention"]);
+  validateSection(sections.approvals, `${path}.sections.approvals`, "approvals", ["total", "pending", "claimed", "attention"]);
   validateSection(sections.automation, `${path}.sections.automation`, "automation", ["total", "workflows", "watches", "schedules", "attention"]);
   validateSection(sections.context, `${path}.sections.context`, "context", ["total", "attention"]);
   validateSection(sections.recovery, `${path}.sections.recovery`, "recovery", ["total", "attention"]);
   validateSection(sections.audit, `${path}.sections.audit`, "audit", ["total", "events", "runs", "attention"]);
   validateSection(sections.surfaces, `${path}.sections.surfaces`, "surfaces", ["total", "attention"]);
+  validateUniqueOperatorTargets(sections, `${path}.sections`);
 
   if ((health.status === "healthy") !== (Number(health.attention) === 0)) fail(`${path}.health.status must reflect attention totals`, `${path}.health.status`);
+  const visibleSectionAttention = OPERATOR_SNAPSHOT_SECTION_NAMES.reduce((total, name) => {
+    const section = sections[name] as Record<string, unknown>;
+    const counts = section.counts as Record<string, unknown>;
+    return total + Number(counts.attention);
+  }, 0);
+  if (Number(health.attention) < visibleSectionAttention) {
+    fail(`${path}.health.attention cannot be lower than visible section attention`, `${path}.health.attention`);
+  }
 
   if (!Array.isArray(input.actions)) fail(`${path}.actions must be an array`, `${path}.actions`);
   const seen = new Set<string>();
@@ -351,6 +382,27 @@ function assertOperatorSnapshotV1(input: JsonObject, path: string, response: boo
   return input as unknown as OperatorSnapshotV1 | OperatorSnapshotResponseV1;
 }
 
+function validateUniqueOperatorTargets(sections: Record<string, unknown>, path: string): void {
+  const itemIdentities = new Set<string>();
+  const actionTargets = new Set<string>();
+  for (const sectionName of OPERATOR_SNAPSHOT_SECTION_NAMES) {
+    const section = sections[sectionName] as Record<string, unknown>;
+    const items = section.items as readonly Record<string, unknown>[];
+    items.forEach((item, index) => {
+      const itemPath = `${path}.${sectionName}.items[${index}]`;
+      const identity = JSON.stringify([item.kind, item.id]);
+      if (itemIdentities.has(identity)) fail(`${itemPath} duplicates a public operator identity`, `${itemPath}.id`);
+      itemIdentities.add(identity);
+      if (!Array.isArray(item.controls)) return;
+      for (const action of item.controls) {
+        const target = JSON.stringify([action, item.id]);
+        if (actionTargets.has(target)) fail(`${itemPath} duplicates an operator action target`, `${itemPath}.id`);
+        actionTargets.add(target);
+      }
+    });
+  }
+}
+
 function validateSection(input: unknown, path: string, name: OperatorSnapshotSectionNameV1, countKeys: readonly string[]): void {
   const section = object(input, path, ["status", "counts", "items", "pagination"]);
   oneOf(section.status, `${path}.status`, ["healthy", "attention", "degraded"]);
@@ -358,7 +410,7 @@ function validateSection(input: unknown, path: string, name: OperatorSnapshotSec
   for (const key of countKeys) count(counts[key], `${path}.counts.${key}`);
   if (Number(counts.attention) > Number(counts.total)) fail(`${path}.counts.attention cannot exceed total`, `${path}.counts.attention`);
   if (name === "work" && Number(counts.jobs) + Number(counts.runs) !== Number(counts.total)) fail(`${path}.counts jobs and runs must equal total`, `${path}.counts.total`);
-  if (name === "approvals" && counts.pending !== counts.total) fail(`${path}.counts.pending must equal total`, `${path}.counts.pending`);
+  if (name === "approvals" && Number(counts.pending) + Number(counts.claimed) !== Number(counts.total)) fail(`${path}.counts pending and claimed must equal total`, `${path}.counts.total`);
   if (name === "automation" && Number(counts.workflows) + Number(counts.watches) + Number(counts.schedules) !== Number(counts.total)) fail(`${path}.counts automation categories must equal total`, `${path}.counts.total`);
   if ((section.status === "healthy") !== (Number(counts.attention) === 0)) fail(`${path}.status must reflect section attention`, `${path}.status`);
 
@@ -383,6 +435,10 @@ function validateSection(input: unknown, path: string, name: OperatorSnapshotSec
   const expectedItems = expectedTo === 0 ? 0 : expectedTo - expectedFrom + 1;
   if (section.items.length !== expectedItems) fail(`${path}.items length does not match pagination`, `${path}.items`);
   section.items.forEach((item, index) => validateItem(item, `${path}.items[${index}]`, name));
+  const visibleAttention = section.items.filter((item) => (item as Record<string, unknown>).attention === true).length;
+  if (visibleAttention > Number(counts.attention)) {
+    fail(`${path}.counts.attention cannot be lower than visible item attention`, `${path}.counts.attention`);
+  }
 }
 
 function validateItem(input: unknown, path: string, section: OperatorSnapshotSectionNameV1): void {
@@ -404,30 +460,36 @@ function validateItem(input: unknown, path: string, section: OperatorSnapshotSec
     case "runtime": {
       const value = itemBase(input, path, []);
       oneOf(value.status, `${path}.status`, ["running", "available", "enabled", "disabled", "degraded"]);
+      attentionFlag(value, path, value.status === "degraded");
       return;
     }
     case "job": {
       const value = itemBase(input, path, ["controls", "details"]);
       oneOf(value.status, `${path}.status`, ["queued", "running", "awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review"]);
-      if (value.controls !== undefined) actionList(value.controls, `${path}.controls`, ["cancel-job"]);
+      attentionFlag(value, path, value.status === "failed" || value.status === "needs-review");
+      const jobCanCancel = ["queued", "running", "awaiting-approval", "cancelling"].includes(String(value.status));
+      if (jobCanCancel) exactActionList(value.controls, `${path}.controls`, ["cancel-job"]);
+      else if (value.controls !== undefined) fail(`${path}.controls is not allowed for a terminal job`, `${path}.controls`);
       const details = object(value.details, `${path}.details`, ["attempts", "retrySafe", "executionRunId", "envelopeDigest", "auditCorrelationId", "latestAttempt"], ["attempts", "retrySafe"]);
       count(details.attempts, `${path}.details.attempts`);
       bool(details.retrySafe, `${path}.details.retrySafe`);
-      optionalText(details.executionRunId, `${path}.details.executionRunId`);
+      if (details.executionRunId !== undefined) validateOperatorIdentifierV1(details.executionRunId, `${path}.details.executionRunId`);
       if (details.envelopeDigest !== undefined) sha256(details.envelopeDigest, `${path}.details.envelopeDigest`);
-      optionalText(details.auditCorrelationId, `${path}.details.auditCorrelationId`);
+      if (details.auditCorrelationId !== undefined) validateOperatorIdentifierV1(details.auditCorrelationId, `${path}.details.auditCorrelationId`);
       if (details.latestAttempt !== undefined) {
         validateAttempt(details.latestAttempt, `${path}.details.latestAttempt`);
         if (details.executionRunId === undefined) fail(`${path}.details.latestAttempt requires executionRunId`, `${path}.details.latestAttempt`);
         if ((details.latestAttempt as Record<string, unknown>).runId !== details.executionRunId) {
           fail(`${path}.details.latestAttempt.runId must match executionRunId`, `${path}.details.latestAttempt.runId`);
         }
+        validateAttemptBinding("job", String(value.status), String((details.latestAttempt as Record<string, unknown>).state), `${path}.details.latestAttempt.state`);
       }
       return;
     }
     case "run": {
       const value = itemBase(input, path, ["details"]);
       oneOf(value.status, `${path}.status`, ["unknown", "running", "awaiting_approval", "completed", "failed", "blocked", "cancelled", "denied", "needs-review"]);
+      attentionFlag(value, path, ["unknown", "failed", "blocked", "needs-review"].includes(String(value.status)));
       const details = object(value.details, `${path}.details`, ["eventCount", "actor", "latestAttempt"], ["eventCount", "actor"]);
       count(details.eventCount, `${path}.details.eventCount`);
       text(details.actor, `${path}.details.actor`);
@@ -436,15 +498,18 @@ function validateItem(input: unknown, path: string, section: OperatorSnapshotSec
         if ((details.latestAttempt as Record<string, unknown>).runId !== value.id) {
           fail(`${path}.details.latestAttempt.runId must match run id`, `${path}.details.latestAttempt.runId`);
         }
+        validateAttemptBinding("run", String(value.status), String((details.latestAttempt as Record<string, unknown>).state), `${path}.details.latestAttempt.state`);
       }
       return;
     }
     case "approval": {
       const value = itemBase(input, path, ["controls", "details"]);
       oneOf(value.status, `${path}.status`, ["pending", "claimed"]);
-      actionList(value.controls, `${path}.controls`, ["approve", "deny-approval"]);
+      attentionFlag(value, path, true);
+      if (value.status === "pending") exactActionList(value.controls, `${path}.controls`, ["approve", "deny-approval"]);
+      else if (value.controls !== undefined) fail(`${path}.controls is not allowed while approval execution is claimed`, `${path}.controls`);
       const details = object(value.details, `${path}.details`, ["runId", "expiresAt", "effect"], []);
-      optionalText(details.runId, `${path}.details.runId`, true);
+      if (details.runId !== undefined) validateOperatorIdentifierV1(details.runId, `${path}.details.runId`);
       if (details.expiresAt !== undefined) count(details.expiresAt, `${path}.details.expiresAt`);
       if (details.effect !== undefined) validateApprovalEffect(details.effect, `${path}.details.effect`);
       return;
@@ -452,12 +517,18 @@ function validateItem(input: unknown, path: string, section: OperatorSnapshotSec
     case "workflow": {
       const value = itemBase(input, path, ["controls"]);
       oneOf(value.status, `${path}.status`, ["queued", "running", "awaiting-approval", "stopping", "cancelling", "completed", "failed", "cancelled", "needs-review"]);
-      if (value.controls !== undefined) actionList(value.controls, `${path}.controls`, ["cancel-workflow", "resume-workflow"]);
+      attentionFlag(value, path, ["awaiting-approval", "failed", "needs-review"].includes(String(value.status)));
+      const workflowControl = ["queued", "running", "awaiting-approval", "stopping", "cancelling"].includes(String(value.status))
+          ? ["cancel-workflow"]
+          : undefined;
+      if (workflowControl) exactActionList(value.controls, `${path}.controls`, workflowControl);
+      else if (value.controls !== undefined) fail(`${path}.controls is not allowed for a terminal workflow`, `${path}.controls`);
       return;
     }
     case "event-watch": {
       const value = itemBase(input, path, ["details"]);
       oneOf(value.status, `${path}.status`, ["enabled", "disabled"]);
+      attentionFlag(value, path, false);
       const details = object(value.details, `${path}.details`, ["enabled"]);
       bool(details.enabled, `${path}.details.enabled`);
       return;
@@ -465,6 +536,7 @@ function validateItem(input: unknown, path: string, section: OperatorSnapshotSec
     case "schedule": {
       const value = itemBase(input, path, ["details"]);
       oneOf(value.status, `${path}.status`, ["enabled", "disabled", "needs-review"]);
+      attentionFlag(value, path, value.status === "needs-review");
       const details = object(value.details, `${path}.details`, ["nextRunAt"]);
       if (details.nextRunAt !== null) timestamp(details.nextRunAt, `${path}.details.nextRunAt`);
       return;
@@ -472,6 +544,7 @@ function validateItem(input: unknown, path: string, section: OperatorSnapshotSec
     case "context": {
       const value = itemBase(input, path, []);
       oneOf(value.status, `${path}.status`, ["enabled", "disabled"]);
+      attentionFlag(value, path, false);
       return;
     }
     case "recovery": validateRecoveryItem(input, path); return;
@@ -479,15 +552,22 @@ function validateItem(input: unknown, path: string, section: OperatorSnapshotSec
       const value = itemBase(input, path, ["controls", "details"]);
       literal(value.id, `${path}.id`, "audit-journal");
       oneOf(value.status, `${path}.status`, ["verified", "unknown", "needs-review"]);
-      if (value.controls !== undefined) actionList(value.controls, `${path}.controls`, ["verify-audit"]);
+      attentionFlag(value, path, value.status !== "verified");
+      if (value.status === "verified") {
+        if (value.controls !== undefined) fail(`${path}.controls is not allowed for verified audit state`, `${path}.controls`);
+      } else exactActionList(value.controls, `${path}.controls`, ["verify-audit"]);
       const details = object(value.details, `${path}.details`, ["events", "runs", "unsigned", "failures", "checked"]);
       for (const key of ["events", "runs", "unsigned", "failures"] as const) count(details[key], `${path}.details.${key}`);
       bool(details.checked, `${path}.details.checked`);
+      if (value.status === "verified" && details.checked !== true) fail(`${path}.details.checked must be true for verified audit status`, `${path}.details.checked`);
+      if (value.status === "unknown" && (details.checked !== false || Number(details.failures) !== 0)) fail(`${path}.status is inconsistent with audit evidence`, `${path}.status`);
+      if (Number(details.failures) > 0 && value.status !== "needs-review") fail(`${path}.status must reflect audit failures`, `${path}.status`);
       return;
     }
     case "surface": {
       const value = itemBase(input, path, []);
       literal(value.status, `${path}.status`, "available");
+      attentionFlag(value, path, false);
       return;
     }
     default: fail(`${path}.kind is unsupported`, `${path}.kind`);
@@ -501,11 +581,16 @@ function validateRecoveryItem(input: unknown, path: string): void {
     case "browser-recovery":
       oneOf(value.status, `${path}.status`, ["clear", "executing", "unknown", "resolved", "completed", "needs-review"]);
       bool(details.pending, `${path}.details.pending`);
+      attentionFlag(value, path, !["clear", "resolved", "completed"].includes(String(value.status)));
+      if (details.pending !== (value.attention === true)) fail(`${path}.details.pending must match recovery attention`, `${path}.details.pending`);
       break;
     case "sandbox-recovery":
     case "process-recovery":
       oneOf(value.status, `${path}.status`, ["clear", "needs-review"]);
       if (details.pending !== null) count(details.pending, `${path}.details.pending`);
+      attentionFlag(value, path, value.status === "needs-review");
+      if (value.status === "clear" && details.pending !== 0) fail(`${path}.details.pending must be zero when recovery is clear`, `${path}.details.pending`);
+      if (value.status === "needs-review" && details.pending === 0) fail(`${path}.details.pending must be positive or unknown when recovery needs review`, `${path}.details.pending`);
       break;
     default: fail(`${path}.id is not a V1 recovery source`, `${path}.id`);
   }
@@ -513,7 +598,7 @@ function validateRecoveryItem(input: unknown, path: string): void {
 
 function itemBase(input: unknown, path: string, extra: readonly string[]): Record<string, unknown> {
   const value = object(input, path, [...ITEM_BASE_KEYS, ...extra], ["id", "kind", "label", "status"]);
-  text(value.id, `${path}.id`);
+  validateOperatorIdentifierV1(value.id, `${path}.id`);
   text(value.kind, `${path}.kind`);
   text(value.label, `${path}.label`);
   text(value.status, `${path}.status`);
@@ -525,8 +610,8 @@ function itemBase(input: unknown, path: string, extra: readonly string[]): Recor
 
 function validateAttempt(input: unknown, path: string): void {
   const value = object(input, path, ["id", "runId", "attemptNumber", "state", "createdAt", "startedAt", "settledAt", "outcomeDigest", "errorCode"], ["id", "runId", "attemptNumber", "state", "createdAt"]);
-  text(value.id, `${path}.id`);
-  text(value.runId, `${path}.runId`);
+  validateOperatorIdentifierV1(value.id, `${path}.id`);
+  validateOperatorIdentifierV1(value.runId, `${path}.runId`);
   positiveCount(value.attemptNumber, `${path}.attemptNumber`);
   oneOf(value.state, `${path}.state`, ATTEMPT_STATES);
   timestamp(value.createdAt, `${path}.createdAt`);
@@ -536,6 +621,12 @@ function validateAttempt(input: unknown, path: string): void {
   if (value.errorCode !== undefined) {
     text(value.errorCode, `${path}.errorCode`);
     if (!/^[A-Z][A-Z0-9_]{0,127}$/u.test(value.errorCode as string)) fail(`${path}.errorCode is invalid`, `${path}.errorCode`);
+  }
+}
+
+function validateAttemptBinding(kind: "job" | "run", status: string, state: string, path: string): void {
+  if (state === "needs-review" && status !== "needs-review") {
+    fail(`${path} is inconsistent with the public ${kind} status`, path);
   }
 }
 
@@ -562,6 +653,18 @@ function actionList(input: unknown, path: string, allowed: readonly string[]): v
     if (seen.has(entry as string)) fail(`${path} cannot contain duplicate actions`, `${path}[${index}]`);
     seen.add(entry as string);
   });
+}
+
+function exactActionList(input: unknown, path: string, expected: readonly string[]): void {
+  actionList(input, path, expected);
+  if (!Array.isArray(input) || input.length !== expected.length
+    || input.some((entry, index) => entry !== expected[index])) {
+    fail(`${path} must contain the exact actions for this item state`, path);
+  }
+}
+
+function attentionFlag(value: Record<string, unknown>, path: string, required: boolean): void {
+  if ((value.attention === true) !== required) fail(`${path}.attention must match item state`, `${path}.attention`);
 }
 
 function object(input: unknown, path: string, allowed: readonly string[], required: readonly string[] = allowed): Record<string, unknown> {

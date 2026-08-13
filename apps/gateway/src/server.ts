@@ -3,11 +3,11 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateGatewayChannelDiagnosticsV1, validateOperatorSnapshotResponseV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorBrowserRecoverySourceV1, type OperatorJobSourceV1, type OperatorPendingRecoverySourceV1, type OperatorRunSourceV1, type OperatorScheduleSourceV1, type OperatorSnapshotReadInputV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { APPLICATION_CONTRACT_VERSION, ApplicationContractValidationError, OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validateOperatorSnapshotResponseV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSnapshotReadInputV1, type OperatorSurfaceV1 } from "@odinn/application";
+import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -53,102 +53,10 @@ async function productCommit() {
   }
 }
 
-const GATEWAY_OPERATOR_JOB_STATUSES = new Set<OperatorJobSourceV1["status"]>(["queued", "running", "awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review"]);
-const GATEWAY_OPERATOR_RUN_STATUSES = new Set<OperatorRunSourceV1["status"]>(["unknown", "running", "awaiting_approval", "completed", "failed", "blocked", "cancelled", "denied", "needs-review"]);
 const GATEWAY_OPERATOR_SURFACES = new Set<OperatorSurfaceV1>(["cli", "tui", "http", "console"]);
-
-function gatewayOperatorRecord(input: unknown, label: string): Record<string, unknown> {
-  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`${label} must be an object`);
-  return input as Record<string, unknown>;
-}
-
-function gatewayOperatorString(input: unknown, label: string): string {
-  if (typeof input !== "string" || !input) throw new Error(`${label} must be a non-empty string`);
-  return input;
-}
-
-function gatewayOperatorCount(input: unknown, label: string): number {
-  const value = Number(input);
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${label} must be a non-negative integer`);
-  return value;
-}
-
-function gatewayOperatorEnum<T extends string>(input: unknown, values: ReadonlySet<T>, label: string): T {
-  if (typeof input !== "string" || !values.has(input as T)) throw new Error(`${label} is invalid`);
-  return input as T;
-}
 
 function gatewayOperatorSurface(input: string): OperatorSurfaceV1 {
   return GATEWAY_OPERATOR_SURFACES.has(input as OperatorSurfaceV1) ? input as OperatorSurfaceV1 : "http";
-}
-
-function gatewayOperatorJobSource(input: unknown): OperatorJobSourceV1 {
-  const job = gatewayOperatorRecord(input, "operator job");
-  const id = gatewayOperatorString(job.id, "operator job id");
-  const payload = job.payload && typeof job.payload === "object" && !Array.isArray(job.payload)
-    ? job.payload as Record<string, unknown>
-    : {};
-  const task = payload.task && typeof payload.task === "object" && !Array.isArray(payload.task)
-    ? payload.task as Record<string, unknown>
-    : {};
-  return {
-    id,
-    status: gatewayOperatorEnum(job.status, GATEWAY_OPERATOR_JOB_STATUSES, `operator job ${id} status`),
-    tool: typeof task.tool === "string" && task.tool ? task.tool : "job",
-    attempts: gatewayOperatorCount(job.attempts, `operator job ${id} attempts`),
-    retrySafe: job.retrySafe === true,
-    ...(typeof job.createdAt === "string" ? { createdAt: job.createdAt } : {}),
-    ...(typeof job.updatedAt === "string" ? { updatedAt: job.updatedAt } : {}),
-    ...(typeof job.completedAt === "string" ? { completedAt: job.completedAt } : {}),
-    ...(typeof job.executionRunId === "string" ? { executionRunId: job.executionRunId } : {}),
-    ...(typeof job.envelopeDigest === "string" ? { envelopeDigest: job.envelopeDigest } : {}),
-    ...(typeof job.auditCorrelationId === "string" ? { auditCorrelationId: job.auditCorrelationId } : {}),
-  };
-}
-
-function gatewayOperatorRunSource(input: unknown): OperatorRunSourceV1 {
-  const run = gatewayOperatorRecord(input, "operator audit run");
-  const id = gatewayOperatorString(run.id, "operator audit run id");
-  return {
-    id,
-    status: gatewayOperatorEnum(run.status, GATEWAY_OPERATOR_RUN_STATUSES, `operator audit run ${id} status`),
-    eventCount: gatewayOperatorCount(run.eventCount, `operator audit run ${id} eventCount`),
-    actor: gatewayOperatorString(run.actor, `operator audit run ${id} actor`),
-    ...(typeof run.tool === "string" ? { tool: run.tool } : {}),
-    ...(typeof run.message === "string" ? { message: run.message } : {}),
-    ...(typeof run.lastEventAt === "string" ? { lastEventAt: run.lastEventAt } : {}),
-    ...(typeof run.completedAt === "string" ? { completedAt: run.completedAt } : {}),
-    ...(typeof run.startedAt === "string" ? { startedAt: run.startedAt } : {}),
-  };
-}
-
-function gatewayOperatorScheduleSource(input: unknown): OperatorScheduleSourceV1 {
-  const schedule = gatewayOperatorRecord(input, "operator schedule");
-  const id = gatewayOperatorString(schedule.id, "operator schedule id");
-  if (typeof schedule.enabled !== "boolean") throw new Error(`operator schedule ${id} enabled must be a boolean`);
-  if (schedule.nextRunAt !== undefined && schedule.nextRunAt !== null && typeof schedule.nextRunAt !== "string") {
-    throw new Error(`operator schedule ${id} nextRunAt is invalid`);
-  }
-  return {
-    id,
-    enabled: schedule.enabled,
-    ...(typeof schedule.name === "string" ? { name: schedule.name } : {}),
-    ...(typeof schedule.lastStatus === "string" ? { lastStatus: schedule.lastStatus } : {}),
-    ...(typeof schedule.updatedAt === "string" ? { updatedAt: schedule.updatedAt } : {}),
-    ...(schedule.nextRunAt === null || typeof schedule.nextRunAt === "string" ? { nextRunAt: schedule.nextRunAt } : {}),
-  };
-}
-
-function gatewayBrowserRecoverySource(input: unknown): OperatorBrowserRecoverySourceV1 {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return { invalid: true };
-  const status = (input as Record<string, unknown>).status;
-  return typeof status === "string" && status ? { invalid: false, status } : { invalid: true };
-}
-
-function gatewayPendingRecoverySource(input: unknown): OperatorPendingRecoverySourceV1 {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return { invalid: true };
-  const pending = (input as Record<string, unknown>).pending;
-  return Array.isArray(pending) ? { invalid: false, pendingCount: pending.length } : { invalid: true };
 }
 
 function createQuotaGate(value: any = {}) {
@@ -196,9 +104,25 @@ class GatewayError extends Error {
   }
 }
 
+export function gatewayOperatorSnapshotFailure(error: unknown, requestId: string) {
+  if (!(error instanceof ApplicationContractValidationError)
+    || error.code !== OPERATOR_SNAPSHOT_CHANGED_CODE) return undefined;
+  return Object.freeze({
+    status: 503 as const,
+    retryAfter: "1",
+    body: Object.freeze({
+      ok: false as const,
+      error: "operator snapshot changed while it was being read; retry the request",
+      code: OPERATOR_SNAPSHOT_CHANGED_CODE,
+      retryable: true as const,
+      requestId,
+    }),
+  });
+}
+
 class MissingChannelCredentialError extends Error {}
 
-const CRON_SCHEMA_VERSION = 2;
+const CRON_SCHEMA_VERSION = OPERATOR_SCHEDULE_SCHEMA_VERSION;
 const CRON_MAX_JOBS = 500;
 const CRON_MAX_FILE_BYTES = 4 * 1024 * 1024;
 const CRON_DISPATCH_LEASE_MS = 10 * 60 * 1000;
@@ -207,24 +131,34 @@ export class CronStore {
   path: string;
   writeChain: Promise<unknown> = Promise.resolve();
   constructor(path: string) { this.path = path; }
-  async read() {
+  async readRaw() {
     try {
       if ((await statPath(this.path)).size > CRON_MAX_FILE_BYTES) throw new GatewayError(409, `cron state exceeds the ${CRON_MAX_FILE_BYTES}-byte limit`);
-      const value = JSON.parse(await readFile(this.path, "utf8"));
-      if ((value?.schemaVersion !== 1 && value?.schemaVersion !== CRON_SCHEMA_VERSION) || !Array.isArray(value.jobs)) {
-        return { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
-      }
-      if (value.jobs.length > CRON_MAX_JOBS) throw new GatewayError(409, `cron state exceeds the ${CRON_MAX_JOBS}-job limit`);
-      return value.jobs.length
-        ? { schemaVersion: CRON_SCHEMA_VERSION, jobs: value.jobs.map((job: any) => normalizeCronJob(job)) }
-        : { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
+      return JSON.parse(await readFile(this.path, "utf8"));
     } catch (error: any) {
       if (error?.code === "ENOENT") return { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
       throw error;
     }
   }
+  async readSource() {
+    const value = await this.readRaw();
+    if ((value?.schemaVersion !== 1 && value?.schemaVersion !== CRON_SCHEMA_VERSION) || !Array.isArray(value.jobs)) {
+      return { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
+    }
+    if (value.jobs.length > CRON_MAX_JOBS) throw new GatewayError(409, `cron state exceeds the ${CRON_MAX_JOBS}-job limit`);
+    return { schemaVersion: CRON_SCHEMA_VERSION, jobs: value.jobs };
+  }
+  async read() {
+    const value = await this.readSource();
+    return value.jobs.length
+      ? { schemaVersion: CRON_SCHEMA_VERSION, jobs: value.jobs.map((job: any) => normalizeCronJob(job)) }
+      : value;
+  }
+  async readOperatorSchedules() {
+    return projectOperatorScheduleEnvelopeV1(await this.readRaw());
+  }
   async list({ limit = CRON_MAX_JOBS, offset = 0 }: { limit?: number; offset?: number } = {}) {
-    const jobs = (await this.read()).jobs.sort((left: any, right: any) => String(left.name).localeCompare(String(right.name)));
+    const jobs = (await this.read()).jobs.sort((left: any, right: any) => String(left.name).localeCompare(String(right.name)) || String(left.id).localeCompare(String(right.id)));
     const boundedLimit = Math.min(CRON_MAX_JOBS, Math.max(0, Number.isSafeInteger(Number(limit)) ? Number(limit) : CRON_MAX_JOBS));
     const boundedOffset = Math.max(0, Number.isSafeInteger(Number(offset)) ? Number(offset) : 0);
     return jobs.slice(boundedOffset, boundedOffset + boundedLimit);
@@ -902,6 +836,12 @@ export async function createGatewayServer(options: any = {}) {
     : undefined;
   const contextRecords = config.runtime?.enableProjectContext === true ? new SqliteRecordStore(join(state, "db", "records.sqlite")) : undefined;
   const projectContext = contextRecords ? new ProjectContextService({ records: contextRecords }) : undefined;
+  const operatorAuditPath = join(state, config.auditLog ?? "audit.jsonl");
+  const operatorAuditDatabasePath = join(dirname(operatorAuditPath), "db", `${basename(operatorAuditPath, ".jsonl")}.sqlite`);
+  const operatorReadStore = new SqliteOperatorReadStore({
+    runtimeDatabasePath: join(state, "db", "odinn.sqlite"),
+    auditDatabasePath: operatorAuditDatabasePath,
+  });
   const quotaGate = createQuotaGate(quotas);
   const cronStore = new CronStore(join(state, "cron-jobs.json"));
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
@@ -1241,15 +1181,6 @@ export async function createGatewayServer(options: any = {}) {
     return { approvalId: id, denied: true, ...(pending.runId ? { runId: pending.runId } : {}) };
   };
 
-  const readOperatorFile = async (name: string, fallback: unknown): Promise<unknown> => {
-    try {
-      const path = join(state, name);
-      if ((await statPath(path)).size > 4 * 1024 * 1024) return undefined;
-      return JSON.parse(await readFile(path, "utf8")) as unknown;
-    }
-    catch (error) { return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? fallback : undefined; }
-  };
-
   const operatorSnapshotRead = createOperatorSnapshotReadUseCase({
     readEnvironment: async () => ({
       identity: { state, workspaceRoot: root, version, commit: await productCommit() },
@@ -1261,35 +1192,29 @@ export async function createGatewayServer(options: any = {}) {
         projectContext: Boolean(projectContext)
       }
     }),
-    queryJobs: async (query) => {
-      const page = await supervisor.queryJobs(query);
-      return {
-        ...page,
-        items: page.items.map((job: unknown) => gatewayOperatorJobSource(job))
-      };
-    },
-    queryRuns: async (query) => {
-      const page = await auditStore.queryRuns(query);
-      return { ...page, items: page.items.map((run: unknown) => gatewayOperatorRunSource(run)) };
-    },
+    queryJobs: async (query) => operatorReadStore.queryJobs(query),
+    queryRuns: async (query) => operatorReadStore.queryRuns(query),
     readLatestAttempts: async (runIds) => runtime.ledger.readLatestExecutionAttempts(runIds),
     readApprovals: async () => readApprovalSummaries(join(state, "approvals.json")),
-    queryWorkflows: async (query) => workflowRuntime
-      ? workflowRuntime.queryWorkflows(query)
-      : { items: [], total: 0, attention: 0 },
-    queryEventWatches: async (query) => eventIngress
-      ? eventIngress.queryWatches(query)
-      : { items: [], total: 0, attention: 0 },
-    readSchedules: async () => (await cronStore.list()).map((schedule: unknown) => gatewayOperatorScheduleSource(schedule)),
-    readRecovery: async () => ({
-      browser: gatewayBrowserRecoverySource(await readOperatorFile("browser-recovery.json", { status: "clear" })),
-      sandbox: gatewayPendingRecoverySource(await readOperatorFile("sandbox-recovery.json", { pending: [] })),
-      process: gatewayPendingRecoverySource(await readOperatorFile("process-recovery.json", { pending: [] }))
+    queryWorkflows: async (query) => operatorReadStore.queryWorkflows(query),
+    queryEventWatches: async (query) => operatorReadStore.queryEventWatches(query),
+    readSchedules: async () => cronStore.readOperatorSchedules(),
+    readRecovery: async () => inspectOperatorRecovery(state, {
+      sandboxQuarantined: sandboxRecoveryStartupError,
+      processQuarantined: processRecoveryStartupError,
     }),
-    readAudit: async () => ({
-      summary: await auditStore.readSummary(),
-      integrity: auditStore.getIntegrityStatus()
-    })
+    readAudit: async () => {
+      const integrity = auditStore.getIntegrityStatus();
+      return {
+        summary: await auditStore.readSummary(),
+        integrity: {
+          valid: integrity.valid,
+          checked: integrity.checked,
+          unsigned: integrity.unsigned,
+          failureCount: integrity.failures.length,
+        },
+      };
+    }
   });
 
   const server: any = createServer(async (request: any, response: any) => {
@@ -1371,20 +1296,28 @@ export async function createGatewayServer(options: any = {}) {
         const page = numericParameter("page");
         const pageSize = numericParameter("pageSize");
         const sourcePath = url.pathname === "/operator" ? "/operator" : "/operator/snapshot";
-        const result = await operatorSnapshotRead.execute(createGatewayOperatorSnapshotReadRequest({
-          applicationRequestId: randomUUID(),
-          hostedUserId: trustedHostedUserId,
-          authentication,
-          sourcePath,
-          input: {
-            surface,
-            ...(page === undefined ? {} : { page }),
-            ...(pageSize === undefined ? {} : { pageSize }),
-            ...(url.searchParams.has("q") ? { query: url.searchParams.get("q") ?? "" } : {}),
-            ...(url.searchParams.has("status") ? { status: url.searchParams.get("status") ?? "" } : {}),
-            ...(Object.keys(pages).length ? { pages } : {})
-          }
-        }));
+        let result;
+        try {
+          result = await operatorSnapshotRead.execute(createGatewayOperatorSnapshotReadRequest({
+            applicationRequestId: randomUUID(),
+            hostedUserId: trustedHostedUserId,
+            authentication,
+            sourcePath,
+            input: {
+              surface,
+              ...(page === undefined ? {} : { page }),
+              ...(pageSize === undefined ? {} : { pageSize }),
+              ...(url.searchParams.has("q") ? { query: url.searchParams.get("q") ?? "" } : {}),
+              ...(url.searchParams.has("status") ? { status: url.searchParams.get("status") ?? "" } : {}),
+              ...(Object.keys(pages).length ? { pages } : {})
+            }
+          }));
+        } catch (error) {
+          const failure = gatewayOperatorSnapshotFailure(error, requestId);
+          if (!failure) throw error;
+          response.setHeader("retry-after", failure.retryAfter);
+          return json(response, failure.status, failure.body);
+        }
         return json(response, 200, validateOperatorSnapshotResponseV1({ ok: true, ...result.output }));
       }
       if (request.method === "POST" && url.pathname === "/operator/actions") {
@@ -1392,36 +1325,52 @@ export async function createGatewayServer(options: any = {}) {
         const action = String(body.action || "").trim();
         if (!operatorActionNames().includes(action as any)) throw new GatewayError(400, "operator action is unsupported");
         if (action !== "verify-audit" && body.confirm !== true) throw new GatewayError(400, "operator action requires confirm=true");
-        const targetId = String(body.targetId || "").trim();
-        if (action !== "verify-audit" && (!targetId || targetId.length > 512)) throw new GatewayError(400, "operator action targetId is required");
+        let targetId: string | undefined;
+        if (action !== "verify-audit") {
+          try { targetId = validateOperatorIdentifierV1(body.targetId, "operator action targetId"); }
+          catch { throw new GatewayError(400, "operator action targetId is invalid"); }
+        }
         let result: any;
+        const requiredTargetId = () => {
+          if (!targetId) throw new GatewayError(400, "operator action targetId is required");
+          return targetId;
+        };
         if (action === "cancel-job") {
           for (const approval of approvalStore.list()) if (approval.runId === targetId && approval.id) approvalStore.revoke(approval.id);
-          result = await supervisor.cancel(targetId);
+          result = await supervisor.cancel(requiredTargetId());
         } else if (action === "approve") {
-          result = await approveGatewayApproval(targetId);
+          result = await approveGatewayApproval(requiredTargetId());
         } else if (action === "deny-approval") {
-          result = await denyGatewayApproval(targetId);
+          result = await denyGatewayApproval(requiredTargetId());
         } else if (action === "cancel-workflow") {
           if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled");
-          result = await workflowRuntime.cancel(targetId);
-        } else if (action === "resume-workflow") {
-          if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled");
-          result = await workflowRuntime.resume(targetId);
+          result = await workflowRuntime.cancel(requiredTargetId());
         } else {
           result = await auditStore.verifyIntegrity({ allowUnsigned: true });
         }
         const requestedSurface = String(body.surface || "http");
         const surface = gatewayOperatorSurface(requestedSurface);
-        const snapshotResult = await operatorSnapshotRead.execute(createGatewayOperatorSnapshotReadRequest({
-          applicationRequestId: randomUUID(),
-          hostedUserId: trustedHostedUserId,
-          authentication,
-          sourcePath: "/operator/actions",
-          input: { surface }
-        }));
-        const snapshot = snapshotResult.output;
-        return json(response, 200, { ok: true, action, ...(targetId ? { targetId } : {}), result, snapshot });
+        try {
+          const snapshotResult = await operatorSnapshotRead.execute(createGatewayOperatorSnapshotReadRequest({
+            applicationRequestId: randomUUID(),
+            hostedUserId: trustedHostedUserId,
+            authentication,
+            sourcePath: "/operator/actions",
+            input: { surface }
+          }));
+          return json(response, 200, { ok: true, action, ...(targetId ? { targetId } : {}), result, snapshot: snapshotResult.output });
+        } catch (error) {
+          const failure = gatewayOperatorSnapshotFailure(error, requestId);
+          return json(response, 200, {
+            ok: true,
+            action,
+            ...(targetId ? { targetId } : {}),
+            result,
+            snapshotUnavailable: failure
+              ? { code: OPERATOR_SNAPSHOT_CHANGED_CODE, retryable: true }
+              : { code: "OPERATOR_SNAPSHOT_UNAVAILABLE", retryable: false },
+          });
+        }
       }
       if (request.method === "GET" && url.pathname === "/channels") {
         return json(response, 200, { ok: true, channels: channelSupervisor.status() });
@@ -2356,6 +2305,7 @@ export async function createGatewayServer(options: any = {}) {
         try { governedRegistry.close(); } catch (error) { registryError ??= error; }
         try { auditStore.close?.(); } catch (error) { registryError ??= error; }
         try { contextRecords?.close?.(); } catch (error) { registryError ??= error; }
+        try { operatorReadStore.close(); } catch (error) { registryError ??= error; }
         close((serverError: unknown) => callback?.(serverError ?? registryError));
       })
       .catch((error: any) => callback?.(error));

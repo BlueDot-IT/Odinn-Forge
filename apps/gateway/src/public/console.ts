@@ -2698,11 +2698,14 @@ export function renderConsoleHtml(version = "development") {
 
     async function runOperatorAction(action, targetId) {
       if (!state.operatorSnapshot) throw new Error("Refresh the operator snapshot before applying an action.");
-      const item = Object.values(state.operatorSnapshot.sections).flatMap((section) => section.items).find((candidate) => candidate.id === targetId);
-      if (!item) throw new Error("The selected operator item is no longer in the current snapshot.");
+      const matchingItems = Object.values(state.operatorSnapshot.sections)
+        .flatMap((section) => section.items)
+        .filter((candidate) => candidate.id === targetId && candidate.controls?.includes(action));
+      if (matchingItems.length !== 1) throw new Error("The selected operator action target is no longer unique in the current snapshot.");
+      const item = matchingItems[0];
       const effect = item.kind === "approval" ? item.details.effect : undefined;
       const effectSummary = effect?.summary || item.summary || "the selected operator item";
-      const labels = { "cancel-job": "Cancel this job?", "deny-approval": "Deny this pending approval?", "cancel-workflow": "Cancel this workflow?", "resume-workflow": "Resume this workflow?" };
+      const labels = { "cancel-job": "Cancel this job?", "deny-approval": "Deny this pending approval?", "cancel-workflow": "Cancel this workflow?" };
       if (action === "approve") {
         if (!window.confirm("Approve this effect once?\\n\\n" + effectSummary + "\\n\\nCapability: " + String(effect?.capability || item.label || "unknown") + ".")) return;
         if (effect?.reversible !== "reversible" || effect?.idempotency !== "idempotent") {

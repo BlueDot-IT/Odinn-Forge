@@ -214,18 +214,18 @@ export class SqliteWorkflowStore {
     const normalizedStatus = String(status).trim();
     const conditions = ["1=1"];
     const parameters: any[] = [];
-    if (normalizedStatus === "cancelling") conditions.push("cancellation_requested_at IS NOT NULL AND status NOT IN ('completed','failed','cancelled','needs-review')");
-    else if (normalizedStatus === "stopping") conditions.push("cancellation_requested_at IS NULL AND failure_requested_at IS NOT NULL AND status NOT IN ('completed','failed','cancelled','needs-review')");
-    else if (normalizedStatus) {
-      conditions.push(TERMINAL_RUN_STATUSES.has(normalizedStatus as WorkflowRunStatus)
-        ? "status = ?"
-        : "status = ? AND cancellation_requested_at IS NULL AND failure_requested_at IS NULL");
-      parameters.push(normalizedStatus);
+    const effectiveStatus = `CASE
+      WHEN cancellation_requested_at IS NOT NULL AND status NOT IN ('completed','failed','cancelled','needs-review') THEN 'cancelling'
+      WHEN cancellation_requested_at IS NULL AND failure_requested_at IS NOT NULL AND status NOT IN ('completed','failed','cancelled','needs-review') THEN 'stopping'
+      ELSE status END`;
+    if (normalizedStatus) { conditions.push(`(${effectiveStatus}) = ?`); parameters.push(normalizedStatus); }
+    if (needle) {
+      conditions.push(`instr(lower('workflow durable workflow run ' || run_id || ' ' || definition_id || ' ' || definition_digest || ' ' || (${effectiveStatus})), lower(?)) > 0`);
+      parameters.push(needle);
     }
-    if (needle) { conditions.push("instr(lower('workflow durable workflow run ' || run_id || ' ' || definition_id || ' ' || definition_digest || ' ' || status), lower(?)) > 0"); parameters.push(needle); }
     const where = conditions.join(" AND ");
     const totals = this.database.db.prepare(`SELECT count(*) AS total,
-      sum(CASE WHEN status IN ('failed','needs-review','awaiting-approval') THEN 1 ELSE 0 END) AS attention
+      sum(CASE WHEN (${effectiveStatus}) IN ('failed','needs-review','awaiting-approval') THEN 1 ELSE 0 END) AS attention
       FROM workflow_runs WHERE ${where}`).get(...parameters) as Row;
     const rows = (this.database.db.prepare(`SELECT run_id FROM workflow_runs WHERE ${where}
       ORDER BY updated_at DESC,run_id LIMIT ? OFFSET ?`).all(...parameters, safeLimit, safeOffset) as Row[])

@@ -108,7 +108,7 @@ function basePort(overrides: Partial<OperatorSnapshotReadPort> = {}): OperatorSn
     }),
     readAudit: async () => ({
       summary: { events: 12, runs: 2, attentionRuns: 1 },
-      integrity: { valid: true, checked: true, unsigned: 0, failures: [] }
+      integrity: { valid: true, checked: true, unsigned: 0, failureCount: 0 }
     }),
     ...overrides
   };
@@ -166,6 +166,31 @@ test("operator application use case owns deterministic paging, counts, filters, 
   assert.deepEqual(filtered.sections.work.items.map((item) => item.id), ["job-2"]);
   assert.deepEqual(filtered.sections.work.counts, { total: 1, jobs: 1, runs: 0, attention: 1 });
   assert.equal(filtered.health.attention, output.health.attention, "global health must not change with filters");
+});
+
+test("needs-review workflows do not advertise an unusable resume action", async () => {
+  const reviewWorkflow = { runId: "workflow-review", definitionDigest: DIGEST, status: "needs-review" as const, updatedAt: NOW };
+  const output = await snapshot({ pageSize: 50 }, basePort({
+    queryWorkflows: async (query) => page([...workflows, reviewWorkflow], query, ["failed", "needs-review", "awaiting-approval"]),
+  }));
+  const item = output.sections.automation.items.find((candidate) => candidate.id === reviewWorkflow.runId);
+  assert.ok(item && item.kind === "workflow");
+  assert.equal(item.controls, undefined);
+  assert.deepEqual(output.actions.map((action) => action.action), ["cancel-job", "approve", "deny-approval", "cancel-workflow", "verify-audit"]);
+});
+
+test("all operator surfaces receive an equivalent application projection", async () => {
+  const surfaces = ["cli", "tui", "http", "console"] as const;
+  const outputs = await Promise.all(surfaces.map((surface) => snapshot({ surface, pageSize: 50 })));
+  const withoutSurface = (value: (typeof outputs)[number]) => {
+    const clone = structuredClone(value) as Record<string, unknown>;
+    delete clone.surface;
+    return clone;
+  };
+  outputs.forEach((output, index) => {
+    assert.equal(output.surface, surfaces[index]);
+    assert.deepEqual(withoutSurface(output), withoutSurface(outputs[0]!));
+  });
 });
 
 test("application paging reaches jobs and runs beyond the legacy in-memory caps", async () => {
@@ -334,18 +359,93 @@ test("operator use case fails closed on malformed adapters without invoking host
 });
 
 test("operator projection redacts secret-like source text and does not expose raw tool input or output", async () => {
-  const secret = "authorization=Bearer abcdefghijklmnop";
-  const output = await snapshot({ pageSize: 50 }, basePort({
-    queryJobs: async (query) => ({
-      items: query.limit ? [{ ...jobs[0], tool: secret, rawInput: { password: "never" }, rawResult: "never" }] : [],
-      total: 1,
-      attention: 0
-    }),
-    queryRuns: async () => ({ items: [], total: 0, attention: 0 })
+  const secrets = [
+    "authorization=Bearer abcdefghijklmnop",
+    "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "eyJabcdefghijk.eyJabcdefghijklmnop.abcdefghijklmnopqrstuvwxyz",
+  ];
+  for (const secret of secrets) {
+    const output = await snapshot({ pageSize: 50 }, basePort({
+      queryJobs: async (query) => ({
+        items: query.limit ? [{ ...jobs[0], tool: secret, rawInput: { password: "never" }, rawResult: "never" }] : [],
+        total: 1,
+        attention: 0
+      }),
+      queryRuns: async () => ({ items: [], total: 0, attention: 0 })
+    }));
+    const serialized = JSON.stringify(output);
+    assert.equal(output.sections.work.items[0]?.label, "[redacted]");
+    assert.doesNotMatch(serialized, /abcdefghijklmnop|abcdefghijklmnopqrstuvwxyz|password|rawInput|rawResult|never/u);
+  }
+});
+
+test("operator identity projection is lossless and rejects colliding action or join targets", async () => {
+  const sourceJobs = (items: readonly Record<string, unknown>[]) => async (query: OperatorSnapshotSourceQueryV1) => ({
+    items: query.limit ? items.slice(query.offset, query.offset + query.limit) : [],
+    total: items.length,
+    attention: 0,
+  });
+  const runningJob = (id: string, executionRunId?: string) => ({
+    id,
+    status: "running" as const,
+    tool: "text.echo",
+    attempts: 1,
+    retrySafe: true,
+    createdAt: EARLIER,
+    updatedAt: NOW,
+    ...(executionRunId ? { executionRunId } : {}),
+  });
+  const noRuns = async () => ({ items: [], total: 0, attention: 0 });
+
+  const exact = await snapshot({ pageSize: 50 }, basePort({
+    queryJobs: sourceJobs([runningJob("job exact")]),
+    queryRuns: noRuns,
+    readLatestAttempts: async () => [],
   }));
-  const serialized = JSON.stringify(output);
-  assert.equal(output.sections.work.items[0]?.label, "[redacted]");
-  assert.doesNotMatch(serialized, /abcdefghijklmnop|password|rawInput|rawResult|never/u);
+  assert.equal(exact.sections.work.items[0]?.id, "job exact");
+  assert.deepEqual(exact.sections.work.items[0]?.controls, ["cancel-job"]);
+
+  const secretLikeId = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+  const secretCollision = await snapshot({ pageSize: 50 }, basePort({
+    queryJobs: sourceJobs([runningJob("[redacted]"), runningJob(secretLikeId)]),
+    queryRuns: noRuns,
+    readLatestAttempts: async () => [],
+  })).then(() => undefined, (error: unknown) => error);
+  assert.ok(secretCollision instanceof ApplicationContractValidationError);
+  assert.equal(secretCollision.code, "UNREDACTED_APPLICATION_METADATA");
+  assert.doesNotMatch(String(secretCollision), /ghp_|abcdefghijklmnopqrstuvwxyz/u);
+
+  const approvalCollision = await snapshot({ pageSize: 50 }, basePort({
+    readApprovals: async () => [
+      { id: "approval one", status: "pending", tool: "text.echo", createdAt: EARLIER, expiresAt: Date.parse(NOW) + 60_000 },
+      { id: "approval  one", status: "pending", tool: "text.echo", createdAt: EARLIER, expiresAt: Date.parse(NOW) + 60_000 },
+    ],
+  })).then(() => undefined, (error: unknown) => error);
+  assert.ok(approvalCollision instanceof ApplicationContractValidationError);
+  assert.match(approvalCollision.message, /canonical operator identifier/u);
+  assert.doesNotMatch(approvalCollision.message, /approval  one/u);
+
+  const joinCollision = await snapshot({ pageSize: 50 }, basePort({
+    queryJobs: sourceJobs([runningJob("join-job", "run one")]),
+    queryRuns: noRuns,
+    readLatestAttempts: async () => [{
+      id: "attempt one",
+      runId: "run  one",
+      attemptNumber: 1,
+      state: "running",
+      createdAt: EARLIER,
+    }],
+  })).then(() => undefined, (error: unknown) => error);
+  assert.ok(joinCollision instanceof ApplicationContractValidationError);
+  assert.match(joinCollision.message, /canonical operator identifier/u);
+
+  const duplicateTarget = await snapshot({ pageSize: 50 }, basePort({
+    queryJobs: sourceJobs([runningJob("duplicate-job"), runningJob("duplicate-job")]),
+    queryRuns: noRuns,
+    readLatestAttempts: async () => [],
+  })).then(() => undefined, (error: unknown) => error);
+  assert.ok(duplicateTarget instanceof ApplicationContractValidationError);
+  assert.match(duplicateTarget.message, /duplicates (?:a public operator identity|an operator action target)/u);
 });
 
 test("operator read honors cancellation before querying authoritative sources", async () => {

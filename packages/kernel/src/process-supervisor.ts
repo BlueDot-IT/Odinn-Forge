@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { join, resolve } from "node:path";
 import { kill as killProcess } from "node:process";
 import { withStateMutationLock } from "./state-mutation.ts";
+import { readRecoveryJournalJson } from "./recovery-journal-file.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_JOURNAL_BYTES = 512 * 1024;
@@ -175,29 +176,19 @@ export class ProcessSupervisor {
 
   async readJournal(): Promise<ProcessRecoveryJournal> {
     await this.ensureStateDirectory();
-    try {
-      const metadata = await lstat(this.journalPath);
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_JOURNAL_BYTES
-        || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
-        throw new ProcessRecoveryError("process recovery journal is unsafe; process execution remains quarantined");
-      }
-    } catch (error) {
-      if (isCode(error, "ENOENT")) {
-        const journal = Object.freeze({ schemaVersion: 1 as const, namespaceId: `pex_${randomBytes(18).toString("hex")}`, pending: Object.freeze([]) });
-        await this.writeJournal(journal);
-        return journal;
-      }
-      if (error instanceof ProcessRecoveryError) throw error;
-      throw new ProcessRecoveryError("process recovery journal could not be inspected; process execution remains quarantined");
+    let value: unknown | undefined;
+    try { value = await readRecoveryJournalJson(this.journalPath, MAX_JOURNAL_BYTES); }
+    catch { throw new ProcessRecoveryError("process recovery journal is unsafe; process execution remains quarantined"); }
+    if (value === undefined) {
+      const journal = Object.freeze({ schemaVersion: 1 as const, namespaceId: `pex_${randomBytes(18).toString("hex")}`, pending: Object.freeze([]) });
+      await this.writeJournal(journal);
+      return journal;
     }
-    let value: unknown;
-    try { value = JSON.parse(await readFile(this.journalPath, "utf8")); }
-    catch { throw new ProcessRecoveryError("process recovery journal is invalid; process execution remains quarantined"); }
-    return normalizeJournal(value);
+    return validateProcessRecoveryJournal(value);
   }
 
   async writeJournal(input: ProcessRecoveryJournal): Promise<void> {
-    const journal = normalizeJournal(input);
+    const journal = validateProcessRecoveryJournal(input);
     await this.ensureStateDirectory();
     const temporary = join(this.stateDir, `.process-recovery.${process.pid}.${randomUUID()}.tmp`);
     let handle;
@@ -505,7 +496,7 @@ async function readProcessIdentity(pid: number): Promise<string | undefined> {
   return undefined;
 }
 
-function normalizeJournal(value: unknown): ProcessRecoveryJournal {
+export function validateProcessRecoveryJournal(value: unknown): ProcessRecoveryJournal {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new ProcessRecoveryError("process recovery journal is invalid; process execution remains quarantined");
   const record = value as Record<string, unknown>;
   if (record.schemaVersion !== 1 || !/^pex_[a-f0-9]{36}$/u.test(String(record.namespaceId)) || !Array.isArray(record.pending)

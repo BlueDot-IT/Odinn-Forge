@@ -9,7 +9,7 @@ import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateRuntimeSecuritySummaryV1, type CliStatusSnapshotV1, type DiagnosticsReportV1, type OperatorSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateOperatorIdentifierV1, validateOperatorSnapshotResponseV1, validateRuntimeSecuritySummaryV1, type CliStatusSnapshotV1, type DiagnosticsReportV1, type OperatorSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
 import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteOperatorReadStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
@@ -425,7 +425,7 @@ function usage() {
   odinn status [--state .odinn]
   odinn doctor [--state .odinn]
   odinn operator snapshot [--page <n>] [--page-size <n>] [--query <text>] [--state .odinn]
-  odinn operator action cancel-job|cancel-workflow|resume-workflow|verify-audit <id> [--confirm] [--state .odinn]
+  odinn operator action cancel-job|cancel-workflow|verify-audit <id> [--confirm] [--state .odinn]
   odinn sessions [--limit 20] [--state .odinn]
   odinn audit [--state .odinn]
   odinn audit verify [--allow-unsigned] [--state .odinn]
@@ -1375,18 +1375,26 @@ async function readBoundedJsonIfPresent(path: string, fallback: any, maxBytes = 
   }
 }
 
-async function readRuntimeJobs(state: string) {
+async function readRuntimeJobCounts(state: string) {
   const databasePath = join(state, "db", "odinn.sqlite");
   if (existsSync(databasePath)) {
     const store = new SqliteOperatorReadStore({ runtimeDatabasePath: databasePath });
     try {
-      if (store.hasRuntimeJobs()) return store.queryJobs({ limit: 10_000 }).items;
+      if (store.hasRuntimeJobs()) return store.readJobCounts();
     } finally {
       store.close();
     }
   }
   const legacy = await readJsonIfPresent(join(state, "jobs.json"), { jobs: {} });
-  return Object.values(legacy?.jobs ?? {}) as Array<{ status: string }>;
+  const jobs = Object.values(legacy?.jobs ?? {}) as Array<{ status: string }>;
+  return {
+    total: jobs.length,
+    queued: jobs.filter((job) => job.status === "queued").length,
+    running: jobs.filter((job) => job.status === "running").length,
+    failed: jobs.filter((job) => job.status === "failed").length,
+    needsReview: jobs.filter((job) => job.status === "needs-review").length,
+    completed: jobs.filter((job) => job.status === "completed").length,
+  };
 }
 
 async function doctor(args: any) {
@@ -1432,14 +1440,7 @@ async function readDoctorDiagnostics(args: any): Promise<DiagnosticsReportV1> {
   }
   const approvals = createApprovalStore({ path: join(state, "approvals.json") });
   const pendingApprovals = approvals.list();
-  const jobs = await readRuntimeJobs(state);
-  const jobCounts = {
-    queued: jobs.filter((job) => job.status === "queued").length,
-    running: jobs.filter((job) => job.status === "running").length,
-    failed: jobs.filter((job) => job.status === "failed").length,
-    needsReview: jobs.filter((job) => job.status === "needs-review").length,
-    completed: jobs.filter((job) => job.status === "completed").length
-  };
+  const jobCounts = await readRuntimeJobCounts(state);
   const recovery = await readJsonIfPresent(join(state, "browser-recovery.json"), { status: "clear" });
   const sandboxRecovery = await readJsonIfPresent(join(state, "sandbox-recovery.json"), { pending: [] });
   let processRecovery: any = { pending: [] };
@@ -1492,7 +1493,7 @@ async function readDoctorDiagnostics(args: any): Promise<DiagnosticsReportV1> {
     audit: { valid: audit.valid, events: audit.events, unsigned: audit.unsigned, failureCount: audit.failures.length },
     approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
     browserRecovery: { status: recovery.status ?? "clear", pending: ["executing", "unknown"].includes(recovery.status), id: recovery.id ?? undefined },
-    jobs: { total: jobs.length, ...jobCounts },
+    jobs: jobCounts,
     sandbox: {
       configured: summarizeSandboxRisk(sandboxConfig),
       recovery: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null, quarantined: sandboxRecoveryStartupError || sandboxRecovery.pending === null },
@@ -2736,7 +2737,8 @@ async function operatorCommand(args: any[]) {
   if (subcommand === "snapshot" || subcommand === "show") {
     if (option(rest, "--gateway-url") || hasFlag(rest, "--remote")) {
       const query = operatorSnapshotRemoteQueryFromArgs(rest, "cli");
-      await printJson(await operatorGatewayRequest(rest, `/operator/snapshot?${query.toString()}`));
+      const snapshot = validateOperatorSnapshotResponseV1(await operatorGatewayRequest(rest, `/operator/snapshot?${query.toString()}`));
+      await printJson(snapshot);
     } else {
       const snapshot = await localOperatorSnapshot(rest, "cli");
       if (hasFlag(rest, "--text")) console.log(renderTui(snapshot)); else await printJson(snapshot);
@@ -2745,9 +2747,14 @@ async function operatorCommand(args: any[]) {
   }
   if (subcommand !== "action") throw new Error("operator requires snapshot or action");
   const action = String(rest[0] || "");
-  const targetId = action === "verify-audit" ? undefined : option(rest, "--target", rest.find((value: any, index: number) => index > 0 && !String(value).startsWith("-")));
+  const requestedTargetId = action === "verify-audit" ? undefined : option(rest, "--target", rest.find((value: any, index: number) => index > 0 && !String(value).startsWith("-")));
   if (!action) throw new Error("operator action requires an action name");
-  if (["cancel-job", "cancel-workflow", "resume-workflow", "approve", "deny-approval"].includes(action) && !hasFlag(rest, "--confirm")) throw new Error("operator mutation requires --confirm");
+  if (["cancel-job", "cancel-workflow", "approve", "deny-approval"].includes(action) && !hasFlag(rest, "--confirm")) throw new Error("operator mutation requires --confirm");
+  let targetId: string | undefined;
+  if (action !== "verify-audit") {
+    try { targetId = validateOperatorIdentifierV1(requestedTargetId, "operator action targetId"); }
+    catch { throw new Error("operator action targetId is invalid"); }
+  }
   if (action === "approve" || action === "deny-approval" || option(rest, "--gateway-url") || hasFlag(rest, "--remote")) {
     await printJson(await operatorGatewayRequest(rest, "/operator/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, targetId, confirm: hasFlag(rest, "--confirm"), surface: "cli" }) }));
     return;
@@ -2757,7 +2764,7 @@ async function operatorCommand(args: any[]) {
     let result: any;
     if (action === "verify-audit") { const store = createAuditStore(join(state, config.auditLog ?? "audit.jsonl")); try { result = await store.verifyIntegrity({ allowUnsigned: true }); } finally { store.close(); } }
     else if (action === "cancel-job") { if (!targetId) throw new Error("cancel-job requires a target id"); result = await new SqliteJobStore(ledger, { legacyPath: join(state, "jobs.json") }).cancel(targetId, { requestedBy: "cli", reason: "operator cancelled job" }); }
-    else if (action === "cancel-workflow" || action === "resume-workflow") { if (!targetId) throw new Error(`${action} requires a target id`); const workflows = new SqliteWorkflowStore(ledger.database); result = action === "cancel-workflow" ? workflows.cancel(targetId) : workflows.resume(targetId); }
+    else if (action === "cancel-workflow") { if (!targetId) throw new Error(`${action} requires a target id`); result = new SqliteWorkflowStore(ledger.database).cancel(targetId); }
     else throw new Error("approve requires a running gateway; pass --gateway-url");
     await printJson({ ok: true, action, ...(targetId ? { targetId } : {}), result, snapshot: await localOperatorSnapshot(rest, "cli") });
   } finally { ledger.close(); }

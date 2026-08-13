@@ -58,6 +58,8 @@ export { SANDBOX_PROCESS_PROFILE, SandboxProcessRefusalError, compileProcessProf
 export type { SandboxProcessBackendResolver, SandboxProcessBundleMaterializer, SandboxProcessExecutionContext, SandboxProcessExecutorOptions, SandboxProcessInput, SandboxProcessResult } from "./sandbox-process.ts";
 export { SandboxRecoveryCoordinator, SandboxRecoveryError, SandboxRecoverySession } from "./sandbox-recovery.ts";
 export type { SandboxRecoveryAdapter, SandboxRecoveryBackend, SandboxRecoveryIdentity, SandboxRecoveryPhase, SandboxRecoveryRecord } from "./sandbox-recovery.ts";
+export { inspectOperatorRecovery } from "./recovery-inspection.ts";
+export type { OperatorRecoveryInspection } from "./recovery-inspection.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
 export { CheckpointCoordinator };

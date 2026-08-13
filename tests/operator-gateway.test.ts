@@ -174,7 +174,7 @@ test("both Gateway operator routes expose the strict application snapshot withou
     assert.equal(reviewJob.details.latestAttempt?.errorCode, "OUTCOME_UNKNOWN");
     assert.equal(reviewJob.details.latestAttempt?.outcomeDigest, undefined);
     assert.equal(full.sections.approvals.items.find((item) => item.id === approvalId)?.status, "claimed");
-    assert.equal(full.sections.recovery.items.find((item) => item.id === "browser-recovery")?.status, "executing");
+    assert.equal(full.sections.recovery.items.find((item) => item.id === "browser-recovery")?.status, "needs-review");
     assert.equal(full.sections.recovery.items.find((item) => item.id === "sandbox-recovery")?.status, "needs-review");
     assert.equal(full.sections.recovery.items.find((item) => item.id === "process-recovery")?.status, "needs-review");
     assert.doesNotMatch(JSON.stringify(full), /must-not-leak|malformed-recovery-json/u);

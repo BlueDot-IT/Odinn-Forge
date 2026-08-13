@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promise
 import { join, resolve } from "node:path";
 import { kill as killProcess } from "node:process";
 import { withStateMutationLock } from "./state-mutation.ts";
+import { readRecoveryJournalJson } from "./recovery-journal-file.ts";
 
 export type SandboxRecoveryBackend = "docker" | "podman";
 export type SandboxRecoveryPhase = "creating" | "created" | "attested" | "starting" | "running" | "cleanup-uncertain";
@@ -176,28 +177,19 @@ export class SandboxRecoveryCoordinator {
 
   async readJournal(): Promise<SandboxRecoveryJournal> {
     await this.ensureStateDirectory();
-    try {
-      const metadata = await lstat(this.journalPath);
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_JOURNAL_BYTES || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
-        throw new SandboxRecoveryError("sandbox recovery journal is unsafe; backend remains quarantined");
-      }
-    } catch (error) {
-      if (isCode(error, "ENOENT")) {
-        const journal = Object.freeze({ schemaVersion: 1 as const, namespaceId: `sbx_${randomBytes(18).toString("hex")}`, pending: Object.freeze([]) });
-        await this.writeJournal(journal);
-        return journal;
-      }
-      if (error instanceof SandboxRecoveryError) throw error;
-      throw new SandboxRecoveryError("sandbox recovery journal could not be inspected; backend remains quarantined");
+    let value: unknown | undefined;
+    try { value = await readRecoveryJournalJson(this.journalPath, MAX_JOURNAL_BYTES); }
+    catch { throw new SandboxRecoveryError("sandbox recovery journal is unsafe; backend remains quarantined"); }
+    if (value === undefined) {
+      const journal = Object.freeze({ schemaVersion: 1 as const, namespaceId: `sbx_${randomBytes(18).toString("hex")}`, pending: Object.freeze([]) });
+      await this.writeJournal(journal);
+      return journal;
     }
-    let value: unknown;
-    try { value = JSON.parse(await readFile(this.journalPath, "utf8")); }
-    catch { throw new SandboxRecoveryError("sandbox recovery journal is invalid; backend remains quarantined"); }
-    return normalizeJournal(value);
+    return validateSandboxRecoveryJournal(value);
   }
 
   async writeJournal(input: SandboxRecoveryJournal): Promise<void> {
-    const journal = normalizeJournal(input);
+    const journal = validateSandboxRecoveryJournal(input);
     await this.ensureStateDirectory();
     const temporary = join(this.stateDir, `.sandbox-recovery.${process.pid}.${randomUUID()}.tmp`);
     let handle;
@@ -310,7 +302,7 @@ export class SandboxRecoveryCoordinator {
   }
 }
 
-function normalizeJournal(value: unknown): SandboxRecoveryJournal {
+export function validateSandboxRecoveryJournal(value: unknown): SandboxRecoveryJournal {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new SandboxRecoveryError("sandbox recovery journal is invalid; backend remains quarantined");
   const record = value as Record<string, unknown>;
   if (record.schemaVersion !== 1 || !/^sbx_[a-f0-9]{36}$/u.test(String(record.namespaceId)) || !Array.isArray(record.pending)

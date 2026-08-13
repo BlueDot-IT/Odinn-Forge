@@ -48,6 +48,7 @@ export {
   defaultOperatorSnapshotActionsV1,
   parseOperatorSnapshotResponseV1,
   parseOperatorSnapshotV1,
+  validateOperatorIdentifierV1,
   validateOperatorSnapshotResponseV1,
   validateOperatorSnapshotV1
 } from "./operator-snapshot-contracts.ts";
@@ -120,14 +121,17 @@ export type {
 export type { ApplicationInvocationOptions, ChannelPort, ExecutionPort } from "./ports.ts";
 export {
   OPERATOR_SNAPSHOT_READ_OPERATION_ID,
+  OPERATOR_SNAPSHOT_CHANGED_CODE,
+  OPERATOR_SCHEDULE_MAX_ITEMS,
+  OPERATOR_SCHEDULE_SCHEMA_VERSION,
   createOperatorSnapshotReadUseCase,
   normalizeOperatorSnapshotReadInputV1,
+  projectOperatorScheduleEnvelopeV1,
   validateOperatorSnapshotReadRequestV1
 } from "./operator-snapshot.ts";
 export type {
   NormalizedOperatorSnapshotReadInputV1,
   OperatorApprovalSourceV1,
-  OperatorAuditFailureSourceV1,
   OperatorAuditSourceV1,
   OperatorBrowserRecoverySourceV1,
   OperatorEnvironmentSourceV1,

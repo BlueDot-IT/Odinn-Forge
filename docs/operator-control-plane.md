@@ -10,8 +10,9 @@ they do not maintain separate health or mutation semantics.
 these sections:
 
 - `runtime` — active and disabled runtime surfaces;
-- `work` — durable jobs and audited runs;
-- `approvals` — pending one-time decisions;
+- `work` — durable jobs and audited runs, with at most the latest bounded
+  execution-attempt summary for each visible run;
+- `approvals` — pending and claimed one-time decisions;
 - `automation` — workflows, event watches, and schedules;
 - `context` — whether governed project context is available;
 - `recovery` — browser, sandbox, and process recovery boundaries;
@@ -26,6 +27,11 @@ identifiers, statuses, counts, timestamps, digests, and bounded effect summaries
 only. Prompts, message content, credentials, headers, raw tool input, and raw
 tool results are not part of the contract.
 
+All four adapters invoke the query-only `operator.snapshot.read` application
+use case. It owns filtering, combined job/run paging, counts, attention and
+health calculation, projection, redaction, and final contract validation. Its
+port has no mutation or recovery-reconciliation capability.
+
 The HTTP route retains the gateway's bearer/cookie authentication and mutation
 origin checks. A web-console request can set `surface=console`; API clients
 normally use `surface=http`.
@@ -39,7 +45,7 @@ normally use `surface=http`.
 ```
 
 Supported actions are `cancel-job`, `approve`, `deny-approval`,
-`cancel-workflow`, `resume-workflow`, and `verify-audit`. Mutations require
+`cancel-workflow`, and `verify-audit`. Mutations require
 `confirm: true` and remain behind the existing supervisor, approval, workflow,
 audit, and recovery boundaries. Approval projections include a code-generated,
 bounded effect summary; the operator projection never executes a tool directly.
@@ -50,7 +56,9 @@ record if that settlement cannot be completed.
 
 - `odinn operator snapshot` emits the same JSON contract locally.
 - `odinn operator action ... --confirm` performs local durable cancellation,
-  workflow control, or audit verification. Approval execution requires a live
+  workflow cancellation, or audit verification. A workflow in `needs-review`
+  remains deliberately unresolved until a dedicated operator-resolution flow
+  exists. Approval execution requires a live
   authenticated gateway and can be sent with `--gateway-url`.
 - `odinn tui` renders the same snapshot as a compact terminal dashboard.
   `odinn tui --watch` exits cleanly on SIGINT/SIGTERM and performs no browser or
@@ -74,3 +82,7 @@ The shared projection performs a second bounded redaction pass before data is
 returned or rendered. It treats authority-shaped keys, credentials, cookies,
 headers, prompts, content, and results as non-displayable data. The control
 plane is an inspection and governed-action surface, not a raw state browser.
+Opaque item, action-target, and execution-attempt identifiers are never
+trimmed, collapsed, truncated, or replaced with a shared redaction marker. An
+identifier that cannot be published byte-for-byte within the bounded contract
+fails the snapshot with a sanitized error before any control is rendered.
