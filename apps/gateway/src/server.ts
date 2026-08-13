@@ -3155,7 +3155,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
         credentialPresent: channelCredentialEnvironments(channel.config).every((name) => Boolean(process.env[name])),
         allowlistEntries: channel.config.allowlist.length,
         capabilities: channel.plugin.capabilities,
-        error: channel.status.error ?? "",
+        error: channel.status.error ? "channel adapter reported an error" : "",
         connectedAt: channel.status.connectedAt,
         lastEventAt: channel.status.lastEventAt,
         reconnectAttempts: channel.status.reconnectAttempts,

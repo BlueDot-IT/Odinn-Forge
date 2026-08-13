@@ -1,5 +1,5 @@
 import type { JsonObject } from "./contracts.ts";
-import { normalizeReadContractJsonObjectV1, normalizeReadContractJsonValueV1, parseReadContractJsonObjectV1 } from "./read-contract-json.ts";
+import { normalizeReadContractJsonObjectV1, normalizeReadContractJsonValueV1, omitReadContractObjectListFieldsV1, parseReadContractJsonObjectV1 } from "./read-contract-json.ts";
 import { ApplicationContractValidationError } from "./validation.ts";
 
 export type ExperimentalFeatureV1 = "capabilities" | "capsules" | "counterfactual";
@@ -199,8 +199,6 @@ export interface PendingApprovalSummaryV1 {
   readonly tool: string;
   readonly summary?: string;
   readonly effect?: ApprovalEffectSummaryV1;
-  /** Redacted, bounded operator preview; secret-bearing keys must contain `[redacted]`. */
-  readonly input?: JsonObject;
   readonly recovery?: string;
   readonly expectedUrl?: string;
   readonly snapshotId?: string;
@@ -294,8 +292,6 @@ export interface GatewayChannelDiagnosticV1 {
   readonly lastEventAt?: string;
   readonly reconnectAttempts?: number;
   readonly latencyMs?: number;
-  /** Plugin-defined health evidence; secret-bearing keys must contain `[redacted]`. */
-  readonly details?: JsonObject;
 }
 
 export type ChannelDiagnosticV1 = CliChannelSummaryV1 | GatewayChannelDiagnosticV1;
@@ -489,14 +485,16 @@ export function validateStatusSnapshotV1(input: unknown): StatusSnapshotV1 {
 }
 
 export function validatePendingApprovalSummariesV1(input: unknown): readonly PendingApprovalSummaryV1[] {
-  const normalized = normalizeReadContractJsonValueV1(input, "pending approval summaries");
+  const projected = omitReadContractObjectListFieldsV1(input, "pending approval summaries", ["input"]);
+  const normalized = normalizeReadContractJsonValueV1(projected, "pending approval summaries");
   if (!Array.isArray(normalized)) fail("pending approval summaries must be an array", "pending approval summaries");
   normalized.forEach((item, index) => validatePendingApproval(openObject(item, `pending approval summaries[${index}]`), `pending approval summaries[${index}]`));
   return normalized as unknown as readonly PendingApprovalSummaryV1[];
 }
 
 export function validateGatewayChannelDiagnosticsV1(input: unknown): readonly GatewayChannelDiagnosticV1[] {
-  const normalized = normalizeReadContractJsonValueV1(input, "gateway channel diagnostics", {
+  const projected = omitReadContractObjectListFieldsV1(input, "gateway channel diagnostics", ["details"]);
+  const normalized = normalizeReadContractJsonValueV1(projected, "gateway channel diagnostics", {
     allowSensitiveField: allowKnownReadContractSensitiveField,
   });
   if (!Array.isArray(normalized)) fail("gateway channel diagnostics must be an array", "gateway channel diagnostics");
@@ -692,10 +690,9 @@ function validateSelfImprovement(input: unknown, path: string): void {
 }
 
 function validatePendingApproval(input: Record<string, unknown>, path: string): void {
-  object(input, path, ["type", "id", "status", "createdAt", "expiresAt", "approvedAt", "runId", "accountId", "actor", "tool", "summary", "effect", "input", "recovery", "expectedUrl", "snapshotId"], ["tool"]);
+  object(input, path, ["type", "id", "status", "createdAt", "expiresAt", "approvedAt", "runId", "accountId", "actor", "tool", "summary", "effect", "recovery", "expectedUrl", "snapshotId"], ["tool"]);
   optionalText(input.type, `${path}.type`); optionalText(input.id, `${path}.id`); if (input.status !== undefined) oneOf(input.status, `${path}.status`, ["pending", "claimed"]); optionalText(input.createdAt, `${path}.createdAt`); if (input.expiresAt !== undefined) count(input.expiresAt, `${path}.expiresAt`); optionalText(input.approvedAt, `${path}.approvedAt`); optionalText(input.runId, `${path}.runId`, true); optionalText(input.accountId, `${path}.accountId`, true); optionalText(input.actor, `${path}.actor`, true); text(input.tool, `${path}.tool`); optionalText(input.summary, `${path}.summary`); optionalText(input.recovery, `${path}.recovery`); optionalText(input.expectedUrl, `${path}.expectedUrl`); optionalText(input.snapshotId, `${path}.snapshotId`);
   if (input.effect !== undefined) validateApprovalEffect(input.effect, `${path}.effect`);
-  if (input.input !== undefined) openObject(input.input, `${path}.input`);
 }
 
 function validateApprovalEffect(input: unknown, path: string): void {
@@ -708,12 +705,11 @@ function validateApprovalEffect(input: unknown, path: string): void {
 }
 
 function validateGatewayChannel(input: Record<string, unknown>, path: string): void {
-  object(input, path, ["name", "type", "enabled", "running", "state", "credentialConfigured", "credentialPresent", "allowlistEntries", "capabilities", "error", "connectedAt", "lastEventAt", "reconnectAttempts", "latencyMs", "details"], ["name", "type", "enabled", "running", "state", "credentialConfigured", "credentialPresent", "allowlistEntries", "capabilities", "error"]);
+  object(input, path, ["name", "type", "enabled", "running", "state", "credentialConfigured", "credentialPresent", "allowlistEntries", "capabilities", "error", "connectedAt", "lastEventAt", "reconnectAttempts", "latencyMs"], ["name", "type", "enabled", "running", "state", "credentialConfigured", "credentialPresent", "allowlistEntries", "capabilities", "error"]);
   text(input.name, `${path}.name`); text(input.type, `${path}.type`); bool(input.enabled, `${path}.enabled`); bool(input.running, `${path}.running`); oneOf(input.state, `${path}.state`, ["stopped", "starting", "connected", "degraded", "failed"]); bool(input.credentialConfigured, `${path}.credentialConfigured`); bool(input.credentialPresent, `${path}.credentialPresent`); count(input.allowlistEntries, `${path}.allowlistEntries`); text(input.error, `${path}.error`, true); optionalText(input.connectedAt, `${path}.connectedAt`); optionalText(input.lastEventAt, `${path}.lastEventAt`); if (input.reconnectAttempts !== undefined) count(input.reconnectAttempts, `${path}.reconnectAttempts`); if (input.latencyMs !== undefined) count(input.latencyMs, `${path}.latencyMs`);
   const capabilities = object(input.capabilities, `${path}.capabilities`, ["chatTypes", "reactions", "replies", "typing", "threads", "media", "edits", "deletes", "components", "nativeCommands", "streaming"], ["chatTypes"]);
   enumList(capabilities.chatTypes, `${path}.capabilities.chatTypes`, ["direct", "group", "channel", "thread"]);
   for (const key of ["reactions", "replies", "typing", "threads", "media", "edits", "deletes", "components", "nativeCommands", "streaming"] as const) optionalBool(capabilities[key], `${path}.capabilities.${key}`);
-  if (input.details !== undefined) openObject(input.details, `${path}.details`);
 }
 
 function validateJobTotals(input: unknown, path: string): void {

@@ -37,6 +37,37 @@ interface ReadContractJsonOptions {
   readonly allowSensitiveField?: (context: ReadContractSensitiveFieldContext) => boolean;
 }
 
+/**
+ * Build a descriptor-safe projection of application read records while
+ * deliberately discarding fields that belong only to an internal storage or
+ * plugin model. Discarded values are never traversed or read.
+ */
+export function omitReadContractObjectListFieldsV1(
+  input: unknown,
+  name: string,
+  omittedFields: readonly string[],
+): readonly Record<string, unknown>[] {
+  if (!Array.isArray(input)) fail(`${name} must be an array`, "INVALID_APPLICATION_READ_CONTRACT", name);
+  const omitted = new Set(omittedFields);
+  return plainArrayValues(input, name).map((item, index) => {
+    const path = `${name}[${index}]`;
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      fail(`${path} must be an object`, "INVALID_APPLICATION_READ_CONTRACT", path);
+    }
+    const value = plainObject(item, path);
+    const keys = Object.keys(value);
+    if (keys.length > MAX_LIST_ITEMS) fail(`${path} cannot contain more than ${MAX_LIST_ITEMS} fields`, "INVALID_APPLICATION_READ_CONTRACT", path);
+    const output: Record<string, unknown> = {};
+    for (const key of keys) {
+      if (omitted.has(key)) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor)) fail(`${path}.${key} must be a data field`, "NON_JSON_APPLICATION_FIELD", `${path}.${key}`);
+      output[key] = descriptor.value;
+    }
+    return output;
+  });
+}
+
 export function normalizeReadContractJsonValueV1(
   input: unknown,
   name: string,

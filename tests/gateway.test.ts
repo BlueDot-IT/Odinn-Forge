@@ -179,7 +179,7 @@ test("gateway diagnostics expose safe state and errors carry correlation metadat
   }
 });
 
-test("gateway rejects compound secret fields from channel diagnostics before response", async () => {
+test("gateway omits raw channel diagnostics before every read response", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-channel-diagnostic-secret-"));
   const credentialEnvironment = "ODINN_TEST_COMPOUND_CHANNEL_TOKEN";
   const previousCredential = process.env[credentialEnvironment];
@@ -242,10 +242,11 @@ test("gateway rejects compound secret fields from channel diagnostics before res
       const channel = body.channels[0];
       assert.equal(channel.credentialConfigured, true, path);
       assert.equal(channel.credentialPresent, true, path);
-      assert.equal(channel.details.mode, "mutual-tls", path);
+      assert.equal("details" in channel, false, path);
     }
 
     const maliciousDetails = [
+      ["SENTINEL_OPAQUE_SECRET_123456", { foo: "SENTINEL_OPAQUE_SECRET_123456" }],
       ["SENTINEL_CHANNEL_DATABASE_PASSWORD", { databasePassword: "SENTINEL_CHANNEL_DATABASE_PASSWORD" }],
       ["SENTINEL_CHANNEL_AUTHENTICATION", { authentication: "SENTINEL_CHANNEL_AUTHENTICATION" }],
       ["SENTINEL_CHANNEL_TOKEN_ENV", { tokenEnv: "SENTINEL_CHANNEL_TOKEN_ENV" }],
@@ -264,17 +265,19 @@ test("gateway rejects compound secret fields from channel diagnostics before res
       for (const path of ["/diagnostics", "/channels"]) {
         const response = await fetch(`${base}${path}`);
         const body = await response.text();
-        assert.equal(response.status, 400, `${path}: ${sentinel}`);
+        assert.equal(response.status, 200, `${path}: ${sentinel}`);
         assert.equal(body.includes(sentinel), false, `${path}: ${sentinel}`);
+        assert.equal(body.includes('"details"'), false, `${path}: ${sentinel}`);
       }
     }
 
-    updateDiagnosticStatus!({ details: { mode: "mutual-tls", health: "ok", counters: { reconnects: 0 } } });
+    updateDiagnosticStatus!({ error: "SENTINEL_OPAQUE_ERROR_123456" });
     for (const path of ["/diagnostics", "/channels"]) {
       const response = await fetch(`${base}${path}`);
       const body = await response.text();
       assert.equal(response.status, 200, path);
-      assert.equal(body.includes("mutual-tls"), true, path);
+      assert.equal(body.includes("SENTINEL_OPAQUE_ERROR_123456"), false, path);
+      assert.equal(body.includes("channel adapter reported an error"), true, path);
     }
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
@@ -283,7 +286,7 @@ test("gateway rejects compound secret fields from channel diagnostics before res
   }
 });
 
-test("gateway rejects compound secret fields from pending approval projections", async () => {
+test("gateway omits raw pending approval input before every read response", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-approval-compound-secret-"));
   const approvalPath = join(stateDir, "approvals.json");
   const approvalStore = createApprovalStore({ path: approvalPath });
@@ -292,10 +295,17 @@ test("gateway rejects compound secret fields from pending approval projections",
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
-    assert.equal((await fetch(`${base}/status`)).status, 200);
-    assert.equal((await fetch(`${base}/approvals`)).status, 200);
+    for (const path of ["/status", "/approvals"]) {
+      const response = await fetch(`${base}${path}`);
+      assert.equal(response.status, 200, path);
+      const body = await response.json() as any;
+      const approvals = path === "/status" ? body.pendingApprovals : body;
+      assert.equal("input" in approvals[0], false, path);
+      assert.equal(approvals[0].effect.selector, "#save", path);
+    }
 
     const maliciousInputs = [
+      ["SENTINEL_OPAQUE_SECRET_123456", { foo: "SENTINEL_OPAQUE_SECRET_123456" }],
       ["SENTINEL_APPROVAL_OAUTH_CREDENTIAL", { oauthCredential: "SENTINEL_APPROVAL_OAUTH_CREDENTIAL" }],
       ["SENTINEL_APPROVAL_AUTHENTICATION", { authentication: "SENTINEL_APPROVAL_AUTHENTICATION" }],
       ["SENTINEL_APPROVAL_TOKEN_ENV", { tokenEnv: "SENTINEL_APPROVAL_TOKEN_ENV" }],
@@ -314,8 +324,9 @@ test("gateway rejects compound secret fields from pending approval projections",
       for (const path of ["/status", "/approvals"]) {
         const response = await fetch(`${base}${path}`);
         const body = await response.text();
-        assert.equal(response.status, 400, `${path}: ${sentinel}`);
+        assert.equal(response.status, 200, `${path}: ${sentinel}`);
         assert.equal(body.includes(sentinel), false, `${path}: ${sentinel}`);
+        assert.equal(body.includes('"input"'), false, `${path}: ${sentinel}`);
       }
       assert.equal(approvalStore.revoke(approvalId), true);
     }

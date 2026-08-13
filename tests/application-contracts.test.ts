@@ -23,8 +23,10 @@ import {
   validateDiagnosticsReportV1,
   validateExecutionRequestV1,
   validateExecutionResultV1,
+  validateGatewayChannelDiagnosticsV1,
   validateInboundEnvelopeV1,
   validateOutboundEnvelopeV1,
+  validatePendingApprovalSummariesV1,
   validateSessionPageV1,
   validateStatusSnapshotV1,
   type ChannelPort,
@@ -851,6 +853,51 @@ test("diagnostics output contract rejects unstable fields and unredacted materia
     () => validateDiagnosticsReportV1({ ...fixture, privateKey: "-----BEGIN PRIVATE KEY-----" }),
     (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
   );
+});
+
+test("producer-only plugin details and approval input are omitted without traversal", () => {
+  let detailAccessorInvoked = false;
+  const details = { foo: "SENTINEL_OPAQUE_SECRET_123456" };
+  Object.defineProperty(details, "hidden", {
+    enumerable: true,
+    get() {
+      detailAccessorInvoked = true;
+      return "SENTINEL_DETAIL_ACCESSOR_SECRET";
+    }
+  });
+  const channels = validateGatewayChannelDiagnosticsV1([{
+    name: "test",
+    type: "custom",
+    enabled: true,
+    running: true,
+    state: "connected",
+    credentialConfigured: true,
+    credentialPresent: true,
+    allowlistEntries: 1,
+    capabilities: { chatTypes: ["direct"] },
+    error: "",
+    details
+  }]);
+  assert.equal("details" in channels[0]!, false);
+  assert.equal(detailAccessorInvoked, false);
+
+  let inputAccessorInvoked = false;
+  const input = { foo: "SENTINEL_OPAQUE_SECRET_123456" };
+  Object.defineProperty(input, "hidden", {
+    enumerable: true,
+    get() {
+      inputAccessorInvoked = true;
+      return "SENTINEL_INPUT_ACCESSOR_SECRET";
+    }
+  });
+  const approvals = validatePendingApprovalSummariesV1([{
+    id: "approval:1",
+    status: "pending",
+    tool: "browser.click",
+    input
+  }]);
+  assert.equal("input" in approvals[0]!, false);
+  assert.equal(inputAccessorInvoked, false);
 });
 
 test("session page contract rejects projection drift, content leakage, and inconsistent cursors", () => {
