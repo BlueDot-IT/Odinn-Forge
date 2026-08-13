@@ -77,8 +77,8 @@ export { appendSessionMessage, assignSessionProject, createGoal, createProject, 
 export type { GoalCommandInput, GoalView, ProjectCommandInput, ProjectView, SessionCommandInput, SessionView, WorkspaceRecord, WorkspaceRecordStore } from "./workspace-records.ts";
 export { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, listMemoryCandidates, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
 export type { MemoryCommandInput, MemoryRecordStore } from "./memory.ts";
-export { createApprovalStore } from "./approvals.ts";
-export type { ApprovalAction, ApprovalEffect, ApprovalStore, ApprovalStoreListOptions, ApprovalStoreOperationOptions } from "./approvals.ts";
+export { createApprovalStore, readApprovalSummaries } from "./approvals.ts";
+export type { ApprovalAction, ApprovalEffect, ApprovalReadSummary, ApprovalStore, ApprovalStoreListOptions, ApprovalStoreOperationOptions } from "./approvals.ts";
 export { SkillLifecycleError, SkillLifecycleService } from "./skill-lifecycle.ts";
 export type { SkillLifecycleContext, SkillLifecycleTransition } from "./skill-lifecycle.ts";
 export { ProgressiveSkillDisclosure, SkillDisclosureError } from "./skill-disclosure.ts";
@@ -87,7 +87,7 @@ export { createGovernedMcpRuntime, GovernedMcpRuntime, normalizeMcpConfiguration
 export type { GovernedMcpRuntimeOptions, McpRuntimeContext, McpRuntimeStatus, McpServerConfig } from "./mcp-runtime.ts";
 export { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 export { SqliteRecordStore } from "@odinn/store-sqlite";
-export { SqliteWorkflowStore } from "@odinn/store-sqlite";
+export { SqliteOperatorReadStore, SqliteWorkflowStore } from "@odinn/store-sqlite";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
 export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";

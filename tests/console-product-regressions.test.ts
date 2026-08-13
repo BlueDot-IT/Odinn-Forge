@@ -98,6 +98,19 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     );
     assert.ok(navigationTargets.includes("capabilities"), "Web tools must be reachable from navigation");
 
+    const operator = section(html, /<section id="view-operator"[^>]*>/, /<\/section>/);
+    assertIds(operator, ["operator-health", "operator-attention", "operator-work", "operator-payload"]);
+    const operatorPresenter = section(script, /function renderOperatorItem\s*\(/u, /function switchView\s*\(/u);
+    assert.match(operatorPresenter, /item\.kind === ["']approval["'][\s\S]*item\.details\.effect/u);
+    assert.match(operatorPresenter, /item\.kind === ["']job["'] \|\| item\.kind === ["']run["'][\s\S]*item\.details\.latestAttempt/u);
+    assert.match(operatorPresenter, /snapshot\.sections\[name\]/u);
+    assert.match(operatorPresenter, /snapshot\.health\.attention/u);
+    assert.match(operatorPresenter, /section\(["']approvals["']\)\.counts\.pending/u);
+    assert.match(operatorPresenter, /section\(["']recovery["']\)\.items/u);
+    assert.match(operatorPresenter, /section\(["']audit["']\)\.items\[0\]\.status/u);
+    assert.doesNotMatch(operatorPresenter, /item\?\.details|item\.details\?\.|snapshot\.sections\?\.|snapshot\.health\?\./u,
+      "the console must present the validated item union instead of probing internal shapes");
+
     const skills = section(html, /<section id="view-skills"[^>]*>/, /<\/section>/);
     assert.match(skills, /<h1>Skills SDK<\/h1>/);
     assert.match(skills, /Experimental package/);
