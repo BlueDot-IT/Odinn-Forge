@@ -152,6 +152,16 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
     release,
     /^  source-package:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- verify/m
   );
+  assert.match(
+    release,
+    /^  stage-release-assets:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- source-package/m
+  );
+  assert.match(
+    release,
+    /^  validate-downloaded-release:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- stage-release-assets/m
+  );
+  assert.match(release, /matrix:\s*\n\s+os:\s*\n\s+- ubuntu-latest\s*\n\s+- macos-latest\s*\n\s+- windows-latest/u);
+  assert.match(release, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
   assert.doesNotMatch(release.match(/^  source-package:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /id-token: write/);
   assert.match(
     release,

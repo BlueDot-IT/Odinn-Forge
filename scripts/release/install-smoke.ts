@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const releaseDir = join(root, "dist", "release");
+const releaseDir = resolve(process.argv[2] ?? join(root, "dist", "release"));
 const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const expectedRoot = `odinn-v${pkg.version}`;
 
