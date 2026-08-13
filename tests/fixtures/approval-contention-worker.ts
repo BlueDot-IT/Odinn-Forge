@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createApprovalStoreWithTestHooks, type ApprovalAction } from "../../packages/kernel/src/approvals.ts";
 
 type WorkerInput = {
@@ -13,8 +13,6 @@ type WorkerInput = {
   ownerReadyPath?: string;
   path: string;
   releasePath?: string;
-  waitForApprovalIdentityChange?: string;
-  watcherReadyPath?: string;
 };
 
 const input = JSON.parse(process.argv[2] ?? "null") as WorkerInput;
@@ -26,20 +24,6 @@ function waitForBarrier(path: string, timeoutMs = 10_000): void {
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for test barrier: ${path}`);
     Atomics.wait(waitState, 0, 0, 10);
-  }
-}
-
-function approvalFileIdentity(path: string): string {
-  const value = statSync(path);
-  return `${value.dev}:${value.ino}:${value.mtimeMs}:${value.size}`;
-}
-
-if (input.waitForApprovalIdentityChange) {
-  const deadline = Date.now() + (input.barrierTimeoutMs ?? 10_000);
-  if (input.watcherReadyPath) writeFileSync(input.watcherReadyPath, "watching\n", { mode: 0o600 });
-  while (approvalFileIdentity(input.path) === input.waitForApprovalIdentityChange) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for approval file change: ${input.path}`);
-    Atomics.wait(waitState, 0, 0, 2);
   }
 }
 

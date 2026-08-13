@@ -10,15 +10,22 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { assertGatewayBinding } from "../apps/gateway/src/security.ts";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
+import { gatewayTestHooksFor, withGatewayTestHooks } from "../apps/gateway/src/testing.ts";
 import { createApprovalStore, createAuditStore, createBuiltInRegistry, createRunLedger, isOwnerOnlyPath, runTask } from "../packages/kernel/src/index.ts";
 import { createApprovalStoreWithTestHooks } from "../packages/kernel/src/approvals.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 import { createRuntimeIsolatedTaskExecutor } from "../packages/runtime/src/index.ts";
 
-test("approval fault-injection hooks are absent from the kernel package root", async () => {
+test("approval fault-injection hooks are absent from public package roots", async () => {
   const kernel = await import("../packages/kernel/src/index.ts") as Record<string, unknown>;
   assert.equal("createApprovalStoreWithTestHooks" in kernel, false);
   assert.equal("isApprovalStoreContentionError" in kernel, false);
+  const gateway = await import("../apps/gateway/src/server.ts") as Record<string, unknown>;
+  assert.equal("withGatewayTestHooks" in gateway, false);
+  assert.equal("gatewayTestHooksFor" in gateway, false);
+  const gatewayPackage = JSON.parse(await readFile(new URL("../apps/gateway/package.json", import.meta.url), "utf8"));
+  assert.deepEqual(gatewayPackage.exports, { ".": "./src/server.ts" });
+  assert.equal(gatewayTestHooksFor({ __testOnlyAfterApprovalJobClaimed() {} }), undefined);
 });
 
 type ApprovalContentionChildResult = {
@@ -60,11 +67,6 @@ async function waitForApprovalBarrier(path: string): Promise<void> {
 
 function activeApprovalLockArtifacts(approvalPath: string, files: string[]): string[] {
   return files.filter((name) => name === `${basename(approvalPath)}.lock` || name.startsWith(".odinn-approval-lock-recovery."));
-}
-
-async function approvalFileIdentity(path: string): Promise<string> {
-  const value = await stat(path);
-  return `${value.dev}:${value.ino}:${value.mtimeMs}:${value.size}`;
 }
 
 function waitForChild(child: ReturnType<typeof spawn>) {
@@ -504,13 +506,28 @@ test("Gateway sanitizes contention acquired after a durable approval job is clai
   const approvalPath = join(stateDir, "approvals.json");
   const ownerReadyPath = join(stateDir, "owner-ready");
   const releasePath = join(stateDir, "release-owner");
-  const watcherReadyPath = join(stateDir, "watcher-ready");
-  const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  const jobId = "post-claim-contention-job";
+  let owner: ReturnType<typeof spawnApprovalContentionWorker> | undefined;
+  const serverOptions = withGatewayTestHooks({ stateDir, workspaceRoot: stateDir }, {
+    afterApprovalJobClaimed: async ({ approvalId, jobId: claimedJobId }) => {
+      if (claimedJobId !== jobId) return;
+      owner = spawnApprovalContentionWorker({
+        action: { tool: "browser.click", runId: jobId, input: { tabId: "tab_fixture", selector: "#apply" } },
+        barrierTimeoutMs: 60_000,
+        id: approvalId,
+        operation: "list",
+        ownerReadyPath,
+        path: approvalPath,
+        releasePath
+      });
+      await waitForApprovalBarrier(ownerReadyPath);
+    }
+  });
+  const server = await createGatewayServer(serverOptions);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${(server.address() as any).port}`;
   const token = (await readFile(join(stateDir, "gateway.token"), "utf8")).trim();
   const authorization = { authorization: `Bearer ${token}` };
-  let owner: ReturnType<typeof spawnApprovalContentionWorker> | undefined;
   t.after(async () => {
     await writeFile(releasePath, "release\n", { mode: 0o600 }).catch(() => undefined);
     if (owner?.child.exitCode === null) owner.child.kill();
@@ -518,7 +535,6 @@ test("Gateway sanitizes contention acquired after a durable approval job is clai
     await rm(stateDir, { recursive: true, force: true });
   });
 
-  const jobId = "post-claim-contention-job";
   const submitted = await fetch(`${base}/jobs`, {
     method: "POST",
     headers: { ...authorization, "content-type": "application/json", "idempotency-key": jobId },
@@ -537,24 +553,13 @@ test("Gateway sanitizes contention acquired after a durable approval job is clai
   const approval = approvals.find((entry) => entry.runId === jobId);
   assert.ok(approval?.id);
 
-  owner = spawnApprovalContentionWorker({
-    action: { tool: "browser.click", runId: jobId, input: { tabId: "tab_fixture", selector: "#apply" } },
-    barrierTimeoutMs: 60_000,
-    id: approval.id,
-    operation: "list",
-    ownerReadyPath,
-    path: approvalPath,
-    releasePath,
-    waitForApprovalIdentityChange: await approvalFileIdentity(approvalPath),
-    watcherReadyPath
-  });
-  await waitForApprovalBarrier(watcherReadyPath);
   const responsePromise = fetch(`${base}/operator/actions`, {
     method: "POST",
     headers: { ...authorization, "content-type": "application/json" },
     body: JSON.stringify({ action: "approve", targetId: approval.id, confirm: true, surface: "http" })
   }).then(async (response) => ({ body: await response.text(), status: response.status }));
   await waitForApprovalBarrier(ownerReadyPath);
+  assert.ok(owner);
 
   let claimed: any;
   const claimDeadline = Date.now() + 5_000;

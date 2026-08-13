@@ -22,6 +22,7 @@ import {
 import { authenticationMode, isMutatingMethod, permitsGatewayTokenBootstrap, validHostHeader, validMutationOrigin } from "./security.ts";
 import { runGatewayEntrypoint } from "./bootstrap.ts";
 import { renderConsoleHtml } from "./public/console.ts";
+import { gatewayTestHooksFor } from "./testing.ts";
 import { runWithWorkflowLeaseHeartbeat } from "./workflow.ts";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
@@ -698,15 +699,17 @@ export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor
   await Promise.allSettled(dispatches);
 }
 
-export async function createGatewayServer({
-  stateDir = resolve(homedir(), ".odinn"),
-  workspaceRoot = process.cwd(),
-  requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
-  quotas = {},
-  hosted = false,
-  hostedUserId,
-  channelPluginLoader = loadChannelPlugin
-}: any = {}) {
+export async function createGatewayServer(options: any = {}) {
+  const {
+    stateDir = resolve(homedir(), ".odinn"),
+    workspaceRoot = process.cwd(),
+    requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
+    quotas = {},
+    hosted = false,
+    hostedUserId,
+    channelPluginLoader = loadChannelPlugin
+  } = options;
+  const testHooks = gatewayTestHooksFor(options);
   const trustedHostedUserId = hosted ? normalizeHostedUserId(hostedUserId) : undefined;
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
@@ -1020,6 +1023,7 @@ export async function createGatewayServer({
           if (current?.status !== "running") await revokeGatewayApproval(id);
           throw new GatewayError(409, "the originating job approval was already claimed or cancelled");
         }
+        await testHooks?.afterApprovalJobClaimed?.({ approvalId: id, jobId: linkedJob.id });
       }
       const pending = await claimGatewayApproval(id);
       if (!pending) {
