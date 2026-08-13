@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
-import { APPLICATION_CONTRACT_VERSION, ApplicationContractValidationError, OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validateOperatorSnapshotResponseV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSnapshotReadInputV1, type OperatorSurfaceV1 } from "@odinn/application";
+import { OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
 import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
@@ -25,6 +25,18 @@ import { runGatewayEntrypoint } from "./bootstrap.ts";
 import { renderConsoleHtml } from "./public/console.ts";
 import { gatewayTestHooksFor } from "./testing.ts";
 import { runWithWorkflowLeaseHeartbeat } from "./workflow.ts";
+import { gatewayOperatorSnapshotFailure } from "./http/errors.ts";
+import { createGatewayOperatorSnapshotReadRequest, normalizeHostedUserId } from "./http/request-context.ts";
+import { AuthenticatedRouter } from "./http/router.ts";
+import { registerApplicationReadRoutes } from "./routes/application-reads.ts";
+
+export { gatewayOperatorSnapshotFailure } from "./http/errors.ts";
+export {
+  createGatewayDiagnosticsReadRequest,
+  createGatewayOperatorSnapshotReadRequest,
+  createGatewaySessionListRequest,
+  createGatewayStatusReadRequest,
+} from "./http/request-context.ts";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
@@ -102,22 +114,6 @@ class GatewayError extends Error {
     super(message);
     this.status = status;
   }
-}
-
-export function gatewayOperatorSnapshotFailure(error: unknown, requestId: string) {
-  if (!(error instanceof ApplicationContractValidationError)
-    || error.code !== OPERATOR_SNAPSHOT_CHANGED_CODE) return undefined;
-  return Object.freeze({
-    status: 503 as const,
-    retryAfter: "1",
-    body: Object.freeze({
-      ok: false as const,
-      error: "operator snapshot changed while it was being read; retry the request",
-      code: OPERATOR_SNAPSHOT_CHANGED_CODE,
-      retryable: true as const,
-      requestId,
-    }),
-  });
 }
 
 class MissingChannelCredentialError extends Error {}
@@ -1217,6 +1213,13 @@ export async function createGatewayServer(options: any = {}) {
     }
   });
 
+  const applicationReadRouter = registerApplicationReadRoutes(new AuthenticatedRouter(), {
+    statusRead,
+    diagnosticsRead,
+    sessionList,
+    operatorSnapshotRead,
+  });
+
   const server: any = createServer(async (request: any, response: any) => {
     const requestId = String(request.headers["x-odinn-request-id"] || randomUUID());
     response.setHeader("x-odinn-request-id", requestId);
@@ -1246,6 +1249,25 @@ export async function createGatewayServer(options: any = {}) {
       if (isMutatingMethod(request.method) && !validMutationOrigin(request, authentication)) {
         return json(response, 403, { ok: false, error: "origin rejected for control-plane mutation" });
       }
+      const routeAbort = new AbortController();
+      const abortRoute = () => routeAbort.abort();
+      request.once("aborted", abortRoute);
+      response.once("close", abortRoute);
+      try {
+        if (await applicationReadRouter.dispatch(Object.freeze({
+          request,
+          response,
+          url,
+          requestId,
+          applicationRequestId: randomUUID(),
+          authentication,
+          hostedUserId: trustedHostedUserId,
+          signal: routeAbort.signal,
+        }))) return;
+      } finally {
+        request.off("aborted", abortRoute);
+        response.off("close", abortRoute);
+      }
       if (request.method === "GET" && url.pathname === "/config") {
         const editable = await readEditableConfig(state, { hosted });
         return json(response, 200, {
@@ -1262,63 +1284,6 @@ export async function createGatewayServer(options: any = {}) {
           ...saved,
           restartRequired: !configsMatch(saved.config, config)
         });
-      }
-      if (request.method === "GET" && url.pathname === "/status") {
-        const applicationRequestId = randomUUID();
-        const result = await statusRead.execute(createGatewayStatusReadRequest({
-          applicationRequestId,
-          hostedUserId: trustedHostedUserId,
-          authentication
-        }));
-        return json(response, 200, result.output);
-      }
-      if (request.method === "GET" && url.pathname === "/diagnostics") {
-        const applicationRequestId = randomUUID();
-        const result = await diagnosticsRead.execute(createGatewayDiagnosticsReadRequest({
-          applicationRequestId,
-          hostedUserId: trustedHostedUserId,
-          authentication
-        }));
-        return json(response, 200, result.output);
-      }
-      if (request.method === "GET" && (url.pathname === "/operator" || url.pathname === "/operator/snapshot")) {
-        const requestedSurface = String(url.searchParams.get("surface") || "http");
-        const surface = gatewayOperatorSurface(requestedSurface);
-        const pageNames = ["runtime", "work", "approvals", "automation", "context", "recovery", "audit", "surfaces"] as const;
-        const numericParameter = (name: string) => {
-          if (!url.searchParams.has(name)) return undefined;
-          const value = Number(url.searchParams.get(name));
-          return Number.isFinite(value) ? value : undefined;
-        };
-        const pages = Object.fromEntries(pageNames
-          .map((name) => [name, numericParameter(`${name}Page`)] as const)
-          .filter((entry): entry is readonly [typeof pageNames[number], number] => entry[1] !== undefined));
-        const page = numericParameter("page");
-        const pageSize = numericParameter("pageSize");
-        const sourcePath = url.pathname === "/operator" ? "/operator" : "/operator/snapshot";
-        let result;
-        try {
-          result = await operatorSnapshotRead.execute(createGatewayOperatorSnapshotReadRequest({
-            applicationRequestId: randomUUID(),
-            hostedUserId: trustedHostedUserId,
-            authentication,
-            sourcePath,
-            input: {
-              surface,
-              ...(page === undefined ? {} : { page }),
-              ...(pageSize === undefined ? {} : { pageSize }),
-              ...(url.searchParams.has("q") ? { query: url.searchParams.get("q") ?? "" } : {}),
-              ...(url.searchParams.has("status") ? { status: url.searchParams.get("status") ?? "" } : {}),
-              ...(Object.keys(pages).length ? { pages } : {})
-            }
-          }));
-        } catch (error) {
-          const failure = gatewayOperatorSnapshotFailure(error, requestId);
-          if (!failure) throw error;
-          response.setHeader("retry-after", failure.retryAfter);
-          return json(response, failure.status, failure.body);
-        }
-        return json(response, 200, validateOperatorSnapshotResponseV1({ ok: true, ...result.output }));
       }
       if (request.method === "POST" && url.pathname === "/operator/actions") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
@@ -2111,19 +2076,6 @@ export async function createGatewayServer(options: any = {}) {
           registry
         })).output);
       }
-      if (request.method === "GET" && url.pathname === "/sessions") {
-        const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
-        const projectId = url.searchParams.get("projectId") ?? "";
-        const applicationRequestId = randomUUID();
-        const result = await sessionList.execute(createGatewaySessionListRequest({
-          applicationRequestId,
-          hostedUserId: trustedHostedUserId,
-          authentication,
-          limit: normalizeSessionListLimit(limit),
-          projectId
-        }));
-        return json(response, 200, result.output);
-      }
       if (request.method === "POST" && url.pathname === "/sessions") {
         return json(response, 200, (await runIsolatedTask({
           task: { tool: "session.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
@@ -2320,140 +2272,6 @@ export async function createGatewayServer(options: any = {}) {
   });
   server.odinnAuthToken = gatewayToken;
   return server;
-}
-
-function normalizeHostedUserId(value: unknown): string {
-  const normalized = String(value ?? "");
-  if (!/^[a-z0-9][a-z0-9_-]{1,63}$/u.test(normalized)) {
-    throw new Error("hosted gateway requires a canonical host user identity");
-  }
-  return normalized;
-}
-
-export function createGatewayStatusReadRequest({
-  applicationRequestId,
-  hostedUserId,
-  authentication
-}: {
-  applicationRequestId: string;
-  hostedUserId?: string;
-  authentication: string;
-}) {
-  return {
-    version: APPLICATION_CONTRACT_VERSION,
-    kind: "status-read-request" as const,
-    requestId: applicationRequestId,
-    context: {
-      principal: {
-        principalId: hostedUserId ? `host-user:${normalizeHostedUserId(hostedUserId)}` : "local-gateway-user",
-        actorId: "gateway",
-        kind: "host-user" as const,
-        authenticationReference: authentication === "disabled" ? "gateway:auth-disabled" : `gateway:${authentication}`
-      },
-      scope: { tenantId: hostedUserId ? `tenant:${normalizeHostedUserId(hostedUserId)}` : "local" },
-      sourceReference: "http:GET:/status",
-      correlationId: applicationRequestId,
-      cancellationControlReference: `http:request:${applicationRequestId}`
-    },
-    operation: { kind: "query" as const, id: "status.read" as const }
-  };
-}
-
-export function createGatewayDiagnosticsReadRequest({
-  applicationRequestId,
-  hostedUserId,
-  authentication
-}: {
-  applicationRequestId: string;
-  hostedUserId?: string;
-  authentication: string;
-}) {
-  return {
-    version: APPLICATION_CONTRACT_VERSION,
-    kind: "diagnostics-read-request" as const,
-    requestId: applicationRequestId,
-    context: {
-      principal: {
-        principalId: hostedUserId ? `host-user:${normalizeHostedUserId(hostedUserId)}` : "local-gateway-user",
-        actorId: "gateway",
-        kind: "host-user" as const,
-        authenticationReference: authentication === "disabled" ? "gateway:auth-disabled" : `gateway:${authentication}`
-      },
-      scope: { tenantId: hostedUserId ? `tenant:${normalizeHostedUserId(hostedUserId)}` : "local" },
-      sourceReference: "http:GET:/diagnostics",
-      correlationId: applicationRequestId,
-      cancellationControlReference: `http:request:${applicationRequestId}`
-    },
-    operation: { kind: "query" as const, id: "diagnostics.read" as const }
-  };
-}
-
-export function createGatewayOperatorSnapshotReadRequest({
-  applicationRequestId,
-  hostedUserId,
-  authentication,
-  sourcePath,
-  input
-}: {
-  applicationRequestId: string;
-  hostedUserId?: string;
-  authentication: string;
-  sourcePath: "/operator" | "/operator/snapshot" | "/operator/actions";
-  input: OperatorSnapshotReadInputV1;
-}) {
-  return {
-    version: APPLICATION_CONTRACT_VERSION,
-    kind: "operator-snapshot-read-request" as const,
-    requestId: applicationRequestId,
-    context: {
-      principal: {
-        principalId: hostedUserId ? `host-user:${normalizeHostedUserId(hostedUserId)}` : "local-gateway-user",
-        actorId: "gateway",
-        kind: "host-user" as const,
-        authenticationReference: authentication === "disabled" ? "gateway:auth-disabled" : `gateway:${authentication}`
-      },
-      scope: { tenantId: hostedUserId ? `tenant:${normalizeHostedUserId(hostedUserId)}` : "local" },
-      sourceReference: `http:${sourcePath === "/operator/actions" ? "POST" : "GET"}:${sourcePath}`,
-      correlationId: applicationRequestId,
-      cancellationControlReference: `http:request:${applicationRequestId}`
-    },
-    operation: { kind: "query" as const, id: "operator.snapshot.read" as const },
-    input
-  };
-}
-
-export function createGatewaySessionListRequest({
-  applicationRequestId,
-  hostedUserId,
-  authentication,
-  limit,
-  projectId
-}: {
-  applicationRequestId: string;
-  hostedUserId?: string;
-  authentication: string;
-  limit: number;
-  projectId?: string;
-}) {
-  return {
-    version: APPLICATION_CONTRACT_VERSION,
-    kind: "session-list-request" as const,
-    requestId: applicationRequestId,
-    context: {
-      principal: {
-        principalId: hostedUserId ? `host-user:${normalizeHostedUserId(hostedUserId)}` : "local-gateway-user",
-        actorId: "gateway",
-        kind: "host-user" as const,
-        authenticationReference: authentication === "disabled" ? "gateway:auth-disabled" : `gateway:${authentication}`
-      },
-      scope: { tenantId: hostedUserId ? `tenant:${normalizeHostedUserId(hostedUserId)}` : "local" },
-      sourceReference: "http:GET:/sessions",
-      correlationId: applicationRequestId,
-      cancellationControlReference: `http:request:${applicationRequestId}`
-    },
-    operation: { kind: "query" as const, id: "session.list" as const },
-    input: { limit, ...(projectId ? { projectId } : {}) }
-  };
 }
 
 export function createGatewaySessionListPort({ execute, auditStore, policy, registry }: any) {
