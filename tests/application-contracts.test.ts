@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import * as applicationRoot from "../packages/application/src/index.ts";
 import {
+  MAX_APPLICATION_CONTRACT_BYTES,
   ApplicationContractValidationError,
   assertChannelDeliveryReceiptMatchesEnvelopeV1,
   assertExecutionResultMatchesRequestV1,
@@ -19,6 +21,7 @@ import {
   parseDiagnosticsReportV1,
   parseSessionPageV1,
   parseStatusSnapshotV1,
+  validateApplicationEnvelopeV1,
   validateChannelDeliveryReceiptV1,
   validateDiagnosticsReportV1,
   validateExecutionRequestV1,
@@ -43,6 +46,8 @@ import {
   type StatusSnapshotV1,
   type StatusReadRequestV1
 } from "../packages/application/src/index.ts";
+import { normalizeReadContractJsonValueV1 } from "../packages/application/src/read-contract-json.ts";
+import * as validationFacade from "../packages/application/src/validation.ts";
 
 const timestamp = "2026-08-11T12:00:00.000Z";
 const digestA = "a".repeat(64);
@@ -52,6 +57,18 @@ const readContractFixtures = JSON.parse(readFileSync(join(import.meta.dirname, "
   statusGateway: StatusSnapshotV1;
   diagnostics: DiagnosticsReportV1;
   sessionPage: SessionPageV1;
+};
+const validationFixtures = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", "application-validation-v1.json"), "utf8")) as {
+  inbound: InboundEnvelopeV1;
+  executionRequest: ExecutionRequestV1;
+  outbound: OutboundEnvelopeV1;
+  expected: {
+    canonicalApplicationEnvelope: string;
+    executionRequestDigest: string;
+    approvedExecutionRequestDigest: string;
+    executionOperationDigest: string;
+    outboundEnvelopeDigest: string;
+  };
 };
 
 function inbound(overrides: Partial<InboundEnvelopeV1> = {}): InboundEnvelopeV1 {
@@ -139,6 +156,148 @@ function completedResult(requestValue = request(), overrides: Partial<ExecutionR
   };
 }
 
+test("validation facade preserves its exact public surface and error identity", () => {
+  const expectedExports = [
+    "ApplicationContractValidationError",
+    "assertChannelDeliveryReceiptMatchesEnvelopeV1",
+    "assertExecutionResultMatchesRequestV1",
+    "canonicalizeApplicationContractV1",
+    "digestExecutionOperationV1",
+    "digestExecutionRequestV1",
+    "digestOutboundEnvelopeV1",
+    "parseApplicationEnvelopeV1",
+    "validateApplicationEnvelopeV1",
+    "validateChannelDeliveryReceiptV1",
+    "validateExecutionRequestV1",
+    "validateExecutionResultV1",
+    "validateInboundEnvelopeV1",
+    "validateOutboundEnvelopeV1"
+  ] as const;
+  assert.deepEqual(Object.keys(validationFacade).sort(), [...expectedExports].sort());
+  for (const key of expectedExports) assert.equal(validationFacade[key], applicationRoot[key], key);
+
+  const capture = (operation: () => unknown): unknown => {
+    try { operation(); } catch (error) { return error; }
+    assert.fail("expected validation failure");
+  };
+  const wireError = capture(() => validateInboundEnvelopeV1({}));
+  const readError = capture(() => validateSessionPageV1({ sessions: "not-an-array" }));
+  assert.equal(wireError instanceof ApplicationContractValidationError, true);
+  assert.equal(readError instanceof ApplicationContractValidationError, true);
+  assert.equal((wireError as Error).constructor, (readError as Error).constructor);
+});
+
+test("application contract canonical and digest golden vectors remain stable", () => {
+  const { inbound: inboundFixture, executionRequest, outbound: outboundFixture, expected } = validationFixtures;
+  const approvedRequest = { ...executionRequest, approvalReference: "approval:claim-1" };
+  assert.equal(canonicalizeApplicationContractV1(inboundFixture), expected.canonicalApplicationEnvelope);
+  assert.equal(digestExecutionRequestV1(executionRequest), expected.executionRequestDigest);
+  assert.equal(digestExecutionRequestV1(approvedRequest), expected.approvedExecutionRequestDigest);
+  assert.equal(digestExecutionOperationV1(executionRequest), expected.executionOperationDigest);
+  assert.equal(digestExecutionOperationV1(approvedRequest), expected.executionOperationDigest);
+  assert.equal(digestOutboundEnvelopeV1(outboundFixture), expected.outboundEnvelopeDigest);
+  assert.notEqual(digestExecutionRequestV1(approvedRequest), digestExecutionRequestV1(executionRequest));
+  assert.notEqual(digestExecutionOperationV1({ ...executionRequest, input: { path: "CHANGELOG.md" } }), expected.executionOperationDigest);
+  assert.notEqual(digestExecutionOperationV1({ ...executionRequest, idempotencyKey: "idempotency:002" }), expected.executionOperationDigest);
+});
+
+test("application envelope dispatch remains wire-only", () => {
+  const outboundFixture = validationFixtures.outbound;
+  const delivery = {
+    version: 1,
+    kind: "channel-delivery-receipt",
+    envelopeId: outboundFixture.envelopeId,
+    envelopeDigest: digestOutboundEnvelopeV1(outboundFixture),
+    correlationId: outboundFixture.correlationId,
+    status: "sent",
+    messageReferences: ["message:001"],
+    uncertainty: { state: "none" },
+    settledAt: timestamp
+  };
+  assert.equal(validateApplicationEnvelopeV1(validationFixtures.inbound).kind, "inbound");
+  assert.equal(validateApplicationEnvelopeV1(outboundFixture).kind, "outbound");
+  assert.equal(validateApplicationEnvelopeV1(delivery).kind, "channel-delivery-receipt");
+  for (const trusted of [validationFixtures.executionRequest, completedResult()]) {
+    assert.throws(
+      () => validateApplicationEnvelopeV1(trusted),
+      (error: unknown) => error instanceof ApplicationContractValidationError
+        && error.message === "application envelope kind is not wire-admissible"
+        && error.code === "UNSUPPORTED_APPLICATION_ENVELOPE_KIND"
+        && error.path === "kind"
+    );
+  }
+});
+
+test("wire and read JSON limits remain intentionally distinct", () => {
+  const wireList = Array.from({ length: 256 }, (_, index) => index);
+  assert.equal((validateInboundEnvelopeV1(inbound({ payload: wireList })).payload as readonly number[]).length, 256);
+  assert.throws(() => validateInboundEnvelopeV1(inbound({ payload: [...wireList, 256] })), /more than 256/u);
+
+  const wireFields = Object.fromEntries(Array.from({ length: 256 }, (_, index) => [`field${index}`, index]));
+  assert.equal(Object.keys(validateInboundEnvelopeV1(inbound({ payload: wireFields })).payload as object).length, 256);
+  assert.throws(() => validateInboundEnvelopeV1(inbound({ payload: { ...wireFields, overflow: true } })), /more than 256/u);
+
+  const readList = Array.from({ length: 512 }, (_, index) => index);
+  assert.equal((normalizeReadContractJsonValueV1(readList, "read list") as readonly number[]).length, 512);
+  assert.throws(() => normalizeReadContractJsonValueV1([...readList, 512], "read list"), /more than 512/u);
+  const readFields = Object.fromEntries(Array.from({ length: 512 }, (_, index) => [`field${index}`, index]));
+  assert.equal(Object.keys(normalizeReadContractJsonValueV1(readFields, "read fields") as object).length, 512);
+  assert.throws(() => normalizeReadContractJsonValueV1({ ...readFields, overflow: true }, "read fields"), /more than 512/u);
+
+  const nested = (depth: number): unknown => {
+    let value: unknown = true;
+    for (let index = 0; index < depth; index += 1) value = { value };
+    return value;
+  };
+  assert.doesNotThrow(() => validateInboundEnvelopeV1(inbound({ payload: nested(32) as InboundEnvelopeV1["payload"] })));
+  assert.throws(
+    () => validateInboundEnvelopeV1(inbound({ payload: nested(33) as InboundEnvelopeV1["payload"] })),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "APPLICATION_JSON_TOO_DEEP"
+  );
+  assert.doesNotThrow(() => normalizeReadContractJsonValueV1(nested(32), "read depth"));
+  assert.throws(
+    () => normalizeReadContractJsonValueV1(nested(33), "read depth"),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "APPLICATION_JSON_TOO_DEEP"
+  );
+
+  const nodeBoundary = Array.from({ length: 256 }, (_, index) => Array.from({ length: index === 255 ? 30 : 31 }, () => true));
+  assert.doesNotThrow(() => validateInboundEnvelopeV1(inbound({ payload: nodeBoundary })));
+  nodeBoundary[255]!.push(true);
+  assert.throws(
+    () => validateInboundEnvelopeV1(inbound({ payload: nodeBoundary })),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "APPLICATION_JSON_TOO_COMPLEX"
+  );
+
+  const source = JSON.stringify(inbound());
+  const exactLimitSource = `${source}${" ".repeat(MAX_APPLICATION_CONTRACT_BYTES - Buffer.byteLength(source, "utf8"))}`;
+  assert.equal(Buffer.byteLength(exactLimitSource, "utf8"), MAX_APPLICATION_CONTRACT_BYTES);
+  assert.doesNotThrow(() => parseApplicationEnvelopeV1(exactLimitSource));
+  assert.throws(
+    () => parseApplicationEnvelopeV1(`${exactLimitSource} `),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "APPLICATION_CONTRACT_TOO_LARGE"
+  );
+});
+
+test("wire descriptor safety preserves plain-container and freezing behavior", () => {
+  const nullPrototypePayload = Object.assign(Object.create(null) as Record<string, unknown>, { nested: { value: true } });
+  const normalized = validateInboundEnvelopeV1(inbound({ payload: nullPrototypePayload as InboundEnvelopeV1["payload"] }));
+  assert.deepEqual(normalized.payload, { nested: { value: true } });
+  assert.equal(Object.isFrozen(normalized.payload), true);
+  assert.equal(Object.isFrozen((normalized.payload as { nested: object }).nested), true);
+
+  const sparse = new Array<unknown>(1);
+  assert.throws(() => validateInboundEnvelopeV1(inbound({ payload: sparse })), /sparse entries/u);
+  const nonEnumerable = [true];
+  Object.defineProperty(nonEnumerable, "0", { enumerable: false, value: true });
+  assert.throws(() => validateInboundEnvelopeV1(inbound({ payload: nonEnumerable })), /enumerable data field/u);
+  const outOfRange = [true];
+  Object.defineProperty(outOfRange, "4294967295", { enumerable: true, value: false });
+  assert.throws(() => validateInboundEnvelopeV1(inbound({ payload: outOfRange })), /out-of-range numeric field/u);
+  const exoticArray = [true];
+  Object.setPrototypeOf(exoticArray, null);
+  assert.throws(() => validateInboundEnvelopeV1(inbound({ payload: exoticArray })), /plain array/u);
+});
+
 test("application envelopes round-trip canonically and freeze normalized data", () => {
   const first = validateInboundEnvelopeV1(inbound());
   const second = parseApplicationEnvelopeV1(JSON.stringify({ ...inbound(), payload: { z: 1, text: "status", a: [true, null] } }));
@@ -165,6 +324,23 @@ test("inbound claims remain distinct from effective execution authority", () => 
   assert.throws(
     () => parseApplicationEnvelopeV1(JSON.stringify(request())),
     (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "UNSUPPORTED_APPLICATION_ENVELOPE_KIND"
+  );
+});
+
+test("validation preserves first-failure message, code, and path", () => {
+  assert.throws(
+    () => validateExecutionRequestV1({ ...request(), version: 2, actor: "untrusted" }),
+    (error: unknown) => error instanceof ApplicationContractValidationError
+      && error.message === "execution request contains unknown field: actor"
+      && error.code === "UNKNOWN_APPLICATION_FIELD"
+      && error.path === "execution request.actor"
+  );
+  assert.throws(
+    () => validateExecutionResultV1({ ...completedResult(), status: "failed" }),
+    (error: unknown) => error instanceof ApplicationContractValidationError
+      && error.message === "failed result requires a matching normalized error and no uncertainty"
+      && error.code === "INVALID_EXECUTION_RESULT"
+      && error.path === undefined
   );
 });
 
@@ -251,7 +427,10 @@ test("receipt binding rejects cross-principal, scope, correlation, request, and 
     completedResult(requestValue, { scope: { ...requestValue.context.scope, conversationId: "conversation:other" } }),
     completedResult(requestValue, { correlationId: "correlation:other" }),
     completedResult(requestValue, { requestId: "request:other" }),
-    completedResult(requestValue, { operation: { kind: "tool", id: "process.exec" } })
+    completedResult(requestValue, { operation: { kind: "tool", id: "process.exec" } }),
+    completedResult(requestValue, { cancellationControlReference: "cancel:other" }),
+    completedResult(requestValue, { requestDigest: digestA }),
+    completedResult(requestValue, { operationDigest: digestA })
   ];
   for (const result of variants) {
     assert.throws(
@@ -341,6 +520,55 @@ test("cancellation cannot conceal uncertain physical execution", () => {
     output: undefined,
     error: { code: "DISPATCH_TIMEOUT", message: "dispatch timed out", category: "timeout", retryable: true }
   }), /cannot be marked retryable/u);
+});
+
+test("execution result status matrix retains approval, admission, uncertainty, output, and error semantics", () => {
+  const requestValue = validateExecutionRequestV1(request());
+  const withoutAdmission = {
+    executionEnvelopeReference: undefined,
+    executionEnvelopeDigest: undefined,
+    runId: undefined,
+    attemptId: undefined,
+    admittedAt: undefined
+  } as const;
+  const withoutOutput = { outputReference: undefined, outputDigest: undefined } as const;
+  const uncertain = {
+    state: "needs-review",
+    reasonCode: "DISPATCH_DID_NOT_STOP",
+    recoveryReference: "recovery:001",
+    physicalExecutionPending: true,
+    retryAllowed: false
+  } as const;
+  const pendingApproval = {
+    state: "pending",
+    approvalReference: "approval:claim-1",
+    operationDigest: digestExecutionOperationV1(requestValue),
+    expiresAt: "2026-08-11T12:05:00.000Z"
+  } as const;
+
+  const completed = completedResult(requestValue);
+  const failed = completedResult(requestValue, { status: "failed", ...withoutOutput, errorCode: "DEPENDENCY_FAILURE" });
+  const cancelled = completedResult(requestValue, { status: "cancelled", ...withoutOutput });
+  const awaitingApproval = completedResult(requestValue, { status: "awaiting-approval", approval: pendingApproval, ...withoutAdmission, ...withoutOutput });
+  const needsReview = completedResult(requestValue, { status: "needs-review", uncertainty: uncertain, ...withoutOutput });
+  const denied = completedResult(requestValue, { status: "denied", approval: { state: "denied" }, ...withoutAdmission, ...withoutOutput, errorCode: "APPROVAL_DENIED" });
+  const validResults: readonly ExecutionResultV1[] = [
+    completed,
+    { ...failed, output: undefined, error: { code: "DEPENDENCY_FAILURE", message: "provider unavailable", category: "dependency", retryable: true } },
+    { ...cancelled, output: undefined },
+    { ...awaitingApproval, output: undefined },
+    { ...needsReview, output: undefined },
+    { ...denied, output: undefined, error: { code: "APPROVAL_DENIED", message: "approval denied", category: "authorization", retryable: false } }
+  ];
+  for (const result of validResults) assert.doesNotThrow(() => validateExecutionResultV1(result), result.status);
+
+  const query = validateExecutionRequestV1(request({ operation: { kind: "query", id: "status.read" } }));
+  const queryCompleted = completedResult(query, withoutAdmission);
+  assert.doesNotThrow(() => validateExecutionResultV1(queryCompleted));
+  assert.throws(
+    () => validateExecutionResultV1({ ...queryCompleted, status: "needs-review", uncertainty: uncertain, receipt: { ...queryCompleted.receipt, status: "needs-review", uncertainty: uncertain }, output: undefined }),
+    /read-only query cannot report an uncertain physical execution/u
+  );
 });
 
 test("normalized errors reject exception internals and secret-like material", () => {
@@ -518,7 +746,19 @@ test("ports keep runtime cancellation outside serialized transport-neutral DTOs"
   const delivery = await channel.deliver(validateOutboundEnvelopeV1(outbound), { signal: new AbortController().signal });
   assert.equal(delivery.status, "sent");
   assert.doesNotThrow(() => assertChannelDeliveryReceiptMatchesEnvelopeV1(outbound, delivery));
-  assert.throws(() => assertChannelDeliveryReceiptMatchesEnvelopeV1({ ...outbound, payload: { text: "changed" } }, delivery), /not bound/u);
+  for (const [envelopeValue, receiptValue] of [
+    [{ ...outbound, envelopeId: "outbound:other" }, delivery],
+    [{ ...outbound, correlationId: "correlation:other" }, delivery],
+    [{ ...outbound, payload: { text: "changed" } }, delivery],
+    [outbound, { ...delivery, envelopeId: "outbound:other" }],
+    [outbound, { ...delivery, correlationId: "correlation:other" }],
+    [outbound, { ...delivery, envelopeDigest: digestA }]
+  ] as const) {
+    assert.throws(
+      () => assertChannelDeliveryReceiptMatchesEnvelopeV1(envelopeValue, receiptValue),
+      (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "CHANNEL_RECEIPT_BINDING_MISMATCH"
+    );
+  }
   assert.throws(() => validateChannelDeliveryReceiptV1({ ...delivery, status: "partial", messageReferences: [], error: undefined }), /partial delivery requires/u);
   assert.throws(() => validateChannelDeliveryReceiptV1({ ...delivery, status: "partial", error: { code: "TIMEOUT", message: "delivery timed out", category: "timeout", retryable: true } }), /partial delivery requires/u);
   assert.throws(() => validateChannelDeliveryReceiptV1({
@@ -965,8 +1205,18 @@ test("application package resolves independently and excludes implementation dep
   const packageRoot = join(import.meta.dirname, "..", "packages", "application");
   const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), []);
-  const source = ["contracts.ts", "validation.ts", "ports.ts", "sensitive-metadata.ts", "read-contract-json.ts", "read-output-contracts.ts", "status.ts", "diagnostics.ts", "session-list.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
+  const sourceRoot = join(packageRoot, "src");
+  const sourceFiles = readdirSync(sourceRoot, { encoding: "utf8", recursive: true })
+    .filter((file) => file.endsWith(".ts"))
+    .sort();
+  const source = sourceFiles.map((file) => readFileSync(join(sourceRoot, file), "utf8")).join("\n");
   assert.doesNotMatch(source, /discord\.js|@slack|telegram|whatsapp|express|playwright|apps\/gateway|apps\/cli|packages\/kernel/u);
+  assert.equal(sourceFiles.includes("validation/index.ts"), false);
+  const validationSources = sourceFiles
+    .filter((file) => file.startsWith("validation/"))
+    .map((file) => readFileSync(join(sourceRoot, file), "utf8"))
+    .join("\n");
+  assert.doesNotMatch(validationSources, /from ["']\.\.\/(?:index|validation)\.ts["']/u);
   assert.doesNotMatch(readFileSync(join(packageRoot, "src", "contracts.ts"), "utf8"), /\b(?:AbortSignal|Request|Response|Buffer|Readable|Writable)\b/u);
   const probe = spawnSync(process.execPath, ["--input-type=module", "--eval", "const application = await import('@odinn/application'); if (application.APPLICATION_CONTRACT_VERSION !== 1) process.exit(2);"], { cwd: packageRoot, encoding: "utf8" });
   assert.equal(probe.status, 0, probe.stderr);

@@ -5,7 +5,7 @@ import {
 } from "./contracts.ts";
 import type { StatusSnapshotV1 } from "./read-output-contracts.ts";
 import { validateStatusSnapshotV1 } from "./read-output-contracts.ts";
-import { validateExecutionRequestV1 } from "./validation.ts";
+import { validateExecutionRequestV1 } from "./validation/execution-request.ts";
 
 export const STATUS_READ_OPERATION_ID = "status.read" as const;
 

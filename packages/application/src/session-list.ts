@@ -5,7 +5,7 @@ import {
 } from "./contracts.ts";
 import type { SessionPageV1 } from "./read-output-contracts.ts";
 import { validateSessionPageV1 } from "./read-output-contracts.ts";
-import { validateExecutionRequestV1 } from "./validation.ts";
+import { validateExecutionRequestV1 } from "./validation/execution-request.ts";
 
 export const SESSION_LIST_OPERATION_ID = "session.list" as const;
 

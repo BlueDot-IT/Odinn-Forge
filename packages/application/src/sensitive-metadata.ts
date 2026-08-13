@@ -80,6 +80,27 @@ const compactQualifierPattern = new RegExp(
   "u"
 );
 
+const SENSITIVE_APPLICATION_VALUE_PATTERNS = [
+  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|capability(?:[_-]?token)?|token|authorization|cookie|credentials?|password(?:[_-]?hash)?|passwd|secret|client[_-]?secret|bot[_-]?(?:secret|token)|private[_-]?key)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/iu,
+  /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/iu,
+  /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/iu,
+  /\b(?:gh[pousr]_|github_pat_|glpat-|npm_|xox[baprs]-)[A-Za-z0-9_-]{10,}\b/u,
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/u,
+  /\bAIza[A-Za-z0-9_-]{30,}\b/u,
+  /\bhttps:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]{16,}\b/u,
+  /\b(?:sk|rk)(?:[_-](?:live|test))?[_-][A-Za-z0-9_-]{8,}\b/u,
+  /\b(?:access|refresh|id|api|client|bot)[ _-]?(?:key|token|secret)\s*(?:is|[:=])?\s*[A-Za-z0-9._~+\/-]{8,}\b/iu,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/u,
+  /\b(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,})\b/u,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@/iu,
+  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u
+];
+
+/** Classify string values that appear to contain credential material. */
+export function containsSensitiveApplicationValue(value: string): boolean {
+  return SENSITIVE_APPLICATION_VALUE_PATTERNS.some((pattern) => pattern.test(value));
+}
+
 /**
  * Reject metadata keys whose visual representation and comparison form can
  * disagree. Application metadata is a machine contract, so ASCII field names

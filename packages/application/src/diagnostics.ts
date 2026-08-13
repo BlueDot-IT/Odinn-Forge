@@ -5,7 +5,7 @@ import {
 } from "./contracts.ts";
 import type { DiagnosticsReportV1 } from "./read-output-contracts.ts";
 import { validateDiagnosticsReportV1 } from "./read-output-contracts.ts";
-import { validateExecutionRequestV1 } from "./validation.ts";
+import { validateExecutionRequestV1 } from "./validation/execution-request.ts";
 
 export const DIAGNOSTICS_READ_OPERATION_ID = "diagnostics.read" as const;
 
