@@ -45,6 +45,29 @@ The packager archives `HEAD`, not uncommitted working-tree changes. Run the
 soak before checksums so its report is included in the final checksum set. If
 an artifact changes afterward, regenerate the checksums and rerun verification.
 
+## RC2 identity and generated metadata
+
+For the `1.1.0-rc.2` candidate, the reviewed merge commit, source metadata,
+tag, generated package metadata, and release evidence must describe one
+identity:
+
+- `package.json` must declare `1.1.0-rc.2` and the annotated tag must be exactly
+  `v1.1.0-rc.2` at the same commit.
+- The GitHub release for that tag must remain a draft prerelease while the
+  protected Release workflow validates it. Do not publish from an untagged
+  branch or move an existing tag.
+- The source `release-info.json` is an export-substituted template; `pnpm
+  release:package` generates the compiled package's release identity with the
+  exact version, commit, runtime digest, and state-schema compatibility.
+- The generated `release-manifest.json`, package `release-info.json`, archive
+  `package.json`, `SHA256SUMS.txt`, SPDX SBOM, and `release-provenance.json`
+  must agree on version, commit, runtime digest, and archive checksums. The
+  workflow's downloaded-asset verification is the authoritative proof that
+  published files match the generated set.
+- Build provenance must cover the final release assets, and the evidence record
+  must retain sanitized OS/architecture, toolchain, artifact checksum, SBOM,
+  provenance, and downloaded-asset results for each supported platform.
+
 ## Publication sequence
 
 Create the GitHub release as a draft with the exact `vX.Y.Z` tag, then manually
