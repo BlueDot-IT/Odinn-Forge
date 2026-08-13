@@ -24,6 +24,8 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
   dedicated compatibility and artifact-validation pull requests
 * separate the write-capable security-remediation control plane from routine
   GitHub Actions dependency groups so its exact pinned revision is reviewed
+* update the Node 24 declaration baseline to 24.13.3 and fail closed when a
+  worker emits a non-Error failure value at the proof boundary
 
 ### Release engineering
 

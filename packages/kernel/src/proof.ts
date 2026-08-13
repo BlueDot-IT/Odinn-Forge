@@ -319,7 +319,11 @@ async function matchesText(actual: string, matcher: Matcher) {
       if (message.error) finish(new Error(`proof regular expression failed: ${message.error}`));
       else finish(undefined, message.match);
     });
-    worker.once("error", (error) => finish(error));
+    worker.once("error", (error: unknown) => finish(
+      error instanceof Error
+        ? error
+        : new Error("proof regular expression worker failed with an invalid error value")
+    ));
     worker.once("exit", (code) => {
       if (!settled && code !== 0) finish(new Error(`proof regular expression worker exited with code ${code}`));
     });
