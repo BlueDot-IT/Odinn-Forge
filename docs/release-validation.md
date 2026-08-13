@@ -20,6 +20,24 @@ being published.
 - No unresolved security or release-blocking defect is hidden by a green
   synthetic check.
 
+## RC2 candidate identity and downloaded assets
+
+The `v1.1.0-rc.2` candidate is not releasable until the evidence record names
+the exact annotated tag, its resolved commit, and the package version from the
+same clean checkout. Preserve the generated `release-info.json`,
+`release-manifest.json`, `SHA256SUMS.txt`, SPDX SBOM, and provenance output as
+one candidate set. The manifest and provenance must identify the same commit,
+compiled distribution, runtime digest, archive names, and archive digests.
+
+After the draft GitHub release is populated, download its assets into a fresh
+directory and rerun checksum, manifest, SBOM, provenance, archive extraction,
+installation, onboarding, recovery, update, rollback, backup, restore, and
+uninstall checks against those downloaded files on clean Linux, macOS, and
+Windows environments. Local build-directory checks do not substitute for
+downloaded-release evidence. Record each platform's OS, architecture,
+toolchain versions, exact artifact digest, pass/fail result, and sanitized
+failure evidence before allowing publication.
+
 ## Artifact checks
 
 Run these commands from a clean, committed checkout:
