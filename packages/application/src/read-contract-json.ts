@@ -1,9 +1,10 @@
 import { MAX_APPLICATION_CONTRACT_BYTES, type JsonObject, type JsonValue } from "./contracts.ts";
 import {
+  containsSensitiveApplicationValue,
   isAmbiguousApplicationMetadataKey,
   isSensitiveApplicationMetadataKey
 } from "./sensitive-metadata.ts";
-import { ApplicationContractValidationError } from "./validation.ts";
+import { ApplicationContractValidationError } from "./validation/errors.ts";
 
 const MAX_ID_BYTES = 256;
 const MAX_STRING_BYTES = 65_536;
@@ -11,21 +12,6 @@ const MAX_LIST_ITEMS = 512;
 const MAX_JSON_DEPTH = 32;
 const MAX_JSON_NODES = 8_192;
 const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const SENSITIVE_VALUES = [
-  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|capability(?:[_-]?token)?|token|authorization|cookie|credentials?|password(?:[_-]?hash)?|passwd|secret|client[_-]?secret|bot[_-]?(?:secret|token)|private[_-]?key)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/iu,
-  /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/iu,
-  /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/iu,
-  /\b(?:gh[pousr]_|github_pat_|glpat-|npm_|xox[baprs]-)[A-Za-z0-9_-]{10,}\b/u,
-  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/u,
-  /\bAIza[A-Za-z0-9_-]{30,}\b/u,
-  /\bhttps:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]{16,}\b/u,
-  /\b(?:sk|rk)(?:[_-](?:live|test))?[_-][A-Za-z0-9_-]{8,}\b/u,
-  /\b(?:access|refresh|id|api|client|bot)[ _-]?(?:key|token|secret)\s*(?:is|[:=])?\s*[A-Za-z0-9._~+\/-]{8,}\b/iu,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/u,
-  /\b(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,})\b/u,
-  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@/iu,
-  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u
-];
 
 interface ReadContractSensitiveFieldContext {
   readonly path: string;
@@ -83,7 +69,7 @@ export function normalizeReadContractJsonValueV1(
     if (current === null || typeof current === "boolean") return current;
     if (typeof current === "string") {
       if (Buffer.byteLength(current, "utf8") > MAX_STRING_BYTES) fail(`${path} exceeds ${MAX_STRING_BYTES} bytes`, "INVALID_APPLICATION_READ_CONTRACT", path);
-      if (SENSITIVE_VALUES.some((pattern) => pattern.test(current))) fail(`${path} contains secret-like material`, "UNREDACTED_APPLICATION_METADATA", path);
+      if (containsSensitiveApplicationValue(current)) fail(`${path} contains secret-like material`, "UNREDACTED_APPLICATION_METADATA", path);
       return current;
     }
     if (typeof current === "number") {

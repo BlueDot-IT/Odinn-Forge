@@ -1,0 +1,86 @@
+{
+  "inbound": {
+    "version": 1,
+    "kind": "inbound",
+    "envelopeId": "envelope:inbound-1",
+    "source": {
+      "kind": "channel",
+      "adapterId": "discord",
+      "accountReference": "account:primary"
+    },
+    "sourceEventId": "event:001",
+    "receivedAt": "2026-08-11T12:00:00.000Z",
+    "correlationId": "correlation:001",
+    "identityClaims": {
+      "claimedSubject": "remote-user",
+      "claimedTenant": "untrusted-tenant"
+    },
+    "scopeClaims": {
+      "claimedConversation": "conversation:001",
+      "claimedThread": "thread:001"
+    },
+    "payload": {
+      "z": 1,
+      "text": "status",
+      "a": [
+        true,
+        null
+      ]
+    },
+    "redactedMetadata": {
+      "delivery": "webhook",
+      "secret": "[redacted]"
+    }
+  },
+  "executionRequest": {
+    "version": 1,
+    "kind": "execution-request",
+    "requestId": "request:001",
+    "context": {
+      "principal": {
+        "principalId": "principal:operator",
+        "actorId": "actor:operator",
+        "kind": "operator",
+        "authenticationReference": "auth:session-1"
+      },
+      "scope": {
+        "tenantId": "tenant:local",
+        "projectId": "project:001",
+        "sessionId": "session:001",
+        "conversationId": "conversation:001"
+      },
+      "sourceReference": "inbound:envelope-1",
+      "correlationId": "correlation:001",
+      "cancellationControlReference": "cancel:001"
+    },
+    "operation": {
+      "kind": "tool",
+      "id": "workspace.read"
+    },
+    "input": {
+      "path": "README.md"
+    },
+    "responseMode": "sync",
+    "idempotencyKey": "idempotency:001"
+  },
+  "outbound": {
+    "version": 1,
+    "kind": "outbound",
+    "envelopeId": "outbound:001",
+    "correlationId": "correlation:001",
+    "destination": {
+      "transport": "discord",
+      "conversationReference": "conversation:001"
+    },
+    "payload": {
+      "text": "ready"
+    }
+  },
+  "expected": {
+    "canonicalApplicationEnvelope": "{\"correlationId\":\"correlation:001\",\"envelopeId\":\"envelope:inbound-1\",\"identityClaims\":{\"claimedSubject\":\"remote-user\",\"claimedTenant\":\"untrusted-tenant\"},\"kind\":\"inbound\",\"payload\":{\"a\":[true,null],\"text\":\"status\",\"z\":1},\"receivedAt\":\"2026-08-11T12:00:00.000Z\",\"redactedMetadata\":{\"delivery\":\"webhook\",\"secret\":\"[redacted]\"},\"scopeClaims\":{\"claimedConversation\":\"conversation:001\",\"claimedThread\":\"thread:001\"},\"source\":{\"accountReference\":\"account:primary\",\"adapterId\":\"discord\",\"kind\":\"channel\"},\"sourceEventId\":\"event:001\",\"version\":1}",
+    "executionRequestDigest": "10fa10b8c1cc91afc8ea3c6d61d9829c9ce2135908ae1b10c187e599f1d89bc7",
+    "approvedExecutionRequestDigest": "f4851a2dac4dcce446d14010e2e0ea67381e2e4bdb562388561605a7b85c428d",
+    "executionOperationDigest": "10fa10b8c1cc91afc8ea3c6d61d9829c9ce2135908ae1b10c187e599f1d89bc7",
+    "outboundEnvelopeDigest": "aaafa646255c3358625b5aa4716969ab00c7115ab6fa519a8cdc67a19e6c2a2d"
+  }
+}

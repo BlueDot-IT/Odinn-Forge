@@ -1,6 +1,6 @@
 import type { JsonObject } from "./contracts.ts";
 import { normalizeReadContractJsonObjectV1, normalizeReadContractJsonValueV1, omitReadContractObjectListFieldsV1, parseReadContractJsonObjectV1 } from "./read-contract-json.ts";
-import { ApplicationContractValidationError } from "./validation.ts";
+import { ApplicationContractValidationError } from "./validation/errors.ts";
 
 export type ExperimentalFeatureV1 = "capabilities" | "capsules" | "counterfactual";
 export type CoreAdvancedFeatureV1 = "proof" | "sentinel" | "rewind" | "darwin";
