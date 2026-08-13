@@ -224,25 +224,52 @@ export class JobSupervisor {
     return entry.result;
   }
 
-  async settleApproval(id: string, { result, error }: { result?: unknown; error?: unknown }): Promise<JobRecord> {
+  async settleApproval(id: string, {
+    result,
+    error,
+    expectedLeaseToken
+  }: {
+    result?: unknown;
+    error?: unknown;
+    expectedLeaseToken: string;
+  }): Promise<JobRecord> {
+    if (!expectedLeaseToken) throw new Error(`runtime job ${id} approval settlement requires its claim lease`);
     const current = await this.store.get(id);
     if (!current || !["running", "cancelling"].includes(current.status)) {
       throw new Error(`runtime job ${id} has no claimed approval execution`);
     }
+    if (current.dispatchLease?.token !== expectedLeaseToken) {
+      throw new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`);
+    }
     return this.store.update(id, error === undefined ? {
       status: "completed",
       completedAt: new Date().toISOString(),
-      result
+      result,
+      expectedLeaseToken,
+      dispatchLease: undefined
     } : {
       status: "needs-review",
       completedAt: new Date().toISOString(),
-      error: errorMessage(error)
+      error: errorMessage(error),
+      expectedLeaseToken,
+      dispatchLease: undefined
     });
   }
 
   async beginApproval(id: string): Promise<JobRecord> {
     if (!this.store.claimApproval) throw new Error("runtime job store does not support approval claims");
-    const claimed = await this.store.claimApproval(id, { status: "running", error: undefined });
+    const acquiredAt = new Date().toISOString();
+    const claimed = await this.store.claimApproval(id, {
+      status: "running",
+      error: undefined,
+      dispatchLease: {
+        token: randomUUID(),
+        owner: this.leaseOwner,
+        epoch: this.leaseEpoch,
+        acquiredAt,
+        expiresAt: new Date(Date.now() + Math.max(this.defaultTimeoutMs + 30_000, 120_000)).toISOString()
+      }
+    });
     if (!claimed) throw new Error(`runtime job ${id} is no longer awaiting approval`);
     return claimed;
   }
@@ -434,7 +461,6 @@ interface WorkerPayload extends JsonObject {
   actor?: string;
   approvalId?: string;
   approvalRunId?: string;
-  trustedRecovery?: boolean;
   plan?: JsonObject;
   workspaceRoot?: string;
   task?: JsonObject & { tool?: string };
@@ -489,7 +515,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
   const browserExecutor = createPersistentWorkerExecutor({ workerPath: browserWorkerPath, stateDir, workspaceRoot: authoritativeRoot, config, policy });
   const children = new Set<ChildProcess>();
   const execute = ((payload: WorkerPayload, { signal, job }: ExecutorOptions = {}) => {
-    const trustedRecovery = payload.trustedRecovery === true || Number(job?.attempts ?? 0) > 1;
+    const trustedRecovery = Number(job?.attempts ?? 0) > 1;
     const taskWorkspaceRoot = resolve(payload.workspaceRoot || authoritativeRoot);
     if (taskWorkspaceRoot !== authoritativeRoot && !taskWorkspaceRoot.startsWith(`${authoritativeRoot}${sep}`)) {
       return Promise.reject(new Error("task workspaceRoot must remain inside the gateway workspace"));

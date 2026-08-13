@@ -17,7 +17,7 @@ type WorkerRegistryFactory = (options: Record<string, any>) => WorkerRegistry;
 
 interface TaskWorkerMessage {
   type?: "task" | "abort";
-  payload?: { actor?: string; approvalId?: string; approvalRunId?: string; trustedRecovery?: boolean; durableExecution?: boolean; parentCapabilities?: unknown; plan?: unknown; task?: unknown };
+  payload?: { actor?: string; approvalId?: string; approvalRunId?: string; durableExecution?: boolean; parentCapabilities?: unknown; plan?: unknown; task?: unknown };
   stateDir?: string;
   workspaceRoot?: string;
   config?: { auditLog?: string; experimental?: unknown; [key: string]: unknown };
@@ -37,6 +37,7 @@ export function installTaskWorker(createRegistry: WorkerRegistryFactory): void {
     let runLedger: ReturnType<typeof createRunLedger> | undefined;
     let registry: WorkerRegistry | undefined;
     let auditStore: ReturnType<typeof createAuditStore> | undefined;
+    let approvalStore: ReturnType<typeof createApprovalStore> | undefined;
     const controller = new AbortController();
     activeAbortController = controller;
     active = true;
@@ -46,7 +47,7 @@ export function installTaskWorker(createRegistry: WorkerRegistryFactory): void {
       if (!payload || !stateDir || !workspaceRoot) throw new Error("task worker received an incomplete envelope");
       await withStateMutationLock(stateDir, async () => {
         auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
-        const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
+        approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
         const processExecutor = createSandboxProcessExecutor({ workspaceRoot, stateDir, config });
         registry = createRegistry({ workspaceRoot, stateDir, config, approvalStore, auditStore, processExecutor });
         runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
@@ -58,7 +59,7 @@ export function installTaskWorker(createRegistry: WorkerRegistryFactory): void {
       });
       const result = payload.plan
         ? await runPlan({ plan: payload.plan, auditStore, policy, registry, runLedger, actor: payload.actor, signal: controller.signal, durableExecution: payload.durableExecution === true })
-        : await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: controller.signal, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: trustedRecovery === true, durableExecution: payload.durableExecution === true, parentCapabilities: payload.parentCapabilities });
+        : await runTask({ task: payload.task, auditStore, approvalStore, policy, registry, runLedger, signal: controller.signal, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: trustedRecovery === true, durableExecution: payload.durableExecution === true, parentCapabilities: payload.parentCapabilities });
       process.send?.({ ok: true, result });
     } catch (error) {
       process.send?.({ ok: false, error: messageError(error) });

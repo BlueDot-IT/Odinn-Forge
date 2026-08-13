@@ -342,10 +342,12 @@ export async function browserAction(stateDir: any, approvalStore: ApprovalStore,
       type: "approval.required",
       tool,
       runId: execution?.runId,
+      actor: execution?.actor,
       summary: browserActionSummary(tool, input),
       expectedUrl: input.expectedUrl,
       snapshotId: input.snapshotId,
-      input: normalizedInput
+      input: normalizedInput,
+      executionInput: normalizedInput
     });
     return { type: "approval.required", approvalId, tool, summary: browserActionSummary(tool, input), expiresInSeconds: 300 };
   }
@@ -353,12 +355,14 @@ export async function browserAction(stateDir: any, approvalStore: ApprovalStore,
     const approved = approvalStore.consume(execution.approvalId, {
       tool,
       runId: execution.runId,
+      actor: execution.actor,
       input: normalizedInput
     });
-    if (!approved) {
+    const authorized = approved ?? execution.approvalContinuation;
+    if (!authorized) {
       throw new Error("browser action approval is missing, expired, already used, or does not match this action");
     }
-    input = approved.input ?? normalizedInput;
+    input = authorized.input ?? normalizedInput;
   } else {
     input = normalizedInput;
   }

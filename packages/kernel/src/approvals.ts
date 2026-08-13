@@ -63,6 +63,10 @@ export interface ApprovalStore {
   list(options?: { limit?: number; offset?: number }): ApprovalAction[];
 }
 
+export function approvalActionForExecution(action: ApprovalAction): ApprovalAction {
+  return normalizeApprovalAction(action);
+}
+
 export function createApprovalStore({ path }: { path?: string } = {}): ApprovalStore {
   const pending = new Map<string, StoredApprovalAction>();
   const storeKey = path ?? `memory:${randomUUID()}`;
@@ -365,9 +369,10 @@ function acquireApprovalRecoveryMarker(recoveryPath: string, token: string, allo
 }
 
 function normalizeApprovalAction(action: ApprovalAction): ApprovalAction {
-  const input = normalizeApprovalInput(action.executionInput ?? action.input);
+  const tool = String(action.tool ?? "").trim();
+  const input = normalizeApprovalExecutionInput(tool, action.executionInput ?? action.input);
   return {
-    tool: String(action.tool ?? "").trim(),
+    tool,
     runId: String(action.runId ?? "").trim(),
     accountId: String(action.accountId ?? "").trim(),
     actor: String(action.actor ?? "").trim(),
@@ -472,10 +477,16 @@ function boundedEffectText(value: unknown, fallback: string): string {
   return text.slice(0, 160);
 }
 
-function normalizeApprovalInput(input: Record<string, unknown> = {}): Record<string, unknown> {
+const LEGACY_BROWSER_APPROVAL_HINT_TOOLS = new Set(["browser.click", "browser.type", "browser.press"]);
+
+export function normalizeApprovalExecutionInput(tool: string, input: Record<string, unknown> = {}): Record<string, unknown> {
   const normalized = { ...input };
-  delete normalized.confirmed;
-  delete normalized.approvalId;
+  if (LEGACY_BROWSER_APPROVAL_HINT_TOOLS.has(tool)) {
+    delete normalized.confirmed;
+    delete normalized.approvalId;
+  } else if (tool === "process.exec") {
+    delete normalized.approvalId;
+  }
   return normalized;
 }
 

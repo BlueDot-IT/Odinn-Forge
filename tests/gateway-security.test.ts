@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { request as httpRequest } from "node:http";
-import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, readdir, rename, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtemp, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -182,6 +182,40 @@ test("approval records survive restart and consume exactly once for the bound ac
   });
   assert.equal(consumed?.id, id);
   assert.equal(createApprovalStore({ path }).consume(id, action), undefined);
+  assert.deepEqual(createApprovalStore({ path }).list(), []);
+});
+
+test("separate processes atomically serialize one approval continuation owner", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-process-race-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const path = join(stateDir, "approvals.json");
+  const barrier = join(stateDir, "start");
+  const action = { tool: "process.exec", runId: "cross-process-continuation", actor: "operator", input: { command: "/bin/true", args: [], cwd: "." } };
+  const id = createApprovalStore({ path }).create(action);
+  assert.ok(createApprovalStore({ path }).claim(id));
+  const moduleUrl = pathToFileURL(join(process.cwd(), "packages/kernel/src/approvals.ts")).href;
+  const childCode = [
+    `import { existsSync } from "node:fs";`,
+    `import { createApprovalStore } from ${JSON.stringify(moduleUrl)};`,
+    `while (!existsSync(${JSON.stringify(barrier)})) await new Promise((resolve) => setTimeout(resolve, 5));`,
+    `const result = createApprovalStore({ path: ${JSON.stringify(path)} }).consume(${JSON.stringify(id)}, ${JSON.stringify(action)});`,
+    `process.stdout.write(result ? "won" : "lost");`
+  ].join("\n");
+  const execute = () => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", childCode], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
+  const left = execute();
+  const right = execute();
+  await writeFile(barrier, "start\n", { mode: 0o600 });
+  const results = await Promise.all([left, right]);
+  assert.ok(results.every(({ code }) => code === 0), results.map(({ stderr }) => stderr).join("\n"));
+  assert.deepEqual(results.map(({ stdout }) => stdout).sort(), ["lost", "won"]);
   assert.deepEqual(createApprovalStore({ path }).list(), []);
 });
 

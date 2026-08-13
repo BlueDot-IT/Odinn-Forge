@@ -19,7 +19,7 @@ import { withStateMutationLock } from "./state-mutation.ts";
 import { createWorkspaceMutationTools } from "./workspace-mutations.ts";
 import { appendSessionMessage, assignSessionProject, createGoal, createProject, createSession, DEFAULT_PROJECT_ID, deleteSession, listGoals, listProjects, listSessions, readSession, renameSession, resolveSession, updateGoal, updateProject, updateSession } from "./workspace-records.ts";
 import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, formatMemoryContext, learnFromConversation, listMemoryCandidates, normalizeMemoryOptions, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
-import { createApprovalStore } from "./approvals.ts";
+import { approvalActionForExecution, createApprovalStore, normalizeApprovalExecutionInput } from "./approvals.ts";
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
 import { browserAction, browserOpen, browserRecoveryResolve, browserRecoveryStatus, browserSnapshot, browserTabs, closeBrowserManagers } from "./browser.ts";
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
@@ -199,6 +199,8 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     }],
     ["process.exec", {
       capability: "process.exec",
+      capabilityApprovalContinuation: "required",
+      approvalInputNoopKeys: ["approvalId"],
       description: "Execute one bounded argument-array command inside the durable Linux OCI process sandbox.",
       inputSchema: { type: "object", properties: { command: { type: "string" }, args: { type: "array", items: { type: "string" }, maxItems: 256 }, cwd: { type: "string" }, timeoutMs: { type: "integer", minimum: 100, maximum: 120_000 }, maxOutputBytes: { type: "integer", minimum: 1_024, maximum: 1_000_000 } }, required: ["command"], additionalProperties: false },
       execute: async (input: SandboxProcessInput, context: any) => {
@@ -216,18 +218,22 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
             type: "approval.required",
             tool: "process.exec",
             runId: context.request?.id,
+            actor: context.request?.actor,
             summary,
-            input: normalizedInput
+            input: normalizedInput,
+            executionInput: normalizedInput
           });
           return { type: "approval.required", approvalId, tool: "process.exec", summary, expiresInSeconds: 300 };
         }
         const approved = approvalStore.consume(context.trustedApprovalId, {
           tool: "process.exec",
           runId: context.trustedApprovalRunId ?? context.request?.id,
+          actor: context.request?.actor,
           input: normalizedInput
         });
-        if (!approved) throw new Error("process execution approval is missing, expired, already used, or does not match this action");
-        return processExecutor(approved.input ?? normalizedInput, {
+        const authorized = approved ?? context.trustedApprovalContinuation;
+        if (!authorized) throw new Error("process execution approval is missing, expired, already used, or does not match this action");
+        return processExecutor(authorized.input ?? normalizedInput, {
           signal: context.signal,
           requestId: context.request?.id,
           onDispatchAuthorized: async (evidence: any) => {
@@ -282,21 +288,27 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     }],
     ["browser.click", {
       capability: "browser.act",
+      capabilityApprovalContinuation: "browser-policy",
+      approvalInputNoopKeys: ["confirmed", "approvalId"],
       description: "Click a browser control after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor })
     }],
     ["browser.type", {
       capability: "browser.act",
+      capabilityApprovalContinuation: "browser-policy",
+      approvalInputNoopKeys: ["confirmed", "approvalId"],
       description: "Fill a browser field after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor })
     }],
     ["browser.press", {
       capability: "browser.act",
+      capabilityApprovalContinuation: "browser-policy",
+      approvalInputNoopKeys: ["confirmed", "approvalId"],
       description: "Press a browser key after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, runId: context.trustedApprovalRunId ?? context.request.id })
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor })
     }],
     ["browser.recovery.status", {
       capability: "browser.read",
@@ -815,6 +827,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     });
     registry.set("mcp.invoke", {
       capability: "mcp.invoke",
+      capabilityApprovalContinuation: "required",
       description: "Invoke one explicitly pinned MCP tool through the audited OCI extension boundary. Calls require approval and are never automatically retried.",
       inputSchema: {
         type: "object",
@@ -852,8 +865,9 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
           actor: context.request?.actor,
           input
         });
-        if (!approved) throw new Error("MCP invocation approval is missing, expired, already used, or does not match this pinned request");
-        return ownedMcpRuntime.invoke(approved.input ?? input, {
+        const authorized = approved ?? context.trustedApprovalContinuation;
+        if (!authorized) throw new Error("MCP invocation approval is missing, expired, already used, or does not match this pinned request");
+        return ownedMcpRuntime.invoke(authorized.input ?? input, {
           request: context.request,
           admission: context.admission,
           policy: context.policy,
@@ -1314,11 +1328,52 @@ function sanitizeExecutionRequest(task: any) {
   return sanitized;
 }
 
-function taskRequestDigest(request: any): string {
+function canonicalTaskInput(toolName: string, input: any, tool?: AnyRecord): Record<string, unknown> {
+  const normalized = normalizeApprovalExecutionInput(toolName, input && typeof input === "object" && !Array.isArray(input)
+    ? input
+    : {});
+  const noopKeys = Array.isArray(tool?.approvalInputNoopKeys) ? tool.approvalInputNoopKeys : [];
+  for (const key of noopKeys) {
+    if (key === "confirmed" || key === "approvalId") delete normalized[key];
+  }
+  return normalized;
+}
+
+function consumeClaimedApprovalContinuation({
+  approvalStore,
+  trustedApprovalId,
+  trustedApprovalRunId,
+  request,
+  tool
+}: AnyRecord): AnyRecord | undefined {
+  if (typeof trustedApprovalId !== "string" || !trustedApprovalId.trim()) return undefined;
+  if (typeof trustedApprovalRunId !== "string" || trustedApprovalRunId !== request.id) return undefined;
+  if (!approvalStore || typeof approvalStore.recover !== "function" || typeof approvalStore.consume !== "function") return undefined;
+  const recovered = approvalStore.recover(trustedApprovalId);
+  if (!recovered || typeof recovered !== "object" || Array.isArray(recovered)) return undefined;
+  if (String(recovered.runId ?? "") !== request.id) return undefined;
+  if (String(recovered.tool ?? "") !== request.tool) return undefined;
+  if (String(recovered.actor ?? "").trim() !== request.actor) return undefined;
+  if (stableTaskValue(canonicalTaskInput(request.tool, recovered.input, tool)) !== stableTaskValue(canonicalTaskInput(request.tool, request.input, tool))) return undefined;
+  return approvalStore.consume(trustedApprovalId, approvalActionForExecution(recovered));
+}
+
+function taskRequestDigest(request: any, tool?: AnyRecord): string {
+  const requestInput = canonicalTaskInput(request.tool, request.input, tool);
   const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke"
-    ? projectDurableToolInput(request.tool, request.input ?? {})
-    : request.input ?? {};
+    ? projectDurableToolInput(request.tool, requestInput)
+    : requestInput;
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown" })).digest("hex");
+}
+
+function supportsCapabilityApprovalContinuation(tool: AnyRecord, policy: RuntimePolicy): boolean {
+  if (tool?.capabilityApprovalContinuation === "required") return true;
+  return tool?.capabilityApprovalContinuation === "browser-policy"
+    && policy.security.browser.requireApproval !== false;
+}
+
+function capabilityApprovalContinuationPending(tool: AnyRecord, policy: RuntimePolicy, trustedApprovalId: unknown): boolean {
+  return !trustedApprovalId && supportsCapabilityApprovalContinuation(tool, policy);
 }
 
 function mcpApprovalBinding(input: any): Record<string, unknown> {
@@ -1450,7 +1505,7 @@ export class ExecutionAdmissionService {
     return executeTaskThroughAdmission({ ...this.options, task, admissionService: this });
   }
 
-  async admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId, recoveryReplay = false }: any) {
+  async admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId, recoveryReplay = false, approvalContinuation = false }: any) {
     const runLedger = this.options.runLedger;
     if (!runLedger) return undefined;
     const inputDigest = ledgerStep.inputArtifact.digest;
@@ -1489,7 +1544,8 @@ export class ExecutionAdmissionService {
           runId: request.id,
           executionId: request.tool,
           inputDigest,
-          principalId: executionReference("principal", request.actor)
+          principalId: executionReference("principal", request.actor),
+          approvalContinuation: approvalContinuation === true
         })
       : runLedger.admitExecution(envelope, attemptOptions);
     try {
@@ -1513,7 +1569,10 @@ export class ExecutionAdmissionService {
         }
       });
     } catch (error) {
-      runLedger.transitionExecutionAttempt({ attemptId: persisted.attempt.id, from: "queued", to: "failed", errorCode: "AUDIT_CORRELATION_FAILED" });
+      const current = runLedger.getExecutionAttempt(persisted.attempt.id);
+      if (current && !["completed", "failed", "cancelled", "needs-review"].includes(current.state)) {
+        runLedger.transitionExecutionAttempt({ attemptId: persisted.attempt.id, from: current.state, to: "failed", errorCode: "AUDIT_CORRELATION_FAILED" });
+      }
       throw error;
     }
     return { ...persisted, attemptId: persisted.attempt.id, state: persisted.attempt.state };
@@ -1521,7 +1580,10 @@ export class ExecutionAdmissionService {
 
   start(admission: any) {
     if (!admission || !this.options.runLedger) return;
-    this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: admission.state ?? "queued", to: "running" });
+    const current = this.options.runLedger.getExecutionAttempt(admission.attemptId);
+    if (current?.state !== "running") {
+      this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: current?.state ?? admission.state ?? "queued", to: "running" });
+    }
     admission.state = "running";
   }
 
@@ -1597,6 +1659,7 @@ export function previewExecutionAdmission({
 async function executeTaskThroughAdmission({
   task,
   auditStore,
+  approvalStore,
   policy = createDefaultPolicy(),
   registry = createBuiltInRegistry(),
   now = () => new Date().toISOString(),
@@ -1626,7 +1689,24 @@ async function executeTaskThroughAdmission({
   const tool = registeredTool && declaredCapabilities
     ? { ...registeredTool, capability: declaredCapabilities[0], capabilities: declaredCapabilities }
     : registeredTool;
-  const requestDigest = taskRequestDigest(request);
+  const approvalContinuation = consumeClaimedApprovalContinuation({
+    approvalStore,
+    trustedApprovalId,
+    trustedApprovalRunId,
+    request,
+    tool
+  });
+  if (trustedApprovalId !== undefined && !approvalContinuation) {
+    const error = new Error("claimed approval continuation is missing or does not match the exact request") as NodeError;
+    error.code = "APPROVAL_CONTINUATION_DENIED";
+    throw error;
+  }
+  if (approvalContinuation && !supportsCapabilityApprovalContinuation(tool, policy)) {
+    const error = new Error("tool does not support approval continuation authority") as NodeError;
+    error.code = "APPROVAL_CONTINUATION_DENIED";
+    throw error;
+  }
+  const requestDigest = taskRequestDigest(request, tool);
   let runBinding: { replay?: boolean } | undefined;
 
   if (!auditStore) throw new Error("runTask requires an auditStore");
@@ -1648,7 +1728,7 @@ async function executeTaskThroughAdmission({
   if (prior?.status === "completed") {
     const started = [...prior.events].reverse().find((event: any) => event.type === "task.started");
     const priorDigest = started?.data?.requestDigest ?? (started?.tool && started?.data && "input" in started.data
-      ? taskRequestDigest({ tool: started.tool, input: started.data.input, actor: started.actor })
+      ? taskRequestDigest({ tool: started.tool, input: started.data.input, actor: started.actor }, tool)
       : undefined);
     if (!priorDigest || priorDigest !== requestDigest) {
       const error = new Error(`run id ${request.id} was already used for a different request`) as NodeError;
@@ -1667,18 +1747,28 @@ async function executeTaskThroughAdmission({
       output: completed?.data?.output
     };
   }
-  const recoveryReplay = runBinding?.replay === true && trustedRecovery === true;
+  const recoveryReplay = runBinding?.replay === true
+    && (trustedRecovery === true || Boolean(approvalContinuation));
   if (runBinding?.replay && !recoveryReplay) {
     const error = new Error(`run id ${request.id} is already bound to an unfinished or failed request and will not be executed again`) as NodeError;
     error.code = "IDEMPOTENCY_REUSE";
     throw error;
   }
+  if (runBinding?.replay && trustedRecovery === true && !approvalContinuation && runLedger) {
+    const latestAttempt = runLedger.listExecutionAttempts(request.id).at(-1);
+    if (latestAttempt?.state === "awaiting-approval") {
+      const error = new Error(`run id ${request.id} is awaiting an exact approval continuation and cannot use generic recovery`) as NodeError;
+      error.code = "APPROVAL_CONTINUATION_REQUIRED";
+      throw error;
+    }
+  }
 
   throwIfAborted(signal);
   const safety = toolSafetyDescriptor(request.tool, tool);
+  const durableRequestInput = projectDurableToolInput(request.tool, canonicalTaskInput(request.tool, request.input, tool));
   let ledgerStep;
   if (runLedger) {
-    ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: projectDurableToolInput(request.tool, request.input), safety, metadata: { actor: request.actor } });
+    ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: durableRequestInput, safety, metadata: { actor: request.actor } });
   }
   const decision = evaluateTaskPolicy({ policy, request, tool });
   const admittedParentCapabilities = normalizeParentCapabilities(policy, parentCapabilities);
@@ -1708,9 +1798,19 @@ async function executeTaskThroughAdmission({
     throw error;
   }
 
-  const admission = await admissionService.admit({ request, tool, safety, ledgerStep, policyEvent, parentRunId, recoveryReplay });
+  const admission = await admissionService.admit({
+    request,
+    tool,
+    safety,
+    ledgerStep,
+    policyEvent,
+    parentRunId,
+    recoveryReplay,
+    approvalContinuation: Boolean(approvalContinuation)
+  });
 
   let capabilityClaims;
+  let deferredCapabilityConsumption: { broker: CapabilityBroker; token: string; request: AnyRecord } | undefined;
   try {
     if (runLedger && Array.isArray(policy?.invariants) && policy.invariants.length) {
       new Sentinel({ ledger: runLedger }).evaluate({
@@ -1722,19 +1822,28 @@ async function executeTaskThroughAdmission({
         workspaceRoot: runLedger.workspaceRoot
       });
     }
-    const mcpApprovalPending = request.tool === "mcp.invoke" && !trustedApprovalId;
-    if (runLedger?.featureFlags?.capabilities === true && safety.requiresCapability && !mcpApprovalPending) {
+    if (runLedger?.featureFlags?.capabilities === true && safety.requiresCapability) {
       const token = request.input?.capabilityToken;
       if (typeof token !== "string" || !token) {
         const error = new Error(`capability token required for ${request.tool}`) as NodeError;
         error.code = "CAPABILITY_DENIED";
         throw error;
       }
-      capabilityClaims = new CapabilityBroker({ ledger: runLedger, stateDir: runLedger.stateDir, featureFlags: runLedger.featureFlags }).consume(token, {
+      const broker = new CapabilityBroker({ ledger: runLedger, stateDir: runLedger.stateDir, featureFlags: runLedger.featureFlags });
+      const capabilityRequest = {
         runId: request.id,
         toolName: request.tool,
         resource: executionResourceForRequest(request.tool, request.input, tool)
-      });
+      };
+      const deferUntilApprovedDispatch = Boolean(approvalContinuation);
+      if (capabilityApprovalContinuationPending(tool, policy, trustedApprovalId) || deferUntilApprovedDispatch) {
+        capabilityClaims = broker.validate(token, capabilityRequest);
+        if (deferUntilApprovedDispatch) {
+          deferredCapabilityConsumption = { broker, token, request: capabilityRequest };
+        }
+      } else {
+        capabilityClaims = broker.consume(token, capabilityRequest);
+      }
     }
   } catch (error) {
     const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError;
@@ -1758,7 +1867,7 @@ async function executeTaskThroughAdmission({
       capabilities: tool.capabilities,
       attemptId: admission?.attemptId,
       auditCorrelationId: admission?.envelope?.auditCorrelationId,
-      input: safeAuditValue(projectDurableToolInput(request.tool, request.input))
+      input: safeAuditValue(durableRequestInput)
     }
   });
 
@@ -1767,6 +1876,12 @@ async function executeTaskThroughAdmission({
   try {
     throwIfAborted(signal);
     admissionService.start(admission);
+    if (deferredCapabilityConsumption) {
+      capabilityClaims = deferredCapabilityConsumption.broker.consume(
+        deferredCapabilityConsumption.token,
+        deferredCapabilityConsumption.request
+      );
+    }
     const output = await tool.execute(request.input, {
       request,
       admission,
@@ -1795,6 +1910,7 @@ async function executeTaskThroughAdmission({
       capability: capabilityClaims,
       trustedApprovalId,
       trustedApprovalRunId,
+      trustedApprovalContinuation: approvalContinuation,
       durableExecution,
       allowNestedAgentExecution,
       effectiveCapabilities: decision.allowed ? decision.capabilities : [],

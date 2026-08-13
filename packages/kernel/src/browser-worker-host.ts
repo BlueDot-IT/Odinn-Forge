@@ -42,16 +42,17 @@ export function installBrowserWorker(createRegistry: WorkerRegistryFactory): voi
       let runLedger: ReturnType<typeof createRunLedger> | undefined;
       let registry: WorkerRegistry | undefined;
       let auditStore: ReturnType<typeof createAuditStore> | undefined;
+      let approvalStore: ReturnType<typeof createApprovalStore> | undefined;
       try {
         const { payload, stateDir, workspaceRoot, config = {}, policy } = message;
         if (!payload?.task || !stateDir || !workspaceRoot) throw new Error("browser worker received an invalid task envelope");
         await withStateMutationLock(stateDir, async () => {
           auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
-          const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
+          approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
           registry = createRegistry({ workspaceRoot, stateDir, config, approvalStore, auditStore });
           runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
         });
-        const result = await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: undefined, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: message.trustedRecovery === true });
+        const result = await runTask({ task: payload.task, auditStore, approvalStore, policy, registry, runLedger, signal: undefined, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: message.trustedRecovery === true });
         process.send?.({ id: message.id, ok: true, result });
       } catch (error) {
         process.send?.({ id: message.id, ok: false, error: messageError(error) });

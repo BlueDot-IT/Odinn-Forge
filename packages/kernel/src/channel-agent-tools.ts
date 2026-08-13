@@ -38,6 +38,8 @@ export function registerChannelAgentTools(
     const legacyCapability = legacyCapabilitiesForTool(name)[0] ?? capabilitiesForTool(name)[0];
     registry.set(name, {
       capability: legacyCapability,
+      ...(definition.approvalBinding ? { capabilityApprovalContinuation: "required" } : {}),
+      ...(definition.approvalBinding ? { approvalInputNoopKeys: ["confirmed", "approvalId"] } : {}),
       description: definition.description,
       inputSchema: definition.inputSchema,
       resourceForInput: (input: Record<string, unknown>) => definition.resourceBinding(input),
@@ -55,8 +57,10 @@ export function registerChannelAgentTools(
               tool: name,
               runId: context.request?.id,
               accountId: binding.accountId,
+              actor: context.request?.actor,
               summary: binding.summary,
               input,
+              executionInput: input,
             });
             return {
               type: "approval.required",
@@ -70,20 +74,22 @@ export function registerChannelAgentTools(
             tool: name,
             runId: context.trustedApprovalRunId ?? context.request?.id,
             accountId: binding.accountId,
+            actor: context.request?.actor,
             input,
           });
-          if (!approved) {
+          const authorized = approved ?? context.trustedApprovalContinuation;
+          if (!authorized) {
             throw new Error(definition.approvalFailureMessage
               ?? "Channel action approval is missing, expired, already used, or does not match this action");
           }
-          const approvedInput = approved.input;
+          const approvedInput = authorized.input;
           if (!approvedInput || typeof approvedInput !== "object" || Array.isArray(approvedInput)) {
             throw new Error(`channel tool ${name} approval did not recover exact execution input`);
           }
           input = {
             ...approvedInput,
-            ...(typeof approved.accountId === "string" && approved.accountId
-              ? { accountId: approved.accountId }
+            ...(typeof authorized.accountId === "string" && authorized.accountId
+              ? { accountId: authorized.accountId }
               : {}),
           };
         }

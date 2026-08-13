@@ -932,62 +932,103 @@ export async function createGatewayServer({
     registry
   }));
 
-  const approveGatewayApproval = async (id: string) => {
-    const preview = approvalStore.list().find((approval: any) => approval.id === id);
-    let linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
-    if (linkedJob && linkedJob.status !== "awaiting-approval") {
+  const settleClaimedGatewayApproval = async (linkedJob: any, outcome: { result?: unknown; error?: unknown }) => {
+    const expectedLeaseToken = typeof linkedJob?.dispatchLease?.token === "string"
+      ? linkedJob.dispatchLease.token
+      : "";
+    if (!expectedLeaseToken) throw new Error("claimed approval job is missing its dispatch lease");
+    return supervisor.settleApproval(linkedJob.id, { ...outcome, expectedLeaseToken });
+  };
+
+  const recoverGatewayApprovalContinuation = async (id: string, pending: any, linkedJob: any, linkedTask: Record<string, unknown> | undefined) => {
+    const recovered = approvalStore.recover(id);
+    const runId = String(pending?.runId ?? "");
+    const tool = String(pending?.tool ?? "");
+    const recoveredRunId = String(recovered?.runId ?? "");
+    const recoveredTool = String(recovered?.tool ?? "");
+    const recoveredActor = typeof recovered?.actor === "string" && recovered.actor.trim() ? recovered.actor.trim() : "";
+    const linkedActor = typeof linkedTask?.actor === "string" && linkedTask.actor.trim() ? linkedTask.actor.trim() : "";
+    const input = recovered?.input;
+    const invalid = !runId
+      || !tool
+      || recoveredRunId !== runId
+      || recoveredTool !== tool
+      || !input
+      || typeof input !== "object"
+      || Array.isArray(input)
+      || (recoveredActor && linkedActor && recoveredActor !== linkedActor);
+    if (invalid) {
       approvalStore.revoke(id);
-      throw new GatewayError(409, "the originating job is no longer awaiting approval");
-    }
-    if (linkedJob) {
-      try {
-        linkedJob = await supervisor.beginApproval(linkedJob.id);
-      } catch {
-        approvalStore.revoke(id);
-        throw new GatewayError(409, "the originating job approval was already claimed or cancelled");
+      if (linkedJob) {
+        await settleClaimedGatewayApproval(linkedJob, {
+          error: new Error("approved execution continuation could not be recovered exactly")
+        }).catch(() => undefined);
       }
+      throw new GatewayError(409, "approved execution input or authority could not be recovered; refusing dispatch");
     }
-    const pending = approvalStore.claim(id);
-    if (!pending) {
-      if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
-      throw new GatewayError(404, "approval not found or expired");
+    return {
+      runId,
+      tool,
+      input: input as Record<string, unknown>,
+      actor: recoveredActor || linkedActor || "local"
+    };
+  };
+
+  const activeGatewayApprovalExecutions = new Set<string>();
+  const approveGatewayApproval = async (id: string) => {
+    if (activeGatewayApprovalExecutions.has(id)) {
+      throw new GatewayError(409, "approval execution is already in flight");
     }
-    if (pending.type === "skill-lifecycle") {
-      return { approvalId: id, result: await skillLifecycle.applyApproved(id, pending) };
-    }
-    const recoveredMcp = pending.tool === "mcp.invoke" ? approvalStore.recover(id) : undefined;
-    if (pending.tool === "mcp.invoke" && (!recoveredMcp?.input || !pending.runId)) {
-      approvalStore.revoke(id);
-      if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approved MCP execution input could not be recovered") }).catch(() => undefined);
-      throw new GatewayError(409, "approved MCP execution input could not be recovered; refusing dispatch");
-    }
-    const linkedTask = linkedJob?.payload?.task && typeof linkedJob.payload.task === "object" && !Array.isArray(linkedJob.payload.task)
-      ? linkedJob.payload.task as Record<string, unknown>
-      : undefined;
-    const continuation = pending.tool === "mcp.invoke";
-    const pendingRunId = String(pending.runId ?? "");
-    const taskId = continuation ? pendingRunId : `${pendingRunId}:approval:${randomUUID()}`;
+    activeGatewayApprovalExecutions.add(id);
     try {
-      const result = await isolatedTaskExecutor({
-        approvalId: id,
-        approvalRunId: pending.runId,
-        trustedRecovery: continuation,
-        durableExecution: pending.tool === "process.exec" || continuation,
-        task: {
-          id: taskId,
-          tool: pending.tool,
-          input: continuation ? recoveredMcp!.input : pending.input,
-          actor: continuation
-            ? (typeof linkedTask?.actor === "string" && linkedTask.actor.trim() ? linkedTask.actor : pending.actor || "approval-executor")
-            : "approval-executor",
-          reason: "explicit user approval"
+      const preview = approvalStore.list().find((approval: any) => approval.id === id);
+      let linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
+      if (linkedJob && linkedJob.status !== "awaiting-approval") {
+        if (linkedJob.status !== "running") approvalStore.revoke(id);
+        throw new GatewayError(409, "the originating job is no longer awaiting approval");
+      }
+      if (linkedJob) {
+        try {
+          linkedJob = await supervisor.beginApproval(linkedJob.id);
+        } catch {
+          const current = await supervisor.get(linkedJob.id);
+          if (current?.status !== "running") approvalStore.revoke(id);
+          throw new GatewayError(409, "the originating job approval was already claimed or cancelled");
         }
-      });
-      if (linkedJob) await supervisor.settleApproval(linkedJob.id, { result });
-      return { approvalId: id, result };
-    } catch (error) {
-      if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error }).catch(() => undefined);
-      throw error;
+      }
+      const pending = approvalStore.claim(id);
+      if (!pending) {
+        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
+        throw new GatewayError(404, "approval not found or expired");
+      }
+      if (pending.type === "skill-lifecycle") {
+        return { approvalId: id, result: await skillLifecycle.applyApproved(id, pending) };
+      }
+      const linkedTask = linkedJob?.payload?.task && typeof linkedJob.payload.task === "object" && !Array.isArray(linkedJob.payload.task)
+        ? linkedJob.payload.task as Record<string, unknown>
+        : undefined;
+      const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedJob, linkedTask);
+      try {
+        const result = await isolatedTaskExecutor({
+          approvalId: id,
+          approvalRunId: continuation.runId,
+          durableExecution: continuation.tool === "process.exec" || continuation.tool === "mcp.invoke",
+          task: {
+            id: continuation.runId,
+            tool: continuation.tool,
+            input: continuation.input,
+            actor: continuation.actor,
+            reason: "explicit user approval"
+          }
+        });
+        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { result });
+        return { approvalId: id, result };
+      } catch (error) {
+        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { error }).catch(() => undefined);
+        throw error;
+      }
+    } finally {
+      activeGatewayApprovalExecutions.delete(id);
     }
   };
 
@@ -1948,66 +1989,10 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/approve")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/approve".length));
         const preview = approvalStore.list().find((approval: any) => approval.id === id);
-        let linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
-        if (linkedJob && linkedJob.status !== "awaiting-approval") {
-          approvalStore.revoke(id);
-          return json(response, 409, { ok: false, error: "the originating job is no longer awaiting approval" });
-        }
-        if (linkedJob) {
-          try {
-            linkedJob = await supervisor.beginApproval(linkedJob.id);
-          } catch {
-            approvalStore.revoke(id);
-            return json(response, 409, { ok: false, error: "the originating job approval was already claimed or cancelled" });
-          }
-        }
-        const pending = approvalStore.claim(id);
-        if (!pending) {
-          if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
-          return json(response, 404, { ok: false, error: "approval not found or expired" });
-        }
-        if (pending.type === "skill-lifecycle") {
-          try {
-            const result = await skillLifecycle.applyApproved(id, pending);
-            return json(response, 200, { ok: true, approvalId: id, result });
-          } catch (error) {
-            throw error;
-          }
-        }
-        const recoveredMcp = pending.tool === "mcp.invoke" ? approvalStore.recover(id) : undefined;
-        if (pending.tool === "mcp.invoke" && (!recoveredMcp?.input || !pending.runId)) {
-          approvalStore.revoke(id);
-          if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approved MCP execution input could not be recovered") }).catch(() => undefined);
-          return json(response, 409, { ok: false, error: "approved MCP execution input could not be recovered; refusing dispatch" });
-        }
-        const linkedTask = linkedJob?.payload?.task && typeof linkedJob.payload.task === "object" && !Array.isArray(linkedJob.payload.task)
-          ? linkedJob.payload.task as Record<string, unknown>
-          : undefined;
-        const continuation = pending.tool === "mcp.invoke";
-        const pendingRunId = String(pending.runId ?? "");
-        const taskId = continuation ? pendingRunId : `${pendingRunId}:approval:${randomUUID()}`;
-        try {
-          const result = await isolatedTaskExecutor({
-            approvalId: id,
-            approvalRunId: pending.runId,
-            trustedRecovery: continuation,
-            durableExecution: pending.tool === "process.exec" || continuation,
-            task: {
-              id: taskId,
-              tool: pending.tool,
-              input: continuation ? recoveredMcp!.input : pending.input,
-              actor: continuation
-                ? (typeof linkedTask?.actor === "string" && linkedTask.actor.trim() ? linkedTask.actor : pending.actor || "approval-executor")
-                : "approval-executor",
-              reason: "explicit user approval"
-            },
-          });
-          if (linkedJob) await supervisor.settleApproval(linkedJob.id, { result });
-          return json(response, 200, result);
-        } catch (error) {
-          if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error }).catch(() => undefined);
-          throw error;
-        }
+        const approved = await approveGatewayApproval(id);
+        return json(response, 200, preview?.type === "skill-lifecycle"
+          ? { ok: true, ...approved }
+          : approved.result);
       }
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/deny")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/deny".length));
