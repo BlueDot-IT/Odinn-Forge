@@ -932,6 +932,14 @@ export async function createGatewayServer({
     registry
   }));
 
+  const settleClaimedGatewayApproval = async (linkedJob: any, outcome: { result?: unknown; error?: unknown }) => {
+    const expectedLeaseToken = typeof linkedJob?.dispatchLease?.token === "string"
+      ? linkedJob.dispatchLease.token
+      : "";
+    if (!expectedLeaseToken) throw new Error("claimed approval job is missing its dispatch lease");
+    return supervisor.settleApproval(linkedJob.id, { ...outcome, expectedLeaseToken });
+  };
+
   const recoverGatewayApprovalContinuation = async (id: string, pending: any, linkedJob: any, linkedTask: Record<string, unknown> | undefined) => {
     const recovered = approvalStore.recover(id);
     const runId = String(pending?.runId ?? "");
@@ -952,7 +960,7 @@ export async function createGatewayServer({
     if (invalid) {
       approvalStore.revoke(id);
       if (linkedJob) {
-        await supervisor.settleApproval(linkedJob.id, {
+        await settleClaimedGatewayApproval(linkedJob, {
           error: new Error("approved execution continuation could not be recovered exactly")
         }).catch(() => undefined);
       }
@@ -990,7 +998,7 @@ export async function createGatewayServer({
       }
       const pending = approvalStore.claim(id);
       if (!pending) {
-        if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
+        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
         throw new GatewayError(404, "approval not found or expired");
       }
       if (pending.type === "skill-lifecycle") {
@@ -1013,10 +1021,10 @@ export async function createGatewayServer({
             reason: "explicit user approval"
           }
         });
-        if (linkedJob) await supervisor.settleApproval(linkedJob.id, { result });
+        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { result });
         return { approvalId: id, result };
       } catch (error) {
-        if (linkedJob) await supervisor.settleApproval(linkedJob.id, { error }).catch(() => undefined);
+        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { error }).catch(() => undefined);
         throw error;
       }
     } finally {

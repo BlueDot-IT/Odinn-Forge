@@ -390,7 +390,6 @@ export class SqliteJobStore {
       const current = hydrate(row);
       const linked = correlation(this.ledger, current.executionRunId);
       if (linked?.attemptState !== "awaiting-approval") return undefined;
-      transitionAttempt(db, linked.attemptId, "awaiting-approval", "running");
       const normalized = normalizeJob({
         ...current,
         ...patch,
@@ -401,6 +400,13 @@ export class SqliteJobStore {
         cancellationControlReference: linked.cancellationControlReference
       }, current);
       writeJob(db, normalized);
+      if (normalized.leaseToken && normalized.leaseOwner && normalized.leaseEpoch && normalized.leaseAcquiredAt && normalized.leaseExpiresAt) {
+        db.prepare(`INSERT INTO runtime_job_leases(token, job_id, occurrence_key, owner, epoch, acquired_at, expires_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+          normalized.leaseToken, id, normalized.occurrenceKey ?? null, normalized.leaseOwner, normalized.leaseEpoch,
+          normalized.leaseAcquiredAt, normalized.leaseExpiresAt
+        );
+      }
       return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow);
     });
   }
@@ -580,8 +586,13 @@ export class SqliteJobStore {
           status = linked.attemptState;
           error = current.error ?? linked.attemptErrorCode ?? "execution attempt settled before runtime job projection";
           completedAt = current.completedAt ?? now;
-        } else if (linked?.attemptState === "awaiting-approval" || current.status === "awaiting-approval") {
+        } else if (current.status === "awaiting-approval" && linked?.attemptState === "awaiting-approval") {
           status = "awaiting-approval";
+        } else if (linked?.attemptState === "awaiting-approval") {
+          status = "needs-review";
+          error = "an approval continuation lease expired before a terminal result was persisted; outcome requires operator review";
+          completedAt = now;
+          transitionAttempt(db, linked.attemptId, linked.attemptState, "needs-review", "APPROVAL_CONTINUATION_OUTCOME_UNCERTAIN");
         } else if (current.recoveryInputAvailable !== true) {
           const crossedDispatch = linked?.attemptState === "running";
           status = crossedDispatch && !retrySafe ? "needs-review" : "failed";

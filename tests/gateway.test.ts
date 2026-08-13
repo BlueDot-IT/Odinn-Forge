@@ -1047,7 +1047,20 @@ test("gateway durable approval continuation consumes Rune Key and browser approv
       body: "{}"
     });
     const concurrentApprovals = await Promise.all([approvalRequest(), approvalRequest()]);
-    assert.deepEqual(concurrentApprovals.map((response) => response.status).sort(), [200, 409]);
+    const concurrentApprovalDiagnostics = await Promise.all(concurrentApprovals.map(async (response) => ({
+      status: response.status,
+      body: await response.clone().text()
+    })));
+    assert.deepEqual(
+      concurrentApprovals.map((response) => response.status).sort(),
+      [200, 409],
+      JSON.stringify(concurrentApprovalDiagnostics)
+    );
+    const deniedApproval = concurrentApprovalDiagnostics.find((response) => response.status === 409)!;
+    const deniedApprovalBody = JSON.parse(deniedApproval.body);
+    assert.equal(deniedApprovalBody.category, "policy");
+    assert.match(deniedApprovalBody.error, /approval execution is already in flight/u);
+    assert.doesNotMatch(deniedApproval.body, new RegExp(`${approval.id}|${jobId}|${mutationKey.token}`, "u"));
     const approvedResponse = concurrentApprovals.find((response) => response.status === 200)!;
     const approved = await approvedResponse.json();
     assert.equal(approved.output.title, "approved-once:1");

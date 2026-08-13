@@ -274,11 +274,6 @@ test("Rune Key admits an exact process approval continuation while rejecting mis
 
   const originalAttempt = runtime.ledger.listExecutionAttempts(runId)[0];
   assert.equal(originalAttempt.state, "awaiting-approval");
-  runtime.ledger.transitionExecutionAttempt({
-    attemptId: originalAttempt.id,
-    from: "awaiting-approval",
-    to: "running"
-  });
   const envelope = runtime.ledger.getExecutionEnvelope(runId)!.envelope;
   assert.throws(
     () => runtime.ledger.resumeExecution({
@@ -354,6 +349,163 @@ test("Rune Key admits an exact process approval continuation while rejecting mis
   );
   assert.equal(dispatches, 1, "expired continuation authority must fail before process dispatch");
   assert.equal(runtime.capabilities.list(expiredRunId)[0].uses, 0);
+});
+
+test("one of twelve direct approval continuations owns dispatch and generic recovery cannot mint another approval", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-rune-key-direct-race-"));
+  const stateDir = join(root, ".odinn");
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const runtime = createDifferentiatedRuntime({ stateDir, workspaceRoot: root, featureFlags });
+  const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
+  let dispatches = 0;
+  const registry = createBuiltInRegistry({
+    workspaceRoot: root,
+    stateDir,
+    approvalStore,
+    auditStore,
+    processExecutor: async () => {
+      dispatches += 1;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { exitCode: 0 };
+    }
+  });
+  t.after(async () => {
+    registry.close();
+    auditStore.close();
+    runtime.ledger.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const runId = "rune-key-direct-race";
+  const actor = "direct-race-operator";
+  runtime.ledger.ensureRun({ runId, objective: "dispatch one approved continuation" });
+  const issued = runtime.capabilities.issue({
+    runId,
+    stepId: "direct-race",
+    toolName: "process.exec",
+    maxUses: 1
+  });
+  const input = { command: "/bin/true", args: [], cwd: ".", capabilityToken: issued.token };
+  const options = {
+    auditStore,
+    approvalStore,
+    policy: createDefaultPolicy({ allowedCapabilities: ["process.exec"] }),
+    registry,
+    runLedger: runtime.ledger,
+    durableExecution: true
+  };
+  const first = await runTask({
+    ...options,
+    task: { id: runId, tool: "process.exec", input, actor }
+  });
+  const approvalId = first.output.approvalId as string;
+  assert.equal(first.output.type, "approval.required");
+  assert.equal(approvalStore.list().length, 1);
+  assert.deepEqual(runtime.ledger.listExecutionAttempts(runId).map((attempt: any) => attempt.state), ["awaiting-approval"]);
+
+  await assert.rejects(
+    runTask({
+      ...options,
+      task: { id: runId, tool: "process.exec", input, actor },
+      trustedRecovery: true
+    }),
+    (error: any) => error.code === "APPROVAL_CONTINUATION_REQUIRED"
+  );
+  assert.equal(dispatches, 0);
+  assert.deepEqual(approvalStore.list().map((approval: any) => approval.id), [approvalId]);
+  assert.deepEqual(runtime.ledger.listExecutionAttempts(runId).map((attempt: any) => attempt.state), ["awaiting-approval"]);
+  assert.equal(runtime.capabilities.list(runId)[0].uses, 0);
+
+  assert.ok(approvalStore.claim(approvalId));
+  const outcomes = await Promise.allSettled(Array.from({ length: 12 }, () => runTask({
+    ...options,
+    task: { id: runId, tool: "process.exec", input, actor },
+    trustedApprovalId: approvalId,
+    trustedApprovalRunId: runId
+  })));
+  const successes = outcomes.filter((outcome) => outcome.status === "fulfilled");
+  const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+  assert.equal(successes.length, 1);
+  assert.equal(failures.length, 11);
+  assert.ok(failures.every(({ reason }) => reason?.code === "APPROVAL_CONTINUATION_DENIED"));
+  assert.equal(dispatches, 1);
+  assert.equal(runtime.capabilities.list(runId)[0].uses, 1);
+  assert.equal(runtime.capabilities.list(runId)[0].status, "consumed");
+  assert.deepEqual(approvalStore.list(), []);
+  assert.deepEqual(runtime.ledger.listExecutionAttempts(runId).map((attempt: any) => attempt.state), ["completed"]);
+});
+
+test("separate approval stores and ledgers serialize one continuation owner", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-rune-key-cross-instance-"));
+  const stateDir = join(root, ".odinn");
+  const approvalPath = join(stateDir, "approvals.json");
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const leftRuntime = createDifferentiatedRuntime({ stateDir, workspaceRoot: root, featureFlags });
+  const rightRuntime = createDifferentiatedRuntime({ stateDir, workspaceRoot: root, featureFlags });
+  const leftApprovals = createApprovalStore({ path: approvalPath });
+  const rightApprovals = createApprovalStore({ path: approvalPath });
+  let dispatches = 0;
+  const processExecutor = async () => {
+    dispatches += 1;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return { exitCode: 0 };
+  };
+  const leftRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir, approvalStore: leftApprovals, auditStore, processExecutor });
+  const rightRegistry = createBuiltInRegistry({ workspaceRoot: root, stateDir, approvalStore: rightApprovals, auditStore, processExecutor });
+  t.after(async () => {
+    leftRegistry.close();
+    rightRegistry.close();
+    auditStore.close();
+    leftRuntime.ledger.close();
+    rightRuntime.ledger.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const runId = "rune-key-cross-instance";
+  const actor = "cross-instance-operator";
+  leftRuntime.ledger.ensureRun({ runId, objective: "serialize approval continuation ownership" });
+  const issued = leftRuntime.capabilities.issue({
+    runId,
+    stepId: "cross-instance",
+    toolName: "process.exec",
+    maxUses: 1
+  });
+  const input = { command: "/bin/true", args: [], cwd: ".", capabilityToken: issued.token };
+  const policy = createDefaultPolicy({ allowedCapabilities: ["process.exec"] });
+  const first = await runTask({
+    task: { id: runId, tool: "process.exec", input, actor },
+    auditStore,
+    approvalStore: leftApprovals,
+    policy,
+    registry: leftRegistry,
+    runLedger: leftRuntime.ledger,
+    durableExecution: true
+  });
+  const approvalId = first.output.approvalId as string;
+  assert.ok(rightApprovals.claim(approvalId));
+  const continuation = (approvalStore: any, registry: any, runLedger: any) => runTask({
+    task: { id: runId, tool: "process.exec", input, actor },
+    auditStore,
+    approvalStore,
+    policy,
+    registry,
+    runLedger,
+    durableExecution: true,
+    trustedApprovalId: approvalId,
+    trustedApprovalRunId: runId
+  });
+  const outcomes = await Promise.allSettled([
+    continuation(leftApprovals, leftRegistry, leftRuntime.ledger),
+    continuation(rightApprovals, rightRegistry, rightRuntime.ledger)
+  ]);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+  const rejected = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+  assert.equal(rejected?.reason?.code, "APPROVAL_CONTINUATION_DENIED");
+  assert.equal(dispatches, 1);
+  assert.equal(leftRuntime.capabilities.list(runId)[0].uses, 1);
+  assert.equal(leftRuntime.capabilities.list(runId)[0].status, "consumed");
+  assert.deepEqual(createApprovalStore({ path: approvalPath }).list(), []);
+  assert.deepEqual(leftRuntime.ledger.listExecutionAttempts(runId).map((attempt: any) => attempt.state), ["completed"]);
 });
 
 test("legacy approval hints remain exact input for tools that do not define them as no-ops", async (t) => {

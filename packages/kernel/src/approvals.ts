@@ -63,6 +63,10 @@ export interface ApprovalStore {
   list(options?: { limit?: number; offset?: number }): ApprovalAction[];
 }
 
+export function approvalActionForExecution(action: ApprovalAction): ApprovalAction {
+  return normalizeApprovalAction(action);
+}
+
 export function createApprovalStore({ path }: { path?: string } = {}): ApprovalStore {
   const pending = new Map<string, StoredApprovalAction>();
   const storeKey = path ?? `memory:${randomUUID()}`;

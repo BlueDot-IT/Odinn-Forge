@@ -29,7 +29,7 @@ const EXECUTION_ATTEMPT_TRANSITIONS: Readonly<Record<ExecutionAttemptState, Read
   admitted: new Set<ExecutionAttemptState>(["queued", "failed", "cancelled"]),
   queued: new Set<ExecutionAttemptState>(["running", "failed", "cancelled"]),
   running: new Set<ExecutionAttemptState>(["awaiting-approval", "cancelling", "completed", "failed", "cancelled", "needs-review"]),
-  "awaiting-approval": new Set<ExecutionAttemptState>(["running", "completed", "failed", "cancelled"]),
+  "awaiting-approval": new Set<ExecutionAttemptState>(["running", "completed", "failed", "cancelled", "needs-review"]),
   cancelling: new Set<ExecutionAttemptState>(["completed", "failed", "cancelled", "needs-review"]),
   completed: new Set<ExecutionAttemptState>(),
   failed: new Set<ExecutionAttemptState>(),
@@ -735,22 +735,12 @@ export class RunLedger {
           }
         };
       }
-      if (latest?.state === "awaiting-approval") {
+      if (latest?.state === "awaiting-approval" && approvalContinuation) {
         return {
           ...persisted,
           replay: true,
           attempt: {
             id: String(latest.id), runId, attemptNumber: Number(latest.attempt_number), state: "awaiting-approval" as const,
-            createdAt: String(latest.created_at)
-          }
-        };
-      }
-      if (latest?.state === "running" && approvalContinuation) {
-        return {
-          ...persisted,
-          replay: true,
-          attempt: {
-            id: String(latest.id), runId, attemptNumber: Number(latest.attempt_number), state: "running" as const,
             createdAt: String(latest.created_at)
           }
         };

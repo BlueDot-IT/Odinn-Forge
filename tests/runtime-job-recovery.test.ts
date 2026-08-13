@@ -309,10 +309,10 @@ test("restart recovery classifies every crash boundary without replaying unsafe 
   assert.equal(ledger.getExecutionAttempt(unsafe.attempt.id)?.state, "needs-review");
   assert.equal((await store.get("safe-dispatched"))?.status, "queued");
   assert.equal(ledger.getExecutionAttempt(safe.attempt.id)?.state, "failed");
-  assert.equal((await store.get("approval-pending"))?.status, "awaiting-approval");
-  assert.equal(ledger.getExecutionAttempt(approval.attempt.id)?.state, "awaiting-approval");
+  assert.equal((await store.get("approval-pending"))?.status, "needs-review");
+  assert.equal(ledger.getExecutionAttempt(approval.attempt.id)?.state, "needs-review");
   assert.equal((await store.get("settled-before-projection"))?.status, "completed");
-  assert.deepEqual(counts, { queued: 3, running: 0, awaitingApproval: 1, completed: 1, failed: 0, cancelled: 0, needsReview: 1 });
+  assert.deepEqual(counts, { queued: 3, running: 0, awaitingApproval: 0, completed: 1, failed: 0, cancelled: 0, needsReview: 2 });
 });
 
 test("runtime job cancellation correlates cancellation control and uncertainty", async (t) => {
@@ -530,24 +530,95 @@ test("cancellation defers to every already-terminal execution attempt", async (t
   }
 });
 
-test("claimed approvals expose cancellation as in flight until terminal settlement", async (t) => {
+test("claimed approvals have one durable owner and only its lease can settle", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-approval-race-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
-  t.after(() => ledger.close());
-  const store = new SqliteJobStore(ledger);
-  const supervisor = new JobSupervisor({ store, execute: async () => ({ ok: true }) });
+  const stateDir = join(root, ".odinn");
+  const leftLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const rightLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => { leftLedger.close(); rightLedger.close(); });
+  const leftStore = new SqliteJobStore(leftLedger);
+  const rightStore = new SqliteJobStore(rightLedger);
+  const leftSupervisor = new JobSupervisor({ store: leftStore, execute: async () => ({ ok: true }) });
+  const rightSupervisor = new JobSupervisor({ store: rightStore, execute: async () => ({ ok: true }) });
   const runId = "approval-cancel-race";
-  ledger.ensureRun({ runId, objective: "approval cancellation race" });
-  const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
-  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
-  await createRunningJob(store, runId, false);
-  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
-  await store.update(runId, { status: "awaiting-approval" });
-  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "awaiting-approval");
-  assert.equal((await supervisor.beginApproval(runId)).status, "running");
-  assert.equal((await supervisor.cancel(runId)).status, "cancelling");
-  const settled = await supervisor.settleApproval(runId, { result: { applied: true } });
+  leftLedger.ensureRun({ runId, objective: "approval cancellation race" });
+  const admitted = leftLedger.admitExecution(executionEnvelope(root, runId, false));
+  leftLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(leftStore, runId, false);
+  leftLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
+  await leftStore.update(runId, { status: "awaiting-approval", dispatchLease: undefined });
+  const awaiting = await leftStore.get(runId);
+  assert.equal(awaiting?.status, "awaiting-approval");
+  assert.equal(awaiting?.dispatchLease, undefined);
+  assert.equal(leftLedger.getExecutionAttempt(admitted.attempt.id)?.state, "awaiting-approval");
+
+  const claims = await Promise.allSettled([
+    leftSupervisor.beginApproval(runId),
+    rightSupervisor.beginApproval(runId)
+  ]);
+  const winners = claims.filter((claim): claim is PromiseFulfilledResult<Awaited<ReturnType<JobSupervisor["beginApproval"]>>> => claim.status === "fulfilled");
+  assert.equal(winners.length, 1);
+  assert.equal(claims.filter((claim) => claim.status === "rejected").length, 1);
+  const claimed = winners[0].value;
+  const expectedLeaseToken = String(claimed.dispatchLease?.token ?? "");
+  assert.equal(claimed.status, "running");
+  assert.ok(expectedLeaseToken);
+  assert.equal(leftLedger.getExecutionAttempt(admitted.attempt.id)?.state, "awaiting-approval");
+
+  await assert.rejects(
+    () => rightSupervisor.settleApproval(runId, { result: { forged: true }, expectedLeaseToken: "loser-lease" }),
+    /claim lease is no longer owned/u
+  );
+  assert.equal((await leftStore.get(runId))?.status, "running");
+  assert.equal(leftLedger.getExecutionAttempt(admitted.attempt.id)?.state, "awaiting-approval");
+
+  const winner = claims[0].status === "fulfilled" ? leftSupervisor : rightSupervisor;
+  const settled = await winner.settleApproval(runId, { result: { applied: true }, expectedLeaseToken });
   assert.equal(settled.status, "completed");
-  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "completed");
+  assert.equal(settled.dispatchLease, undefined);
+  assert.equal(leftLedger.getExecutionAttempt(admitted.attempt.id)?.state, "completed");
+});
+
+test("expired approval continuation leases require review without replay", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-approval-crash-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const ownerLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const recoveryLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => { ownerLedger.close(); recoveryLedger.close(); });
+  const ownerStore = new SqliteJobStore(ownerLedger);
+  const recoveryStore = new SqliteJobStore(recoveryLedger);
+  const owner = new JobSupervisor({ store: ownerStore, execute: async () => ({ ok: true }) });
+  const runId = "approval-crash-after-claim";
+  ownerLedger.ensureRun({ runId, objective: "approval crash recovery" });
+  const admitted = ownerLedger.admitExecution(executionEnvelope(root, runId, false));
+  ownerLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(ownerStore, runId, false);
+  ownerLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
+  await ownerStore.update(runId, { status: "awaiting-approval", dispatchLease: undefined });
+
+  const claimed = await owner.beginApproval(runId);
+  const leaseToken = String(claimed.dispatchLease?.token ?? "");
+  assert.equal(claimed.status, "running");
+  assert.ok(leaseToken);
+  assert.equal(ownerLedger.getExecutionAttempt(admitted.attempt.id)?.state, "awaiting-approval");
+  const liveRecovery = await recoveryStore.recover({ maxAttempts: 3 });
+  assert.equal((await recoveryStore.get(runId))?.status, "running");
+  assert.equal(recoveryLedger.getExecutionAttempt(admitted.attempt.id)?.state, "awaiting-approval");
+  assert.equal((liveRecovery as { running: number }).running, 1);
+
+  const expiredAt = new Date(Date.now() - 1_000).toISOString();
+  recoveryLedger.database.db.prepare("UPDATE runtime_jobs SET lease_expires_at = ? WHERE id = ?").run(expiredAt, runId);
+  recoveryLedger.database.db.prepare("UPDATE runtime_job_leases SET expires_at = ? WHERE token = ?").run(expiredAt, leaseToken);
+  const expiredRecovery = await recoveryStore.recover({ maxAttempts: 3 });
+  const recovered = await recoveryStore.get(runId);
+  assert.equal(recovered?.status, "needs-review");
+  assert.equal(recovered?.dispatchLease, undefined);
+  assert.match(recovered?.error ?? "", /approval continuation lease expired/u);
+  assert.equal(recoveryLedger.getExecutionAttempt(admitted.attempt.id)?.state, "needs-review");
+  assert.equal((expiredRecovery as { needsReview: number }).needsReview, 1);
+  const lease = recoveryLedger.database.db.prepare("SELECT released_at, release_reason FROM runtime_job_leases WHERE token = ?").get(leaseToken) as { released_at: string; release_reason: string };
+  assert.ok(lease.released_at);
+  assert.equal(lease.release_reason, "restart-recovery");
 });

@@ -24,12 +24,20 @@ approval views. After the operator claims that approval, the continuation
 resumes the original awaiting-approval run with the original actor, tool, and
 sealed input. The kernel independently recovers and verifies that claimed
 binding; a request field or transport boolean cannot assert continuation
-authority. The broker then validates and atomically consumes the same key
-immediately before the tool consumes the one-use approval and can dispatch. A
+authority. The kernel atomically consumes the one-use approval before
+readmission, so concurrent processes cannot share the awaiting attempt. Only
+that winner can validate and atomically consume the same key immediately
+before dispatch. A
 changed run, actor, tool, resource, input, expired or revoked
 key, duplicate approval, or replay cannot create a second dispatch. This model
 does not mint a broader approval capability and does not relax ordinary run
 binding; it delays the existing one-use consumption until the approved leg.
+Generic recovery cannot restart an awaiting-approval first leg. If a process
+stops after claiming an approval continuation, its durable job lease prevents
+another process from dispatching it; an expired unfinished lease is classified
+as needs-review instead of being replayed. A crash between consuming the
+approval and consuming the Rune Key therefore fails closed and may leave the
+key unused, but never authorizes an automatic duplicate dispatch.
 
 Enabling this optional plugin module changes direct CLI execution immediately:
 ordinary tool runs require a matching scoped token after capability enforcement is

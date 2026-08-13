@@ -358,10 +358,11 @@ export async function browserAction(stateDir: any, approvalStore: ApprovalStore,
       actor: execution.actor,
       input: normalizedInput
     });
-    if (!approved) {
+    const authorized = approved ?? execution.approvalContinuation;
+    if (!authorized) {
       throw new Error("browser action approval is missing, expired, already used, or does not match this action");
     }
-    input = approved.input ?? normalizedInput;
+    input = authorized.input ?? normalizedInput;
   } else {
     input = normalizedInput;
   }
