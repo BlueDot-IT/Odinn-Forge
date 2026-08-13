@@ -87,7 +87,7 @@ export { ProgressiveSkillDisclosure, SkillDisclosureError } from "./skill-disclo
 export type { HydratedSkill, SkillCatalogEntry, SkillDisclosureLimits } from "./skill-disclosure.ts";
 export { createGovernedMcpRuntime, GovernedMcpRuntime, normalizeMcpConfiguration } from "./mcp-runtime.ts";
 export type { GovernedMcpRuntimeOptions, McpRuntimeContext, McpRuntimeStatus, McpServerConfig } from "./mcp-runtime.ts";
-export { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
+export { ensureSecureStateDirectory, ensureSecureStateTree, isOwnerOnlyPath } from "@odinn/store-file";
 export { SqliteRecordStore } from "@odinn/store-sqlite";
 export { SqliteOperatorReadStore, SqliteWorkflowStore } from "@odinn/store-sqlite";
 export { closeBrowserManagers } from "./browser.ts";
