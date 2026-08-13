@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { exit as exitProcess } from "node:process";
 import type { RuntimePolicy } from "@odinn/policy";
 import {
   closeBrowserManagers,
@@ -76,7 +77,7 @@ export function installTaskWorker(createRegistry: WorkerRegistryFactory): void {
     if (shuttingDown) return;
     shuttingDown = true;
     await closeBrowserManagers();
-    process.exit(0);
+    exitProcess(0);
   };
 
   process.on("message", (rawMessage: unknown) => {

@@ -1,5 +1,6 @@
 import { createRunId, validateWorkflowDefinition, type WorkflowDefinition, type WorkflowRunRecord, type WorkflowRunRequest, type WorkflowStepDefinition } from "@odinn/protocol";
 import { SqliteWorkflowStore, createRunLedger, type ClaimedWorkflowStep } from "@odinn/store-sqlite";
+import { cwd as currentWorkingDirectory } from "node:process";
 
 export type WorkflowDispatchContext = {
   run: WorkflowRunRecord;
@@ -325,7 +326,7 @@ export class DurableWorkflowRuntime {
   }
 }
 
-export function createDurableWorkflowRuntime({ stateDir = ".odinn", workspaceRoot = process.cwd(), dispatch, onEvent, concurrency = 1, cancellationGraceMs, leaseMs }: Omit<WorkflowRuntimeOptions, "store"> & { stateDir?: string; workspaceRoot?: string }): DurableWorkflowRuntime {
+export function createDurableWorkflowRuntime({ stateDir = ".odinn", workspaceRoot = currentWorkingDirectory(), dispatch, onEvent, concurrency = 1, cancellationGraceMs, leaseMs }: Omit<WorkflowRuntimeOptions, "store"> & { stateDir?: string; workspaceRoot?: string }): DurableWorkflowRuntime {
   const ledger = createRunLedger({ stateDir, workspaceRoot });
   const store = new SqliteWorkflowStore(ledger.database);
   return new DurableWorkflowRuntime({ store, dispatch, onEvent, concurrency, cancellationGraceMs, leaseMs });

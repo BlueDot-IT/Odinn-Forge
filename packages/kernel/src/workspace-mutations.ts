@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { CheckpointCoordinator } from "./checkpoint-coordinator.ts";
 import { OdinnRuntimeError, SnapshotManager } from "./differentiated-runtime.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
@@ -977,7 +978,7 @@ function resolveTopLevelRoots(paths: string[]) {
 type RestoreCheckpointRestoreResult = RestorePreviewResult | RestoreExecutionResult;
 
 export function createWorkspaceMutationTools({
-  workspaceRoot = process.cwd(),
+  workspaceRoot = currentWorkingDirectory(),
   safe = true,
   runLedger,
   coordinator,

@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
+import { kill as killProcess } from "node:process";
 import { withStateMutationLock } from "./state-mutation.ts";
 
 const execFileAsync = promisify(execFile);
@@ -448,7 +449,7 @@ const defaultProcessRecoveryAdapter: ProcessRecoveryAdapter = {
     if (group === "present") return record.processIdentity ? "present" : "unknown";
     if (group === "unknown") return "unknown";
     if (!identity) {
-      try { process.kill(record.pid, 0); return "unknown"; }
+      try { killProcess(record.pid, 0); return "unknown"; }
       catch (error) { return isCode(error, "ESRCH") ? "absent" : "unknown"; }
     }
     return "absent";
@@ -457,8 +458,8 @@ const defaultProcessRecoveryAdapter: ProcessRecoveryAdapter = {
     if (!record.pid || (await this.inspect(record)) !== "present") throw new ProcessRecoveryError("process identity could not be proven for recovery termination", "PROCESS_RECOVERY_REQUIRED");
     if (process.platform === "win32") throw new ProcessRecoveryError("Windows process recovery cannot terminate an unverified process identity", "PROCESS_RECOVERY_REQUIRED");
     const groupId = record.processGroupId ?? record.pid;
-    try { process.kill(-groupId, "SIGKILL"); }
-    catch { try { process.kill(record.pid, "SIGKILL"); } catch (error) { if (!isCode(error, "ESRCH")) throw error; } }
+    try { killProcess(-groupId, "SIGKILL"); }
+    catch { try { killProcess(record.pid, "SIGKILL"); } catch (error) { if (!isCode(error, "ESRCH")) throw error; } }
   }
 };
 
@@ -475,7 +476,7 @@ async function inspectUntilAbsent(adapter: ProcessRecoveryAdapter, record: Proce
 async function inspectProcessGroup(groupId: number | undefined): Promise<ProcessPresence> {
   if (!groupId || process.platform === "win32") return "absent";
   try {
-    process.kill(-groupId, 0);
+    killProcess(-groupId, 0);
     return "present";
   } catch (error) {
     if (isCode(error, "ESRCH")) return "absent";

@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { kill as killProcess } from "node:process";
 import { withStateMutationLock } from "./state-mutation.ts";
 
 export type SandboxRecoveryBackend = "docker" | "podman";
@@ -388,7 +389,7 @@ async function removeDeadLock(path: string): Promise<boolean> {
 }
 
 function processExists(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
+  try { killProcess(pid, 0); return true; }
   catch (error) { return !isCode(error, "ESRCH"); }
 }
 

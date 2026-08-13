@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 
 const [command = "status", ...args] = process.argv.slice(2);
 const prefix = resolve(option("--prefix", process.env.ODINN_INSTALL_PREFIX || join(homedir(), ".local", "share", "odinn")));
@@ -17,7 +18,7 @@ else if (command === "status") console.log(JSON.stringify(await readState(), nul
 else throw new Error("usage: install.ts install|upgrade|rollback|status [--source DIR] [--prefix DIR] [--version VERSION] [--commit SHA] [--artifact-sha256 HASH] [--skip-deps]");
 
 async function install(operation: any) {
-  const source = resolve(option("--source", process.cwd()));
+  const source = resolve(option("--source", currentWorkingDirectory()));
   await validateSource(source);
   const pkg = JSON.parse(await readFile(join(source, "package.json"), "utf8"));
   if (pkg.name !== "odinn" && pkg.name !== "@bluedot-it/odinn") {

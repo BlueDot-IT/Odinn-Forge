@@ -20,18 +20,74 @@ Required jobs:
 The inference job launches the packaged Gateway, configures a local OpenAI-compatible protocol provider, and verifies a persisted model response through the public API. It is real packaged gateway behavior proof, but it is not proof of production-model quality or a live cloud-provider account.
 
 The quality job also runs `pnpm check:architecture`. This repository-owned
-TypeScript AST check rejects channel-adapter and direct adapter imports from
-`packages/kernel`, and rejects channel-adapter, direct adapter, and application
-transport imports from `packages/application`. Diagnostics name the source
-file, import specifier, and violated rule. Repository workspace package names
-and their subpath exports are resolved as well as relative paths, so aliases
-such as `@odinn/gateway` cannot bypass the boundary. Dynamic `import()` and
-`require()` calls in either protected package must use literal module
-specifiers so their dependency direction remains statically enforceable.
+TypeScript AST and manifest check enforces the [complete production workspace
+package graph](architecture/package-dependency-graph.md). Package roots come
+from `pnpm-workspace.yaml`; discovered packages, graph keys, and graph targets
+must agree. The check validates source imports and every package dependency
+field, requires the canonical package name with exact `workspace:*`, rejects
+local-path and npm aliases, rejects package-to-app and adapter-to-adapter edges,
+and requires source imports to be declared. Package subpaths are evaluated with
+Node 24 conditional, wildcard, null-exclusion, and array-fallback `exports`
+semantics, including the default `node-addons` and `module-sync` runtime
+conditions. Type-only references activate TypeScript's `types` condition;
+static import/export mode follows `.mts`/`.mjs`, `.cts`/`.cjs`, the package
+module type, and explicit type-resolution attributes. Every export target in
+every condition is physically audited even when unreferenced. It must remain
+an existing regular file owned by its declared package, so a parent cannot
+proxy files from a nested workspace or through a symlink. Only statically
+auditable JavaScript/TypeScript, extensionless entrypoints, and inert JSON may
+be exported; opaque `.node`, `.txt`, and other loader-defined surfaces fail
+closed. Exported source remains in the inventory even beneath ignored
+build-output directories. Relative, absolute, repository-tool, outside-file,
+ignored-output, and percent-encoded traversal references cannot bypass the
+production package boundary. Explicitly
+matched `dist` package roots are included; generated directories must be
+excluded in the workspace globs, while pnpm's `node_modules` and
+`bower_components` source exclusions remain intact. Package-local dependency
+links are still physically audited and must point to a canonical declared
+workspace package or a declared package in the pnpm store. Production package
+roots, manifests, and descendants cannot traverse symbolic links or junctions;
+broken links and repository escapes fail closed. Archive verification retains
+an independent no-symbolic-link and no-hard-link boundary.
 
-The dependency-direction check has no legacy exemptions. Channel transport
-implementations are assembled by `@odinn/runtime`; the kernel accepts only the
-shared channel-tool contract from `@odinn/channels`.
+Dynamic `import()`, direct `require()`, and `module.require()` calls in every
+production workspace package must use literal module specifiers. Non-`node:`
+URL modules, indirect or computed loaders, private or derived `Module`
+entrypoints, `Reflect.get` loader authority, loader hook registration,
+`createRequire`, dynamic `getBuiltinModule` access, direct or aliased `eval`,
+`Function`, and callable constructor-based code generation fail closed.
+Runtime `node:module`/`module` acquisition is limited to type-only use and the
+static `builtinModules` metadata export; runtime `node:vm`/`vm` acquisition is
+forbidden. Production package scripts are also closed-form: only a
+package-owned audited `node ./entrypoint` without runtime options or
+`tsc -p tsconfig*.json` is accepted. Loader/preload/eval flags, `NODE_OPTIONS`,
+shell wrappers, and path escapes fail closed. Accepted Node entrypoints are
+added to the source inventory even when they live in build output.
+Package `bin` entrypoints follow the same inventory boundary through a stricter
+manifest grammar: string and object forms must name unique portable commands
+and exact package-owned JS/TS files with the canonical `#!/usr/bin/env node`
+shebang. Explicit `dist` bins are scanned; symbolic links, junctions, package
+escapes, ambiguous or opaque paths, command collisions, and non-Node shebangs
+fail closed. Release archive verification separately rejects hard links.
+`directories.bin` is rejected rather than turning a directory into an
+unenumerated executable surface.
+TypeScript triple-slash path, type, and AMD dependency references are checked
+through the same boundary as imports. Package `imports`
+aliases and effective TypeScript `paths` aliases in production package config
+variants and their inherited chains also fail closed so dependency identities
+and packaged build inputs remain statically enforceable. Tool-only TypeScript
+configurations are outside this production-package rule.
+
+This gate enforces its documented syntax, manifest, export, and installed-link
+grammar. It is not a whole-program proof for arbitrary worker or child-process
+execution; those behaviors remain subject to their dedicated runtime and
+sandbox controls.
+
+Diagnostics name the source file or manifest, import/dependency specifier, and
+violated rule. The dependency-direction check has no legacy exemptions.
+Gateway and CLI retain their documented composition-root edges; the kernel
+accepts only the shared channel-tool contract from `@odinn/channels` and cannot
+import a channel adapter.
 
 ### Security
 

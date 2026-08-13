@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { link, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { kill as killProcess } from "node:process";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const POLL_INTERVAL_MS = 50;
@@ -298,7 +299,7 @@ function usesWindowsFileSemantics(options: ReleaseOptions): boolean {
 
 function processExists(pid: number): boolean {
   try {
-    process.kill(pid, 0);
+    killProcess(pid, 0);
     return true;
   } catch (error: unknown) {
     return !isCode(error, "ESRCH");

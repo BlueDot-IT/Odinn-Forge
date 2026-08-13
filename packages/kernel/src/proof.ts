@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory, kill as killProcess } from "node:process";
 import { Worker } from "node:worker_threads";
 import { redact } from "@odinn/store-sqlite";
 import type { RunLedger } from "@odinn/store-sqlite";
@@ -343,7 +344,7 @@ function terminateProcessTree(child: { pid?: number; kill(signal?: NodeJS.Signal
     killer.unref();
     return;
   }
-  try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+  try { killProcess(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
 }
 
 function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes, environment }: { cwd: string; timeoutMs: number; maxOutputBytes: number; environment: NodeJS.ProcessEnv }): Promise<ProcessResult> {
@@ -439,7 +440,7 @@ export class ProofVerifier {
     }
     if (typeof includeRawEvidence !== "boolean") throw new TypeError("ProofVerifier includeRawEvidence must be a boolean");
     this.runLedger = runLedger;
-    this.allowedRoot = resolve(allowedRoot ?? runLedger.workspaceRoot ?? process.cwd());
+    this.allowedRoot = resolve(allowedRoot ?? runLedger.workspaceRoot ?? currentWorkingDirectory());
     this.maxOutputBytes = maxOutputBytes;
     this.maxFileBytes = maxFileBytes;
     this.allowExternalHttp = allowExternalHttp === true;

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { exit as exitProcess } from "node:process";
 import type { RuntimePolicy } from "@odinn/policy";
 import {
   closeBrowserManagers,
@@ -35,7 +36,7 @@ export function installBrowserWorker(createRegistry: WorkerRegistryFactory): voi
       shuttingDown = true;
       await queue;
       await closeBrowserManagers();
-      process.exit(0);
+      exitProcess(0);
     }
     if (message?.type !== "task") return;
     queue = queue.then(async () => {
@@ -74,13 +75,13 @@ export function installBrowserWorker(createRegistry: WorkerRegistryFactory): voi
     shuttingDown = true;
     await queue;
     await closeBrowserManagers();
-    process.exit(0);
+    exitProcess(0);
   });
   process.on("SIGTERM", async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     await queue;
     await closeBrowserManagers();
-    process.exit(0);
+    exitProcess(0);
   });
 }

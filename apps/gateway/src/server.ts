@@ -4,6 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateGatewayChannelDiagnosticsV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1 } from "@odinn/application";
 import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
@@ -702,7 +703,7 @@ export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor
 export async function createGatewayServer(options: any = {}) {
   const {
     stateDir = resolve(homedir(), ".odinn"),
-    workspaceRoot = process.cwd(),
+    workspaceRoot = currentWorkingDirectory(),
     requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
     quotas = {},
     hosted = false,

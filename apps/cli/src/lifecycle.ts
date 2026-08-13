@@ -4,6 +4,7 @@ import { createWriteStream, existsSync } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -584,25 +585,25 @@ async function extractVerifiedArchive(archive: string, destination: string, vers
   rejectArchiveLinks(archive);
   await mkdir(destination, { recursive: true, mode: 0o700 });
   if (isZip(archive) && process.platform !== "win32") {
-    runCommand("unzip", ["-q", archive, "-d", destination], process.cwd());
+    runCommand("unzip", ["-q", archive, "-d", destination], currentWorkingDirectory());
   } else {
     const args = isZip(archive) ? ["-xf", archive, "-C", destination] : ["-xzf", archive, "-C", destination];
-    runCommand("tar", args, process.cwd());
+    runCommand("tar", args, currentWorkingDirectory());
   }
   await validatePhysicalTree(join(destination, expectedRoot));
 }
 
 function listArchive(archive: string): string[] {
   const result = isZip(archive) && process.platform !== "win32"
-    ? runCommand("unzip", ["-Z1", archive], process.cwd()).stdout
-    : runCommand("tar", [isZip(archive) ? "-tf" : "-tzf", archive], process.cwd()).stdout;
+    ? runCommand("unzip", ["-Z1", archive], currentWorkingDirectory()).stdout
+    : runCommand("tar", [isZip(archive) ? "-tf" : "-tzf", archive], currentWorkingDirectory()).stdout;
   return result.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
 }
 
 function rejectArchiveLinks(archive: string): void {
   const listing = isZip(archive) && process.platform !== "win32"
-    ? runCommand("zipinfo", ["-l", archive], process.cwd()).stdout
-    : runCommand("tar", [isZip(archive) ? "-tvf" : "-tvzf", archive], process.cwd()).stdout;
+    ? runCommand("zipinfo", ["-l", archive], currentWorkingDirectory()).stdout
+    : runCommand("tar", [isZip(archive) ? "-tvf" : "-tvzf", archive], currentWorkingDirectory()).stdout;
   for (const line of listing.split(/\r?\n/u)) {
     const type = line.trimStart()[0];
     if (type === "l" || type === "h") throw new Error("release archive contains a symbolic or hard link");

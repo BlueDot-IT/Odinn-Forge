@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep, win32 } from "node:path";
+import { kill as killProcess } from "node:process";
 import { ProcessRecoveryError, createProcessExecutionDescriptor, type ProcessExecutionSession, type ProcessSupervisor } from "./process-supervisor.ts";
 
 const DEFAULT_MAX_FILE_BYTES = 1_000_000;
@@ -783,7 +784,7 @@ export async function executeWorkspaceProcess(workspaceRoot: string, input: any 
       if (process.platform === "win32") {
         return;
       } else {
-        try { process.kill(-activeChild.pid, "SIGKILL"); } catch { activeChild.kill("SIGKILL"); }
+        try { killProcess(-activeChild.pid, "SIGKILL"); } catch { activeChild.kill("SIGKILL"); }
       }
     };
     const abort = () => {
