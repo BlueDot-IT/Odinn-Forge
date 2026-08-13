@@ -87,6 +87,23 @@ type ApprovalStoreTestHooks = {
   __testOnlyOnLockContention?: () => void;
 };
 
+export type ApprovalReadSummary = {
+  id: string;
+  status: "pending" | "claimed";
+  createdAt: string;
+  expiresAt: number;
+  tool: string;
+  type?: string;
+  approvedAt?: string;
+  runId?: string;
+  accountId?: string;
+  summary?: string;
+  effect?: ApprovalEffect;
+  recovery?: string;
+  expectedUrl?: string;
+  snapshotId?: string;
+};
+
 export interface ApprovalStore {
   create(action: ApprovalAction, options?: ApprovalStoreOperationOptions): string;
   claim(id: unknown, options?: ApprovalStoreOperationOptions): ApprovalAction | undefined;
@@ -101,6 +118,60 @@ export interface ApprovalStore {
   revokeAsync?(id: unknown, options?: ApprovalStoreOperationOptions): Promise<boolean>;
   list(options?: ApprovalStoreListOptions): ApprovalAction[];
   listAsync?(options?: ApprovalStoreListOptions): Promise<ApprovalAction[]>;
+}
+
+/**
+ * Read the durable public approval projection without claiming, expiring, or
+ * rewriting approval state. Exact output validation remains application-owned.
+ */
+export function readApprovalSummaries(path: string, now = Date.now()): ApprovalReadSummary[] {
+  let parsed: unknown;
+  try {
+    if (statSync(path).size > MAX_APPROVAL_FILE_BYTES) {
+      const error = new Error(`approval state exceeds the ${MAX_APPROVAL_FILE_BYTES}-byte limit`) as NodeError;
+      error.code = "APPROVAL_STATE_TOO_LARGE";
+      throw error;
+    }
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    if ((error as NodeError).code === "ENOENT") return [];
+    throw error;
+  }
+  const envelope = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+  const records = Array.isArray(parsed) ? parsed : envelope?.schemaVersion === 1 && Array.isArray(envelope.approvals) ? envelope.approvals : undefined;
+  if (!records) throw new Error("approval state must contain a V1 approvals array");
+  if (records.length > MAX_PENDING_APPROVALS) throw new Error(`approval state exceeds the ${MAX_PENDING_APPROVALS}-approval limit`);
+  const summaries: ApprovalReadSummary[] = [];
+  records.forEach((input, index) => {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`approval state record ${index} must be an object`);
+    const record = input as Record<string, unknown>;
+    if (record.status !== "pending" && record.status !== "approved") throw new Error(`approval state record ${index} has an invalid status`);
+    if (!Number.isSafeInteger(record.expiresAt) || Number(record.expiresAt) < 0) throw new Error(`approval state record ${index} has an invalid expiry`);
+    if (Number(record.expiresAt) <= now) return;
+    if (typeof record.id !== "string" || !record.id || typeof record.tool !== "string" || !record.tool || typeof record.createdAt !== "string" || !record.createdAt) {
+      throw new Error(`approval state record ${index} is missing its public identity`);
+    }
+    if (record.effect !== undefined && (!record.effect || typeof record.effect !== "object" || Array.isArray(record.effect))) {
+      throw new Error(`approval state record ${index} has an invalid effect summary`);
+    }
+    summaries.push({
+      ...(typeof record.type === "string" ? { type: record.type } : {}),
+      id: record.id,
+      status: record.status === "approved" ? "claimed" : "pending",
+      createdAt: record.createdAt,
+      expiresAt: Number(record.expiresAt),
+      ...(typeof record.approvedAt === "string" ? { approvedAt: record.approvedAt } : {}),
+      ...(typeof record.runId === "string" ? { runId: record.runId } : {}),
+      ...(typeof record.accountId === "string" ? { accountId: record.accountId } : {}),
+      tool: record.tool,
+      ...(typeof record.summary === "string" ? { summary: record.summary } : {}),
+      ...(record.effect ? { effect: record.effect as ApprovalEffect } : {}),
+      ...(record.status === "approved" ? { recovery: "execution claim is in flight; inspect before retrying" } : typeof record.recovery === "string" ? { recovery: record.recovery } : {}),
+      ...(typeof record.expectedUrl === "string" ? { expectedUrl: record.expectedUrl } : {}),
+      ...(typeof record.snapshotId === "string" ? { snapshotId: record.snapshotId } : {})
+    });
+  });
+  return summaries;
 }
 
 export function approvalActionForExecution(action: ApprovalAction): ApprovalAction {

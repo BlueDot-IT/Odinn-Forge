@@ -4,9 +4,9 @@ _Status: incremental migration in progress. Gateway authentication, process
 bootstrap, and the embedded console have been extracted into separately
 auditable modules. Transport-neutral application contracts now exist; runtime
 use-case migration has begun with the read-only `status.read`,
-`diagnostics.read`, and `session.list` paths. Discord agent-tool definitions and
-REST behavior now live in the Discord adapter and are composed outside the
-kernel._
+`diagnostics.read`, `session.list`, and `operator.snapshot.read` paths. Discord
+agent-tool definitions and REST behavior now live in the Discord adapter and
+are composed outside the kernel._
 
 ## Evidence from the current tree
 
@@ -16,8 +16,8 @@ kernel._
   in `bootstrap.ts`, and the large console document lives under `src/public/`.
 - `apps/cli/src/cli.ts` is the command composition root. It owns command
   parsing, terminal-oriented output, onboarding, and lifecycle commands. The
-  status, doctor, and session-list commands now cross `@odinn/application`;
-  other commands still call the kernel directly.
+  status, doctor, session-list, and operator-snapshot commands now cross
+  `@odinn/application`; other commands still call the kernel directly.
 - `packages/kernel/src/index.ts` exports the runtime service surface, including
   policy, approvals, jobs, memory, providers, state, extensions, and task
   execution. It accepts transport-neutral channel-tool definitions and keeps
@@ -61,10 +61,12 @@ with these concepts:
 - `ExecutionResult` and `ExecutionReceipt`: output evidence, terminal status,
   authorization and audit references, correlation, and uncertainty/approval
   state.
-- `StatusSnapshotV1`, `DiagnosticsReportV1`, and `SessionPageV1`: explicit,
-  versioned read models with allowlisted fields, boundary validation, and
-  redaction checks. CLI and gateway presenters no longer receive arbitrary
-  kernel objects for the migrated read paths.
+- `StatusSnapshotV1`, `DiagnosticsReportV1`, `SessionPageV1`, and
+  `OperatorSnapshotV1`: explicit, versioned read models with allowlisted
+  fields, boundary validation, and redaction checks. CLI and gateway
+  presenters no longer receive arbitrary kernel objects for the migrated read
+  paths. Operator action and join identifiers are validated as bounded,
+  byte-stable values rather than normalized presentation text.
 - `ChannelPort`: delivery capability that accepts an outbound envelope; it must
   not expose channel SDK objects to the kernel.
 
@@ -93,11 +95,13 @@ behind explicit modules:
 3. `gateway/runtime`: process startup, worker supervision, shutdown, and state
    directory setup.
 
-The authenticated `GET /status`, `GET /diagnostics`, and `GET /sessions` routes
-now construct a trusted principal and scope, invoke transport-neutral read use
-cases, and map only their output to the stable HTTP responses. Session listing
-continues through the existing isolated, policy-checked, audited kernel task
-path behind its application port. Other routes remain incremental migration
+The authenticated `GET /status`, `GET /diagnostics`, `GET /sessions`, and
+`GET /operator` routes now construct a trusted principal and scope, invoke
+transport-neutral read use cases, and map only their output to stable HTTP
+responses. Session listing continues through the existing isolated,
+policy-checked, audited kernel task path behind its application port. The
+operator read port exposes query-only projections and cannot reconcile,
+approve, cancel, or transition work. Other routes remain incremental migration
 targets. The gateway should depend on application ports, not on channel adapter
 details.
 
@@ -132,11 +136,13 @@ a time while preserving the current kernel exports as a compatibility facade.
 1. **Complete:** add boundary types and contract tests without moving runtime
    code.
 2. **In progress:** add gateway and CLI mapping modules that use the boundary
-   types; both transports now map `status.read`, `diagnostics.read`, and
-   `session.list` with authenticated server-side principal and scope.
+   types; both transports now map `status.read`, `diagnostics.read`,
+   `session.list`, and `operator.snapshot.read` with authenticated server-side
+   principal and scope.
 3. **In progress:** move read-only use cases through the boundary. Status,
-   diagnostics, and session listing now have explicit V1 output contracts; the
-   remaining inspection surfaces are pending.
+   diagnostics, session listing, and the bounded operator snapshot now have
+   explicit V1 output contracts; the remaining inspection surfaces are
+   pending.
 4. Move model execution and approval-bearing task execution with identical
    audit and failure semantics.
 5. **In progress:** migrate channel adapters to the same inbound/outbound

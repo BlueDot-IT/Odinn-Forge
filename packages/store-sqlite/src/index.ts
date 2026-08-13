@@ -814,6 +814,32 @@ export class RunLedger {
     }));
   }
 
+  /** Read at most one authoritative execution-attempt projection per run. */
+  readLatestExecutionAttempts(runIds: readonly string[]) {
+    if (!Array.isArray(runIds) || runIds.length > 50) throw new Error("latest execution-attempt read accepts at most 50 run ids");
+    const normalized = runIds.map((runId) => String(runId));
+    if (normalized.some((runId) => !runId || runId.length > 512) || new Set(normalized).size !== normalized.length) {
+      throw new Error("latest execution-attempt read requires unique bounded run ids");
+    }
+    if (!normalized.length) return [];
+    const placeholders = normalized.map(() => "?").join(",");
+    return (this.database.db.prepare(`SELECT id, run_id, attempt_number, state, created_at, started_at, settled_at, outcome_digest, error_code
+      FROM execution_attempts AS attempt
+      WHERE run_id IN (${placeholders})
+        AND attempt_number = (SELECT MAX(latest.attempt_number) FROM execution_attempts AS latest WHERE latest.run_id = attempt.run_id)
+      ORDER BY run_id`).all(...normalized) as SqlRow[]).map((row) => ({
+      id: String(row.id),
+      runId: String(row.run_id),
+      attemptNumber: Number(row.attempt_number),
+      state: row.state as ExecutionAttemptState,
+      createdAt: String(row.created_at),
+      ...(row.started_at === null ? {} : { startedAt: String(row.started_at) }),
+      ...(row.settled_at === null ? {} : { settledAt: String(row.settled_at) }),
+      ...(row.outcome_digest === null ? {} : { outcomeDigest: String(row.outcome_digest) }),
+      ...(row.error_code === null ? {} : { errorCode: String(row.error_code) })
+    }));
+  }
+
   getExecutionAttempt(attemptId: string) {
     const row = this.database.db.prepare(`SELECT id, run_id, attempt_number, state, created_at, started_at, settled_at, outcome_digest, error_code
       FROM execution_attempts WHERE id = ?`).get(attemptId) as SqlRow | undefined;
@@ -1301,4 +1327,13 @@ export type {
 export { SqliteJobStore } from "./runtime-jobs.ts";
 export type { RuntimeJobRecord } from "./runtime-jobs.ts";
 export { SqliteWorkflowStore } from "./workflows.ts";
+export { SqliteOperatorReadStore } from "./operator-read.ts";
+export type {
+  SqliteOperatorAttemptReadRecord,
+  SqliteOperatorAuditReadRecord,
+  SqliteOperatorEventWatchReadRecord,
+  SqliteOperatorJobReadRecord,
+  SqliteOperatorRunReadRecord,
+  SqliteOperatorWorkflowReadRecord,
+} from "./operator-read.ts";
 export type { ClaimedWorkflowStep } from "./workflows.ts";

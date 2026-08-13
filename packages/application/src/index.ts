@@ -40,6 +40,51 @@ export {
   validateSessionPageV1,
   validateStatusSnapshotV1
 } from "./read-output-contracts.ts";
+export {
+  OPERATOR_SNAPSHOT_DEFAULT_PAGE_SIZE,
+  OPERATOR_SNAPSHOT_MAX_PAGE_SIZE,
+  OPERATOR_SNAPSHOT_SCHEMA_VERSION,
+  OPERATOR_SNAPSHOT_SECTION_NAMES,
+  defaultOperatorSnapshotActionsV1,
+  parseOperatorSnapshotResponseV1,
+  parseOperatorSnapshotV1,
+  validateOperatorIdentifierV1,
+  validateOperatorSnapshotResponseV1,
+  validateOperatorSnapshotV1
+} from "./operator-snapshot-contracts.ts";
+export type {
+  OperatorActionDescriptorV1,
+  OperatorActionNameV1,
+  OperatorApprovalCountsV1,
+  OperatorApprovalItemV1,
+  OperatorAuditCountsV1,
+  OperatorAuditItemV1,
+  OperatorAutomationCountsV1,
+  OperatorBaseCountsV1,
+  OperatorBrowserRecoveryItemV1,
+  OperatorContextItemV1,
+  OperatorEventWatchItemV1,
+  OperatorExecutionAttemptStateV1,
+  OperatorExecutionAttemptSummaryV1,
+  OperatorHealthV1,
+  OperatorItemV1,
+  OperatorJobItemV1,
+  OperatorPaginationV1,
+  OperatorProcessRecoveryItemV1,
+  OperatorRecoveryItemV1,
+  OperatorRunItemV1,
+  OperatorRuntimeItemV1,
+  OperatorSandboxRecoveryItemV1,
+  OperatorScheduleItemV1,
+  OperatorSectionV1,
+  OperatorSnapshotResponseV1,
+  OperatorSnapshotSectionNameV1,
+  OperatorSnapshotV1,
+  OperatorSurfaceItemV1,
+  OperatorSurfaceV1,
+  OperatorWorkflowItemV1,
+  OperatorWorkCountsV1
+} from "./operator-snapshot-contracts.ts";
 export { isSensitiveApplicationMetadataKey } from "./sensitive-metadata.ts";
 export type {
   ApprovalEffectSummaryV1,
@@ -74,6 +119,38 @@ export type {
   ToolSummaryV1
 } from "./read-output-contracts.ts";
 export type { ApplicationInvocationOptions, ChannelPort, ExecutionPort } from "./ports.ts";
+export {
+  OPERATOR_SNAPSHOT_READ_OPERATION_ID,
+  OPERATOR_SNAPSHOT_CHANGED_CODE,
+  OPERATOR_SCHEDULE_MAX_ITEMS,
+  OPERATOR_SCHEDULE_SCHEMA_VERSION,
+  createOperatorSnapshotReadUseCase,
+  normalizeOperatorSnapshotReadInputV1,
+  projectOperatorScheduleEnvelopeV1,
+  validateOperatorSnapshotReadRequestV1
+} from "./operator-snapshot.ts";
+export type {
+  NormalizedOperatorSnapshotReadInputV1,
+  OperatorApprovalSourceV1,
+  OperatorAuditSourceV1,
+  OperatorBrowserRecoverySourceV1,
+  OperatorEnvironmentSourceV1,
+  OperatorEventWatchSourceV1,
+  OperatorExecutionAttemptSourceV1,
+  OperatorJobSourceV1,
+  OperatorPendingRecoverySourceV1,
+  OperatorRecoverySourceV1,
+  OperatorRunSourceV1,
+  OperatorScheduleSourceV1,
+  OperatorSnapshotReadInputV1,
+  OperatorSnapshotReadPort,
+  OperatorSnapshotReadRequestV1,
+  OperatorSnapshotReadResultV1,
+  OperatorSnapshotReadUseCase,
+  OperatorSnapshotSourcePageV1,
+  OperatorSnapshotSourceQueryV1,
+  OperatorWorkflowSourceV1
+} from "./operator-snapshot.ts";
 export {
   DIAGNOSTICS_READ_OPERATION_ID,
   createDiagnosticsReadUseCase,

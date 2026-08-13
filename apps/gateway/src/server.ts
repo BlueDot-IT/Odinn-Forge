@@ -3,11 +3,11 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateGatewayChannelDiagnosticsV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1 } from "@odinn/application";
-import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { APPLICATION_CONTRACT_VERSION, ApplicationContractValidationError, OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validateOperatorSnapshotResponseV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSnapshotReadInputV1, type OperatorSurfaceV1 } from "@odinn/application";
+import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -51,6 +51,12 @@ async function productCommit() {
     if (error?.code !== "ENOENT") throw error;
     return String(process.env.ODINN_COMMIT || "unknown");
   }
+}
+
+const GATEWAY_OPERATOR_SURFACES = new Set<OperatorSurfaceV1>(["cli", "tui", "http", "console"]);
+
+function gatewayOperatorSurface(input: string): OperatorSurfaceV1 {
+  return GATEWAY_OPERATOR_SURFACES.has(input as OperatorSurfaceV1) ? input as OperatorSurfaceV1 : "http";
 }
 
 function createQuotaGate(value: any = {}) {
@@ -98,9 +104,25 @@ class GatewayError extends Error {
   }
 }
 
+export function gatewayOperatorSnapshotFailure(error: unknown, requestId: string) {
+  if (!(error instanceof ApplicationContractValidationError)
+    || error.code !== OPERATOR_SNAPSHOT_CHANGED_CODE) return undefined;
+  return Object.freeze({
+    status: 503 as const,
+    retryAfter: "1",
+    body: Object.freeze({
+      ok: false as const,
+      error: "operator snapshot changed while it was being read; retry the request",
+      code: OPERATOR_SNAPSHOT_CHANGED_CODE,
+      retryable: true as const,
+      requestId,
+    }),
+  });
+}
+
 class MissingChannelCredentialError extends Error {}
 
-const CRON_SCHEMA_VERSION = 2;
+const CRON_SCHEMA_VERSION = OPERATOR_SCHEDULE_SCHEMA_VERSION;
 const CRON_MAX_JOBS = 500;
 const CRON_MAX_FILE_BYTES = 4 * 1024 * 1024;
 const CRON_DISPATCH_LEASE_MS = 10 * 60 * 1000;
@@ -109,24 +131,34 @@ export class CronStore {
   path: string;
   writeChain: Promise<unknown> = Promise.resolve();
   constructor(path: string) { this.path = path; }
-  async read() {
+  async readRaw() {
     try {
       if ((await statPath(this.path)).size > CRON_MAX_FILE_BYTES) throw new GatewayError(409, `cron state exceeds the ${CRON_MAX_FILE_BYTES}-byte limit`);
-      const value = JSON.parse(await readFile(this.path, "utf8"));
-      if ((value?.schemaVersion !== 1 && value?.schemaVersion !== CRON_SCHEMA_VERSION) || !Array.isArray(value.jobs)) {
-        return { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
-      }
-      if (value.jobs.length > CRON_MAX_JOBS) throw new GatewayError(409, `cron state exceeds the ${CRON_MAX_JOBS}-job limit`);
-      return value.jobs.length
-        ? { schemaVersion: CRON_SCHEMA_VERSION, jobs: value.jobs.map((job: any) => normalizeCronJob(job)) }
-        : { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
+      return JSON.parse(await readFile(this.path, "utf8"));
     } catch (error: any) {
       if (error?.code === "ENOENT") return { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
       throw error;
     }
   }
+  async readSource() {
+    const value = await this.readRaw();
+    if ((value?.schemaVersion !== 1 && value?.schemaVersion !== CRON_SCHEMA_VERSION) || !Array.isArray(value.jobs)) {
+      return { schemaVersion: CRON_SCHEMA_VERSION, jobs: [] };
+    }
+    if (value.jobs.length > CRON_MAX_JOBS) throw new GatewayError(409, `cron state exceeds the ${CRON_MAX_JOBS}-job limit`);
+    return { schemaVersion: CRON_SCHEMA_VERSION, jobs: value.jobs };
+  }
+  async read() {
+    const value = await this.readSource();
+    return value.jobs.length
+      ? { schemaVersion: CRON_SCHEMA_VERSION, jobs: value.jobs.map((job: any) => normalizeCronJob(job)) }
+      : value;
+  }
+  async readOperatorSchedules() {
+    return projectOperatorScheduleEnvelopeV1(await this.readRaw());
+  }
   async list({ limit = CRON_MAX_JOBS, offset = 0 }: { limit?: number; offset?: number } = {}) {
-    const jobs = (await this.read()).jobs.sort((left: any, right: any) => String(left.name).localeCompare(String(right.name)));
+    const jobs = (await this.read()).jobs.sort((left: any, right: any) => String(left.name).localeCompare(String(right.name)) || String(left.id).localeCompare(String(right.id)));
     const boundedLimit = Math.min(CRON_MAX_JOBS, Math.max(0, Number.isSafeInteger(Number(limit)) ? Number(limit) : CRON_MAX_JOBS));
     const boundedOffset = Math.max(0, Number.isSafeInteger(Number(offset)) ? Number(offset) : 0);
     return jobs.slice(boundedOffset, boundedOffset + boundedLimit);
@@ -804,6 +836,12 @@ export async function createGatewayServer(options: any = {}) {
     : undefined;
   const contextRecords = config.runtime?.enableProjectContext === true ? new SqliteRecordStore(join(state, "db", "records.sqlite")) : undefined;
   const projectContext = contextRecords ? new ProjectContextService({ records: contextRecords }) : undefined;
+  const operatorAuditPath = join(state, config.auditLog ?? "audit.jsonl");
+  const operatorAuditDatabasePath = join(dirname(operatorAuditPath), "db", `${basename(operatorAuditPath, ".jsonl")}.sqlite`);
+  const operatorReadStore = new SqliteOperatorReadStore({
+    runtimeDatabasePath: join(state, "db", "odinn.sqlite"),
+    auditDatabasePath: operatorAuditDatabasePath,
+  });
   const quotaGate = createQuotaGate(quotas);
   const cronStore = new CronStore(join(state, "cron-jobs.json"));
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
@@ -1143,212 +1181,41 @@ export async function createGatewayServer(options: any = {}) {
     return { approvalId: id, denied: true, ...(pending.runId ? { runId: pending.runId } : {}) };
   };
 
-  const readOperatorFile = async (name: string, fallback: any) => {
-    try {
-      const path = join(state, name);
-      if ((await statPath(path)).size > 4 * 1024 * 1024) return { ...fallback, invalid: true };
-      return JSON.parse(await readFile(path, "utf8"));
-    }
-    catch (error: any) { return error?.code === "ENOENT" ? fallback : { ...fallback, invalid: true }; }
-  };
-
-  const operatorSnapshot = async (surface: any = "http", page = 1, pageSize = 10, query = "", statusFilter = "", pages: Record<string, number> = {}) => {
-    const [jobCounts, auditSummary, cronJobs, auditVerification, browserRecovery, sandboxRecovery, processRecovery] = await Promise.all([
-      supervisor.counts(),
-      typeof auditStore.readSummary === "function" ? auditStore.readSummary() : Promise.resolve({ events: 0, runs: 0, attentionRuns: 0 }),
-      cronStore.list(),
-      typeof auditStore.getIntegrityStatus === "function"
-        ? Promise.resolve(auditStore.getIntegrityStatus())
-        : Promise.resolve({ valid: true, checked: false, events: 0, unsigned: 0, failures: [] }),
-      readOperatorFile("browser-recovery.json", { status: "clear" }),
-      readOperatorFile("sandbox-recovery.json", { pending: [] }),
-      readOperatorFile("process-recovery.json", { pending: [] })
-    ]);
-    const queryText = String(query || "").trim().toLowerCase();
-    const queryStatus = statusFilter && statusFilter !== "all" ? String(statusFilter) : "";
-    const normalizedPageSize = Math.min(50, Math.max(1, Number.isSafeInteger(Number(pageSize)) && Number(pageSize) > 0 ? Number(pageSize) : 10));
-    const requestedPageFor = (section: string) => {
-      const requested = pages[section] ?? page;
-      return Number.isSafeInteger(Number(requested)) && Number(requested) > 0 ? Number(requested) : 1;
-    };
-    const makePage = (total: number, requested: number) => {
-      const safeTotal = Math.max(0, Number(total) || 0);
-      const pageCount = Math.max(1, Math.ceil(safeTotal / normalizedPageSize));
-      const currentPage = Math.min(Math.max(1, requested), pageCount);
-      const offset = (currentPage - 1) * normalizedPageSize;
-      return {
-        page: currentPage,
-        pageSize: normalizedPageSize,
-        pages: pageCount,
-        total: safeTotal,
-        from: safeTotal ? offset + 1 : 0,
-        to: safeTotal ? Math.min(offset + normalizedPageSize, safeTotal) : 0
-      };
-    };
-    const emptyQuery = () => ({ items: [] as any[], total: 0, attention: 0 });
-    const selectPage = async <T>(sectionPage: { page: number; pageSize: number }, categories: Array<{ total: number; fetch: (offset: number, limit: number) => Promise<T[]> }>) => {
-      let skip = (sectionPage.page - 1) * sectionPage.pageSize;
-      let remaining = sectionPage.pageSize;
-      const selected: T[] = [];
-      for (const category of categories) {
-        const total = Math.max(0, Number(category.total) || 0);
-        if (skip >= total) {
-          skip -= total;
-          continue;
-        }
-        const limit = Math.min(remaining, total - skip);
-        if (limit > 0) selected.push(...await category.fetch(skip, limit));
-        remaining -= limit;
-        skip = 0;
-        if (remaining <= 0) break;
-      }
-      return selected;
-    };
-    const matches = (item: any) => (!queryText || [item.id, item.label, item.status, item.summary, item.kind].some((value) => String(value ?? "").toLowerCase().includes(queryText)))
-      && (!statusFilter || statusFilter === "all" || item.status === statusFilter);
-    const filter = (items: any[]) => items.filter(matches);
-    const mapJob = (job: any) => {
-      const task = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task) ? job.payload.task : {};
-      const tool = String(task.tool || "job");
-      const attention = ["failed", "needs-review"].includes(job.status);
-      return {
-        id: job.id,
-        kind: "job",
-        label: tool,
-        status: job.status,
-        summary: attention ? "Execution needs operator attention." : `${job.attempts ?? 0} attempt(s) · ${job.retrySafe ? "retry-safe" : "effectful"}`,
-        updatedAt: job.updatedAt || job.completedAt || job.createdAt,
-        attention,
-        controls: ["queued", "running", "cancelling", "awaiting-approval"].includes(job.status) ? ["cancel-job"] : [],
-        details: {
-          attempts: Number(job.attempts || 0),
-          retrySafe: job.retrySafe === true,
-          ...(job.executionRunId ? { executionRunId: job.executionRunId } : {}),
-          ...(job.envelopeDigest ? { envelopeDigest: job.envelopeDigest } : {}),
-          ...(job.auditCorrelationId ? { auditCorrelationId: job.auditCorrelationId } : {})
-        }
-      };
-    };
-    const mapRun = (run: any) => ({
-      id: String(run.id),
-      kind: "run",
-      label: String(run.tool || "run"),
-      status: String(run.status || "unknown"),
-      summary: String(run.message || "Audited run"),
-      updatedAt: run.lastEventAt || run.completedAt || run.startedAt,
-      attention: ["failed", "blocked", "needs-review"].includes(String(run.status || "")),
-      details: { eventCount: Number(run.eventCount || 0), actor: String(run.actor || "local") }
-    });
-    const [jobQuery, runQuery, workflowQuery, watchQuery] = await Promise.all([
-      supervisor.queryJobs({ limit: 0, offset: 0, query: queryText, status: queryStatus }),
-      typeof (auditStore as any).queryRuns === "function"
-        ? (auditStore as any).queryRuns({ limit: 0, offset: 0, query: queryText, status: queryStatus })
-        : (async () => {
-          const allRuns = typeof (auditStore as any).readRuns === "function" ? await (auditStore as any).readRuns() : [];
-          const filteredRuns = allRuns.filter((run: any) => (!queryStatus || String(run.status || "") === queryStatus) && (!queryText || JSON.stringify(run).toLowerCase().includes(queryText)));
-          return { items: [], total: filteredRuns.length, attention: filteredRuns.filter((run: any) => ["failed", "blocked", "needs-review"].includes(String(run.status || ""))).length, fetch: (offset: number, limit: number) => filteredRuns.slice(offset, offset + limit) };
-        })(),
-      workflowRuntime ? workflowRuntime.queryWorkflows({ limit: 0, offset: 0, query: queryText, status: queryStatus }) : Promise.resolve(emptyQuery()),
-      eventIngress ? Promise.resolve(eventIngress.queryWatches({ limit: 0, offset: 0, query: queryText, status: queryStatus })) : Promise.resolve(emptyQuery())
-    ]);
-    const allCronItems = cronJobs.map((job: any) => ({ id: job.id, kind: "schedule", label: job.name, status: job.lastStatus === "error" ? "needs-review" : job.enabled ? "enabled" : "disabled", summary: job.lastStatus ? `Last run: ${job.lastStatus}` : "Scheduled automation", updatedAt: job.updatedAt, attention: job.lastStatus === "error", details: { nextRunAt: job.nextRunAt ?? null } }));
-    const cronItems = filter(allCronItems);
-    const workPage = makePage(Number(jobQuery.total || 0) + Number(runQuery.total || 0), requestedPageFor("work"));
-    const workItems = await selectPage<any>(workPage, [
-      {
-        total: Number(jobQuery.total || 0),
-        fetch: async (offset, limit) => (await supervisor.queryJobs({ limit, offset, query: queryText, status: queryStatus })).items.map(mapJob)
-      },
-      {
-        total: Number(runQuery.total || 0),
-        fetch: async (offset, limit) => {
-          if (typeof (auditStore as any).queryRuns === "function") return (await (auditStore as any).queryRuns({ limit, offset, query: queryText, status: queryStatus })).items.map(mapRun);
-          if (typeof (runQuery as any).fetch === "function") return (runQuery as any).fetch(offset, limit).map(mapRun);
-          return [];
-        }
-      }
-    ]);
-    const allApprovalItems = approvalStore.list().map((approval: any) => ({
-      id: String(approval.id),
-      kind: "approval",
-      label: String(approval.tool || approval.type || "approval"),
-      status: String(approval.status || "pending"),
-      summary: String(approval.effect?.summary || "Review the bounded effect details before deciding."),
-      updatedAt: approval.createdAt,
-      attention: true,
-      controls: ["approve", "deny-approval"],
-      details: {
-        ...(approval.runId ? { runId: approval.runId } : {}),
-        ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {}),
-        ...(approval.effect ? { effect: approval.effect } : {})
-      }
-    }));
-    const approvals = filter(allApprovalItems);
-    const workflowCounts = workflowRuntime?.counts?.() ?? { total: 0, attention: 0 };
-    const automationPage = makePage(Number(workflowQuery.total || 0) + Number(watchQuery.total || 0) + cronItems.length, requestedPageFor("automation"));
-    const automationItems = await selectPage<any>(automationPage, [
-      {
-        total: Number(workflowQuery.total || 0),
-        fetch: async (offset, limit) => workflowRuntime
-          ? (await workflowRuntime.queryWorkflows({ limit, offset, query: queryText, status: queryStatus })).items.map((run: any) => ({
-            id: String(run.runId), kind: "workflow", label: String(run.definitionDigest || "workflow"), status: String(run.status),
-            summary: "Durable workflow run", updatedAt: run.updatedAt,
-            attention: ["failed", "needs-review", "awaiting-approval"].includes(String(run.status)),
-            controls: ["running", "queued", "awaiting-approval"].includes(String(run.status)) ? ["cancel-workflow"] : ["needs-review"].includes(String(run.status)) ? ["resume-workflow"] : []
-          }))
-          : []
-      },
-      {
-        total: Number(watchQuery.total || 0),
-        fetch: async (offset, limit) => eventIngress
-          ? (await eventIngress.queryWatches({ limit, offset, query: queryText, status: queryStatus })).items.map((watch: any) => ({ id: watch.watchId, kind: "event-watch", label: "Event watch", status: watch.enabled ? "enabled" : "disabled", summary: "Durable event ingress declaration", updatedAt: watch.updatedAt, details: { enabled: watch.enabled === true } }))
-          : []
-      },
-      { total: cronItems.length, fetch: async (offset, limit) => cronItems.slice(offset, offset + limit) }
-    ]);
-    const allRecoveryItems = [
-      { id: "browser-recovery", kind: "recovery", label: "Browser recovery", status: String(browserRecovery.status || "clear"), summary: browserRecovery.status === "clear" ? "No browser action is awaiting resolution." : "Browser action recovery is required.", attention: ["executing", "unknown"].includes(String(browserRecovery.status)), details: { pending: ["executing", "unknown"].includes(String(browserRecovery.status)) } },
-      { id: "sandbox-recovery", kind: "recovery", label: "Sandbox recovery", status: Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length ? "needs-review" : "clear", summary: "Sandbox process recovery state", attention: Array.isArray(sandboxRecovery.pending) && sandboxRecovery.pending.length > 0, details: { pending: Array.isArray(sandboxRecovery.pending) ? sandboxRecovery.pending.length : null } },
-      { id: "process-recovery", kind: "recovery", label: "Process recovery", status: processRecovery.invalid === true ? "needs-review" : Array.isArray(processRecovery.pending) && processRecovery.pending.length ? "needs-review" : "clear", summary: "Durable process recovery state", attention: processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0), details: { pending: Array.isArray(processRecovery.pending) ? processRecovery.pending.length : null } }
-    ];
-    const recoveryItems = filter(allRecoveryItems);
-    const auditItem = {
-      id: "audit-journal", kind: "audit", label: "Audit journal", status: auditVerification.valid === false ? "needs-review" : auditVerification.checked === false ? "unknown" : "verified", summary: auditVerification.valid === false ? "Audit integrity needs attention." : auditVerification.checked === false ? "Audit integrity has not been explicitly verified in this process." : "Hash-chain verification passed.", attention: auditVerification.valid === false || auditVerification.checked === false,
-      details: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0), unsigned: Number(auditVerification.unsigned || 0), failures: Array.isArray(auditVerification.failures) ? auditVerification.failures.length : 0, checked: auditVerification.checked === true }
-    };
-    const runtimeItems = [
-      { id: "gateway", kind: "runtime", label: "Gateway", status: "running", summary: "Authenticated local control plane" },
-      { id: "mcp", kind: "runtime", label: "MCP", status: mcpRuntime ? "enabled" : "disabled", summary: mcpRuntime ? "Governed MCP activation" : "Disabled by default" },
-      { id: "workflows", kind: "runtime", label: "Durable workflows", status: workflowRuntime ? "enabled" : "disabled", summary: workflowRuntime ? "Durable workflow runtime" : "Disabled by default" },
-      { id: "event-ingress", kind: "runtime", label: "Event ingress", status: eventIngress ? "enabled" : "disabled", summary: eventIngress ? "Authenticated event and heartbeat ingress" : "Disabled by default" },
-      { id: "project-context", kind: "runtime", label: "Project context", status: projectContext ? "enabled" : "disabled", summary: projectContext ? "Bounded context retrieval" : "Disabled by default" }
-    ];
-    const surfaces = ["CLI", "TUI", "HTTP JSON", "Web console"].map((label) => ({ id: label.toLowerCase().replace(/\s+/gu, "-"), kind: "surface", label, status: "available", summary: "Uses the shared operator contract" }));
-    const attentionCount = Number(jobCounts.attention || 0)
-      + Number(auditSummary.attentionRuns || 0)
-      + allApprovalItems.filter((item: any) => item.attention).length
-      + Number(workflowCounts.attention || 0)
-      + allRecoveryItems.filter((item: any) => item.attention).length
-      + (auditItem.attention ? 1 : 0);
-    return buildOperatorSnapshot({
-      surface,
+  const operatorSnapshotRead = createOperatorSnapshotReadUseCase({
+    readEnvironment: async () => ({
       identity: { state, workspaceRoot: root, version, commit: await productCommit() },
-      health: { status: attentionCount ? "attention" : "healthy", ok: attentionCount === 0, attention: attentionCount, summary: attentionCount ? `${attentionCount} item(s) need operator attention.` : "All governed surfaces are operating normally." },
-      page,
-      pageSize,
-      pages: pages as any,
-      sections: {
-        runtime: { items: runtimeItems },
-        work: { items: workItems, pagination: workPage, counts: { total: workPage.total, jobs: Number(jobQuery.total || 0), runs: Number(runQuery.total || 0), attention: Number(jobQuery.attention || 0) + Number(runQuery.attention || 0) }, attentionCount: Number(jobQuery.attention || 0) + Number(runQuery.attention || 0) },
-        approvals: { items: approvals, counts: { total: allApprovalItems.length, pending: allApprovalItems.length }, attentionCount: allApprovalItems.filter((item: any) => item.attention).length },
-        automation: { items: automationItems, pagination: automationPage, counts: { total: automationPage.total, workflows: Number(workflowQuery.total || 0), watches: Number(watchQuery.total || 0), schedules: cronItems.length, attention: Number(workflowQuery.attention || 0) + Number(watchQuery.attention || 0) + cronItems.filter((item: any) => item.attention).length }, attentionCount: Number(workflowQuery.attention || 0) + Number(watchQuery.attention || 0) + cronItems.filter((item: any) => item.attention).length },
-        context: { items: [{ id: "project-context", kind: "context", label: "Project context", status: projectContext ? "enabled" : "disabled", summary: projectContext ? "Context retrieval is available through the governed context surface." : "Project context is disabled by default." }] },
-        recovery: { items: recoveryItems, attentionCount: allRecoveryItems.filter((item: any) => item.attention).length },
-        audit: { items: [auditItem], counts: { events: Number(auditSummary.events || 0), runs: Number(auditSummary.runs || 0) } },
-        surfaces: { items: surfaces }
+      runtime: {
+        gateway: "running",
+        mcp: Boolean(mcpRuntime),
+        workflows: Boolean(workflowRuntime),
+        eventIngress: Boolean(eventIngress),
+        projectContext: Boolean(projectContext)
       }
-    });
-  };
+    }),
+    queryJobs: async (query) => operatorReadStore.queryJobs(query),
+    queryRuns: async (query) => operatorReadStore.queryRuns(query),
+    readLatestAttempts: async (runIds) => runtime.ledger.readLatestExecutionAttempts(runIds),
+    readApprovals: async () => readApprovalSummaries(join(state, "approvals.json")),
+    queryWorkflows: async (query) => operatorReadStore.queryWorkflows(query),
+    queryEventWatches: async (query) => operatorReadStore.queryEventWatches(query),
+    readSchedules: async () => cronStore.readOperatorSchedules(),
+    readRecovery: async () => inspectOperatorRecovery(state, {
+      sandboxQuarantined: sandboxRecoveryStartupError,
+      processQuarantined: processRecoveryStartupError,
+    }),
+    readAudit: async () => {
+      const integrity = auditStore.getIntegrityStatus();
+      return {
+        summary: await auditStore.readSummary(),
+        integrity: {
+          valid: integrity.valid,
+          checked: integrity.checked,
+          unsigned: integrity.unsigned,
+          failureCount: integrity.failures.length,
+        },
+      };
+    }
+  });
 
   const server: any = createServer(async (request: any, response: any) => {
     const requestId = String(request.headers["x-odinn-request-id"] || randomUUID());
@@ -1416,43 +1283,94 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "GET" && (url.pathname === "/operator" || url.pathname === "/operator/snapshot")) {
         const requestedSurface = String(url.searchParams.get("surface") || "http");
-        const surface = ["cli", "tui", "http", "console"].includes(requestedSurface) ? requestedSurface : "http";
-        const page = Number.parseInt(url.searchParams.get("page") || "1", 10) || 1;
-        const pageSize = Number.parseInt(url.searchParams.get("pageSize") || "10", 10) || 10;
-        const pageNames = ["runtime", "work", "approvals", "automation", "context", "recovery", "audit", "surfaces"];
+        const surface = gatewayOperatorSurface(requestedSurface);
+        const pageNames = ["runtime", "work", "approvals", "automation", "context", "recovery", "audit", "surfaces"] as const;
+        const numericParameter = (name: string) => {
+          if (!url.searchParams.has(name)) return undefined;
+          const value = Number(url.searchParams.get(name));
+          return Number.isFinite(value) ? value : undefined;
+        };
         const pages = Object.fromEntries(pageNames
-          .map((name) => [name, Number.parseInt(url.searchParams.get(`${name}Page`) || "", 10)])
-          .filter(([, value]) => Number.isSafeInteger(value) && Number(value) > 0));
-        const snapshot = await operatorSnapshot(surface, page, pageSize, url.searchParams.get("q") || "", url.searchParams.get("status") || "", pages);
-        return json(response, 200, { ok: true, ...snapshot });
+          .map((name) => [name, numericParameter(`${name}Page`)] as const)
+          .filter((entry): entry is readonly [typeof pageNames[number], number] => entry[1] !== undefined));
+        const page = numericParameter("page");
+        const pageSize = numericParameter("pageSize");
+        const sourcePath = url.pathname === "/operator" ? "/operator" : "/operator/snapshot";
+        let result;
+        try {
+          result = await operatorSnapshotRead.execute(createGatewayOperatorSnapshotReadRequest({
+            applicationRequestId: randomUUID(),
+            hostedUserId: trustedHostedUserId,
+            authentication,
+            sourcePath,
+            input: {
+              surface,
+              ...(page === undefined ? {} : { page }),
+              ...(pageSize === undefined ? {} : { pageSize }),
+              ...(url.searchParams.has("q") ? { query: url.searchParams.get("q") ?? "" } : {}),
+              ...(url.searchParams.has("status") ? { status: url.searchParams.get("status") ?? "" } : {}),
+              ...(Object.keys(pages).length ? { pages } : {})
+            }
+          }));
+        } catch (error) {
+          const failure = gatewayOperatorSnapshotFailure(error, requestId);
+          if (!failure) throw error;
+          response.setHeader("retry-after", failure.retryAfter);
+          return json(response, failure.status, failure.body);
+        }
+        return json(response, 200, validateOperatorSnapshotResponseV1({ ok: true, ...result.output }));
       }
       if (request.method === "POST" && url.pathname === "/operator/actions") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const action = String(body.action || "").trim();
         if (!operatorActionNames().includes(action as any)) throw new GatewayError(400, "operator action is unsupported");
         if (action !== "verify-audit" && body.confirm !== true) throw new GatewayError(400, "operator action requires confirm=true");
-        const targetId = String(body.targetId || "").trim();
-        if (action !== "verify-audit" && (!targetId || targetId.length > 512)) throw new GatewayError(400, "operator action targetId is required");
+        let targetId: string | undefined;
+        if (action !== "verify-audit") {
+          try { targetId = validateOperatorIdentifierV1(body.targetId, "operator action targetId"); }
+          catch { throw new GatewayError(400, "operator action targetId is invalid"); }
+        }
         let result: any;
+        const requiredTargetId = () => {
+          if (!targetId) throw new GatewayError(400, "operator action targetId is required");
+          return targetId;
+        };
         if (action === "cancel-job") {
           for (const approval of approvalStore.list()) if (approval.runId === targetId && approval.id) approvalStore.revoke(approval.id);
-          result = await supervisor.cancel(targetId);
+          result = await supervisor.cancel(requiredTargetId());
         } else if (action === "approve") {
-          result = await approveGatewayApproval(targetId);
+          result = await approveGatewayApproval(requiredTargetId());
         } else if (action === "deny-approval") {
-          result = await denyGatewayApproval(targetId);
+          result = await denyGatewayApproval(requiredTargetId());
         } else if (action === "cancel-workflow") {
           if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled");
-          result = await workflowRuntime.cancel(targetId);
-        } else if (action === "resume-workflow") {
-          if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled");
-          result = await workflowRuntime.resume(targetId);
+          result = await workflowRuntime.cancel(requiredTargetId());
         } else {
           result = await auditStore.verifyIntegrity({ allowUnsigned: true });
         }
-        const surface = String(body.surface || "http");
-        const snapshot = await operatorSnapshot(["cli", "tui", "http", "console"].includes(surface) ? surface : "http");
-        return json(response, 200, { ok: true, action, ...(targetId ? { targetId } : {}), result, snapshot });
+        const requestedSurface = String(body.surface || "http");
+        const surface = gatewayOperatorSurface(requestedSurface);
+        try {
+          const snapshotResult = await operatorSnapshotRead.execute(createGatewayOperatorSnapshotReadRequest({
+            applicationRequestId: randomUUID(),
+            hostedUserId: trustedHostedUserId,
+            authentication,
+            sourcePath: "/operator/actions",
+            input: { surface }
+          }));
+          return json(response, 200, { ok: true, action, ...(targetId ? { targetId } : {}), result, snapshot: snapshotResult.output });
+        } catch (error) {
+          const failure = gatewayOperatorSnapshotFailure(error, requestId);
+          return json(response, 200, {
+            ok: true,
+            action,
+            ...(targetId ? { targetId } : {}),
+            result,
+            snapshotUnavailable: failure
+              ? { code: OPERATOR_SNAPSHOT_CHANGED_CODE, retryable: true }
+              : { code: "OPERATOR_SNAPSHOT_UNAVAILABLE", retryable: false },
+          });
+        }
       }
       if (request.method === "GET" && url.pathname === "/channels") {
         return json(response, 200, { ok: true, channels: channelSupervisor.status() });
@@ -2387,6 +2305,7 @@ export async function createGatewayServer(options: any = {}) {
         try { governedRegistry.close(); } catch (error) { registryError ??= error; }
         try { auditStore.close?.(); } catch (error) { registryError ??= error; }
         try { contextRecords?.close?.(); } catch (error) { registryError ??= error; }
+        try { operatorReadStore.close(); } catch (error) { registryError ??= error; }
         close((serverError: unknown) => callback?.(serverError ?? registryError));
       })
       .catch((error: any) => callback?.(error));
@@ -2466,6 +2385,40 @@ export function createGatewayDiagnosticsReadRequest({
       cancellationControlReference: `http:request:${applicationRequestId}`
     },
     operation: { kind: "query" as const, id: "diagnostics.read" as const }
+  };
+}
+
+export function createGatewayOperatorSnapshotReadRequest({
+  applicationRequestId,
+  hostedUserId,
+  authentication,
+  sourcePath,
+  input
+}: {
+  applicationRequestId: string;
+  hostedUserId?: string;
+  authentication: string;
+  sourcePath: "/operator" | "/operator/snapshot" | "/operator/actions";
+  input: OperatorSnapshotReadInputV1;
+}) {
+  return {
+    version: APPLICATION_CONTRACT_VERSION,
+    kind: "operator-snapshot-read-request" as const,
+    requestId: applicationRequestId,
+    context: {
+      principal: {
+        principalId: hostedUserId ? `host-user:${normalizeHostedUserId(hostedUserId)}` : "local-gateway-user",
+        actorId: "gateway",
+        kind: "host-user" as const,
+        authenticationReference: authentication === "disabled" ? "gateway:auth-disabled" : `gateway:${authentication}`
+      },
+      scope: { tenantId: hostedUserId ? `tenant:${normalizeHostedUserId(hostedUserId)}` : "local" },
+      sourceReference: `http:${sourcePath === "/operator/actions" ? "POST" : "GET"}:${sourcePath}`,
+      correlationId: applicationRequestId,
+      cancellationControlReference: `http:request:${applicationRequestId}`
+    },
+    operation: { kind: "query" as const, id: "operator.snapshot.read" as const },
+    input
   };
 }
 

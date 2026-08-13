@@ -2662,9 +2662,10 @@ export function renderConsoleHtml(version = "development") {
 
     function renderOperatorItem(item) {
       const controls = (item.controls || []).map((action) => '<button class="secondary" data-operator-action="' + escapeHtml(action) + '" data-operator-target="' + escapeHtml(item.id) + '" type="button">' + escapeHtml(friendlyStatus(action)) + '</button>').join("");
-      const effect = item.details?.effect;
-      const effectView = effect?.summary ? '<div class="muted">Effect: ' + escapeHtml(effect.summary) + '</div>' : "";
-      return '<div class="item"><div class="item-line"><strong>' + escapeHtml(item.label || item.kind) + '</strong><span class="chip ' + (item.attention ? "danger" : item.status === "enabled" || item.status === "running" || item.status === "verified" || item.status === "available" ? "ok" : "warn") + '">' + escapeHtml(friendlyStatus(item.status)) + '</span></div><div>' + escapeHtml(item.summary || "") + '</div>' + effectView + '<div class="muted">' + escapeHtml(item.id || "") + (item.updatedAt ? " · " + escapeHtml(relativeTime(item.updatedAt)) : "") + '</div>' + (controls ? '<div class="row">' + controls + '</div>' : "") + '</div>';
+      const effectView = item.kind === "approval" && item.details.effect?.summary ? '<div class="muted">Effect: ' + escapeHtml(item.details.effect.summary) + '</div>' : "";
+      const latestAttempt = item.kind === "job" || item.kind === "run" ? item.details.latestAttempt : undefined;
+      const attemptView = latestAttempt ? '<div class="muted">Latest attempt #' + escapeHtml(latestAttempt.attemptNumber) + ': ' + escapeHtml(friendlyStatus(latestAttempt.state)) + (latestAttempt.errorCode ? ' · ' + escapeHtml(latestAttempt.errorCode) : "") + '</div>' : "";
+      return '<div class="item"><div class="item-line"><strong>' + escapeHtml(item.label || item.kind) + '</strong><span class="chip ' + (item.attention ? "danger" : item.status === "enabled" || item.status === "running" || item.status === "verified" || item.status === "available" ? "ok" : "warn") + '">' + escapeHtml(friendlyStatus(item.status)) + '</span></div><div>' + escapeHtml(item.summary || "") + '</div>' + effectView + attemptView + '<div class="muted">' + escapeHtml(item.id || "") + (item.updatedAt ? " · " + escapeHtml(relativeTime(item.updatedAt)) : "") + '</div>' + (controls ? '<div class="row">' + controls + '</div>' : "") + '</div>';
     }
 
     async function refreshOperator() {
@@ -2672,36 +2673,41 @@ export function renderConsoleHtml(version = "development") {
       const params = new URLSearchParams({ surface: "console", pageSize: "25", workPage: String(state.operatorPages.work || 1) });
       const snapshot = await api("/operator/snapshot?" + params.toString());
       state.operatorSnapshot = snapshot;
-      const section = (name) => snapshot.sections?.[name] || { items: [], counts: {} };
+      const section = (name) => snapshot.sections[name];
       const work = section("work");
       const attention = [...work.items, ...section("approvals").items, ...section("automation").items, ...section("recovery").items, ...section("audit").items].filter((item) => item.attention || ["failed", "needs-review", "unknown"].includes(item.status));
-      $("operator-health").textContent = friendlyStatus(snapshot.health?.status || "unknown");
-      $("operator-health").className = "chip " + (snapshot.health?.status === "healthy" ? "ok" : "danger");
-      $("operator-attention").textContent = String(snapshot.health?.attention || 0);
-      $("operator-work-count").textContent = String(work.counts?.total || work.items.length || 0);
-      $("operator-approval-count").textContent = String(section("approvals").counts?.pending || section("approvals").items.length || 0);
-      $("operator-audit-status").textContent = friendlyStatus(section("audit").items[0]?.status || "unknown");
+      $("operator-health").textContent = friendlyStatus(snapshot.health.status);
+      $("operator-health").className = "chip " + (snapshot.health.status === "healthy" ? "ok" : "danger");
+      $("operator-attention").textContent = String(snapshot.health.attention);
+      $("operator-work-count").textContent = String(work.counts.total);
+      $("operator-approval-count").textContent = String(section("approvals").counts.pending);
+      $("operator-audit-status").textContent = friendlyStatus(section("audit").items[0].status);
       $("operator-generated").textContent = snapshot.generatedAt ? relativeTime(snapshot.generatedAt) : "—";
       $("operator-runtime").innerHTML = section("runtime").items.map(renderOperatorItem).join("") || '<div class="empty-state"><strong>No runtime surfaces</strong><span>Nothing is registered.</span></div>';
       $("operator-attention-list").innerHTML = attention.map(renderOperatorItem).join("") || '<div class="empty-state"><strong>Nothing needs attention</strong><span>Governed work is proceeding normally.</span></div>';
       $("operator-work").innerHTML = work.items.map(renderOperatorItem).join("") || '<div class="empty-state"><strong>No recent work</strong><span>There is no durable work to show.</span></div>';
-      $("operator-work-page").textContent = (work.pagination?.total || 0) + " items · page " + (work.pagination?.page || 1) + " of " + (work.pagination?.pages || 1);
-      state.operatorPages.work = work.pagination?.page || 1;
+      $("operator-work-page").textContent = work.pagination.total + " items · page " + work.pagination.page + " of " + work.pagination.pages;
+      state.operatorPages.work = work.pagination.page;
       $("operator-work-prev").disabled = state.operatorPages.work <= 1;
-      $("operator-work-next").disabled = state.operatorPages.work >= (work.pagination?.pages || 1);
+      $("operator-work-next").disabled = state.operatorPages.work >= work.pagination.pages;
       $("operator-payload").textContent = JSON.stringify(snapshot, null, 2);
-      $("nav-operator-attention").textContent = String(snapshot.health?.attention || 0);
-      $("nav-operator-attention").className = "badge " + (snapshot.health?.attention ? "danger" : "ok");
+      $("nav-operator-attention").textContent = String(snapshot.health.attention);
+      $("nav-operator-attention").className = "badge " + (snapshot.health.attention ? "danger" : "ok");
       return snapshot;
     }
 
     async function runOperatorAction(action, targetId) {
-      const item = Object.values(state.operatorSnapshot?.sections || {}).flatMap((section) => section?.items || []).find((candidate) => candidate.id === targetId);
-      const effect = item?.details?.effect;
-      const effectSummary = effect?.summary || item?.summary || "the selected operator item";
-      const labels = { "cancel-job": "Cancel this job?", "deny-approval": "Deny this pending approval?", "cancel-workflow": "Cancel this workflow?", "resume-workflow": "Resume this workflow?" };
+      if (!state.operatorSnapshot) throw new Error("Refresh the operator snapshot before applying an action.");
+      const matchingItems = Object.values(state.operatorSnapshot.sections)
+        .flatMap((section) => section.items)
+        .filter((candidate) => candidate.id === targetId && candidate.controls?.includes(action));
+      if (matchingItems.length !== 1) throw new Error("The selected operator action target is no longer unique in the current snapshot.");
+      const item = matchingItems[0];
+      const effect = item.kind === "approval" ? item.details.effect : undefined;
+      const effectSummary = effect?.summary || item.summary || "the selected operator item";
+      const labels = { "cancel-job": "Cancel this job?", "deny-approval": "Deny this pending approval?", "cancel-workflow": "Cancel this workflow?" };
       if (action === "approve") {
-        if (!window.confirm("Approve this effect once?\\n\\n" + effectSummary + "\\n\\nCapability: " + String(effect?.capability || item?.label || "unknown") + ".")) return;
+        if (!window.confirm("Approve this effect once?\\n\\n" + effectSummary + "\\n\\nCapability: " + String(effect?.capability || item.label || "unknown") + ".")) return;
         if (effect?.reversible !== "reversible" || effect?.idempotency !== "idempotent") {
           if (window.prompt("This effect is irreversible or its outcome is uncertain. Type APPROVE to continue.") !== "APPROVE") return;
         }

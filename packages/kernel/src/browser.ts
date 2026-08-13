@@ -8,10 +8,13 @@ import { dirname, join, resolve } from "node:path";
 import { chromium } from "playwright-core";
 import type { ApprovalStore } from "./approvals.ts";
 import { assertPublicWebUrl, browserSecurityFingerprint, dnsLookupAll, pinnedAddressLookup, validateBrowserNetworkUrl, WEB_TIMEOUT_MS } from "./web.ts";
+import { readRecoveryJournalJson } from "./recovery-journal-file.ts";
 
 type NodeError = Error & { code?: string };
 
 const browserManagers = new Map<string, BrowserManager>();
+const MAX_BROWSER_RECOVERY_BYTES = 512 * 1024;
+const BROWSER_RECOVERY_STATUSES = new Set(["clear", "executing", "unknown", "completed", "resolved"]);
 
 async function getBrowserManager(stateDir: any): Promise<BrowserManager> {
   const key = resolve(stateDir);
@@ -261,15 +264,7 @@ class BrowserManager {
   }
 
   async recovery() {
-    try {
-      const value = JSON.parse(await readFile(this.recoveryPath, "utf8"));
-      if (value?.schemaVersion !== 1) throw new Error("invalid browser recovery journal");
-      if (value.status === "executing") value.status = "unknown";
-      return value;
-    } catch (error) {
-      if ((error as NodeError | undefined)?.code === "ENOENT") return { schemaVersion: 1, status: "clear" };
-      throw error;
-    }
+    return readBrowserRecoveryJournal(this.recoveryPath);
   }
 
   async writeRecovery(value: any) {
@@ -279,6 +274,35 @@ class BrowserManager {
     await rename(temporary, this.recoveryPath);
     await chmod(this.recoveryPath, 0o600);
   }
+}
+
+export async function readBrowserRecoveryJournal(path: string): Promise<Record<string, unknown>> {
+  const source = await readRecoveryJournalJson(path, MAX_BROWSER_RECOVERY_BYTES);
+  if (source === undefined) return Object.freeze({ schemaVersion: 1, status: "clear" });
+  const value = validateBrowserRecoveryJournal(source);
+  return Object.freeze({ ...value, ...(value.status === "executing" ? { status: "unknown" } : {}) });
+}
+
+export function validateBrowserRecoveryJournal(input: unknown): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input) || Object.getPrototypeOf(input) !== Object.prototype) {
+    throw new Error("invalid browser recovery journal");
+  }
+  const value = input as Record<string, unknown>;
+  const allowed = new Set([
+    "schemaVersion", "id", "status", "tool", "tabId", "expectedUrl", "beforeSnapshotId", "startedAt", "input",
+    "failedAt", "error", "completedAt", "afterUrl", "afterSnapshotId", "outcome", "note", "resolvedAt",
+  ]);
+  if (value.schemaVersion !== 1 || typeof value.status !== "string" || !BROWSER_RECOVERY_STATUSES.has(value.status)
+    || Object.keys(value).some((key) => !allowed.has(key))) throw new Error("invalid browser recovery journal");
+  if (value.status !== "clear" && (typeof value.id !== "string" || !value.id || Buffer.byteLength(value.id, "utf8") > 512)) {
+    throw new Error("invalid browser recovery journal");
+  }
+  for (const key of ["tool", "tabId", "expectedUrl", "beforeSnapshotId", "startedAt", "failedAt", "error", "completedAt", "afterUrl", "afterSnapshotId", "outcome", "note", "resolvedAt"] as const) {
+    if (value[key] !== undefined && (typeof value[key] !== "string" || Buffer.byteLength(value[key], "utf8") > 8_192)) {
+      throw new Error("invalid browser recovery journal");
+    }
+  }
+  return value;
 }
 
 function isPrivateBrowserUrl(value: any) {
@@ -367,7 +391,7 @@ export async function browserAction(stateDir: any, approvalStore: ApprovalStore,
   }
   const manager = await getBrowserManager(stateDir);
   const unresolved = await manager.recovery();
-  if (["executing", "unknown"].includes(unresolved.status)) {
+  if (unresolved.status === "executing" || unresolved.status === "unknown") {
     const error = new Error(`browser mutation ${unresolved.id} has an uncertain outcome; inspect the current page and resolve recovery before another mutation`) as NodeError;
     error.code = "BROWSER_RECOVERY_REQUIRED";
     throw error;
@@ -431,7 +455,7 @@ export async function browserRecoveryStatus(stateDir: any) {
 export async function browserRecoveryResolve(stateDir: any, input: any = {}) {
   const manager = await getBrowserManager(stateDir);
   const current = await manager.recovery();
-  if (!["executing", "unknown"].includes(current.status)) throw new Error("no uncertain browser mutation requires resolution");
+  if (current.status !== "executing" && current.status !== "unknown") throw new Error("no uncertain browser mutation requires resolution");
   const outcome = cleanRequired(input.outcome, "browser.recovery.resolve requires outcome");
   if (!["completed", "not-applied", "manual-recovery"].includes(outcome)) throw new Error("browser recovery outcome must be completed, not-applied, or manual-recovery");
   const resolved = { ...current, status: "resolved", outcome, note: cleanString(input.note, ""), resolvedAt: new Date().toISOString() };

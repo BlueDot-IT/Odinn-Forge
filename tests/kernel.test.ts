@@ -660,7 +660,7 @@ test("browser recovery journal turns interrupted mutations into explicit operato
   const { root, auditStore } = await fixture();
   const stateDir = join(root, ".odinn");
   await mkdir(stateDir, { recursive: true });
-  await writeFile(join(stateDir, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, id: "browser_tx_interrupted", status: "executing", tool: "browser.click", tabId: "tab_lost" })}\n`);
+  await writeFile(join(stateDir, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, id: "browser_tx_interrupted", status: "executing", tool: "browser.click", tabId: "tab_lost" })}\n`, { mode: 0o600 });
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir });
   const status = await runTask({ task: { id: "browser-recovery-status", tool: "browser.recovery.status", input: {}, actor: "test" }, auditStore, registry });
   assert.equal(status.output.recovery.status, "unknown");

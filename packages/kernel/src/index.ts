@@ -58,6 +58,8 @@ export { SANDBOX_PROCESS_PROFILE, SandboxProcessRefusalError, compileProcessProf
 export type { SandboxProcessBackendResolver, SandboxProcessBundleMaterializer, SandboxProcessExecutionContext, SandboxProcessExecutorOptions, SandboxProcessInput, SandboxProcessResult } from "./sandbox-process.ts";
 export { SandboxRecoveryCoordinator, SandboxRecoveryError, SandboxRecoverySession } from "./sandbox-recovery.ts";
 export type { SandboxRecoveryAdapter, SandboxRecoveryBackend, SandboxRecoveryIdentity, SandboxRecoveryPhase, SandboxRecoveryRecord } from "./sandbox-recovery.ts";
+export { inspectOperatorRecovery } from "./recovery-inspection.ts";
+export type { OperatorRecoveryInspection } from "./recovery-inspection.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
 export { CheckpointCoordinator };
@@ -77,8 +79,8 @@ export { appendSessionMessage, assignSessionProject, createGoal, createProject, 
 export type { GoalCommandInput, GoalView, ProjectCommandInput, ProjectView, SessionCommandInput, SessionView, WorkspaceRecord, WorkspaceRecordStore } from "./workspace-records.ts";
 export { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, listMemoryCandidates, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
 export type { MemoryCommandInput, MemoryRecordStore } from "./memory.ts";
-export { createApprovalStore } from "./approvals.ts";
-export type { ApprovalAction, ApprovalEffect, ApprovalStore, ApprovalStoreListOptions, ApprovalStoreOperationOptions } from "./approvals.ts";
+export { createApprovalStore, readApprovalSummaries } from "./approvals.ts";
+export type { ApprovalAction, ApprovalEffect, ApprovalReadSummary, ApprovalStore, ApprovalStoreListOptions, ApprovalStoreOperationOptions } from "./approvals.ts";
 export { SkillLifecycleError, SkillLifecycleService } from "./skill-lifecycle.ts";
 export type { SkillLifecycleContext, SkillLifecycleTransition } from "./skill-lifecycle.ts";
 export { ProgressiveSkillDisclosure, SkillDisclosureError } from "./skill-disclosure.ts";
@@ -87,7 +89,7 @@ export { createGovernedMcpRuntime, GovernedMcpRuntime, normalizeMcpConfiguration
 export type { GovernedMcpRuntimeOptions, McpRuntimeContext, McpRuntimeStatus, McpServerConfig } from "./mcp-runtime.ts";
 export { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
 export { SqliteRecordStore } from "@odinn/store-sqlite";
-export { SqliteWorkflowStore } from "@odinn/store-sqlite";
+export { SqliteOperatorReadStore, SqliteWorkflowStore } from "@odinn/store-sqlite";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
 export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";
