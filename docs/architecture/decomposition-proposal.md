@@ -61,6 +61,10 @@ with these concepts:
 - `ExecutionResult` and `ExecutionReceipt`: output evidence, terminal status,
   authorization and audit references, correlation, and uncertainty/approval
   state.
+- `StatusSnapshotV1`, `DiagnosticsReportV1`, and `SessionPageV1`: explicit,
+  versioned read models with allowlisted fields, boundary validation, and
+  redaction checks. CLI and gateway presenters no longer receive arbitrary
+  kernel objects for the migrated read paths.
 - `ChannelPort`: delivery capability that accepts an outbound envelope; it must
   not expose channel SDK objects to the kernel.
 
@@ -131,8 +135,8 @@ a time while preserving the current kernel exports as a compatibility facade.
    types; both transports now map `status.read`, `diagnostics.read`, and
    `session.list` with authenticated server-side principal and scope.
 3. **In progress:** move read-only use cases through the boundary. Status,
-   diagnostics, and session listing are complete; the remaining inspection
-   surfaces are pending.
+   diagnostics, and session listing now have explicit V1 output contracts; the
+   remaining inspection surfaces are pending.
 4. Move model execution and approval-bearing task execution with identical
    audit and failure semantics.
 5. **In progress:** migrate channel adapters to the same inbound/outbound

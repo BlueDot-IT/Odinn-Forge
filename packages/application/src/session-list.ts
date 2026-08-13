@@ -1,9 +1,10 @@
 import type { ApplicationInvocationOptions } from "./ports.ts";
 import {
   APPLICATION_CONTRACT_VERSION,
-  type ExecutionContextV1,
-  type JsonObject
+  type ExecutionContextV1
 } from "./contracts.ts";
+import type { SessionPageV1 } from "./read-output-contracts.ts";
+import { validateSessionPageV1 } from "./read-output-contracts.ts";
 import { validateExecutionRequestV1 } from "./validation.ts";
 
 export const SESSION_LIST_OPERATION_ID = "session.list" as const;
@@ -27,7 +28,7 @@ export interface SessionListResultV1 {
   readonly kind: "session-list-result";
   readonly requestId: string;
   readonly correlationId: string;
-  readonly output: JsonObject;
+  readonly output: SessionPageV1;
 }
 
 export interface SessionListPort {
@@ -35,7 +36,7 @@ export interface SessionListPort {
     input: SessionListInputV1,
     context: ExecutionContextV1,
     options?: ApplicationInvocationOptions
-  ): Promise<unknown>;
+  ): Promise<SessionPageV1>;
 }
 
 export interface SessionListUseCase {
@@ -52,7 +53,7 @@ export function createSessionListUseCase(port: SessionListPort): SessionListUseC
     async execute(request: SessionListRequestV1, options: ApplicationInvocationOptions = {}) {
       const validated = validateSessionListRequestV1(request);
       throwIfCancelled(options.signal);
-      const output = normalizeSessionListOutput(await port.readSessions(validated.input, validated.context, options));
+      const output = validateSessionPageV1(await port.readSessions(validated.input, validated.context, options));
       throwIfCancelled(options.signal);
       return Object.freeze({
         version: APPLICATION_CONTRACT_VERSION,
@@ -102,26 +103,6 @@ function normalizeSessionListInput(value: unknown): SessionListInputV1 {
   }
   const projectId = typeof input.projectId === "string" ? input.projectId.trim() : "";
   return Object.freeze({ limit, ...(projectId ? { projectId } : {}) });
-}
-
-function normalizeSessionListOutput(value: unknown): JsonObject {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) throw new Error("session list output must be a JSON object");
-  const normalized = JSON.parse(serialized);
-  if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) {
-    throw new Error("session list output must be a JSON object");
-  }
-  return freezeJson(normalized) as JsonObject;
-}
-
-function freezeJson(value: unknown): unknown {
-  if (!value || typeof value !== "object") return value;
-  if (Array.isArray(value)) {
-    for (const item of value) freezeJson(item);
-  } else {
-    for (const item of Object.values(value)) freezeJson(item);
-  }
-  return Object.freeze(value);
 }
 
 function throwIfCancelled(signal: AbortSignal | undefined): void {

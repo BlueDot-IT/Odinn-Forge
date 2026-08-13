@@ -1,0 +1,300 @@
+{
+  "statusCli": {
+    "ok": true,
+    "state": "/state",
+    "workspaceRoot": "/workspace",
+    "auditLog": "audit.jsonl",
+    "tools": ["text.echo"],
+    "toolDetails": [
+      {
+        "name": "text.echo",
+        "capabilities": ["workspace.inspect"],
+        "description": "Return provided text."
+      }
+    ],
+    "allowedTools": ["text.echo"],
+    "allowedCapabilities": ["workspace.inspect"],
+    "capabilityRegistryVersion": 1,
+    "capabilityMigration": {
+      "registryVersion": 1,
+      "required": false,
+      "legacyCapabilities": [],
+      "entries": [],
+      "automaticWidening": false
+    },
+    "policy": {
+      "deniedTools": [],
+      "capabilityRegistryVersion": 1,
+      "allowedCapabilities": ["workspace.inspect"],
+      "scopedCapabilities": [],
+      "capabilityMigration": {
+        "registryVersion": 1,
+        "required": false,
+        "legacyCapabilities": [],
+        "entries": [],
+        "automaticWidening": false
+      },
+      "maxInputBytes": 16384,
+      "security": {
+        "web": {
+          "enabled": true,
+          "allowPrivateNetwork": false,
+          "allowedDomains": [],
+          "blockedDomains": []
+        },
+        "browser": {
+          "enabled": true,
+          "allowPrivateNetwork": false,
+          "allowedDomains": [],
+          "blockedDomains": [],
+          "requireApproval": true,
+          "allowDownloads": false,
+          "allowUploads": false
+        },
+        "workspace": {
+          "deniedPatterns": [".env"],
+          "ignoreFiles": [".gitignore"]
+        }
+      },
+      "invariants": []
+    },
+    "security": {
+      "web": {
+        "enabled": true,
+        "allowPrivateNetwork": false,
+        "allowedDomains": [],
+        "blockedDomains": []
+      },
+      "browser": {
+        "enabled": true,
+        "allowPrivateNetwork": false,
+        "allowedDomains": [],
+        "blockedDomains": [],
+        "requireApproval": true,
+        "allowDownloads": false,
+        "allowUploads": false
+      },
+      "workspace": {
+        "deniedPatterns": [".env"],
+        "ignoreFiles": [".gitignore"]
+      }
+    },
+    "experimental": {
+      "flags": {
+        "capabilities": false,
+        "capsules": false,
+        "counterfactual": false
+      },
+      "warning": "optional plugin modules disabled"
+    },
+    "defaultModel": "",
+    "models": [],
+    "providers": [
+      {
+        "name": "fixture",
+        "displayName": "Fixture Provider",
+        "supportTier": "custom",
+        "locallyTested": false,
+        "genericCompatibilityMode": true,
+        "modelAvailability": "provider-dependent",
+        "type": "openai-compatible",
+        "baseUrl": "https://api.example.test/v1",
+        "authMode": "api-key",
+        "apiKeyEnv": "ODINN_FIXTURE_API_KEY",
+        "models": ["fixture-model"],
+        "configured": false
+      }
+    ],
+    "channels": []
+  },
+  "statusGateway": {
+    "ok": true,
+    "version": "1.1.0-rc.1",
+    "state": "/state",
+    "workspaceRoot": "/workspace",
+    "tools": ["text.echo"],
+    "toolDetails": [
+      {
+        "name": "text.echo",
+        "capability": "workspace.inspect",
+        "capabilities": ["workspace.inspect"],
+        "description": "Return provided text."
+      }
+    ],
+    "capabilityRegistryVersion": 1,
+    "capabilityRegistry": [
+      {
+        "id": "workspace.inspect",
+        "description": "Inspect bounded workspace state."
+      }
+    ],
+    "capabilityMigration": {
+      "registryVersion": 1,
+      "required": false,
+      "legacyCapabilities": [],
+      "entries": [],
+      "automaticWidening": false
+    },
+    "allowedCapabilities": ["workspace.inspect"],
+    "allowedTools": ["text.echo"],
+    "defaultModel": "",
+    "models": [],
+    "providers": [],
+    "coreAdvanced": ["proof", "sentinel", "rewind", "darwin"],
+    "pluginModules": [
+      {
+        "id": "capabilities",
+        "displayName": "Capability Tokens",
+        "configKey": "experimental.capabilities",
+        "enabled": false
+      }
+    ],
+    "experimental": {
+      "capabilities": false,
+      "capsules": false,
+      "counterfactual": false
+    },
+    "runtimeSurfaces": {
+      "durableWorkflows": { "enabled": false },
+      "eventIngress": { "enabled": false },
+      "projectContext": { "enabled": false }
+    },
+    "security": {
+      "web": {
+        "enabled": true,
+        "allowPrivateNetwork": false,
+        "allowedDomains": [],
+        "blockedDomains": []
+      },
+      "browser": {
+        "enabled": true,
+        "allowPrivateNetwork": false,
+        "allowedDomains": [],
+        "blockedDomains": [],
+        "requireApproval": true,
+        "allowDownloads": false,
+        "allowUploads": false
+      },
+      "workspace": {
+        "deniedPatterns": [".env"],
+        "ignoreFiles": [".gitignore"]
+      }
+    },
+    "selfImprovement": {
+      "enabled": true,
+      "mode": "propose",
+      "intervalMs": 300000,
+      "maxChangesPerCycle": 1,
+      "rollbackOnFailure": true,
+      "automatic": false,
+      "advisor": {
+        "source": "waiting-for-provider",
+        "model": ""
+      }
+    },
+    "pendingApprovals": []
+  },
+  "diagnostics": {
+    "ok": true,
+    "command": "doctor",
+    "version": "1.1.0-rc.1",
+    "commit": "fixture-commit",
+    "platform": {
+      "os": "linux",
+      "arch": "x64",
+      "node": "v24.0.0"
+    },
+    "providerMode": [],
+    "coreAdvanced": ["proof", "sentinel", "rewind", "darwin"],
+    "experimental": {
+      "capabilities": false,
+      "capsules": false,
+      "counterfactual": false
+    },
+    "channels": [],
+    "audit": {
+      "valid": true,
+      "events": 0,
+      "unsigned": 0,
+      "failureCount": 0
+    },
+    "approvals": {
+      "pending": 0,
+      "ids": []
+    },
+    "browserRecovery": {
+      "status": "clear",
+      "pending": false
+    },
+    "jobs": {
+      "total": 0,
+      "queued": 0,
+      "running": 0,
+      "failed": 0,
+      "needsReview": 0,
+      "completed": 0
+    },
+    "sandbox": {
+      "configured": {
+        "elevated": false,
+        "broadFilesystemGrants": 0,
+        "writableFilesystemGrants": 0,
+        "networkMode": "brokered-public",
+        "privateNetworkAccess": false,
+        "loopbackAccess": false,
+        "shellEnabled": true,
+        "inheritedEnvironmentVariables": 0,
+        "secretReferences": 0,
+        "deviceGrants": 0,
+        "hostExecution": {
+          "mode": "deny",
+          "scope": "restricted"
+        },
+        "enginePathsConfigured": {
+          "podman": true,
+          "docker": true
+        },
+        "risks": []
+      },
+      "recovery": {
+        "pending": 0,
+        "quarantined": false
+      },
+      "extensionLane": {
+        "status": "disabled"
+      },
+      "activation": "durable jobs require approval",
+      "backends": []
+    },
+    "processRecovery": {
+      "pending": 0,
+      "needsReview": 0,
+      "quarantined": false
+    },
+    "state": {
+      "ownerOnly": true,
+      "runtimeStateOutsideSourceCheckout": true,
+      "secretsExcludedFromDiagnostics": true
+    }
+  },
+  "sessionPage": {
+    "sessions": [
+      {
+        "id": "session:001",
+        "title": "First session",
+        "status": "open",
+        "createdAt": "2026-08-12T12:00:00.000Z",
+        "updatedAt": "2026-08-12T12:00:00.000Z",
+        "lastEventAt": "2026-08-12T12:00:00.000Z",
+        "messageCount": 1,
+        "tags": ["fixture"],
+        "actor": "local",
+        "source": "local",
+        "projectId": "project_default",
+        "lastMessageRole": "user"
+      }
+    ],
+    "nextCursor": "cursor:002",
+    "hasMore": true
+  }
+}

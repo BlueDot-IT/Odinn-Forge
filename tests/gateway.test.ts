@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/teams/src/index.ts";
-import { createRunLedger } from "../packages/kernel/src/index.ts";
+import { createApprovalStore, createRunLedger } from "../packages/kernel/src/index.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
@@ -174,6 +174,195 @@ test("gateway diagnostics expose safe state and errors carry correlation metadat
     assert.equal(error.category, "validation");
     assert.equal(error.requestId, "diagnostics-error-request");
     assert.match(error.nextAction, /doctor/);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway omits raw channel diagnostics before every read response", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-channel-diagnostic-secret-"));
+  const credentialEnvironment = "ODINN_TEST_COMPOUND_CHANNEL_TOKEN";
+  const previousCredential = process.env[credentialEnvironment];
+  process.env[credentialEnvironment] = "test-channel-credential";
+  await writeFile(join(stateDir, "config.json"), JSON.stringify({
+    version: 1,
+    channels: {
+      compound: {
+        type: "telegram",
+        enabled: true,
+        tokenEnv: credentialEnvironment,
+        allowlist: ["compound:user"]
+      }
+    }
+  }));
+  let updateDiagnosticStatus: ((status: Record<string, unknown>) => void) | undefined;
+  const capabilities = { chatTypes: ["direct"] } as any;
+  const plugin: any = {
+    id: "telegram",
+    displayName: "Compound field test",
+    capabilities,
+    normalizeAccountConfig(_accountId: string, value: any) {
+      return { enabled: value.enabled === true, tokenEnv: value.tokenEnv, allowlist: value.allowlist ?? [] };
+    },
+    validateAccountConfig() { return []; },
+    createAdapter({ accountId }: any) {
+      return {
+        id: `compound-test:${accountId}`,
+        channel: "telegram",
+        accountId,
+        capabilities,
+        async start({ updateStatus }: any) {
+          updateDiagnosticStatus = updateStatus;
+          updateStatus({ state: "connected", details: { mode: "mutual-tls", health: "ok" } });
+        },
+        async stop() {},
+        async send() { return { status: "sent", messageIds: [], conversationId: "compound", sentChunks: 0, totalChunks: 0 }; }
+      };
+    }
+  };
+  const server = await createGatewayServer({
+    stateDir,
+    workspaceRoot: root,
+    async channelPluginLoader(type: string) {
+      assert.equal(type, "telegram");
+      return plugin;
+    }
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (let attempts = 0; attempts < 20 && !updateDiagnosticStatus; attempts += 1) {
+      await new Promise((resolveWait) => setImmediate(resolveWait));
+    }
+    assert.ok(updateDiagnosticStatus);
+    for (const path of ["/diagnostics", "/channels"]) {
+      const response = await fetch(`${base}${path}`);
+      assert.equal(response.status, 200, path);
+      const body = await response.json() as any;
+      const channel = body.channels[0];
+      assert.equal(channel.credentialConfigured, true, path);
+      assert.equal(channel.credentialPresent, true, path);
+      assert.equal("details" in channel, false, path);
+    }
+
+    const maliciousDetails = [
+      ["SENTINEL_OPAQUE_SECRET_123456", { foo: "SENTINEL_OPAQUE_SECRET_123456" }],
+      ["SENTINEL_CHANNEL_DATABASE_PASSWORD", { databasePassword: "SENTINEL_CHANNEL_DATABASE_PASSWORD" }],
+      ["SENTINEL_CHANNEL_AUTHENTICATION", { authentication: "SENTINEL_CHANNEL_AUTHENTICATION" }],
+      ["SENTINEL_CHANNEL_TOKEN_ENV", { tokenEnv: "SENTINEL_CHANNEL_TOKEN_ENV" }],
+      ["SENTINEL_CHANNEL_API_KEY_ENV", { apiKeyEnv: "SENTINEL_CHANNEL_API_KEY_ENV" }],
+      ["SENTINEL_CHANNEL_PRESENCE", { credentialPresent: "SENTINEL_CHANNEL_PRESENCE" }],
+      ["SENTINEL_CHANNEL_REFERENCE", { authorizationDecisionReferences: ["SENTINEL_CHANNEL_REFERENCE"] }],
+      ["SENTINEL_CHANNEL_NESTED_AUTH", { nested: { authentication: "SENTINEL_CHANNEL_NESTED_AUTH" } }],
+      ["SENTINEL_CHANNEL_ARRAY_TOKEN", { nested: [{ tokenEnv: "SENTINEL_CHANNEL_ARRAY_TOKEN" }] }],
+      ["SENTINEL_CHANNEL_UNICODE_PASSWORD", { ["passw\u043erd"]: "SENTINEL_CHANNEL_UNICODE_PASSWORD" }],
+      ["SENTINEL_CHANNEL_FULLWIDTH_PASSWORD", { ["\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44"]: "SENTINEL_CHANNEL_FULLWIDTH_PASSWORD" }],
+      ["SENTINEL_CHANNEL_COMPACT_TOKEN", { tokendigestsha256: "SENTINEL_CHANNEL_COMPACT_TOKEN" }],
+      ["SENTINEL_CHANNEL_COMPACT_PASSWORD", { passwordciphertextbase64: "SENTINEL_CHANNEL_COMPACT_PASSWORD" }]
+    ] as const;
+    for (const [sentinel, details] of maliciousDetails) {
+      updateDiagnosticStatus!({ details });
+      for (const path of ["/diagnostics", "/channels"]) {
+        const response = await fetch(`${base}${path}`);
+        const body = await response.text();
+        assert.equal(response.status, 200, `${path}: ${sentinel}`);
+        assert.equal(body.includes(sentinel), false, `${path}: ${sentinel}`);
+        assert.equal(body.includes('"details"'), false, `${path}: ${sentinel}`);
+      }
+    }
+
+    updateDiagnosticStatus!({ error: "SENTINEL_OPAQUE_ERROR_123456" });
+    for (const path of ["/diagnostics", "/channels"]) {
+      const response = await fetch(`${base}${path}`);
+      const body = await response.text();
+      assert.equal(response.status, 200, path);
+      assert.equal(body.includes("SENTINEL_OPAQUE_ERROR_123456"), false, path);
+      assert.equal(body.includes("channel adapter reported an error"), true, path);
+    }
+
+    for (const field of ["connectedAt", "lastEventAt"] as const) {
+      const sentinel = `SENTINEL_OPAQUE_${field.toUpperCase()}`;
+      updateDiagnosticStatus!({ error: "", connectedAt: undefined, lastEventAt: undefined, [field]: sentinel });
+      for (const path of ["/diagnostics", "/channels"]) {
+        const response = await fetch(`${base}${path}`);
+        const body = await response.text();
+        assert.equal(response.status, 400, `${path}: ${field}`);
+        assert.equal(body.includes(sentinel), false, `${path}: ${field}`);
+      }
+    }
+
+    updateDiagnosticStatus!({
+      connectedAt: "2026-08-12T12:00:00.000Z",
+      lastEventAt: "2026-08-12T12:01:00.000Z"
+    });
+    for (const path of ["/diagnostics", "/channels"]) {
+      const response = await fetch(`${base}${path}`);
+      assert.equal(response.status, 200, path);
+    }
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+    if (previousCredential === undefined) delete process.env[credentialEnvironment];
+    else process.env[credentialEnvironment] = previousCredential;
+  }
+});
+
+test("gateway omits raw pending approval input before every read response", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-approval-compound-secret-"));
+  const approvalPath = join(stateDir, "approvals.json");
+  const approvalStore = createApprovalStore({ path: approvalPath });
+  approvalStore.create({
+    actor: "SENTINEL_OPAQUE_APPROVAL_ACTOR_123456",
+    tool: "browser.click",
+    input: { selector: "#save", nested: { attempts: 1 } }
+  });
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (const path of ["/status", "/approvals"]) {
+      const response = await fetch(`${base}${path}`);
+      assert.equal(response.status, 200, path);
+      const body = await response.json() as any;
+      const approvals = path === "/status" ? body.pendingApprovals : body;
+      assert.equal("input" in approvals[0], false, path);
+      assert.equal("actor" in approvals[0], false, path);
+      assert.equal(approvals[0].effect.selector, "#save", path);
+      assert.equal(JSON.stringify(body).includes("SENTINEL_OPAQUE_APPROVAL_ACTOR_123456"), false, path);
+    }
+
+    const maliciousInputs = [
+      ["SENTINEL_OPAQUE_SECRET_123456", { foo: "SENTINEL_OPAQUE_SECRET_123456" }],
+      ["SENTINEL_APPROVAL_OAUTH_CREDENTIAL", { oauthCredential: "SENTINEL_APPROVAL_OAUTH_CREDENTIAL" }],
+      ["SENTINEL_APPROVAL_AUTHENTICATION", { authentication: "SENTINEL_APPROVAL_AUTHENTICATION" }],
+      ["SENTINEL_APPROVAL_TOKEN_ENV", { tokenEnv: "SENTINEL_APPROVAL_TOKEN_ENV" }],
+      ["SENTINEL_APPROVAL_API_KEY_ENV", { apiKeyEnv: "SENTINEL_APPROVAL_API_KEY_ENV" }],
+      ["SENTINEL_APPROVAL_PRESENCE", { credentialConfigured: "SENTINEL_APPROVAL_PRESENCE" }],
+      ["SENTINEL_APPROVAL_REFERENCE", { secretReferences: ["SENTINEL_APPROVAL_REFERENCE"] }],
+      ["SENTINEL_APPROVAL_NESTED_AUTH", { nested: { authentication: "SENTINEL_APPROVAL_NESTED_AUTH" } }],
+      ["SENTINEL_APPROVAL_ARRAY_TOKEN", { nested: [{ tokenEnv: "SENTINEL_APPROVAL_ARRAY_TOKEN" }] }],
+      ["SENTINEL_APPROVAL_UNICODE_TOKEN", { ["t\u043eken"]: "SENTINEL_APPROVAL_UNICODE_TOKEN" }],
+      ["SENTINEL_APPROVAL_FULLWIDTH_PASSWORD", { ["\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44"]: "SENTINEL_APPROVAL_FULLWIDTH_PASSWORD" }],
+      ["SENTINEL_APPROVAL_COMPACT_PASSWORD", { passwordhashhex: "SENTINEL_APPROVAL_COMPACT_PASSWORD" }],
+      ["SENTINEL_APPROVAL_COMPACT_PRIVATE_KEY", { privatekeyfingerprint: "SENTINEL_APPROVAL_COMPACT_PRIVATE_KEY" }]
+    ] as const;
+    for (const [sentinel, input] of maliciousInputs) {
+      const approvalId = approvalStore.create({ tool: "browser.click", input });
+      for (const path of ["/status", "/approvals"]) {
+        const response = await fetch(`${base}${path}`);
+        const body = await response.text();
+        assert.equal(response.status, 200, `${path}: ${sentinel}`);
+        assert.equal(body.includes(sentinel), false, `${path}: ${sentinel}`);
+        assert.equal(body.includes('"input"'), false, `${path}: ${sentinel}`);
+      }
+      assert.equal(approvalStore.revoke(approvalId), true);
+    }
+
+    for (const path of ["/status", "/approvals"]) {
+      const response = await fetch(`${base}${path}`);
+      const body = await response.text();
+      assert.equal(response.status, 200, path);
+      assert.equal(body.includes("#save"), true, path);
+    }
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

@@ -5,7 +5,7 @@ import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as stat
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit } from "@odinn/application";
+import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateGatewayChannelDiagnosticsV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1 } from "@odinn/application";
 import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, buildOperatorSnapshot, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, ProofVerifier, ProgressiveSkillDisclosure, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
@@ -95,6 +95,8 @@ class GatewayError extends Error {
     this.status = status;
   }
 }
+
+class MissingChannelCredentialError extends Error {}
 
 const CRON_SCHEMA_VERSION = 2;
 const CRON_MAX_JOBS = 500;
@@ -882,8 +884,9 @@ export async function createGatewayServer({
     ? setInterval(runImprovementCycle, selfImprovement.intervalMs)
     : undefined;
   improvementTimer?.unref?.();
+  const statusSecurity = validateRuntimeSecuritySummaryV1(policy.security);
   const statusRead = createStatusReadUseCase({
-    readStatus: async () => ({
+    readStatus: async (): Promise<GatewayStatusSnapshotV1> => ({
       ok: true,
       version,
       state,
@@ -911,7 +914,7 @@ export async function createGatewayServer({
         eventIngress: { enabled: Boolean(eventIngress) },
         projectContext: { enabled: Boolean(projectContext) }
       },
-      security: policy.security,
+      security: statusSecurity,
       selfImprovement: {
         ...selfImprovement,
         automatic: automaticImprovement,
@@ -919,7 +922,7 @@ export async function createGatewayServer({
           ? { source: "configured-provider", model: normalizeModelConfig(config).defaultModel }
           : { source: "waiting-for-provider", model: "" }
       },
-      pendingApprovals: approvalStore.list()
+      pendingApprovals: validatePendingApprovalSummariesV1(approvalStore.list())
     })
   });
   const diagnosticsRead = createDiagnosticsReadUseCase({
@@ -1984,7 +1987,7 @@ export async function createGatewayServer({
         return json(response, 200, { ok: true, subscriber, sequence: await auditStore.getCursor(subscriber) });
       }
       if (request.method === "GET" && url.pathname === "/approvals") {
-        return json(response, 200, approvalStore.list());
+        return json(response, 200, validatePendingApprovalSummariesV1(approvalStore.list()));
       }
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/approve")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/approve".length));
@@ -3136,7 +3139,8 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
         accountId: name,
         state: "stopped",
         error: ""
-      } as any
+      } as any,
+      publicError: ""
     };
   });
   const runtimes: Array<{ adapter: any; router: ChannelRouter; healthTimer?: NodeJS.Timeout }> = [];
@@ -3144,7 +3148,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
   let started = false;
   return {
     status() {
-      return configured.map((channel) => ({
+      return validateGatewayChannelDiagnosticsV1(configured.map((channel) => ({
         name: channel.name,
         type: channel.type,
         enabled: channel.config.enabled,
@@ -3154,13 +3158,13 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
         credentialPresent: channelCredentialEnvironments(channel.config).every((name) => Boolean(process.env[name])),
         allowlistEntries: channel.config.allowlist.length,
         capabilities: channel.plugin.capabilities,
-        error: channel.status.error ?? "",
+        error: channel.publicError || (channel.status.error ? "channel adapter reported an error" : ""),
         connectedAt: channel.status.connectedAt,
         lastEventAt: channel.status.lastEventAt,
         reconnectAttempts: channel.status.reconnectAttempts,
         latencyMs: channel.status.latencyMs,
         details: channel.status.details
-      }));
+      })));
     },
     async handleWebhook(request: any, response: any, url: URL) {
       const webhook = webhooks.get(url.pathname);
@@ -3198,7 +3202,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
             throw new Error(validation.join("; "));
           }
           const token = channel.config.tokenEnv ? process.env[channel.config.tokenEnv] : "";
-          if (!token) throw new Error(`channel credential is unavailable in ${channel.config.tokenEnv || "an environment variable"}`);
+          if (!token) throw new MissingChannelCredentialError(`channel credential is unavailable in ${channel.config.tokenEnv || "an environment variable"}`);
           const credentials = Object.fromEntries(Object.entries(channel.config.credentialEnvs ?? {}).map(([key, environmentName]) => [
             key,
             process.env[String(environmentName)] ?? ""
@@ -3206,13 +3210,14 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
           const missingCredential = Object.entries(channel.config.credentialEnvs ?? {}).find(([, environmentName]) => (
             !process.env[String(environmentName)]
           ));
-          if (missingCredential) throw new Error(`channel credential is unavailable in ${String(missingCredential[1])}`);
+          if (missingCredential) throw new MissingChannelCredentialError(`channel credential is unavailable in ${String(missingCredential[1])}`);
           const adapter = channel.plugin.createAdapter({
             accountId: channel.name,
             config: channel.config,
             credential: token,
             credentials,
             onError(error) {
+              channel.publicError = "";
               channel.status.error = error instanceof Error ? error.message : String(error);
             }
           });
@@ -3249,11 +3254,13 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
             access: channel.plugin.createAccessPolicy?.(channel.config) ?? createAllowlistPolicy(channel.config.allowlist),
             dedupe,
             onError(error) {
+              channel.publicError = "";
               channel.status.error = error instanceof Error ? error.message : String(error);
             },
             onExecutionState: recordChannelExecutionState
           });
           await router.attach(adapter, (patch) => {
+            if (Object.hasOwn(patch, "error")) channel.publicError = "";
             channel.status = { ...channel.status, ...patch };
           });
           const runtime: { adapter: any; router: ChannelRouter; healthTimer?: NodeJS.Timeout } = { adapter, router };
@@ -3261,8 +3268,10 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
           if (probe) {
             runtime.healthTimer = setInterval(() => {
               void probe().then((status: any) => {
+                if (Object.hasOwn(status, "error")) channel.publicError = "";
                 channel.status = { ...channel.status, ...status };
               }).catch((error: unknown) => {
+                channel.publicError = "";
                 channel.status = {
                   ...channel.status,
                   state: "degraded",
@@ -3280,9 +3289,13 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
               requestMode: channel.plugin.webhookRequestMode ?? "buffer"
             });
           }
+          channel.publicError = "";
           channel.status.error = "";
         } catch (error) {
           channel.status.state = "failed";
+          channel.publicError = error instanceof MissingChannelCredentialError
+            ? "channel credential is unavailable"
+            : "";
           channel.status.error = error instanceof Error ? error.message : String(error);
         }
       }
@@ -3306,7 +3319,7 @@ function channelCredentialEnvironments(config: any): string[] {
   ].filter(Boolean);
 }
 
-async function diagnostics({ state, workspaceRoot, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false, sandboxRecoveryStartupError = false }: any) {
+async function diagnostics({ state, workspaceRoot, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false, sandboxRecoveryStartupError = false }: any): Promise<DiagnosticsReportV1> {
   let audit = { valid: true, events: 0, unsigned: 0, failureCount: 0 };
   try {
     const auditPath = join(state, config.auditLog ?? "audit.jsonl");

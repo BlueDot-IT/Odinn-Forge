@@ -14,13 +14,23 @@ import {
   digestExecutionOperationV1,
   digestExecutionRequestV1,
   digestOutboundEnvelopeV1,
+  isSensitiveApplicationMetadataKey,
   parseApplicationEnvelopeV1,
+  parseDiagnosticsReportV1,
+  parseSessionPageV1,
+  parseStatusSnapshotV1,
   validateChannelDeliveryReceiptV1,
+  validateDiagnosticsReportV1,
   validateExecutionRequestV1,
   validateExecutionResultV1,
+  validateGatewayChannelDiagnosticsV1,
   validateInboundEnvelopeV1,
   validateOutboundEnvelopeV1,
+  validatePendingApprovalSummariesV1,
+  validateSessionPageV1,
+  validateStatusSnapshotV1,
   type ChannelPort,
+  type DiagnosticsReportV1,
   type DiagnosticsReadRequestV1,
   type ExecutionPort,
   type ExecutionReceiptV1,
@@ -28,13 +38,21 @@ import {
   type ExecutionResultV1,
   type InboundEnvelopeV1,
   type OutboundEnvelopeV1,
+  type SessionPageV1,
   type SessionListRequestV1,
+  type StatusSnapshotV1,
   type StatusReadRequestV1
 } from "../packages/application/src/index.ts";
 
 const timestamp = "2026-08-11T12:00:00.000Z";
 const digestA = "a".repeat(64);
 const digestB = "b".repeat(64);
+const readContractFixtures = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", "application-read-contracts-v1.json"), "utf8")) as {
+  statusCli: StatusSnapshotV1;
+  statusGateway: StatusSnapshotV1;
+  diagnostics: DiagnosticsReportV1;
+  sessionPage: SessionPageV1;
+};
 
 function inbound(overrides: Partial<InboundEnvelopeV1> = {}): InboundEnvelopeV1 {
   return {
@@ -340,6 +358,121 @@ test("normalized errors reject exception internals and secret-like material", ()
   for (const key of ["accessToken", "refreshToken", "clientSecret", "credentials"]) {
     assert.throws(() => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { [key]: "visible" } } }), /not permitted in redacted metadata/u);
   }
+  const compoundSensitiveKeys = [
+    "databasePassword",
+    "database_password",
+    "DATABASEPASSWORD",
+    "databasePasswordValue",
+    "databasePasswordDigest",
+    "databasepassworddigest",
+    "passwordCiphertext",
+    "passwordencoded",
+    "sessionCookie",
+    "session-cookie",
+    "sessionCookieHeader",
+    "oauthCredential",
+    "oauth_credential",
+    "oauthCredentialMaterial",
+    "authHeader",
+    "authToken",
+    "servicePrivateKey",
+    "service_private_key",
+    "servicePrivateKeyPem",
+    "httpAuthorization",
+    "httpAuthorizationHeader",
+    "clientSecretValue",
+    "clientsecrethash",
+    "tokendigestsha256",
+    "passwordhashhex",
+    "passwordciphertextbase64",
+    "privatekeyfingerprint",
+    "clientsecretvaluebase64",
+    "oauthcredentialmaterialsha256",
+    "dbPwd",
+    "oauthCred"
+  ];
+  for (const key of compoundSensitiveKeys) {
+    assert.equal(isSensitiveApplicationMetadataKey(key), true, key);
+    assert.throws(
+      () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { [key]: "compound-secret-sentinel" } } }),
+      (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA",
+      key
+    );
+    assert.doesNotThrow(() => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { [key]: "[redacted]" } } }));
+  }
+  const genericSensitiveProjectionMetadata = {
+    credentialPresent: true,
+    credentialConfigured: true,
+    tokenEnv: "ODINN_CHANNEL_TOKEN",
+    apiKeyEnv: "ODINN_PROVIDER_API_KEY",
+    authMode: "oauth",
+    authentication: "mutual-tls",
+    secretsExcludedFromDiagnostics: true,
+    secretReferences: 0,
+    authorizationDecisionReferences: ["decision-1"],
+    cookiePolicy: "strict",
+    authorizationStatus: "allowed"
+  };
+  for (const [key, value] of Object.entries(genericSensitiveProjectionMetadata)) {
+    assert.equal(isSensitiveApplicationMetadataKey(key), true, key);
+    assert.throws(
+      () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { nested: [{ [key]: value }] } } }),
+      (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA",
+      key
+    );
+  }
+  const ambiguousKeys = [
+    "passw\u043erd",
+    "t\u043eken",
+    "secr\u0435t",
+    "\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44",
+    "pass\u200bword"
+  ];
+  for (const key of ambiguousKeys) {
+    assert.equal(isSensitiveApplicationMetadataKey(key), true, key);
+    assert.throws(
+      () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { nested: [{ [key]: "ambiguous-secret-sentinel" }] } } }),
+      (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "AMBIGUOUS_APPLICATION_METADATA_KEY",
+      key
+    );
+  }
+  const safeMetadata = {
+    secretary: "Alice",
+    tokenize: false,
+    monkey: 1,
+    privateNetworkAccess: false
+  };
+  for (const key of Object.keys(safeMetadata)) assert.equal(isSensitiveApplicationMetadataKey(key), false, key);
+  assert.doesNotThrow(() => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: safeMetadata } }));
+  let objectAccessorInvoked = false;
+  const objectAccessor = {};
+  Object.defineProperty(objectAccessor, "authentication", {
+    enumerable: true,
+    get() {
+      objectAccessorInvoked = true;
+      return "ACCESSOR_SECRET_SENTINEL";
+    }
+  });
+  assert.throws(
+    () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: objectAccessor } }),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  assert.equal(objectAccessorInvoked, false);
+  let arrayAccessorInvoked = false;
+  const arrayAccessor: unknown[] = [];
+  Object.defineProperty(arrayAccessor, "0", {
+    enumerable: true,
+    get() {
+      arrayAccessorInvoked = true;
+      return { authentication: "ARRAY_ACCESSOR_SECRET_SENTINEL" };
+    }
+  });
+  arrayAccessor.length = 1;
+  assert.throws(
+    () => validateExecutionResultV1({ ...base, error: { ...base.error, redactedDetails: { nested: arrayAccessor } } }),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  assert.equal(arrayAccessorInvoked, false);
   for (const message of ["OpenAI key sk-do-not-log-this", "access token actual-secret-value"]) {
     assert.throws(() => validateExecutionResultV1({ ...base, error: { ...base.error, message } }), /secret-like/u);
   }
@@ -417,14 +550,14 @@ test("status.read preserves authenticated principal scope and normalizes transpo
   const statusRead = createStatusReadUseCase({
     async readStatus(context) {
       observedContext = context;
-      return { ok: true, tools: ["text.echo"], nested: { omitted: undefined } } as any;
+      return { ...structuredClone(readContractFixtures.statusCli), omitted: undefined } as any;
     }
   });
   const result = await statusRead.execute(request);
   assert.equal(result.requestId, request.requestId);
   assert.equal(result.correlationId, request.context.correlationId);
   assert.deepEqual(observedContext, request.context);
-  assert.deepEqual(result.output, { nested: {}, ok: true, tools: ["text.echo"] });
+  assert.deepEqual(result.output, readContractFixtures.statusCli);
   assert.equal(Object.isFrozen(result.output), true);
   assert.equal(Object.isFrozen(result), true);
   await assert.rejects(
@@ -462,7 +595,7 @@ test("status.read snapshots authenticated authority before asynchronous port wor
     async readStatus(context) {
       await gate;
       observedContext = context;
-      return { ok: true };
+      return structuredClone(readContractFixtures.statusGateway);
     }
   });
   const request: any = {
@@ -500,7 +633,7 @@ test("diagnostics.read snapshots authority, normalizes output, and rejects opera
     async readDiagnostics(context) {
       await gate;
       observedContext = context;
-      return { ok: true, state: { safe: true, omitted: undefined } } as any;
+      return { ...structuredClone(readContractFixtures.diagnostics), omitted: undefined } as any;
     }
   });
   const request: DiagnosticsReadRequestV1 = {
@@ -525,7 +658,7 @@ test("diagnostics.read snapshots authority, normalizes output, and rejects opera
   assert.equal(observedContext.principal.principalId, "principal:alice");
   assert.equal(observedContext.scope.tenantId, "tenant:alice");
   assert.equal(result.correlationId, "correlation:diagnostics-alice");
-  assert.deepEqual(result.output, { ok: true, state: { safe: true } });
+  assert.deepEqual(result.output, readContractFixtures.diagnostics);
   assert.equal(Object.isFrozen(observedContext), true);
   assert.equal(Object.isFrozen(result.output), true);
   await assert.rejects(
@@ -565,7 +698,7 @@ test("session.list snapshots authority and query input before asynchronous port 
       await gate;
       observedInput = input;
       observedContext = context;
-      return { sessions: [{ id: "session:001", title: "First" }], omitted: undefined } as any;
+      return { ...structuredClone(readContractFixtures.sessionPage), omitted: undefined } as any;
     }
   });
   const request: SessionListRequestV1 = {
@@ -594,11 +727,11 @@ test("session.list snapshots authority and query input before asynchronous port 
   assert.equal(observedContext.principal.principalId, "principal:alice");
   assert.equal(observedContext.scope.tenantId, "tenant:alice");
   assert.equal(result.correlationId, "correlation:sessions-alice");
-  assert.deepEqual(result.output, { sessions: [{ id: "session:001", title: "First" }] });
+  assert.deepEqual(result.output, readContractFixtures.sessionPage);
   assert.equal(Object.isFrozen(observedInput), true);
   assert.equal(Object.isFrozen(observedContext), true);
   assert.equal(Object.isFrozen(result.output), true);
-  assert.equal(Object.isFrozen((result.output.sessions as any[])[0]), true);
+  assert.equal(Object.isFrozen(result.output.sessions[0]), true);
   await assert.rejects(
     () => sessionList.execute({ ...request, operation: { kind: "query", id: "status.read" as any } }),
     /session list operation/u
@@ -638,11 +771,201 @@ test("session.list validates bounded input and cancellation before invocation an
   await assert.rejects(() => sessionList.execute({ ...request, input: { limit: 201 } }), /integer from 1 to 200/u);
 });
 
+test("versioned read-model golden fixtures retain CLI and gateway compatibility shapes", () => {
+  const statusCli = parseStatusSnapshotV1(JSON.stringify(readContractFixtures.statusCli));
+  const statusGateway = parseStatusSnapshotV1(JSON.stringify(readContractFixtures.statusGateway));
+  const diagnostics = parseDiagnosticsReportV1(JSON.stringify(readContractFixtures.diagnostics));
+  const sessionPage = parseSessionPageV1(JSON.stringify(readContractFixtures.sessionPage));
+  assert.deepEqual(statusCli, readContractFixtures.statusCli);
+  assert.deepEqual(statusGateway, readContractFixtures.statusGateway);
+  assert.deepEqual(diagnostics, readContractFixtures.diagnostics);
+  assert.deepEqual(sessionPage, readContractFixtures.sessionPage);
+  assert.equal(Object.isFrozen(statusCli), true);
+  assert.equal(Object.isFrozen((statusGateway as any).toolDetails[0]), true);
+  assert.equal(Object.isFrozen(diagnostics.sandbox.configured), true);
+  assert.equal(Object.isFrozen(sessionPage.sessions[0]), true);
+});
+
+test("status output contract rejects missing, extra, mistyped, accessor, and leaking fields", () => {
+  const fixture: any = structuredClone(readContractFixtures.statusGateway);
+  const { allowedTools: _missing, ...missing } = fixture;
+  assert.throws(() => validateStatusSnapshotV1(missing), /missing required field: allowedTools/u);
+  assert.throws(() => validateStatusSnapshotV1({ ...fixture, kernelRegistry: {} }), /unknown field: kernelRegistry/u);
+  assert.throws(() => validateStatusSnapshotV1({ ...fixture, ok: "yes" }), /status snapshot\.ok must be true/u);
+  const cliFixture: any = structuredClone(readContractFixtures.statusCli);
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...cliFixture, providers: [{ ...cliFixture.providers[0], apiKeyEnv: "opaquecredentialvalue1234" }] }),
+    (error: unknown) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
+  );
+  assert.doesNotThrow(() => validateStatusSnapshotV1({
+    ...cliFixture,
+    providers: [{ ...cliFixture.providers[0], authMode: "cli", baseUrl: "" }]
+  }));
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...cliFixture, providers: [{ ...cliFixture.providers[0], authMode: "api-key", baseUrl: "" }] }),
+    /baseUrl must be a non-empty string/u
+  );
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, accessToken: "top-secret-value" }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
+  );
+  const accessor = structuredClone(fixture);
+  Object.defineProperty(accessor, "state", { enumerable: true, get: () => "/stolen" });
+  assert.throws(
+    () => validateStatusSnapshotV1(accessor),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  const accessorArray: unknown[] = [];
+  let accessorInvoked = false;
+  Object.defineProperty(accessorArray, "0", {
+    enumerable: true,
+    get() {
+      accessorInvoked = true;
+      return "text.echo";
+    }
+  });
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, tools: accessorArray }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  assert.equal(accessorInvoked, false);
+  const nonEnumerableArray = ["text.echo"];
+  Object.defineProperty(nonEnumerableArray, "0", { enumerable: false, value: "text.echo" });
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, tools: nonEnumerableArray }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+  const outOfRangeArray = ["text.echo"];
+  Object.defineProperty(outOfRangeArray, "4294967295", { enumerable: true, value: "hidden.kernel.tool" });
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, tools: outOfRangeArray }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "NON_JSON_APPLICATION_FIELD"
+  );
+});
+
+test("diagnostics output contract rejects unstable fields and unredacted material", () => {
+  const fixture: any = structuredClone(readContractFixtures.diagnostics);
+  const { state: _missing, ...missing } = fixture;
+  assert.throws(() => validateDiagnosticsReportV1(missing), /missing required field: state/u);
+  assert.throws(() => validateDiagnosticsReportV1({ ...fixture, stateDirectory: "/private/state" }), /unknown field: stateDirectory/u);
+  assert.throws(() => validateDiagnosticsReportV1({ ...fixture, jobs: { ...fixture.jobs, failed: "0" } }), /jobs\.failed must be a non-negative safe integer/u);
+  assert.throws(
+    () => validateDiagnosticsReportV1({ ...fixture, privateKey: "-----BEGIN PRIVATE KEY-----" }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
+  );
+});
+
+test("producer-only plugin details and approval identity/input are omitted without traversal", () => {
+  let detailAccessorInvoked = false;
+  const details = { foo: "SENTINEL_OPAQUE_SECRET_123456" };
+  Object.defineProperty(details, "hidden", {
+    enumerable: true,
+    get() {
+      detailAccessorInvoked = true;
+      return "SENTINEL_DETAIL_ACCESSOR_SECRET";
+    }
+  });
+  const channels = validateGatewayChannelDiagnosticsV1([{
+    name: "test",
+    type: "custom",
+    enabled: true,
+    running: true,
+    state: "connected",
+    credentialConfigured: true,
+    credentialPresent: true,
+    allowlistEntries: 1,
+    capabilities: { chatTypes: ["direct"] },
+    error: "",
+    details
+  }]);
+  assert.equal("details" in channels[0]!, false);
+  assert.equal(detailAccessorInvoked, false);
+
+  let inputAccessorInvoked = false;
+  const input = { foo: "SENTINEL_OPAQUE_SECRET_123456" };
+  Object.defineProperty(input, "hidden", {
+    enumerable: true,
+    get() {
+      inputAccessorInvoked = true;
+      return "SENTINEL_INPUT_ACCESSOR_SECRET";
+    }
+  });
+  const approvals = validatePendingApprovalSummariesV1([{
+    id: "approval:1",
+    status: "pending",
+    actor: "SENTINEL_OPAQUE_ACTOR_123456",
+    tool: "browser.click",
+    input
+  }]);
+  assert.equal("input" in approvals[0]!, false);
+  assert.equal("actor" in approvals[0]!, false);
+  assert.equal(inputAccessorInvoked, false);
+
+  const channel = {
+    ...channels[0],
+    connectedAt: "2026-08-12T12:00:00.000Z",
+    lastEventAt: "2026-08-12T12:01:00.000Z"
+  };
+  assert.equal(validateGatewayChannelDiagnosticsV1([channel])[0]!.connectedAt, channel.connectedAt);
+  for (const [field, value] of [
+    ["connectedAt", "SENTINEL_OPAQUE_CONNECTED_AT"],
+    ["lastEventAt", "2026-99-99T99:99:99.999Z"]
+  ] as const) {
+    assert.throws(
+      () => validateGatewayChannelDiagnosticsV1([{ ...channel, [field]: value }]),
+      (error: any) => error instanceof ApplicationContractValidationError
+        && error.code === "INVALID_APPLICATION_READ_CONTRACT"
+        && !error.message.includes(value)
+    );
+  }
+});
+
+test("session page contract rejects projection drift, content leakage, and inconsistent cursors", () => {
+  const fixture: any = structuredClone(readContractFixtures.sessionPage);
+  const [session] = fixture.sessions;
+  const { title: _missing, ...missingSession } = session;
+  assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [missingSession] }), /missing required field: title/u);
+  assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [{ ...session, messages: [{ content: "not part of summary" }] }] }), /unknown field: messages/u);
+  assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [{ ...session, messageCount: -1 }] }), /messageCount must be a non-negative safe integer/u);
+  for (const field of ["createdAt", "updatedAt", "lastEventAt"] as const) {
+    const invalid = `NOT_A_TIMESTAMP_${field}\0SENTINEL`;
+    assert.throws(
+      () => validateSessionPageV1({ ...fixture, sessions: [{ ...session, [field]: invalid }] }),
+      (error: any) => error instanceof ApplicationContractValidationError
+        && error.code === "INVALID_APPLICATION_READ_CONTRACT"
+        && error.path === `session page.sessions[0].${field}`
+        && !error.message.includes(invalid)
+    );
+  }
+  assert.throws(() => validateSessionPageV1({ sessions: fixture.sessions, nextCursor: fixture.nextCursor }), /cursor and hasMore must appear together/u);
+  assert.throws(
+    () => validateSessionPageV1({ ...fixture, authToken: "Bearer abcdefghijklmnop" }),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"
+  );
+  assert.throws(() => parseSessionPageV1('{"sessions":[],"sessions":[]}'), /duplicate JSON object field/u);
+  const deeplyNested = `{"sessions":${"[".repeat(10_000)}null${"]".repeat(10_000)}}`;
+  assert.throws(
+    () => parseSessionPageV1(deeplyNested),
+    (error: any) => error instanceof ApplicationContractValidationError && error.code === "APPLICATION_JSON_TOO_DEEP"
+  );
+});
+
+test("CLI and gateway producers compile against the explicit read contracts", () => {
+  const repositoryRoot = join(import.meta.dirname, "..");
+  for (const workspace of ["@odinn/gateway", "@odinn/cli"]) {
+    const result = spawnSync("corepack", ["pnpm", "--filter", workspace, "typecheck"], {
+      cwd: repositoryRoot,
+      encoding: "utf8"
+    });
+    assert.equal(result.status, 0, `${workspace} typecheck failed:\n${result.stdout}\n${result.stderr}`);
+  }
+});
+
 test("application package resolves independently and excludes implementation dependencies", () => {
   const packageRoot = join(import.meta.dirname, "..", "packages", "application");
   const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), []);
-  const source = ["contracts.ts", "validation.ts", "ports.ts", "status.ts", "diagnostics.ts", "session-list.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
+  const source = ["contracts.ts", "validation.ts", "ports.ts", "sensitive-metadata.ts", "read-contract-json.ts", "read-output-contracts.ts", "status.ts", "diagnostics.ts", "session-list.ts", "index.ts"].map((file) => readFileSync(join(packageRoot, "src", file), "utf8")).join("\n");
   assert.doesNotMatch(source, /discord\.js|@slack|telegram|whatsapp|express|playwright|apps\/gateway|apps\/cli|packages\/kernel/u);
   assert.doesNotMatch(readFileSync(join(packageRoot, "src", "contracts.ts"), "utf8"), /\b(?:AbortSignal|Request|Response|Buffer|Readable|Writable)\b/u);
   const probe = spawnSync(process.execPath, ["--input-type=module", "--eval", "const application = await import('@odinn/application'); if (application.APPLICATION_CONTRACT_VERSION !== 1) process.exit(2);"], { cwd: packageRoot, encoding: "utf8" });

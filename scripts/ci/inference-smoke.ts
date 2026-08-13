@@ -3,9 +3,11 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 const sourceRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
+const GATEWAY_STARTUP_TIMEOUT_MS = 20_000;
 
 export type InferenceSmokeOptions = {
   root?: string;
@@ -70,14 +72,28 @@ export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions =
   });
   let childError = "";
   let childOutput = "";
+  let childExited = false;
+  let childSpawnError: Error | undefined;
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk: any) => { childOutput += chunk; });
-  child.on("error", (error: any) => { childError += `\n[child error] ${error.message}`; });
-  child.on("exit", (code: any, signal: any) => { childOutput += `\n[child exit code=${code} signal=${signal}]`; });
+  child.on("error", (error: Error) => {
+    childSpawnError = error;
+    childError += `\n[child error] ${error.message}`;
+  });
+  child.on("exit", (code: any, signal: any) => {
+    childExited = true;
+    childOutput += `\n[child exit code=${code} signal=${signal}]`;
+  });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: any) => { childError += chunk; });
   try {
-    const gatewayPort = await waitForChildPort(child, () => childOutput, () => childError);
+    const gatewayPort = await waitForChildPort(
+      child,
+      () => childOutput,
+      () => childError,
+      () => childSpawnError,
+      () => childExited,
+    );
     const gatewayBase = `http://127.0.0.1:${gatewayPort}`;
     const bootstrap = await fetch(`${gatewayBase}/`);
     const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
@@ -110,7 +126,7 @@ export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions =
 }
 
 async function terminateChild(child: any) {
-  if (child.exitCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
   const closed = new Promise((resolve: any) => child.once("close", resolve));
   if (process.platform === "win32" && child.pid) {
     spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
@@ -137,14 +153,24 @@ async function close(server: any) {
   await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
 }
 
-async function waitForChildPort(child: any, getOutput: any, getError: any) {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+async function waitForChildPort(child: any, getOutput: any, getError: any, getSpawnError: any, hasExited: any) {
+  const deadline = performance.now() + GATEWAY_STARTUP_TIMEOUT_MS;
+  while (performance.now() < deadline) {
     const match = getOutput().match(/"port"\s*:\s*(\d+)/);
     if (match && Number(match[1]) > 0) return Number(match[1]);
-    if (child.exitCode !== null) throw new Error(`packaged gateway exited before binding: ${getError() || getOutput() || "no output"}`);
+    const spawnError = getSpawnError();
+    if (spawnError) throw new Error(`packaged gateway failed to start: ${spawnError.message}`);
+    if (hasExited() || child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`packaged gateway exited before binding: ${getError() || getOutput() || "no output"}`);
+    }
     await new Promise((resolve: any) => setTimeout(resolve, 100));
   }
-  throw new Error(`packaged gateway did not report a port: ${getError() || getOutput() || "no output"}`);
+  const spawnError = getSpawnError();
+  if (spawnError) throw new Error(`packaged gateway failed to start: ${spawnError.message}`);
+  if (hasExited() || child.exitCode !== null || child.signalCode !== null) {
+    throw new Error(`packaged gateway exited before binding: ${getError() || getOutput() || "no output"}`);
+  }
+  throw new Error(`packaged gateway did not report a port within ${GATEWAY_STARTUP_TIMEOUT_MS}ms: ${getError() || getOutput() || "no output"}`);
 }
 
 async function waitForStatus(url: any, cookie: any, child: any, getChildError: any) {

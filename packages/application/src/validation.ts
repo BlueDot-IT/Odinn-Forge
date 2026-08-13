@@ -18,6 +18,10 @@ import {
   type NormalizedExecutionErrorV1,
   type OutboundEnvelopeV1
 } from "./contracts.ts";
+import {
+  isAmbiguousApplicationMetadataKey,
+  isSensitiveApplicationMetadataKey
+} from "./sensitive-metadata.ts";
 
 const MAX_ID_BYTES = 256;
 const MAX_REFERENCE_BYTES = 2_048;
@@ -27,10 +31,6 @@ const MAX_JSON_DEPTH = 32;
 const MAX_JSON_NODES = 8_192;
 const MAX_RETRY_AFTER_MS = 86_400_000;
 const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const SENSITIVE_KEY_WORDS = new Set([
-  "apikey", "authorization", "bottoken", "clientsecret", "cookie", "credential", "credentials", "idtoken",
-  "password", "passwordhash", "passwd", "privatekey", "refreshtoken", "secret", "token", "accesstoken"
-]);
 const SENSITIVE_VALUES = [
   /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|capability(?:[_-]?token)?|token|authorization|cookie|credentials?|password(?:[_-]?hash)?|passwd|secret|client[_-]?secret|bot[_-]?(?:secret|token)|private[_-]?key)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/iu,
   /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/iu,
@@ -526,9 +526,9 @@ function jsonValue(input: unknown, name: string, options: { rejectSensitive?: bo
     seen.add(current);
     try {
       if (Array.isArray(current)) {
-        assertPlainArray(current, path);
-        if (current.length > MAX_LIST_ITEMS) throw invalid(`${path} cannot contain more than ${MAX_LIST_ITEMS} items`, undefined, path);
-        return current.map((item, index) => visit(item, `${path}[${index}]`, depth + 1));
+        const items = plainArrayValues(current, path);
+        if (items.length > MAX_LIST_ITEMS) throw invalid(`${path} cannot contain more than ${MAX_LIST_ITEMS} items`, undefined, path);
+        return items.map((item, index) => visit(item, `${path}[${index}]`, depth + 1));
       }
       const value = exactObject(current, path, [], { allowAdditional: true });
       const output: Record<string, JsonValue> = {};
@@ -537,7 +537,10 @@ function jsonValue(input: unknown, name: string, options: { rejectSensitive?: bo
       for (const key of keys) {
         if (RESERVED_KEYS.has(key)) throw invalid(`${path} contains reserved field ${key}`, "RESERVED_APPLICATION_FIELD", `${path}.${key}`);
         if (Buffer.byteLength(key, "utf8") > MAX_ID_BYTES) throw invalid(`${path} field name exceeds ${MAX_ID_BYTES} bytes`, undefined, `${path}.${key}`);
-        if (options.rejectSensitive && isSensitiveKey(key) && value[key] !== "[redacted]") {
+        if (options.rejectSensitive && isAmbiguousApplicationMetadataKey(key)) {
+          throw invalid(`${path} contains an ambiguous metadata field`, "AMBIGUOUS_APPLICATION_METADATA_KEY", path);
+        }
+        if (options.rejectSensitive && isSensitiveApplicationMetadataKey(key) && value[key] !== "[redacted]") {
           throw invalid(`${path}.${key} is not permitted in redacted metadata`, "UNREDACTED_APPLICATION_METADATA", `${path}.${key}`);
         }
         output[key] = visit(value[key], `${path}.${key}`, depth + 1);
@@ -575,21 +578,42 @@ function exactObject(
   return input as Record<string, unknown>;
 }
 
-function assertPlainArray(input: readonly unknown[], name: string): void {
+function plainArrayValues(input: readonly unknown[], name: string): readonly unknown[] {
   if (Object.getPrototypeOf(input) !== Array.prototype) throw invalid(`${name} must be a plain array`, "NON_PLAIN_APPLICATION_OBJECT", name);
-  const keys = Reflect.ownKeys(input);
-  for (let index = 0; index < input.length; index += 1) {
-    if (!Object.hasOwn(input, index)) throw invalid(`${name} cannot contain sparse entries`, "NON_JSON_APPLICATION_FIELD", `${name}[${index}]`);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(input, "length");
+  if (!lengthDescriptor || !("value" in lengthDescriptor) || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0) {
+    throw invalid(`${name}.length must be a safe data field`, "NON_JSON_APPLICATION_FIELD", `${name}.length`);
   }
-  const extra = keys.find((key) => key !== "length" && (typeof key !== "string" || !/^(0|[1-9]\d*)$/u.test(key)));
-  if (extra !== undefined) throw invalid(`${name} cannot contain extra fields`, "NON_JSON_APPLICATION_FIELD", name);
+  const length = Number(lengthDescriptor.value);
+  if (length > MAX_LIST_ITEMS) throw invalid(`${name} cannot contain more than ${MAX_LIST_ITEMS} items`, undefined, name);
+  const keys = Reflect.ownKeys(input);
+  for (const key of keys) {
+    if (key === "length") continue;
+    if (typeof key !== "string" || !/^(0|[1-9]\d*)$/u.test(key)) {
+      throw invalid(`${name} cannot contain extra fields`, "NON_JSON_APPLICATION_FIELD", name);
+    }
+    const index = Number(key);
+    if (!Number.isSafeInteger(index) || index >= length) {
+      throw invalid(`${name} cannot contain an out-of-range numeric field`, "NON_JSON_APPLICATION_FIELD", `${name}.${key}`);
+    }
+  }
+  const output = new Array<unknown>(length);
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
+    if (!descriptor) throw invalid(`${name} cannot contain sparse entries`, "NON_JSON_APPLICATION_FIELD", `${name}[${index}]`);
+    if (!descriptor.enumerable || !("value" in descriptor)) {
+      throw invalid(`${name}[${index}] must be an enumerable data field`, "NON_JSON_APPLICATION_FIELD", `${name}[${index}]`);
+    }
+    output[index] = descriptor.value;
+  }
+  return output;
 }
 
 function referenceList(input: unknown, name: string, allowEmpty: boolean): readonly string[] {
   if (!Array.isArray(input)) throw invalid(`${name} must be an array`, undefined, name);
-  assertPlainArray(input, name);
-  if (input.length > MAX_LIST_ITEMS || (!allowEmpty && input.length === 0)) throw invalid(`${name} has an invalid item count`, undefined, name);
-  const values = input.map((item, index) => reference(item, `${name}[${index}]`));
+  const items = plainArrayValues(input, name);
+  if (items.length > MAX_LIST_ITEMS || (!allowEmpty && items.length === 0)) throw invalid(`${name} has an invalid item count`, undefined, name);
+  const values = items.map((item, index) => reference(item, `${name}[${index}]`));
   if (new Set(values).size !== values.length) throw invalid(`${name} cannot contain duplicate references`, undefined, name);
   return values;
 }
@@ -634,11 +658,6 @@ function safeString(input: unknown, name: string, maxBytes: number): string {
   const value = boundedString(input, name, maxBytes);
   if (SENSITIVE_VALUES.some((pattern) => pattern.test(value))) throw invalid(`${name} contains secret-like material`, "UNREDACTED_APPLICATION_ERROR", name);
   return value;
-}
-
-function isSensitiveKey(key: string): boolean {
-  const normalized = key.replace(/[^a-z0-9]/giu, "").toLowerCase();
-  return SENSITIVE_KEY_WORDS.has(normalized) || normalized.endsWith("token") || normalized.endsWith("secret") || normalized.endsWith("apikey");
 }
 
 function nonnegativeInteger(input: unknown, name: string, maximum: number): number {
