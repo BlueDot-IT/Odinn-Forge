@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { createRunLedger, ensureStateCompatibility, inspectStateSchemas, planStateMigration, STATE_SCHEMA_TARGETS } from "../packages/kernel/src/index.ts";
+import { createRunLedger, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, STATE_SCHEMA_TARGETS } from "../packages/kernel/src/index.ts";
 import { ArtifactStore, inspectExistingSqliteSchema, RunLedger, SqliteJobStore, SqliteStore } from "../packages/store-sqlite/src/index.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -56,6 +56,16 @@ test("latest pre-v1 state plans, backs up, migrates atomically, and preserves st
     const inspection = await inspectStateSchemas(state);
     assert.equal(inspection.healthy, true);
     assert.deepEqual(inspection.currentVersions, STATE_SCHEMA_TARGETS);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Windows migration hardens the activated state tree", { skip: process.platform !== "win32" }, async () => {
+  const { temporary, state } = await fixture("latest-pre-v1");
+  try {
+    await ensureStateCompatibility(state, { applicationVersion: "1.0.0", applicationCommit: "windows-migration" });
+    assert.equal(await isOwnerOnlyPath(state), true);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

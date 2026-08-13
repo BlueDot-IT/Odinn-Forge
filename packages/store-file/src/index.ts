@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, open, readFile, rename, writeFile, copyFile, link, rm, stat, lstat } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, rename, writeFile, copyFile, link, rm, stat, lstat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { normalizeAuditEvent, redactDurableValue, type AuditEvent, type JsonObject } from "@odinn/protocol";
@@ -203,6 +203,20 @@ export async function ensureSecureStateDirectory(path: string) {
   if (process.platform === "win32") await secureWindowsPath(path, true);
   else await chmod(path, 0o700);
   return path;
+}
+
+export async function ensureSecureStateTree(root: string): Promise<void> {
+  const metadata = await lstat(root);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`state path must be a physical directory: ${root}`);
+  await ensureSecureStateDirectory(root);
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    const child = await lstat(path);
+    if (child.isSymbolicLink()) throw new Error(`state path must not contain a symbolic link: ${path}`);
+    if (child.isDirectory()) await ensureSecureStateTree(path);
+    else if (child.isFile()) await secureStoreFile(path, true);
+    else throw new Error(`state path contains an unsupported file type: ${path}`);
+  }
 }
 
 async function secureStoreFile(path: string, parentAlreadyValidated = false) {

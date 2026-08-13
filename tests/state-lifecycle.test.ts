@@ -204,6 +204,21 @@ test("restore verifies into staging, backs up current state, and activates atomi
   }
 });
 
+test("Windows restore hardens the activated state tree and reports owner-only status", { skip: process.platform !== "win32" }, async () => {
+  const fixture = await preparedState();
+  const backup = join(fixture.temporary, "windows-backup");
+  try {
+    await createStateBackup(fixture.state, backup, { applicationVersion: "1.0.0", applicationCommit: "windows-backup" });
+    const restored = await restoreStateBackup(backup, fixture.state, { applicationVersion: "1.0.1", applicationCommit: "windows-restore" });
+    assert.equal(restored.ok, true);
+    const status = await stateLifecycleStatus(fixture.state);
+    assert.equal(status.ok, true);
+    assert.equal(status.stateDirectory.ownerOnly, true);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
 test("backup snapshots and restores the authoritative record database without WAL sidecars", async () => {
   const fixture = await preparedState();
   const backup = join(fixture.temporary, "sqlite-backup");

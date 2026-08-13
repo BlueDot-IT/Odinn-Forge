@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { FileAuditStore } from "@odinn/store-file";
+import { ensureSecureStateTree, FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
 import { inspectAuthoritativeRecordSchema, inspectExistingSqliteAuditSchema, inspectExistingSqliteSchema, SqliteAuditStore } from "@odinn/store-sqlite";
 import { STATE_MIGRATIONS, type StateMigrationDefinition, type StateMigrationResult } from "./migrations/index.ts";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
@@ -365,6 +365,8 @@ async function applyStateMigrationPlanUnlocked(
   }
   const activeAudit = await verifyAuditIntegrity(plan.stateRoot);
   if (!activeAudit.valid) throw new Error("activated state failed audit integrity verification");
+  await ensureSecureStateTree(plan.stateRoot);
+  if (!await isOwnerOnlyPath(plan.stateRoot)) throw new Error("activated state failed owner-only permission verification");
   const report: StateMigrationReport = {
     schemaVersion: 1,
     id,
@@ -775,12 +777,7 @@ async function validatePhysicalTree(root: string): Promise<void> {
 }
 
 async function secureTree(root: string): Promise<void> {
-  await chmod(root, 0o700);
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) await secureTree(path);
-    else if (entry.isFile()) await chmod(path, 0o600);
-  }
+  await ensureSecureStateTree(root);
 }
 
 async function readJson(path: string): Promise<{ present: false } | { present: true; value: Record<string, unknown> | unknown[] }> {

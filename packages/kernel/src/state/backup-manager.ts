@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { backup as backupSqlite, DatabaseSync } from "node:sqlite";
-import { FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
+import { ensureSecureStateTree, FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
 import { SqliteAuditStore } from "@odinn/store-sqlite";
 import { withStateMutationLock } from "../state-mutation.ts";
 import { inspectStateSchemas, type StateInspection } from "./migration-manager.ts";
@@ -254,6 +254,8 @@ async function restoreStateBackupUnlocked(
         sourceCommit: source.manifest.sourceApplication.commit,
         sourceSchemas: source.manifest.stateSchemas
       });
+      await ensureSecureStateTree(stateRoot);
+      if (!await isOwnerOnlyPath(stateRoot)) throw new Error("activated restore failed owner-only permission verification");
       if (stateExists) await rm(displaced, { recursive: true, force: true });
       return {
         ok: true,
@@ -575,12 +577,7 @@ async function validatePhysicalTree(root: string, label: string): Promise<void> 
 }
 
 async function secureTree(root: string): Promise<void> {
-  await chmod(root, 0o700);
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) await secureTree(path);
-    else if (entry.isFile()) await chmod(path, 0o600);
-  }
+  await ensureSecureStateTree(root);
 }
 
 async function ensurePhysicalParent(directory: string, label: string): Promise<void> {
