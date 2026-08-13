@@ -179,7 +179,10 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
     release,
     /^  publish-release:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- source-package\s*\n[\s\S]*?^    environment: release\s*\n[\s\S]*?^      id-token: write/m
   );
-  assert.match(release, /mapfile -t package_manifests < <\(find dist\/npm-package -type f -name package\.json -print\)/);
+  assert.match(
+    release,
+    /mapfile -t package_manifests < <\(find dist\/npm-package -type f -name package\.json -not -path '\*\/node_modules\/\*' -print\)/
+  );
   assert.match(release, /test "\$\{#package_manifests\[@\]\}" -eq 1/);
   assert.match(release, /npm publish "\$package_dir" --tag next --access public --provenance/);
   assert.match(release, /proving the registry tarball matches the candidate/);
