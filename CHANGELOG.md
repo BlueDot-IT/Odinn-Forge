@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.1.0-rc.2](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.1...v1.1.0-rc.2) (2026-08-13)
+
 ### Added
 
 * durable OCI jobs, child-agent graphs, skills, MCP, workflows, event ingress,
@@ -29,11 +31,17 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ### Release engineering
 
-* prepare the post-`v1.0.0` development line as `1.1.0-rc.1`
+* prepare the post-`v1.0.0` development line as `1.1.0-rc.2`
 * require draft-release verification before immutable publication
 * freeze the 1.1 candidate around boundary completion, defect repair,
   decomposition, and exact-artifact validation without promoting experimental
   interfaces
+
+### Validation
+
+* prepare the exact `v1.1.0-rc.2` candidate metadata; the protected Release
+  workflow remains authoritative for tagged-commit, downloaded-archive,
+  checksum, SBOM, provenance, and clean-platform validation
 
 ## [1.0.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.0.0-rc.1...v1.0.0) (2026-07-25)
 
