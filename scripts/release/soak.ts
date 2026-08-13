@@ -235,11 +235,16 @@ try {
     throw new Error("interrupted job did not enter needs-review after restart");
   });
 
-  await writeFile(join(state, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, id: "soak-browser-transaction", status: "unknown" })}\n`);
+  await writeFile(join(state, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, id: "soak-browser-transaction", status: "unknown" })}\n`, { mode: 0o600 });
   await record("browser-interruption-recovery-block", async () => {
     const status = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.recovery.status", input: {} }) });
     if (status.body.output?.recovery?.status !== "unknown") throw new Error("browser recovery journal was not observed");
-    const blocked = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.press", input: { key: "Escape", confirmed: true } }) });
+    const requested = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.press", input: { key: "Escape", confirmed: true } }) });
+    const approvalId = requested.body.output?.approvalId;
+    if (requested.response.status !== 200 || requested.body.output?.type !== "approval.required" || typeof approvalId !== "string") {
+      throw new Error("browser mutation did not enter explicit approval while recovery was unresolved");
+    }
+    const blocked = await gatewayRequest(gateway, `/approvals/${encodeURIComponent(approvalId)}/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     if (blocked.response.status !== 400 || blocked.body.category !== "browser-recovery") throw new Error("browser mutation was not blocked by unresolved recovery");
     const resolved = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.recovery.resolve", input: { outcome: "not-applied" } }) });
     if (!resolved.response.ok || resolved.body.output?.recovery?.status !== "resolved") throw new Error("browser recovery could not be resolved");
@@ -248,12 +253,20 @@ try {
   await stopGateway(gateway);
 
   const configPath = join(state, "config.json");
-  const config = JSON.parse(await readFile(configPath, "utf8"));
-  config.experimental = { ...(config.experimental ?? {}), rewind: true };
-  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
   const rewindRun = JSON.parse(await run(process.execPath, [cliEntry, "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_SOAK_REWIND" }), "--state", state], workspace, { INIT_CWD: workspace }));
-  const checkpoint = JSON.parse(await run(process.execPath, [cliEntry, "experimental", "rewind", "checkpoint", "create", rewindRun.id, "--path", "soak-output.txt", "--state", state], workspace, { INIT_CWD: workspace }));
-  await record("rewind-dry-run", async () => { const preview = JSON.parse(await run(process.execPath, [cliEntry, "experimental", "rewind", "restore", checkpoint.snapshotId, "--state", state], workspace, { INIT_CWD: workspace })); if (preview.applied !== false) throw new Error("rewind dry-run applied a restore"); return { applied: false }; });
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.experimental = { ...(config.experimental ?? {}), capabilities: true };
+  config.policy = {
+    ...(config.policy ?? {}),
+    allowedCapabilities: [...new Set([...(config.policy?.allowedCapabilities ?? []), "restore.create", "restore.apply"])]
+  };
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  const checkpointTaskId = `soak-checkpoint-${rewindRun.id}`;
+  const checkpointToken = JSON.parse(await run(process.execPath, [cliEntry, "capability", "issue", "--run", checkpointTaskId, "--step", "checkpoint-create", "--tool", "snapshot.create", "--show-token", "--state", state], workspace, { INIT_CWD: workspace }));
+  const checkpoint = JSON.parse(await run(process.execPath, [cliEntry, "checkpoint", "create", rewindRun.id, "--path", "soak-output.txt", "--task-run", checkpointTaskId, "--capability-token", checkpointToken.token, "--state", state], workspace, { INIT_CWD: workspace }));
+  const rewindPreviewRunId = `soak-rewind-preview-${rewindRun.id}`;
+  const rewindPreviewToken = JSON.parse(await run(process.execPath, [cliEntry, "capability", "issue", "--run", rewindPreviewRunId, "--step", "rewind-preview", "--tool", "snapshot.restore", "--constraints", JSON.stringify({ snapshotId: checkpoint.snapshotId }), "--show-token", "--state", state], workspace, { INIT_CWD: workspace }));
+  await record("rewind-dry-run", async () => { const preview = JSON.parse(await run(process.execPath, [cliEntry, "rewind", checkpoint.snapshotId, "--run", rewindPreviewRunId, "--capability-token", rewindPreviewToken.token, "--state", state], workspace, { INIT_CWD: workspace })); if (preview.applied !== false) throw new Error("rewind dry-run applied a restore"); return { applied: false }; });
   await record("audit-integrity-and-persisted-output", async () => { const verification = JSON.parse(await run(process.execPath, [cliEntry, "audit", "verify", "--state", state], workspace, { INIT_CWD: workspace })); if (!verification.valid) throw new Error("audit verification failed"); await run(process.execPath, [cliEntry, "run", "show", rewindRun.id, "--state", state], workspace, { INIT_CWD: workspace }); return { auditVerification: true }; });
 
   await record("installer-upgrade-rollback", async () => {
