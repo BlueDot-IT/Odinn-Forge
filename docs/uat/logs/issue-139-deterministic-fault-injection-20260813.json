@@ -1,0 +1,68 @@
+{
+  "issue": 139,
+  "repository": "BlueDot-IT/Odinn-Forge",
+  "base": "origin/main@58980180ac60726337a1866587a49457f9b157b8",
+  "suite": "tests/fault-injection-workflow.test.ts",
+  "command": "corepack pnpm exec node --test --test-concurrency=1 --test-reporter=spec tests/fault-injection-workflow.test.ts",
+  "result": {
+    "tests": 5,
+    "passed": 5,
+    "failed": 0,
+    "cleanupVerified": true,
+    "secretsOrCredentialsIncluded": false
+  },
+  "cases": [
+    {
+      "caseId": "pre-dispatch-cancel",
+      "injectionPoint": "after admission telemetry, before dispatch",
+      "expectedInvariant": "cancellation must not cross the physical effect boundary",
+      "observedDurableState": {
+        "workflowStatus": "cancelled",
+        "stepStatus": "cancelled",
+        "physicalDispatches": 0,
+        "replayDispatches": 0,
+        "completedEvents": 0
+      },
+      "recoveryResult": "cancelled without invoking the controlled fake"
+    },
+    {
+      "caseId": "post-dispatch-shutdown",
+      "injectionPoint": "after the controlled fake begins its physical effect, before durable settlement",
+      "expectedInvariant": "uncertain effectful work must be quarantined and never replayed automatically",
+      "observedDurableState": {
+        "workflowStatus": "needs-review",
+        "stepStatus": "needs-review",
+        "physicalDispatches": 1,
+        "replayDispatches": 0,
+        "completedEvents": 0
+      },
+      "recoveryResult": "restart preserved needs-review and did not dispatch again"
+    },
+    {
+      "caseId": "settlement-before-commit",
+      "injectionPoint": "controlled failure before SQLite completeStep commit",
+      "expectedInvariant": "a failed settlement after an effect must not be treated as retry-safe",
+      "observedDurableState": {
+        "workflowStatus": "needs-review",
+        "stepStatus": "needs-review",
+        "physicalDispatches": 1,
+        "replayDispatches": 0,
+        "completedEvents": 0
+      },
+      "recoveryResult": "restart preserved needs-review and did not dispatch again"
+    },
+    {
+      "caseId": "settlement-after-commit",
+      "injectionPoint": "controlled acknowledgement loss after SQLite completeStep commit",
+      "expectedInvariant": "durable settlement must win over a lost post-commit acknowledgement",
+      "observedDurableState": {
+        "workflowStatus": "completed",
+        "stepStatus": "completed",
+        "physicalDispatches": 1,
+        "replayDispatches": 0,
+        "completedEvents": 1
+      },
+      "recoveryResult": "restart observed the durable completion and did not dispatch again"
+    }
+  ]
+}
