@@ -43,8 +43,10 @@ ignored-output, and percent-encoded traversal references cannot bypass the
 production package boundary. Explicitly
 matched `dist` package roots are included; generated directories must be
 excluded in the workspace globs, while pnpm's `node_modules` and
-`bower_components` exclusions remain intact. Production package roots,
-manifests, and descendants cannot traverse symbolic links or junctions;
+`bower_components` source exclusions remain intact. Package-local dependency
+links are still physically audited and must point to a canonical declared
+workspace package or a declared package in the pnpm store. Production package
+roots, manifests, and descendants cannot traverse symbolic links or junctions;
 broken links and repository escapes fail closed. Archive verification retains
 an independent no-symbolic-link and no-hard-link boundary.
 
@@ -54,12 +56,24 @@ URL modules, indirect or computed loaders, private or derived `Module`
 entrypoints, `Reflect.get` loader authority, loader hook registration,
 `createRequire`, dynamic `getBuiltinModule` access, direct or aliased `eval`,
 `Function`, and callable constructor-based code generation fail closed.
+Runtime `node:module`/`module` acquisition is limited to type-only use and the
+static `builtinModules` metadata export; runtime `node:vm`/`vm` acquisition is
+forbidden. Production package scripts are also closed-form: only a
+package-owned audited `node ./entrypoint` without runtime options or
+`tsc -p tsconfig*.json` is accepted. Loader/preload/eval flags, `NODE_OPTIONS`,
+shell wrappers, and path escapes fail closed. Accepted Node entrypoints are
+added to the source inventory even when they live in build output.
 TypeScript triple-slash path, type, and AMD dependency references are checked
 through the same boundary as imports. Package `imports`
 aliases and effective TypeScript `paths` aliases in production package config
 variants and their inherited chains also fail closed so dependency identities
 and packaged build inputs remain statically enforceable. Tool-only TypeScript
 configurations are outside this production-package rule.
+
+This gate enforces its documented syntax, manifest, export, and installed-link
+grammar. It is not a whole-program proof for arbitrary worker or child-process
+execution; those behaviors remain subject to their dedicated runtime and
+sandbox controls.
 
 Diagnostics name the source file or manifest, import/dependency specifier, and
 violated rule. The dependency-direction check has no legacy exemptions.

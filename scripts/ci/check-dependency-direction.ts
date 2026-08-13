@@ -59,11 +59,13 @@ export const DEPENDENCY_RULES = {
   encodedModuleSpecifier: "percent-encoded module specifiers are unsupported in production workspace packages",
   executableExportTarget: "workspace exports must use statically auditable source or inert JSON targets",
   missingGraphPackage: "allowed dependency graph packages must be discovered from pnpm-workspace.yaml",
+  moduleHookScript: "production workspace scripts must be closed-form typechecks or package-owned audited Node entrypoints",
   packageImportAlias: "package.json imports aliases are unsupported in production workspace packages",
   packageToApp: "packages and adapters cannot depend on apps",
   physicalExportTarget: "workspace exports must resolve to an existing regular file inside their package",
   privateWorkspaceSubpath: "workspace imports must use package.json exports",
   unscannedSourcePath: "production file references must remain in the scanned source of their workspace package",
+  unmanagedNodeModulesLink: "package-local node_modules links must resolve to declared package-manager dependencies",
   productionSymlink: "production workspace packages cannot contain symbolic links",
   typescriptPathAlias: "TypeScript paths aliases are unsupported for production workspace architecture",
   undeclaredWorkspaceDependency: "workspace source imports must be declared in package.json",
@@ -87,6 +89,7 @@ export type ImportKind =
   | "import-type"
   | "manifest-dependency"
   | "manifest-export"
+  | "manifest-script"
   | "module-loader"
   | "package-import-alias"
   | "require-call"
@@ -152,6 +155,13 @@ interface ManifestExportTarget {
   column: number;
 }
 
+interface ManifestScript {
+  name: string;
+  command: string;
+  line: number;
+  column: number;
+}
+
 interface WorkspacePackage {
   name: string;
   kind: WorkspacePackageKind;
@@ -161,6 +171,8 @@ interface WorkspacePackage {
   moduleType: "commonjs" | "module";
   exports: unknown;
   exportTargets: readonly ManifestExportTarget[];
+  scripts: readonly ManifestScript[];
+  scriptSourceFiles: ReadonlySet<string>;
   dependencies: readonly ManifestDependency[];
   dependencyNames: ReadonlySet<string>;
   packageImports: readonly ManifestAlias[];
@@ -188,6 +200,7 @@ const unscannedPackageDirectories = new Set(["bower_components", "dist", "node_m
 const dependencyFields = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] as const;
 const nonLiteralSpecifier = "<non-literal module specifier>";
 const unsupportedModuleLoader = "<unsupported module loader>";
+const nodeModuleStoreDirectory = "node_modules/.pnpm";
 
 function isExportedSourceTarget(path: string): boolean {
   const extension = extname(path).toLowerCase();
@@ -432,6 +445,27 @@ function manifestExportTargets(content: string, exportsValue: unknown): Manifest
     || left.target.localeCompare(right.target));
 }
 
+function manifestScripts(content: string, manifest: Record<string, unknown>): ManifestScript[] {
+  const scriptsValue = manifest.scripts;
+  if (!scriptsValue || typeof scriptsValue !== "object" || Array.isArray(scriptsValue)) return [];
+  return Object.entries(scriptsValue as Record<string, unknown>)
+    .flatMap(([name, command]) => typeof command === "string"
+      ? [{ name, command, ...manifestStringLocation(content, command) }]
+      : [])
+    .sort((left, right) => left.line - right.line
+      || left.column - right.column
+      || left.name.localeCompare(right.name));
+}
+
+function manifestScriptSourceFiles(directory: string, scripts: readonly ManifestScript[]): ReadonlySet<string> {
+  const files = new Set<string>();
+  for (const script of scripts) {
+    const match = /^node (\.\/[A-Za-z\d_./-]+\.(?:cjs|cts|js|jsx|mjs|mts|ts|tsx))$/u.exec(script.command);
+    if (match) files.add(resolve(directory, match[1]!));
+  }
+  return files;
+}
+
 function workspacePackageKind(repositoryManifestPath: string): WorkspacePackageKind {
   if (repositoryManifestPath.startsWith("adapters/")) return "adapter";
   if (repositoryManifestPath.startsWith("apps/")) return "app";
@@ -459,6 +493,7 @@ async function workspacePackages(repositoryRoot: string): Promise<WorkspacePacka
       throw new Error(`${repositoryManifestPath} must declare a package name`);
     }
     const dependencies = manifestDependencies(content, record);
+    const scripts = manifestScripts(content, record);
     return {
       name: record.name,
       kind: workspacePackageKind(repositoryManifestPath),
@@ -468,6 +503,8 @@ async function workspacePackages(repositoryRoot: string): Promise<WorkspacePacka
       moduleType: record.type === "module" ? "module" : "commonjs",
       exports: record.exports,
       exportTargets: manifestExportTargets(content, record.exports),
+      scripts,
+      scriptSourceFiles: manifestScriptSourceFiles(directory, scripts),
       dependencies,
       dependencyNames: new Set(dependencies.map(({ name }) => name)),
       packageImports: manifestPackageImports(content, record),
@@ -481,6 +518,91 @@ async function workspacePackages(repositoryRoot: string): Promise<WorkspacePacka
     names.add(workspacePackage.name);
   }
   return packages.sort((left, right) => left.repositoryManifestPath.localeCompare(right.repositoryManifestPath));
+}
+
+interface NodeModulesLink {
+  moduleName: string;
+  path: string;
+}
+
+function unmanagedNodeModulesViolation(
+  repositoryRoot: string,
+  moduleName: string,
+  path: string,
+): DependencyViolation {
+  return {
+    sourceFile: repositoryPath(repositoryRoot, path),
+    line: 1,
+    column: 1,
+    specifier: moduleName,
+    kind: "workspace-symlink",
+    rule: DEPENDENCY_RULES.unmanagedNodeModulesLink,
+  };
+}
+
+async function packageNodeModulesLinks(
+  repositoryRoot: string,
+  workspacePackage: WorkspacePackage,
+): Promise<{ links: NodeModulesLink[]; violations: DependencyViolation[] }> {
+  const nodeModules = resolve(workspacePackage.directory, "node_modules");
+  const violations: DependencyViolation[] = [];
+  const links: NodeModulesLink[] = [];
+  const metadata = await lstat(nodeModules).catch(() => undefined);
+  if (!metadata) return { links, violations };
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    violations.push(unmanagedNodeModulesViolation(repositoryRoot, "node_modules", nodeModules));
+    return { links, violations };
+  }
+
+  for (const entry of (await readdir(nodeModules, { withFileTypes: true }))
+    .sort((left, right) => left.name.localeCompare(right.name))) {
+    if (entry.name.startsWith(".")) continue;
+    const entryPath = resolve(nodeModules, entry.name);
+    if (entry.name.startsWith("@")) {
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        violations.push(unmanagedNodeModulesViolation(repositoryRoot, entry.name, entryPath));
+        continue;
+      }
+      for (const child of (await readdir(entryPath, { withFileTypes: true }))
+        .sort((left, right) => left.name.localeCompare(right.name))) {
+        if (child.isSymbolicLink()) {
+          links.push({ moduleName: `${entry.name}/${child.name}`, path: resolve(entryPath, child.name) });
+        } else {
+          violations.push(unmanagedNodeModulesViolation(
+            repositoryRoot,
+            `${entry.name}/${child.name}`,
+            resolve(entryPath, child.name),
+          ));
+        }
+      }
+    } else if (entry.isSymbolicLink()) {
+      links.push({ moduleName: entry.name, path: entryPath });
+    } else {
+      violations.push(unmanagedNodeModulesViolation(repositoryRoot, entry.name, entryPath));
+    }
+  }
+  return { links, violations };
+}
+
+async function nodeModulesLinkViolations(
+  repositoryRoot: string,
+  workspacePackage: WorkspacePackage,
+  packages: readonly WorkspacePackage[],
+): Promise<DependencyViolation[]> {
+  const { links, violations } = await packageNodeModulesLinks(repositoryRoot, workspacePackage);
+  const packageManagerStore = resolve(repositoryRoot, nodeModuleStoreDirectory);
+  for (const link of links) {
+    const physical = await realpath(link.path).catch(() => undefined);
+    const targetPackage = physical
+      ? packages.find((candidate) => candidate.physicalDirectory === physical)
+      : undefined;
+    const declared = workspacePackage.dependencyNames.has(link.moduleName);
+    const canonicalWorkspaceLink = declared && targetPackage?.name === link.moduleName;
+    const packageManagerLink = declared && physical !== undefined && isPathInside(packageManagerStore, physical);
+    if (canonicalWorkspaceLink || packageManagerLink) continue;
+    violations.push(unmanagedNodeModulesViolation(repositoryRoot, link.moduleName, link.path));
+  }
+  return violations;
 }
 
 function stringSpecifier(node: ts.Node | undefined): string | undefined {
@@ -525,17 +647,31 @@ function nodeModuleSpecifier(node: ts.Node | undefined): boolean {
   return moduleName === "node:module" || moduleName === "module";
 }
 
-function exportExposesModuleLoader(node: ts.ExportDeclaration): boolean {
+function nodeVmSpecifier(node: ts.Node | undefined): boolean {
+  const moduleName = stringSpecifier(node);
+  return moduleName === "node:vm" || moduleName === "vm";
+}
+
+function runtimeAuthorityModuleSpecifier(node: ts.Node | undefined): boolean {
+  return nodeModuleSpecifier(node) || nodeVmSpecifier(node);
+}
+
+function importExposesModuleLoader(node: ts.ImportDeclaration, source: ts.SourceFile): boolean {
+  if (importDeclarationIsTypeOnly(node, source)) return false;
+  if (nodeVmSpecifier(node.moduleSpecifier)) return true;
   if (!nodeModuleSpecifier(node.moduleSpecifier)) return false;
-  if (!node.exportClause || ts.isNamespaceExport(node.exportClause)) return true;
-  return node.exportClause.elements.some((element) => {
-    const exportedName = (element.propertyName ?? element.name).text;
-    return exportedName === "createRequire"
-      || exportedName === "default"
-      || exportedName === "Module"
-      || exportedName === "register"
-      || exportedName === "registerHooks";
-  });
+  const bindings = node.importClause?.namedBindings;
+  return !bindings || !ts.isNamedImports(bindings) || bindings.elements.some((element) =>
+    !element.isTypeOnly && (element.propertyName ?? element.name).text !== "builtinModules");
+}
+
+function exportExposesModuleLoader(node: ts.ExportDeclaration, source: ts.SourceFile): boolean {
+  if (exportDeclarationIsTypeOnly(node, source)) return false;
+  if (nodeVmSpecifier(node.moduleSpecifier)) return true;
+  if (!nodeModuleSpecifier(node.moduleSpecifier)) return false;
+  return !node.exportClause || ts.isNamespaceExport(node.exportClause)
+    || node.exportClause.elements.some((element) =>
+      !element.isTypeOnly && (element.propertyName ?? element.name).text !== "builtinModules");
 }
 
 function isDirectCallTarget(node: ts.Node): boolean {
@@ -723,11 +859,47 @@ function moduleLoaderRoots(source: ts.SourceFile): ReadonlySet<string> {
 interface DynamicCodeRoots {
   evaluators: ReadonlySet<string>;
   globals: ReadonlySet<string>;
+  proxies: ReadonlySet<string>;
+}
+
+const dynamicEvaluatorNames = new Set(["eval", "Function"]);
+const reflectiveAuthorityMethods = new Map([
+  ["Object", new Set(["create", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors", "setPrototypeOf"])],
+  ["Reflect", new Set(["apply", "construct", "get", "getPrototypeOf", "setPrototypeOf"])],
+]);
+
+function proxyTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
+  node = unwrapExpression(node);
+  if (ts.isIdentifier(node)) return roots.proxies.has(node.text);
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    const name = propertyName(node);
+    if (name === "value") return proxyTarget(node.expression, roots);
+    return name === "Proxy" && globalObjectTarget(node.expression, roots);
+  }
+  if (ts.isCallExpression(node) && callTargetNamed(node, "Object", "getOwnPropertyDescriptor")
+    && node.arguments[0]
+    && globalObjectTarget(node.arguments[0], roots)) {
+    return staticStringExpression(node.arguments[1]) === "Proxy";
+  }
+  return false;
 }
 
 function globalObjectTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
   node = unwrapExpression(node);
-  return ts.isIdentifier(node) && roots.globals.has(node.text);
+  if (ts.isIdentifier(node)) return roots.globals.has(node.text);
+  if ((ts.isCallExpression(node) || ts.isNewExpression(node))
+    && proxyTarget(node.expression, roots)
+    && Boolean(node.arguments?.[0] && globalObjectTarget(node.arguments[0], roots))) return true;
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  const revocableCall = unwrapExpression(node.expression);
+  return propertyName(node) === "proxy"
+    && ts.isCallExpression(revocableCall)
+    && propertyName(revocableCall.expression) === "revocable"
+    && (ts.isPropertyAccessExpression(revocableCall.expression)
+      || ts.isElementAccessExpression(revocableCall.expression))
+    && proxyTarget(revocableCall.expression.expression, roots)
+    && Boolean(revocableCall.arguments[0]
+      && globalObjectTarget(revocableCall.arguments[0], roots));
 }
 
 function dynamicCodeTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
@@ -739,17 +911,28 @@ function dynamicCodeTarget(node: ts.Expression, roots: DynamicCodeRoots): boolea
     return dynamicCodeTarget(node.right, roots);
   }
   if (ts.isIdentifier(node)) return roots.evaluators.has(node.text);
+  if (ts.isCallExpression(node) && callTargetNamed(node, "Object", "getOwnPropertyDescriptor")
+    && node.arguments[0]
+    && globalObjectTarget(node.arguments[0], roots)) {
+    const name = staticStringExpression(node.arguments[1]);
+    return name === undefined || dynamicEvaluatorNames.has(name);
+  }
+  if (ts.isCallExpression(node) && callTargetNamed(node, "Object", "getOwnPropertyDescriptors")
+    && node.arguments[0]
+    && globalObjectTarget(node.arguments[0], roots)) return true;
   if (ts.isCallExpression(node) && callTargetNamed(node, "Reflect", "get")
     && node.arguments[0]
     && globalObjectTarget(node.arguments[0], roots)) {
     const name = staticStringExpression(node.arguments[1]);
-    return name === undefined || name === "eval" || name === "Function";
+    return name === undefined || dynamicEvaluatorNames.has(name);
   }
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = propertyName(node);
-    if ((name === undefined || name === "eval" || name === "Function")
+    if ((name === undefined || (name !== undefined && dynamicEvaluatorNames.has(name)))
       && globalObjectTarget(node.expression, roots)) return true;
-    if (name === "call" || name === "apply" || name === "bind" || name === "prototype") {
+    if (name === "constructor") return true;
+    if (name === "call" || name === "apply" || name === "bind" || name === "prototype"
+      || name === "value" || (name !== undefined && dynamicEvaluatorNames.has(name))) {
       return dynamicCodeTarget(node.expression, roots);
     }
   }
@@ -757,9 +940,10 @@ function dynamicCodeTarget(node: ts.Expression, roots: DynamicCodeRoots): boolea
 }
 
 function dynamicCodeRoots(source: ts.SourceFile): DynamicCodeRoots {
-  const evaluators = new Set(["eval", "Function"]);
+  const evaluators = new Set(dynamicEvaluatorNames);
   const globals = new Set(["global", "globalThis", "self", "window"]);
-  const roots: DynamicCodeRoots = { evaluators, globals };
+  const proxies = new Set(["Proxy"]);
+  const roots: DynamicCodeRoots = { evaluators, globals, proxies };
   let changed = true;
   while (changed) {
     changed = false;
@@ -771,17 +955,41 @@ function dynamicCodeRoots(source: ts.SourceFile): DynamicCodeRoots {
         } else if (dynamicCodeTarget(node.initializer, roots) && !evaluators.has(node.name.text)) {
           evaluators.add(node.name.text);
           changed = true;
+        } else if (proxyTarget(node.initializer, roots) && !proxies.has(node.name.text)) {
+          proxies.add(node.name.text);
+          changed = true;
         }
       } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
         && globalObjectTarget(node.initializer, roots)) {
         for (const element of node.name.elements) {
           const property = bindingPropertyName(element.propertyName)
             ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
-          if ((property === "eval" || property === "Function")
-            && ts.isIdentifier(element.name)
-            && !evaluators.has(element.name.text)) {
-            evaluators.add(element.name.text);
-            changed = true;
+          if (ts.isIdentifier(element.name)) {
+            if (property !== undefined && dynamicEvaluatorNames.has(property)
+              && !evaluators.has(element.name.text)) {
+              evaluators.add(element.name.text);
+              changed = true;
+            } else if (property === "Proxy" && !proxies.has(element.name.text)) {
+              proxies.add(element.name.text);
+              changed = true;
+            }
+          }
+        }
+      } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
+        && ts.isCallExpression(unwrapExpression(node.initializer))) {
+        const call = unwrapExpression(node.initializer) as ts.CallExpression;
+        if (propertyName(call.expression) === "revocable"
+          && (ts.isPropertyAccessExpression(call.expression) || ts.isElementAccessExpression(call.expression))
+          && proxyTarget(call.expression.expression, roots)
+          && call.arguments[0]
+          && globalObjectTarget(call.arguments[0], roots)) {
+          for (const element of node.name.elements) {
+            const property = bindingPropertyName(element.propertyName)
+              ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
+            if (property === "proxy" && ts.isIdentifier(element.name) && !globals.has(element.name.text)) {
+              globals.add(element.name.text);
+              changed = true;
+            }
           }
         }
       } else if (ts.isBinaryExpression(node)
@@ -792,6 +1000,9 @@ function dynamicCodeRoots(source: ts.SourceFile): DynamicCodeRoots {
           changed = true;
         } else if (dynamicCodeTarget(node.right, roots) && !evaluators.has(node.left.text)) {
           evaluators.add(node.left.text);
+          changed = true;
+        } else if (proxyTarget(node.right, roots) && !proxies.has(node.left.text)) {
+          proxies.add(node.left.text);
           changed = true;
         }
       }
@@ -804,14 +1015,67 @@ function dynamicCodeRoots(source: ts.SourceFile): DynamicCodeRoots {
 
 function isDynamicCodeCall(node: ts.CallExpression | ts.NewExpression, roots: DynamicCodeRoots): boolean {
   if (dynamicCodeTarget(node.expression, roots)) return true;
+  const proxyCall = propertyName(node.expression) === "revocable"
+    && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+    ? proxyTarget(node.expression.expression, roots)
+    : proxyTarget(node.expression, roots);
+  if (proxyCall && node.arguments[0] && globalObjectTarget(node.arguments[0], roots)) return true;
   if (ts.isCallExpression(node)
     && ts.isPropertyAccessExpression(node.expression)
     && ts.isIdentifier(node.expression.expression)
     && node.expression.expression.text === "Reflect"
-    && node.expression.name.text === "construct") {
+    && (node.expression.name.text === "apply" || node.expression.name.text === "construct")) {
     return Boolean(node.arguments[0] && dynamicCodeTarget(node.arguments[0], roots));
   }
   return propertyName(node.expression) === "constructor";
+}
+
+function reflectiveAuthorityExtraction(node: ts.Expression): boolean {
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  const target = unwrapExpression(node.expression);
+  const name = propertyName(node);
+  return ts.isIdentifier(target)
+    && name !== undefined
+    && Boolean(reflectiveAuthorityMethods.get(target.text)?.has(name))
+    && !isDirectCallTarget(node);
+}
+
+function runtimeBuiltinLoaderExtraction(node: ts.CallExpression): boolean {
+  if ((callTargetNamed(node, "Reflect", "get")
+    || callTargetNamed(node, "Object", "getOwnPropertyDescriptor"))
+    && staticStringExpression(node.arguments[1]) === "getBuiltinModule") return true;
+  return callTargetNamed(node, "Object", "getOwnPropertyDescriptors")
+    && Boolean(node.parent
+      && (ts.isPropertyAccessExpression(node.parent) || ts.isElementAccessExpression(node.parent))
+      && propertyName(node.parent) === "getBuiltinModule");
+}
+
+function evaluatorIdentifierEscapes(node: ts.Identifier, roots: DynamicCodeRoots): boolean {
+  if (!roots.evaluators.has(node.text)) return false;
+  const parent = node.parent;
+  if ((ts.isPropertyAccessExpression(parent) && parent.name === node)
+    || (ts.isBindingElement(parent) && (parent.name === node || parent.propertyName === node))
+    || (ts.isVariableDeclaration(parent) && parent.name === node)
+    || ((ts.isFunctionDeclaration(parent) || ts.isFunctionExpression(parent)
+      || ts.isClassDeclaration(parent) || ts.isClassExpression(parent)) && parent.name === node)
+    || (ts.isParameter(parent) && parent.name === node)
+    || ((ts.isPropertyAssignment(parent) || ts.isPropertyDeclaration(parent)
+      || ts.isMethodDeclaration(parent) || ts.isPropertySignature(parent)
+      || ts.isMethodSignature(parent)) && parent.name === node)
+    || ts.isImportSpecifier(parent)
+    || ts.isExportSpecifier(parent)) return false;
+  for (let ancestor: ts.Node | undefined = parent; ancestor && !ts.isStatement(ancestor); ancestor = ancestor.parent) {
+    if (ts.isTypeNode(ancestor)
+      && !(ts.isExpressionWithTypeArguments(ancestor)
+        && ts.isHeritageClause(ancestor.parent)
+        && ancestor.parent.token === ts.SyntaxKind.ExtendsKeyword)) return false;
+    if ((ts.isCallExpression(ancestor) || ts.isNewExpression(ancestor))
+      && isDynamicCodeCall(ancestor, roots)) return false;
+  }
+  return !(ts.isVariableDeclaration(parent) && parent.initializer === node)
+    && !(ts.isBinaryExpression(parent)
+      && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && parent.right === node);
 }
 
 function extractImportReferences(
@@ -877,20 +1141,14 @@ function extractImportReferences(
 
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node)) {
+      const typeOnly = importDeclarationIsTypeOnly(node, source);
       record(node, node.moduleSpecifier, "import-declaration", true, undefined, {
         resolutionMode: resolutionModeAttribute(node.attributes)
           ?? sourceResolutionMode(absolutePath, moduleType),
-        typeOnly: importDeclarationIsTypeOnly(node, source),
+        typeOnly,
       });
-      if (nodeModuleSpecifier(node.moduleSpecifier)) {
-        const bindings = node.importClause?.namedBindings;
-        if (bindings && ts.isNamedImports(bindings)) {
-          for (const element of bindings.elements) {
-            if (["createRequire", "register", "registerHooks"].includes((element.propertyName ?? element.name).text)) {
-              record(element, undefined, "module-loader", true, unsupportedModuleLoader);
-            }
-          }
-        }
+      if (importExposesModuleLoader(node, source)) {
+        record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       }
     } else if (ts.isExportDeclaration(node)) {
       record(node, node.moduleSpecifier, "export-declaration", true, undefined, {
@@ -898,12 +1156,15 @@ function extractImportReferences(
           ?? sourceResolutionMode(absolutePath, moduleType),
         typeOnly: exportDeclarationIsTypeOnly(node, source),
       });
-      if (exportExposesModuleLoader(node)) {
+      if (exportExposesModuleLoader(node, source)) {
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       }
     } else if (ts.isImportEqualsDeclaration(node)
       && ts.isExternalModuleReference(node.moduleReference)) {
       record(node, node.moduleReference.expression, "import-equals");
+      if (runtimeAuthorityModuleSpecifier(node.moduleReference.expression)) {
+        record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+      }
     } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
       record(node, node.argument.literal, "import-type", true, undefined, {
         resolutionMode: resolutionModeAttribute(node.attributes)
@@ -916,18 +1177,32 @@ function extractImportReferences(
       } else if (dynamicCodeTarget(node, evaluatorRoots)) {
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       } else if (propertyName(node.expression) === "getBuiltinModule"
-        && (!stringSpecifier(node.arguments[0]) || nodeModuleSpecifier(node.arguments[0]))) {
+        || runtimeBuiltinLoaderExtraction(node)) {
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       } else if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-        record(node, node.arguments[0], "dynamic-import", false);
+        if (runtimeAuthorityModuleSpecifier(node.arguments[0])) {
+          record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+        } else {
+          record(node, node.arguments[0], "dynamic-import", false);
+        }
       } else if ((ts.isIdentifier(node.expression) && node.expression.text === "require")
         || propertyName(node.expression) === "require") {
-        record(node, node.arguments[0], "require-call", false);
+        if (runtimeAuthorityModuleSpecifier(node.arguments[0])) {
+          record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+        } else {
+          record(node, node.arguments[0], "require-call", false);
+        }
       } else if (moduleLoaderCapability(node, loaderRoots)
         || moduleLoaderCapability(node.expression, loaderRoots)) {
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       }
     } else if (ts.isNewExpression(node) && isDynamicCodeCall(node, evaluatorRoots)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
+      && reflectiveAuthorityExtraction(node)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
+      && propertyName(node) === "getBuiltinModule" && !isDirectCallTarget(node)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
       && propertyName(node) === "require" && !isDirectCallTarget(node)) {
@@ -952,6 +1227,10 @@ function extractImportReferences(
     } else if (ts.isBindingElement(node)
       && bindingExposesModuleLoader(node, loaderRoots)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isBindingElement(node)
+      && (bindingPropertyName(node.propertyName)
+        ?? (ts.isIdentifier(node.name) ? node.name.text : undefined)) === "getBuiltinModule") {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isVariableDeclaration(node) && node.initializer
       && dynamicCodeTarget(node.initializer, evaluatorRoots)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
@@ -972,6 +1251,8 @@ function extractImportReferences(
       && !isDirectCallTarget(node)
       && !(ts.isVariableDeclaration(node.parent) && node.parent.initializer === node)
       && !(ts.isBinaryExpression(node.parent) && node.parent.right === node)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isIdentifier(node) && evaluatorIdentifierEscapes(node, evaluatorRoots)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isIdentifier(node) && node.text === "require") {
       const directRequire = node.parent && ts.isCallExpression(node.parent) && node.parent.expression === node;
@@ -1333,12 +1614,53 @@ function dependencyAliasTarget(
   return packages.find((workspacePackage) => workspacePackage.directory === absolutePath);
 }
 
-function manifestViolations(
+async function ownedManifestScriptTarget(
+  repositoryRoot: string,
+  workspacePackage: WorkspacePackage,
+  packages: readonly WorkspacePackage[],
+  relativeTarget: string,
+  allowBuildOutput = false,
+): Promise<boolean> {
+  const target = resolve(workspacePackage.directory, relativeTarget);
+  if (!isPathInside(workspacePackage.directory, target)) return false;
+  const segments = relative(workspacePackage.directory, target).split(sep).filter(Boolean);
+  if (segments.some((segment) => segment === "bower_components" || segment === "node_modules"
+    || (!allowBuildOutput && segment === "dist"))) return false;
+  try {
+    const physical = await physicalPathWithoutLinks(
+      repositoryRoot,
+      target,
+      `${workspacePackage.repositoryManifestPath} script target`,
+    );
+    const metadata = await lstat(physical);
+    return metadata.isFile() && packageForPhysicalPath(packages, physical)?.name === workspacePackage.name;
+  } catch {
+    return false;
+  }
+}
+
+async function safeManifestScript(
+  repositoryRoot: string,
+  workspacePackage: WorkspacePackage,
+  packages: readonly WorkspacePackage[],
+  script: ManifestScript,
+): Promise<boolean> {
+  const nodeEntrypoint = /^node (\.\/[A-Za-z\d_./-]+\.(?:cjs|cts|js|jsx|mjs|mts|ts|tsx))$/u.exec(script.command);
+  if (nodeEntrypoint) {
+    return ownedManifestScriptTarget(repositoryRoot, workspacePackage, packages, nodeEntrypoint[1]!, true);
+  }
+  const typecheckConfig = /^tsc -p ((?:\.\/)?(?:jsconfig|tsconfig)(?:\.[A-Za-z\d_-]+)*\.json)$/u.exec(script.command);
+  return Boolean(typecheckConfig
+    && await ownedManifestScriptTarget(repositoryRoot, workspacePackage, packages, typecheckConfig[1]!));
+}
+
+async function manifestViolations(
+  repositoryRoot: string,
   workspacePackage: WorkspacePackage,
   packages: readonly WorkspacePackage[],
   packagesByName: ReadonlyMap<string, WorkspacePackage>,
   allowedGraph: AllowedDependencyGraph,
-): DependencyViolation[] {
+): Promise<DependencyViolation[]> {
   const violations: DependencyViolation[] = workspacePackage.packageImports.map((entry) => ({
     sourceFile: workspacePackage.repositoryManifestPath,
     line: entry.line,
@@ -1347,6 +1669,18 @@ function manifestViolations(
     kind: "package-import-alias",
     rule: DEPENDENCY_RULES.packageImportAlias,
   }));
+  for (const script of workspacePackage.scripts) {
+    if (!await safeManifestScript(repositoryRoot, workspacePackage, packages, script)) {
+      violations.push({
+        sourceFile: workspacePackage.repositoryManifestPath,
+        line: script.line,
+        column: script.column,
+        specifier: script.name,
+        kind: "manifest-script",
+        rule: DEPENDENCY_RULES.moduleHookScript,
+      });
+    }
+  }
   for (const dependency of workspacePackage.dependencies) {
     const target = packagesByName.get(dependency.name);
     const aliasTarget = dependencyAliasTarget(dependency, workspacePackage, packages, packagesByName);
@@ -1471,7 +1805,10 @@ export async function checkDependencyDirection(
       workspacePackage.directory,
       new Set([...packageDirectories].filter((directory) => directory !== workspacePackage.directory
         && isPathInside(workspacePackage.directory, directory))),
-      exportAudits.get(workspacePackage.name)?.files,
+      new Set([
+        ...(exportAudits.get(workspacePackage.name)?.files ?? []),
+        ...workspacePackage.scriptSourceFiles,
+      ]),
     ),
   })));
   const references = (await Promise.all(packageFiles.flatMap(({ workspacePackage, inventory }) =>
@@ -1495,14 +1832,19 @@ export async function checkDependencyDirection(
       );
       return rule ? [{ ...reference, rule }] : [];
     })))).flat();
+  const packageManifestViolations = (await Promise.all(packages.map((workspacePackage) => manifestViolations(
+    repositoryRoot,
+    workspacePackage,
+    packages,
+    packagesByName,
+    allowedGraph,
+  )))).flat();
+  const packageNodeModulesViolations = (await Promise.all(packages.map((workspacePackage) =>
+    nodeModulesLinkViolations(repositoryRoot, workspacePackage, packages)))).flat();
   const candidates = [
     ...graphIntegrityViolations(packages, allowedGraph),
-    ...packages.flatMap((workspacePackage) => manifestViolations(
-      workspacePackage,
-      packages,
-      packagesByName,
-      allowedGraph,
-    )),
+    ...packageManifestViolations,
+    ...packageNodeModulesViolations,
     ...await typescriptPathViolations(repositoryRoot, packages),
     ...[...exportAudits.values()].flatMap(({ violations }) => violations),
     ...packageFiles.flatMap(({ inventory }) => inventory.violations),
@@ -1551,7 +1893,8 @@ export function formatDependencyViolation(violation: DependencyViolation): strin
     || violation.kind === "workspace-graph"
     || violation.kind === "workspace-package"
     ? "dependency"
-    : violation.kind === "module-loader" || violation.kind === "typescript-path-alias"
+    : violation.kind === "manifest-script" || violation.kind === "module-loader"
+      || violation.kind === "typescript-path-alias"
       ? "construct"
       : violation.kind === "workspace-symlink"
         ? "path"

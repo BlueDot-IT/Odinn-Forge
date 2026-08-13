@@ -56,7 +56,11 @@ both source references and package manifests. It enforces all of the following:
    a discovered graph package. A nested package is not scanned again as part
    of its parent package. Repository and package roots are resolved physically;
    a package root or manifest that traverses a symbolic link fails the check.
-   Pnpm's `node_modules` and `bower_components` exclusions remain in force;
+   Pnpm's `node_modules` and `bower_components` source exclusions remain in
+   force. The checker still audits package-local `node_modules` links: they
+   must resolve to the canonical declared workspace package or to a declared
+   external dependency in the repository pnpm store. Undeclared aliases into
+   apps, workspace source, or repository tooling fail closed.
    other generated directories, including a directory named `dist`, are
    authoritative workspace roots when matched and must be excluded explicitly
    in `pnpm-workspace.yaml` when they are not packages.
@@ -115,13 +119,18 @@ both source references and package manifests. It enforces all of the following:
    `createRequire`, computed or private `Module` loaders, derived `Module`
    classes and instances, `Reflect.get` loader authority, synchronous or
    asynchronous loader registration, unresolved module loader properties, and
-   runtime `getBuiltinModule("module")` access fail closed. Direct, global, or
+   runtime `getBuiltinModule` access fail closed. Production source cannot
+   acquire the runtime `node:module`/`module` namespace (apart from type-only
+   use and the static `builtinModules` metadata export) or `node:vm`/`vm` at
+   all. This acquisition boundary remains effective across descriptors,
+   spreads, bound constructors, proxies, prototype mutation, callbacks, and
+   other capability-preserving JavaScript transforms. Direct, global, or
    aliased `eval`, `Function` construction, evaluator
    call/apply/bind forms, and callable `.constructor` code generation are also
    rejected because their later imports cannot be bound to package identities.
-   Statically computed loader properties, computed destructuring, and
-   re-exports that expose loader authority are covered; unrelated string
-   construction and ordinary function calls remain ordinary source text.
+   Global evaluator descriptors and Proxy-derived global objects are covered;
+   ordinary descriptors, reflection, Proxy use, lookalike methods, string
+   construction, and function calls remain ordinary source text.
 9. The `@odinn/*` namespace and `workspace:` dependency protocol resolve only
    to packages present in this workspace.
 10. TypeScript triple-slash path, type-package, and AMD dependency references
@@ -137,6 +146,13 @@ both source references and package manifests. It enforces all of the following:
     tooling configurations are outside this production graph unless a
     production package config inherits them; nested workspace configs belong
     only to their most-specific package.
+12. Production package scripts use a closed, shell-free grammar. They may run
+    a package-owned, regular, statically audited source entrypoint as
+    `node ./path` with no runtime options, or a package-owned configuration as
+    `tsc -p tsconfig*.json`. Loader/preload flags, inline evaluation,
+    environment injection such as `NODE_OPTIONS`, shell wrappers, URLs, and
+    package/repository escapes are rejected. Accepted Node entrypoints are
+    added to the source inventory, including explicit build-output targets.
 
 There are no legacy exemptions.
 
@@ -153,6 +169,11 @@ There are no legacy exemptions.
   validation concerns, not package edges. They remain subject to their
   dedicated parsers, policy checks, and runtime tests; this static checker does
   not pretend to prove them safe.
+- This is a syntax, manifest, exports, and installed-link policy for the
+  enumerated acquisition grammar. It does not claim whole-program semantic
+  proof over arbitrary execution primitives such as approved worker or child
+  process creation; those remain governed by their dedicated runtime and
+  sandbox boundaries.
 - The graph describes the current migration state. As additional vertical
   slices move behind `@odinn/application`, old app-to-kernel edges should be
   removed from the allowlist in the same change that removes the imports and

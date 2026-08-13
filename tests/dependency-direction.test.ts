@@ -20,6 +20,7 @@ interface ManifestOptions {
   imports?: unknown;
   optionalDependencies?: Record<string, string>;
   peerDependencies?: Record<string, string>;
+  scripts?: Record<string, string>;
 }
 
 function manifest(name: string, options: ManifestOptions = {}): string {
@@ -33,6 +34,7 @@ function manifest(name: string, options: ManifestOptions = {}): string {
     ...(options.devDependencies ? { devDependencies: options.devDependencies } : {}),
     ...(options.optionalDependencies ? { optionalDependencies: options.optionalDependencies } : {}),
     ...(options.peerDependencies ? { peerDependencies: options.peerDependencies } : {}),
+    ...(options.scripts ? { scripts: options.scripts } : {}),
   }, null, 2)}\n`;
 }
 
@@ -650,7 +652,7 @@ test("computed and private Node module loader primitives fail closed", async (t)
     sourceFile === "packages/host/src/index.ts"
       && kind === "module-loader"
       && rule === DEPENDENCY_RULES.unsupportedModuleLoader).map(({ line }) => line));
-  assert.deepEqual([...loaderLines], [2, 4, 7, 9, 10, 11, 12]);
+  assert.deepEqual([...loaderLines], [2, 3, 4, 5, 7, 8, 9, 10, 11, 12]);
 });
 
 test("derived Module authority and synchronous loader-hook redirects fail closed", async (t) => {
@@ -714,7 +716,7 @@ test("dynamic evaluators and createRequire aliases fail closed at their capabili
       && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
     .map(({ line }) => line);
 
-  assert.deepEqual(loaderLines, [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13]);
+  assert.deepEqual(loaderLines, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13]);
 });
 
 test("global evaluator aliases remain rejected while lookalike object methods stay ordinary", async (t) => {
@@ -749,6 +751,308 @@ test("global evaluator aliases remain rejected while lookalike object methods st
   assert(!loaderLines.has(13));
   assert(!loaderLines.has(14));
   assert(!loaderLines.has(15));
+});
+
+test("runtime Module and VM authority is rejected before capability-preserving transforms", async (t) => {
+  const hostileSources: Record<string, string> = {
+    "array-eval.ts": [
+      "const [hidden] = [eval];",
+      "hidden('import(\\\"@odinn/gateway\\\")');",
+    ].join("\n"),
+    "callback-function.ts": [
+      "const hidden = ((value: unknown) => value)(Function) as FunctionConstructor;",
+      "hidden('return import(\\\"@odinn/gateway\\\")')();",
+    ].join("\n"),
+    "aliased-object-create.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "const inherit = Object.create;",
+      "inherit(RuntimeCtor.prototype).load('/tmp/forbidden.cjs');",
+    ].join("\n"),
+    "array-derived-constructor.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "const [HiddenCtor] = [RuntimeCtor];",
+      "new HiddenCtor('hidden').load('/tmp/forbidden.cjs');",
+    ].join("\n"),
+    "bound-constructor.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "const BoundCtor = RuntimeCtor.bind(null);",
+      "new BoundCtor('hidden').load('/tmp/forbidden.cjs');",
+    ].join("\n"),
+    "callback-alias.cjs": [
+      "import('node:module').then(({ Module: RuntimeCtor }) =>",
+      "  new RuntimeCtor('hidden').load('/tmp/forbidden.cjs'));",
+    ].join("\n"),
+    "copied-extensions.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "const copied = { ...RuntimeCtor._extensions };",
+      "copied['.json'] = copied['.js'];",
+      "RuntimeCtor._extensions = copied;",
+      "require('./payload.json');",
+    ].join("\n"),
+    "descriptor-bind.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "Object.getOwnPropertyDescriptor(RuntimeCtor, '_load').value.bind(RuntimeCtor)('@odinn/gateway');",
+    ].join("\n"),
+    "descriptor-load.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "Object.getOwnPropertyDescriptor(RuntimeCtor, '_load').value('@odinn/gateway');",
+    ].join("\n"),
+    "process-builtin-alias.cjs": [
+      "const hiddenBuiltin = process.getBuiltinModule;",
+      "const RuntimeCtor = hiddenBuiltin('node:module').Module;",
+      "RuntimeCtor._load('@odinn/gateway', module, false);",
+    ].join("\n"),
+    "proxy-load.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "Reflect.get(new Proxy(RuntimeCtor, {}), '_load')('@odinn/gateway', module, false);",
+    ].join("\n"),
+    "reflect-get-bind.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "Reflect.get.bind(Reflect)(RuntimeCtor, '_load')('@odinn/gateway', module, false);",
+    ].join("\n"),
+    "run-main.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "RuntimeCtor.runMain();",
+    ].join("\n"),
+    "set-prototype.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "Object.setPrototypeOf({}, RuntimeCtor.prototype).load('/tmp/forbidden.cjs');",
+    ].join("\n"),
+    "spread-load.cjs": [
+      "const { Module: RuntimeCtor } = require('node:module');",
+      "({ ...RuntimeCtor })._load('@odinn/gateway', module, false);",
+    ].join("\n"),
+    "spread-register.cjs": [
+      "const { register, registerHooks } = { ...require('node:module') };",
+      "register('data:text/javascript,export default 1');",
+      "registerHooks({ resolve: () => ({ shortCircuit: true, url: 'node:fs' }) });",
+    ].join("\n"),
+    "vm-context.cjs": [
+      "const { runInThisContext } = require('node:vm');",
+      "runInThisContext('require(\\\"@odinn/gateway\\\")');",
+    ].join("\n"),
+  };
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway"),
+    "apps/gateway/src/index.ts": "export const gateway = true;\n",
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    ...Object.fromEntries(Object.entries(hostileSources)
+      .map(([name, source]) => [`packages/host/src/${name}`, `${source}\n`])),
+  });
+
+  const result = await checkFixture(root, { "@odinn/gateway": [], "@odinn/host": [] }, []);
+  const rejectedFiles = new Set(result.violations
+    .filter(({ kind, rule }) => kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
+    .map(({ sourceFile }) => sourceFile.replace("packages/host/src/", "")));
+
+  assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
+});
+
+test("descriptor, Reflect.apply, constructor alias, and global Proxy evaluators fail closed", async (t) => {
+  const hostileSources: Record<string, string> = {
+    "constructor-alias.ts": [
+      "const HiddenConstructor = (() => undefined).constructor;",
+      "HiddenConstructor('return import(\\\"@odinn/gateway\\\")')();",
+    ].join("\n"),
+    "descriptor-alias.ts": [
+      "const descriptor = Object.getOwnPropertyDescriptor;",
+      "const hidden = descriptor(globalThis, 'eval').value;",
+      "hidden('import(\\\"@odinn/gateway\\\")');",
+    ].join("\n"),
+    "descriptor-eval.ts": [
+      "const hidden = Object.getOwnPropertyDescriptor(globalThis, 'eval')!.value;",
+      "hidden('import(\\\"@odinn/gateway\\\")');",
+    ].join("\n"),
+    "global-proxy.ts": [
+      "const realm = new Proxy(globalThis, {});",
+      "realm.eval('import(\\\"@odinn/gateway\\\")');",
+    ].join("\n"),
+    "proxy-alias.ts": [
+      "const HiddenProxy = Proxy;",
+      "const realm = new HiddenProxy(globalThis, {});",
+      "realm.eval('import(\\\"@odinn/gateway\\\")');",
+    ].join("\n"),
+    "proxy-revocable.ts": [
+      "const { proxy: realm } = Proxy.revocable(globalThis, {});",
+      "realm.eval('import(\\\"@odinn/gateway\\\")');",
+    ].join("\n"),
+    "reflect-apply.ts": "Reflect.apply(eval, undefined, ['import(\\\"@odinn/gateway\\\")']);",
+    "reflect-get-alias.ts": [
+      "const get = Reflect.get.bind(Reflect);",
+      "get(globalThis, 'eval')('import(\\\"@odinn/gateway\\\")');",
+    ].join("\n"),
+  };
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    ...Object.fromEntries(Object.entries(hostileSources)
+      .map(([name, source]) => [`packages/host/src/${name}`, `${source}\n`])),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  const rejectedFiles = new Set(result.violations
+    .filter(({ kind, rule }) => kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
+    .map(({ sourceFile }) => sourceFile.replace("packages/host/src/", "")));
+
+  assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
+});
+
+test("metadata-only node:module and ordinary reflection, Proxy, and lookalikes remain compatible", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": [
+      'import { builtinModules as runtimeNames } from "node:module";',
+      'import type { Module as ModuleType } from "node:module";',
+      'import { type Module as InlineModuleType } from "node:module";',
+      'export { builtinModules as exportedRuntimeNames } from "node:module";',
+      'export type { Module as ExportedModuleType } from "node:module";',
+      "const input = { value: 1, eval: () => true, load: () => true };",
+      "type CallableMetadata = Function;",
+      "const descriptor = Object.getOwnPropertyDescriptor(input, 'value');",
+      "const reflected = Reflect.apply((value: number) => value + 1, undefined, [1]);",
+      "const proxied = new Proxy(input, {});",
+      "input.eval(); input.load();",
+      "export type { CallableMetadata, InlineModuleType, ModuleType };",
+      "export { descriptor, proxied, reflected, runtimeNames };",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  assert.deepEqual(result.violations, []);
+});
+
+test("package-local node_modules redirects fail while canonical dependency links remain compatible", async (t) => {
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway"),
+    "apps/gateway/src/index.ts": "export const gateway = true;\n",
+    "packages/protocol/package.json": manifest("@odinn/protocol"),
+    "packages/protocol/src/index.ts": "export const protocol = true;\n",
+    "packages/host/package.json": manifest("@odinn/host", {
+      dependencies: { "@odinn/protocol": "workspace:*", external: "^1.0.0", materialized: "^1.0.0" },
+    }),
+    "packages/host/src/index.ts": [
+      'import "@odinn/protocol";',
+      'import "external";',
+      'import "gateway-alias";',
+      'import "materialized";',
+      'import "source-alias";',
+      'import "tool-alias";',
+    ].join("\n"),
+    "scripts/tool.cjs": "module.exports = { tool: true };\n",
+  });
+  const scope = join(root, "packages/host/node_modules/@odinn");
+  const externalPackage = join(root, "node_modules/.pnpm/external@1.0.0/node_modules/external");
+  await mkdir(scope, { recursive: true });
+  await mkdir(join(root, "packages/host/node_modules/materialized"), { recursive: true });
+  await mkdir(externalPackage, { recursive: true });
+  await writeFile(join(externalPackage, "package.json"), `${JSON.stringify({
+    name: "external",
+    version: "1.0.0",
+    main: "index.cjs",
+  })}\n`);
+  await writeFile(join(externalPackage, "index.cjs"), "module.exports = { external: true };\n");
+  await writeFile(
+    join(root, "packages/host/node_modules/materialized/package.json"),
+    `${JSON.stringify({ name: "materialized", version: "1.0.0", main: "index.cjs" })}\n`,
+  );
+  await writeFile(
+    join(root, "packages/host/node_modules/materialized/index.cjs"),
+    "module.exports = { materialized: true };\n",
+  );
+  try {
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    await symlink(join(root, "packages/protocol"), join(scope, "protocol"), linkType);
+    await symlink(externalPackage, join(root, "packages/host/node_modules/external"), linkType);
+    await symlink(
+      join(root, "apps/gateway"),
+      join(root, "packages/host/node_modules/gateway-alias"),
+      linkType,
+    );
+    await symlink(
+      join(root, "packages/protocol/src/index.ts"),
+      join(root, "packages/host/node_modules/source-alias"),
+      "file",
+    );
+    await symlink(
+      join(root, "scripts/tool.cjs"),
+      join(root, "packages/host/node_modules/tool-alias"),
+      "file",
+    );
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES" || code === "ENOSYS") {
+      t.skip(`package-local links are unavailable on ${process.platform}: ${code}`);
+      return;
+    }
+    throw error;
+  }
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/host": ["@odinn/protocol"],
+    "@odinn/protocol": [],
+  }, []);
+  assert.deepEqual(result.violations.map(({ sourceFile, specifier, kind, rule }) => ({
+    sourceFile,
+    specifier,
+    kind,
+    rule,
+  })), ["gateway-alias", "materialized", "source-alias", "tool-alias"].map((specifier) => ({
+    sourceFile: `packages/host/node_modules/${specifier}`,
+    specifier,
+    kind: "workspace-symlink" as const,
+    rule: DEPENDENCY_RULES.unmanagedNodeModulesLink,
+  })));
+});
+
+test("production package scripts use only closed-form audited entrypoints and typechecks", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      scripts: {
+        start: "node ./dist/start.js",
+        typecheck: "tsc -p tsconfig.json",
+        loader: "node --loader ./src/loader.mjs ./src/index.ts",
+        preload: "node --import ./src/preload.mjs ./src/index.ts",
+        require: "node --require ./src/preload.cjs ./src/index.ts",
+        shortRequire: "node -r ./src/preload.cjs ./src/index.ts",
+        inlineEval: 'node -e "import(\\\"@odinn/gateway\\\")"',
+        nodeOptions: "NODE_OPTIONS=--loader=./src/loader.mjs node ./src/index.ts",
+        shellSplit: 'node --lo""ader ./src/loader.mjs ./src/index.ts',
+        wrapper: "sh -c 'node ./src/index.ts'",
+        escape: "node ../../../apps/gateway/src/index.ts",
+        buildOutput: "node ./dist/hidden.js",
+      },
+    }),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    "packages/host/dist/start.js": 'import "@odinn/gateway";\n',
+    "packages/host/src/loader.mjs": "export const loader = true;\n",
+    "packages/host/src/preload.mjs": "export const preload = true;\n",
+    "packages/host/src/preload.cjs": "module.exports = {};\n",
+    "packages/host/dist/hidden.js": "export const hidden = true;\n",
+    "packages/host/tsconfig.json": "{}\n",
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  const rejectedScripts = result.violations
+    .filter(({ kind, rule }) => kind === "manifest-script" && rule === DEPENDENCY_RULES.moduleHookScript)
+    .map(({ specifier }) => specifier)
+    .sort();
+  assert.deepEqual(rejectedScripts, [
+    "escape",
+    "inlineEval",
+    "loader",
+    "nodeOptions",
+    "preload",
+    "require",
+    "shellSplit",
+    "shortRequire",
+    "wrapper",
+  ]);
+  assert(result.violations.some(({ sourceFile, rule }) =>
+    sourceFile === "packages/host/dist/start.js" && rule === DEPENDENCY_RULES.unknownWorkspaceTarget));
 });
 
 test("safe conditional exports, extension modes, build targets, and ordinary code remain compatible", async (t) => {
@@ -1176,6 +1480,7 @@ test("module.require is inspected and indirect require or createRequire loaders 
     { kind: "manifest-dependency", rule: DEPENDENCY_RULES.packageToApp },
     { kind: "require-call", rule: DEPENDENCY_RULES.packageToApp },
     { kind: "require-call", rule: DEPENDENCY_RULES.workspaceDynamicImports },
+    { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
     { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
     { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
     { kind: "module-loader", rule: DEPENDENCY_RULES.unsupportedModuleLoader },
