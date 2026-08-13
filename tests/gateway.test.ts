@@ -279,6 +279,26 @@ test("gateway omits raw channel diagnostics before every read response", async (
       assert.equal(body.includes("SENTINEL_OPAQUE_ERROR_123456"), false, path);
       assert.equal(body.includes("channel adapter reported an error"), true, path);
     }
+
+    for (const field of ["connectedAt", "lastEventAt"] as const) {
+      const sentinel = `SENTINEL_OPAQUE_${field.toUpperCase()}`;
+      updateDiagnosticStatus!({ error: "", connectedAt: undefined, lastEventAt: undefined, [field]: sentinel });
+      for (const path of ["/diagnostics", "/channels"]) {
+        const response = await fetch(`${base}${path}`);
+        const body = await response.text();
+        assert.equal(response.status, 400, `${path}: ${field}`);
+        assert.equal(body.includes(sentinel), false, `${path}: ${field}`);
+      }
+    }
+
+    updateDiagnosticStatus!({
+      connectedAt: "2026-08-12T12:00:00.000Z",
+      lastEventAt: "2026-08-12T12:01:00.000Z"
+    });
+    for (const path of ["/diagnostics", "/channels"]) {
+      const response = await fetch(`${base}${path}`);
+      assert.equal(response.status, 200, path);
+    }
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
     if (previousCredential === undefined) delete process.env[credentialEnvironment];
@@ -290,7 +310,11 @@ test("gateway omits raw pending approval input before every read response", asyn
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-approval-compound-secret-"));
   const approvalPath = join(stateDir, "approvals.json");
   const approvalStore = createApprovalStore({ path: approvalPath });
-  approvalStore.create({ tool: "browser.click", input: { selector: "#save", nested: { attempts: 1 } } });
+  approvalStore.create({
+    actor: "SENTINEL_OPAQUE_APPROVAL_ACTOR_123456",
+    tool: "browser.click",
+    input: { selector: "#save", nested: { attempts: 1 } }
+  });
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -301,7 +325,9 @@ test("gateway omits raw pending approval input before every read response", asyn
       const body = await response.json() as any;
       const approvals = path === "/status" ? body.pendingApprovals : body;
       assert.equal("input" in approvals[0], false, path);
+      assert.equal("actor" in approvals[0], false, path);
       assert.equal(approvals[0].effect.selector, "#save", path);
+      assert.equal(JSON.stringify(body).includes("SENTINEL_OPAQUE_APPROVAL_ACTOR_123456"), false, path);
     }
 
     const maliciousInputs = [

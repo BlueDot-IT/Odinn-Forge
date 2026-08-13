@@ -96,6 +96,8 @@ class GatewayError extends Error {
   }
 }
 
+class MissingChannelCredentialError extends Error {}
+
 const CRON_SCHEMA_VERSION = 2;
 const CRON_MAX_JOBS = 500;
 const CRON_MAX_FILE_BYTES = 4 * 1024 * 1024;
@@ -3137,7 +3139,8 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
         accountId: name,
         state: "stopped",
         error: ""
-      } as any
+      } as any,
+      publicError: ""
     };
   });
   const runtimes: Array<{ adapter: any; router: ChannelRouter; healthTimer?: NodeJS.Timeout }> = [];
@@ -3155,7 +3158,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
         credentialPresent: channelCredentialEnvironments(channel.config).every((name) => Boolean(process.env[name])),
         allowlistEntries: channel.config.allowlist.length,
         capabilities: channel.plugin.capabilities,
-        error: channel.status.error ? "channel adapter reported an error" : "",
+        error: channel.publicError || (channel.status.error ? "channel adapter reported an error" : ""),
         connectedAt: channel.status.connectedAt,
         lastEventAt: channel.status.lastEventAt,
         reconnectAttempts: channel.status.reconnectAttempts,
@@ -3199,7 +3202,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
             throw new Error(validation.join("; "));
           }
           const token = channel.config.tokenEnv ? process.env[channel.config.tokenEnv] : "";
-          if (!token) throw new Error(`channel credential is unavailable in ${channel.config.tokenEnv || "an environment variable"}`);
+          if (!token) throw new MissingChannelCredentialError(`channel credential is unavailable in ${channel.config.tokenEnv || "an environment variable"}`);
           const credentials = Object.fromEntries(Object.entries(channel.config.credentialEnvs ?? {}).map(([key, environmentName]) => [
             key,
             process.env[String(environmentName)] ?? ""
@@ -3207,13 +3210,14 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
           const missingCredential = Object.entries(channel.config.credentialEnvs ?? {}).find(([, environmentName]) => (
             !process.env[String(environmentName)]
           ));
-          if (missingCredential) throw new Error(`channel credential is unavailable in ${String(missingCredential[1])}`);
+          if (missingCredential) throw new MissingChannelCredentialError(`channel credential is unavailable in ${String(missingCredential[1])}`);
           const adapter = channel.plugin.createAdapter({
             accountId: channel.name,
             config: channel.config,
             credential: token,
             credentials,
             onError(error) {
+              channel.publicError = "";
               channel.status.error = error instanceof Error ? error.message : String(error);
             }
           });
@@ -3250,11 +3254,13 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
             access: channel.plugin.createAccessPolicy?.(channel.config) ?? createAllowlistPolicy(channel.config.allowlist),
             dedupe,
             onError(error) {
+              channel.publicError = "";
               channel.status.error = error instanceof Error ? error.message : String(error);
             },
             onExecutionState: recordChannelExecutionState
           });
           await router.attach(adapter, (patch) => {
+            if (Object.hasOwn(patch, "error")) channel.publicError = "";
             channel.status = { ...channel.status, ...patch };
           });
           const runtime: { adapter: any; router: ChannelRouter; healthTimer?: NodeJS.Timeout } = { adapter, router };
@@ -3262,8 +3268,10 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
           if (probe) {
             runtime.healthTimer = setInterval(() => {
               void probe().then((status: any) => {
+                if (Object.hasOwn(status, "error")) channel.publicError = "";
                 channel.status = { ...channel.status, ...status };
               }).catch((error: unknown) => {
+                channel.publicError = "";
                 channel.status = {
                   ...channel.status,
                   state: "degraded",
@@ -3281,9 +3289,13 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
               requestMode: channel.plugin.webhookRequestMode ?? "buffer"
             });
           }
+          channel.publicError = "";
           channel.status.error = "";
         } catch (error) {
           channel.status.state = "failed";
+          channel.publicError = error instanceof MissingChannelCredentialError
+            ? "channel credential is unavailable"
+            : "";
           channel.status.error = error instanceof Error ? error.message : String(error);
         }
       }

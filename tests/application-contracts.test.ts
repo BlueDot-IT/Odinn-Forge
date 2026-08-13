@@ -855,7 +855,7 @@ test("diagnostics output contract rejects unstable fields and unredacted materia
   );
 });
 
-test("producer-only plugin details and approval input are omitted without traversal", () => {
+test("producer-only plugin details and approval identity/input are omitted without traversal", () => {
   let detailAccessorInvoked = false;
   const details = { foo: "SENTINEL_OPAQUE_SECRET_123456" };
   Object.defineProperty(details, "hidden", {
@@ -893,11 +893,31 @@ test("producer-only plugin details and approval input are omitted without traver
   const approvals = validatePendingApprovalSummariesV1([{
     id: "approval:1",
     status: "pending",
+    actor: "SENTINEL_OPAQUE_ACTOR_123456",
     tool: "browser.click",
     input
   }]);
   assert.equal("input" in approvals[0]!, false);
+  assert.equal("actor" in approvals[0]!, false);
   assert.equal(inputAccessorInvoked, false);
+
+  const channel = {
+    ...channels[0],
+    connectedAt: "2026-08-12T12:00:00.000Z",
+    lastEventAt: "2026-08-12T12:01:00.000Z"
+  };
+  assert.equal(validateGatewayChannelDiagnosticsV1([channel])[0]!.connectedAt, channel.connectedAt);
+  for (const [field, value] of [
+    ["connectedAt", "SENTINEL_OPAQUE_CONNECTED_AT"],
+    ["lastEventAt", "2026-99-99T99:99:99.999Z"]
+  ] as const) {
+    assert.throws(
+      () => validateGatewayChannelDiagnosticsV1([{ ...channel, [field]: value }]),
+      (error: any) => error instanceof ApplicationContractValidationError
+        && error.code === "INVALID_APPLICATION_READ_CONTRACT"
+        && !error.message.includes(value)
+    );
+  }
 });
 
 test("session page contract rejects projection drift, content leakage, and inconsistent cursors", () => {
