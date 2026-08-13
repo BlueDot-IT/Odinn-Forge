@@ -36,6 +36,17 @@ The HTTP route retains the gateway's bearer/cookie authentication and mutation
 origin checks. A web-console request can set `surface=console`; API clients
 normally use `surface=http`.
 
+## Authenticated read routing
+
+The Gateway routes `GET /status`, `GET /diagnostics`, `GET /operator`,
+`GET /operator/snapshot`, and `GET /sessions` through the application read
+contracts after the existing control-plane authentication and mutation-origin
+checks succeed. These routes share request identity and cancellation context;
+they return bounded, sanitized projections and do not expose raw channel,
+approval, credential, prompt, or tool-result data. Mutation routes remain on
+their existing admission paths and are not granted by this read-plane
+extraction.
+
 ## Actions
 
 `POST /operator/actions` accepts:
