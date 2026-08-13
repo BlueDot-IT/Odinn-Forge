@@ -83,18 +83,26 @@ both source references and package manifests. It enforces all of the following:
    and a selected exact or wildcard `null` target excludes the subpath.
    Inside an exports fallback array, `null`, unmatched conditions, and invalid
    targets may fall through to a later valid target as they do in Node 24.
-   Every syntactically executable target in every condition and fallback is
-   audited even when no current source import selects it. Concrete targets and
-   existing wildcard matches are resolved physically and must be regular files
-   owned by the exporting package. Broken targets, repository escapes, and
-   transitions into a separately discovered nested workspace fail closed.
-   Exported JavaScript/TypeScript targets under otherwise ignored build output,
-   including extensionless Node entrypoints, are added to the source inventory.
-   Public subpaths such as `@odinn/kernel/browser-worker-host` and
-   `@odinn/store-sqlite/memory-index` remain valid.
-7. Relative, absolute, or repository-root paths that cross a workspace package
-   boundary are rejected. Production code must not reach into another
-   package's `src/` tree or depend on files absent as package API. Every
+   Every target in every condition and fallback is audited even when no current
+   source import selects it. Concrete targets and existing wildcard matches are
+   resolved physically and must be regular files owned by the exporting
+   package. Broken targets, repository escapes, and transitions into a
+   separately discovered nested workspace fail closed. Export targets are
+   restricted to statically auditable JavaScript/TypeScript, extensionless Node
+   entrypoints, or inert JSON data. Native addons and arbitrary extensions such
+   as `.node` and `.txt` cannot become opaque executable package surfaces.
+   Exported source targets under otherwise ignored build output are added to
+   the source inventory. Public subpaths such as
+   `@odinn/kernel/browser-worker-host`, `@odinn/protocol/gateway-v2/schema.json`,
+   and `@odinn/store-sqlite/memory-index` remain valid.
+7. Relative, absolute, or repository-root file references that leave a
+   workspace package are rejected, including paths into repository tooling and
+   paths outside the repository. Relative references into ignored package
+   directories such as `dist` or `node_modules`, and references to source
+   extensions the checker cannot statically audit, also fail closed.
+   Percent-encoded module specifiers cannot disguise traversal segments.
+   Production code must not reach into another package's `src/` tree or depend
+   on files absent as package API. Every
    symbolic link or junction beneath a production package is rejected without
    being followed, including broken links and links whose targets cross package
    or repository ownership. The release verifier independently rejects
@@ -104,9 +112,11 @@ both source references and package manifests. It enforces all of the following:
    module specifiers are rejected, including `file:` paths whose physical
    meaning can change through `/proc`, symlinks, or the process working
    directory and executable `data:` modules. Indirect `require` references,
-   `createRequire`, computed or private `Module` loaders, unresolved module
-   loader properties, and runtime `getBuiltinModule("module")` access fail
-   closed. Direct or global `eval`, `Function` construction, evaluator
+   `createRequire`, computed or private `Module` loaders, derived `Module`
+   classes and instances, `Reflect.get` loader authority, synchronous or
+   asynchronous loader registration, unresolved module loader properties, and
+   runtime `getBuiltinModule("module")` access fail closed. Direct, global, or
+   aliased `eval`, `Function` construction, evaluator
    call/apply/bind forms, and callable `.constructor` code generation are also
    rejected because their later imports cannot be bound to package identities.
    Statically computed loader properties, computed destructuring, and
@@ -114,7 +124,12 @@ both source references and package manifests. It enforces all of the following:
    construction and ordinary function calls remain ordinary source text.
 9. The `@odinn/*` namespace and `workspace:` dependency protocol resolve only
    to packages present in this workspace.
-10. `package.json#imports` aliases and effective TypeScript `paths` aliases in
+10. TypeScript triple-slash path, type-package, and AMD dependency references
+    are evaluated through the same file and package boundary as ordinary
+    imports. Local declaration references and external ambient type packages
+    remain valid; cross-package private paths and forbidden workspace edges do
+    not.
+11. `package.json#imports` aliases and effective TypeScript `paths` aliases in
     every `tsconfig*.json` or `jsconfig*.json` owned by a production package are
     rejected, including package build variants and their inherited options.
     Cross-package imports must remain visible as exported workspace package

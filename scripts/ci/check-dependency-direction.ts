@@ -56,11 +56,14 @@ export const DEPENDENCY_RULES = {
   crossPackageExportTarget: "workspace package exports cannot target another workspace package",
   crossPackageSourcePath: "cross-package imports must use an exported workspace package specifier",
   dependencyAliasSpecifier: "file, link, and npm dependency aliases are unsupported in production workspace packages",
+  encodedModuleSpecifier: "percent-encoded module specifiers are unsupported in production workspace packages",
+  executableExportTarget: "workspace exports must use statically auditable source or inert JSON targets",
   missingGraphPackage: "allowed dependency graph packages must be discovered from pnpm-workspace.yaml",
   packageImportAlias: "package.json imports aliases are unsupported in production workspace packages",
   packageToApp: "packages and adapters cannot depend on apps",
   physicalExportTarget: "workspace exports must resolve to an existing regular file inside their package",
   privateWorkspaceSubpath: "workspace imports must use package.json exports",
+  unscannedSourcePath: "production file references must remain in the scanned source of their workspace package",
   productionSymlink: "production workspace packages cannot contain symbolic links",
   typescriptPathAlias: "TypeScript paths aliases are unsupported for production workspace architecture",
   undeclaredWorkspaceDependency: "workspace source imports must be declared in package.json",
@@ -87,6 +90,7 @@ export type ImportKind =
   | "module-loader"
   | "package-import-alias"
   | "require-call"
+  | "triple-slash-reference"
   | "typescript-path-alias"
   | "workspace-graph"
   | "workspace-package"
@@ -120,6 +124,7 @@ export interface DependencyDirectionResult {
 
 type ModuleResolutionMode = "import" | "require";
 type ImportReference = Omit<DependencyViolation, "rule"> & {
+  filesystemReference?: boolean;
   resolutionMode?: ModuleResolutionMode;
   typeOnly?: boolean;
 };
@@ -178,6 +183,8 @@ interface PackageExportAudit {
 }
 
 const sourceExtensions = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
+const inertExportExtensions = new Set([".json"]);
+const unscannedPackageDirectories = new Set(["bower_components", "dist", "node_modules"]);
 const dependencyFields = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] as const;
 const nonLiteralSpecifier = "<non-literal module specifier>";
 const unsupportedModuleLoader = "<unsupported module loader>";
@@ -185,6 +192,10 @@ const unsupportedModuleLoader = "<unsupported module loader>";
 function isExportedSourceTarget(path: string): boolean {
   const extension = extname(path).toLowerCase();
   return extension === "" || sourceExtensions.has(extension);
+}
+
+function isAuditableExportTarget(path: string): boolean {
+  return isExportedSourceTarget(path) || inertExportExtensions.has(extname(path).toLowerCase());
 }
 
 export const LEGACY_DEPENDENCY_BASELINE: readonly LegacyDependencyBaselineEntry[] = [];
@@ -254,7 +265,7 @@ async function sourceInventory(
       files.push(...nested.files);
       violations.push(...nested.violations);
     } else if (entry.isFile()
-      && ((includeSourceFiles && sourceExtensions.has(extname(entry.name).toLowerCase()))
+      && ((includeSourceFiles && isExportedSourceTarget(entry.name))
         || (explicitSourceFiles.has(absolutePath) && isExportedSourceTarget(absolutePath)))) {
       files.push(absolutePath);
     }
@@ -519,7 +530,11 @@ function exportExposesModuleLoader(node: ts.ExportDeclaration): boolean {
   if (!node.exportClause || ts.isNamespaceExport(node.exportClause)) return true;
   return node.exportClause.elements.some((element) => {
     const exportedName = (element.propertyName ?? element.name).text;
-    return exportedName === "createRequire" || exportedName === "default" || exportedName === "Module";
+    return exportedName === "createRequire"
+      || exportedName === "default"
+      || exportedName === "Module"
+      || exportedName === "register"
+      || exportedName === "registerHooks";
   });
 }
 
@@ -565,9 +580,44 @@ function unwrapExpression(node: ts.Expression): ts.Expression {
   return node;
 }
 
+function callTargetNamed(node: ts.CallExpression, object: string, method: string): boolean {
+  return (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+    && ts.isIdentifier(node.expression.expression)
+    && node.expression.expression.text === object
+    && propertyName(node.expression) === method;
+}
+
+function moduleLoaderAuthorityName(name: string | undefined): boolean {
+  return name === undefined
+    || name.startsWith("_")
+    || name === "createRequire"
+    || name === "load"
+    || name === "register"
+    || name === "registerHooks"
+    || name === "require";
+}
+
+function bindingExposesModuleLoader(node: ts.BindingElement, roots: ReadonlySet<string>): boolean {
+  const name = bindingPropertyName(node.propertyName)
+    ?? (ts.isIdentifier(node.name) ? node.name.text : undefined);
+  if (name === "createRequire" || name === "register" || name === "registerHooks" || name === "require") return true;
+  const pattern = node.parent;
+  const declaration = ts.isObjectBindingPattern(pattern) ? pattern.parent : undefined;
+  return name !== undefined
+    && declaration !== undefined
+    && ts.isVariableDeclaration(declaration)
+    && Boolean(declaration.initializer && isModuleLoaderObject(declaration.initializer, roots))
+    && moduleLoaderAuthorityName(name);
+}
+
 function isModuleLoaderObject(node: ts.Expression, roots: ReadonlySet<string>): boolean {
   node = unwrapExpression(node);
   if (ts.isIdentifier(node)) return roots.has(node.text);
+  if (ts.isNewExpression(node)) return isModuleLoaderObject(node.expression, roots);
+  if (ts.isClassExpression(node)) {
+    return node.heritageClauses?.some((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword
+      && clause.types.some((type) => isModuleLoaderObject(type.expression, roots))) ?? false;
+  }
   if (ts.isCallExpression(node)) {
     if (node.expression.kind === ts.SyntaxKind.ImportKeyword) return nodeModuleSpecifier(node.arguments[0]);
     if (((ts.isIdentifier(node.expression) && node.expression.text === "require")
@@ -575,12 +625,37 @@ function isModuleLoaderObject(node: ts.Expression, roots: ReadonlySet<string>): 
     if (propertyName(node.expression) === "getBuiltinModule") {
       return nodeModuleSpecifier(node.arguments[0]);
     }
+    if ((callTargetNamed(node, "Object", "create") || callTargetNamed(node, "Reflect", "construct"))
+      && node.arguments[0]
+      && isModuleLoaderObject(node.arguments[0], roots)) return true;
+    if (callTargetNamed(node, "Reflect", "get")
+      && node.arguments[0]
+      && isModuleLoaderObject(node.arguments[0], roots)) {
+      const name = staticStringExpression(node.arguments[1]);
+      return name === "Module" || name === "constructor" || name === "default" || name === "prototype";
+    }
   }
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = propertyName(node);
     if (name === "mainModule" && ts.isIdentifier(node.expression) && node.expression.text === "process") return true;
-    return (name === "Module" || name === "constructor" || name === "default")
+    return (name === "Module" || name === "constructor" || name === "default" || name === "prototype")
       && isModuleLoaderObject(node.expression, roots);
+  }
+  return false;
+}
+
+function moduleLoaderCapability(node: ts.Expression, roots: ReadonlySet<string>): boolean {
+  node = unwrapExpression(node);
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    const name = propertyName(node);
+    if ((name === "call" || name === "apply" || name === "bind")
+      && moduleLoaderCapability(node.expression, roots)) return true;
+    return moduleLoaderAuthorityName(name) && isModuleLoaderObject(node.expression, roots);
+  }
+  if (ts.isCallExpression(node) && callTargetNamed(node, "Reflect", "get")
+    && node.arguments[0]
+    && isModuleLoaderObject(node.arguments[0], roots)) {
+    return moduleLoaderAuthorityName(staticStringExpression(node.arguments[1]));
   }
   return false;
 }
@@ -617,12 +692,107 @@ function moduleLoaderRoots(source: ts.SourceFile): ReadonlySet<string> {
         for (const element of node.name.elements) {
           const property = bindingPropertyName(element.propertyName)
             ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
-          if (property === "Module"
+          if ((property === "Module" || property === "default")
             && ts.isIdentifier(element.name)
             && !roots.has(element.name.text)) {
             roots.add(element.name.text);
             changed = true;
           }
+        }
+      } else if ((ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name
+        && node.heritageClauses?.some((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword
+          && clause.types.some((type) => isModuleLoaderObject(type.expression, roots)))
+        && !roots.has(node.name.text)) {
+        roots.add(node.name.text);
+        changed = true;
+      } else if (ts.isBinaryExpression(node)
+        && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && ts.isIdentifier(node.left)
+        && isModuleLoaderObject(node.right, roots)
+        && !roots.has(node.left.text)) {
+        roots.add(node.left.text);
+        changed = true;
+      }
+      ts.forEachChild(node, collectAliases);
+    };
+    collectAliases(source);
+  }
+  return roots;
+}
+
+interface DynamicCodeRoots {
+  evaluators: ReadonlySet<string>;
+  globals: ReadonlySet<string>;
+}
+
+function globalObjectTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
+  node = unwrapExpression(node);
+  return ts.isIdentifier(node) && roots.globals.has(node.text);
+}
+
+function dynamicCodeTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
+  if (ts.isParenthesizedExpression(node)
+    || ts.isAsExpression(node)
+    || ts.isNonNullExpression(node)
+    || ts.isSatisfiesExpression(node)) return dynamicCodeTarget(node.expression, roots);
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return dynamicCodeTarget(node.right, roots);
+  }
+  if (ts.isIdentifier(node)) return roots.evaluators.has(node.text);
+  if (ts.isCallExpression(node) && callTargetNamed(node, "Reflect", "get")
+    && node.arguments[0]
+    && globalObjectTarget(node.arguments[0], roots)) {
+    const name = staticStringExpression(node.arguments[1]);
+    return name === undefined || name === "eval" || name === "Function";
+  }
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    const name = propertyName(node);
+    if ((name === undefined || name === "eval" || name === "Function")
+      && globalObjectTarget(node.expression, roots)) return true;
+    if (name === "call" || name === "apply" || name === "bind" || name === "prototype") {
+      return dynamicCodeTarget(node.expression, roots);
+    }
+  }
+  return false;
+}
+
+function dynamicCodeRoots(source: ts.SourceFile): DynamicCodeRoots {
+  const evaluators = new Set(["eval", "Function"]);
+  const globals = new Set(["global", "globalThis", "self", "window"]);
+  const roots: DynamicCodeRoots = { evaluators, globals };
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const collectAliases = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        if (globalObjectTarget(node.initializer, roots) && !globals.has(node.name.text)) {
+          globals.add(node.name.text);
+          changed = true;
+        } else if (dynamicCodeTarget(node.initializer, roots) && !evaluators.has(node.name.text)) {
+          evaluators.add(node.name.text);
+          changed = true;
+        }
+      } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
+        && globalObjectTarget(node.initializer, roots)) {
+        for (const element of node.name.elements) {
+          const property = bindingPropertyName(element.propertyName)
+            ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
+          if ((property === "eval" || property === "Function")
+            && ts.isIdentifier(element.name)
+            && !evaluators.has(element.name.text)) {
+            evaluators.add(element.name.text);
+            changed = true;
+          }
+        }
+      } else if (ts.isBinaryExpression(node)
+        && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && ts.isIdentifier(node.left)) {
+        if (globalObjectTarget(node.right, roots) && !globals.has(node.left.text)) {
+          globals.add(node.left.text);
+          changed = true;
+        } else if (dynamicCodeTarget(node.right, roots) && !evaluators.has(node.left.text)) {
+          evaluators.add(node.left.text);
+          changed = true;
         }
       }
       ts.forEachChild(node, collectAliases);
@@ -632,35 +802,14 @@ function moduleLoaderRoots(source: ts.SourceFile): ReadonlySet<string> {
   return roots;
 }
 
-function dynamicCodeTarget(node: ts.Expression): boolean {
-  if (ts.isParenthesizedExpression(node)
-    || ts.isAsExpression(node)
-    || ts.isNonNullExpression(node)
-    || ts.isSatisfiesExpression(node)) return dynamicCodeTarget(node.expression);
-  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-    return dynamicCodeTarget(node.right);
-  }
-  if (ts.isIdentifier(node)) return node.text === "eval" || node.text === "Function";
-  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-    const name = propertyName(node);
-    if ((name === "eval" || name === "Function")
-      && ts.isIdentifier(node.expression)
-      && ["global", "globalThis", "self", "window"].includes(node.expression.text)) return true;
-    if (name === "call" || name === "apply" || name === "bind" || name === "prototype") {
-      return dynamicCodeTarget(node.expression);
-    }
-  }
-  return false;
-}
-
-function isDynamicCodeCall(node: ts.CallExpression | ts.NewExpression): boolean {
-  if (dynamicCodeTarget(node.expression)) return true;
+function isDynamicCodeCall(node: ts.CallExpression | ts.NewExpression, roots: DynamicCodeRoots): boolean {
+  if (dynamicCodeTarget(node.expression, roots)) return true;
   if (ts.isCallExpression(node)
     && ts.isPropertyAccessExpression(node.expression)
     && ts.isIdentifier(node.expression.expression)
     && node.expression.expression.text === "Reflect"
     && node.expression.name.text === "construct") {
-    return Boolean(node.arguments[0] && dynamicCodeTarget(node.arguments[0]));
+    return Boolean(node.arguments[0] && dynamicCodeTarget(node.arguments[0], roots));
   }
   return propertyName(node.expression) === "constructor";
 }
@@ -673,6 +822,7 @@ function extractImportReferences(
 ): ImportReference[] {
   const source = ts.createSourceFile(absolutePath, content, ts.ScriptTarget.Latest, true);
   const loaderRoots = moduleLoaderRoots(source);
+  const evaluatorRoots = dynamicCodeRoots(source);
   const sourceFile = repositoryPath(repositoryRoot, absolutePath);
   const references: ImportReference[] = [];
 
@@ -699,6 +849,32 @@ function extractImportReferences(
     });
   };
 
+  const recordText = (
+    position: number,
+    specifier: string,
+    options: Pick<ImportReference, "filesystemReference" | "resolutionMode" | "typeOnly"> = {},
+  ): void => {
+    const location = source.getLineAndCharacterOfPosition(position);
+    references.push({
+      sourceFile,
+      line: location.line + 1,
+      column: location.character + 1,
+      specifier,
+      kind: "triple-slash-reference",
+      ...options,
+    });
+  };
+
+  for (const reference of source.referencedFiles) {
+    recordText(reference.pos, reference.fileName, { filesystemReference: true, typeOnly: true });
+  }
+  for (const reference of source.typeReferenceDirectives) {
+    recordText(reference.pos, reference.fileName, { typeOnly: true });
+  }
+  for (const reference of source.amdDependencies) {
+    recordText(Math.max(0, content.indexOf(reference.path)), reference.path, { resolutionMode: "require" });
+  }
+
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node)) {
       record(node, node.moduleSpecifier, "import-declaration", true, undefined, {
@@ -710,7 +886,7 @@ function extractImportReferences(
         const bindings = node.importClause?.namedBindings;
         if (bindings && ts.isNamedImports(bindings)) {
           for (const element of bindings.elements) {
-            if ((element.propertyName ?? element.name).text === "createRequire") {
+            if (["createRequire", "register", "registerHooks"].includes((element.propertyName ?? element.name).text)) {
               record(element, undefined, "module-loader", true, unsupportedModuleLoader);
             }
           }
@@ -735,7 +911,9 @@ function extractImportReferences(
         typeOnly: true,
       });
     } else if (ts.isCallExpression(node)) {
-      if (isDynamicCodeCall(node)) {
+      if (isDynamicCodeCall(node, evaluatorRoots)) {
+        record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+      } else if (dynamicCodeTarget(node, evaluatorRoots)) {
         record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       } else if (propertyName(node.expression) === "getBuiltinModule"
         && (!stringSpecifier(node.arguments[0]) || nodeModuleSpecifier(node.arguments[0]))) {
@@ -745,8 +923,11 @@ function extractImportReferences(
       } else if ((ts.isIdentifier(node.expression) && node.expression.text === "require")
         || propertyName(node.expression) === "require") {
         record(node, node.arguments[0], "require-call", false);
+      } else if (moduleLoaderCapability(node, loaderRoots)
+        || moduleLoaderCapability(node.expression, loaderRoots)) {
+        record(node, undefined, "module-loader", true, unsupportedModuleLoader);
       }
-    } else if (ts.isNewExpression(node) && isDynamicCodeCall(node)) {
+    } else if (ts.isNewExpression(node) && isDynamicCodeCall(node, evaluatorRoots)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
       && propertyName(node) === "require" && !isDirectCallTarget(node)) {
@@ -757,16 +938,40 @@ function extractImportReferences(
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isPropertyAccessExpression(node)
       && isModuleLoaderObject(node.expression, loaderRoots)
-      && (node.name.text.startsWith("_") || node.name.text === "load")) {
+      && moduleLoaderAuthorityName(node.name.text)
+      && !isDirectCallTarget(node)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
-      && propertyName(node) === "createRequire") {
+      && moduleLoaderCapability(node, loaderRoots)
+      && !isDirectCallTarget(node)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
+      && propertyName(node) === "createRequire"
+      && (!isDirectCallTarget(node) || !isModuleLoaderObject(node.expression, loaderRoots))) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isBindingElement(node)
-      && ((bindingPropertyName(node.propertyName) === "createRequire"
-        || bindingPropertyName(node.propertyName) === "require")
-        || bindingPropertyName(node.propertyName)?.startsWith("_")
-        || (ts.isIdentifier(node.name) && node.name.text === "createRequire"))) {
+      && bindingExposesModuleLoader(node, loaderRoots)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isVariableDeclaration(node) && node.initializer
+      && dynamicCodeTarget(node.initializer, evaluatorRoots)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
+      && globalObjectTarget(node.initializer, evaluatorRoots)
+      && node.name.elements.some((element) => {
+        const name = bindingPropertyName(element.propertyName)
+          ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
+        return name === "eval" || name === "Function";
+      })) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if (ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && dynamicCodeTarget(node.right, evaluatorRoots)) {
+      record(node, undefined, "module-loader", true, unsupportedModuleLoader);
+    } else if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
+      && dynamicCodeTarget(node, evaluatorRoots)
+      && !isDirectCallTarget(node)
+      && !(ts.isVariableDeclaration(node.parent) && node.parent.initializer === node)
+      && !(ts.isBinaryExpression(node.parent) && node.parent.right === node)) {
       record(node, undefined, "module-loader", true, unsupportedModuleLoader);
     } else if (ts.isIdentifier(node) && node.text === "require") {
       const directRequire = node.parent && ts.isCallExpression(node.parent) && node.parent.expression === node;
@@ -784,6 +989,27 @@ function extractImportReferences(
 
 function normalizedSpecifier(specifier: string): string {
   return specifier.replaceAll("\\", "/").split(/[?#]/u, 1)[0] ?? "";
+}
+
+function localSourceViolationRule(
+  repositoryRoot: string,
+  sourcePackage: WorkspacePackage,
+  reference: ImportReference,
+): DependencyRule | undefined {
+  const normalized = normalizedSpecifier(reference.specifier);
+  const repositoryRootSpecifier = /^(?:adapters|apps|packages)\//u.test(normalized);
+  const absoluteSpecifier = isAbsolute(normalized) || /^[A-Za-z]:\//u.test(normalized) || normalized.startsWith("//");
+  const relativeSpecifier = reference.filesystemReference || normalized.startsWith(".");
+  if (!repositoryRootSpecifier && !absoluteSpecifier && !relativeSpecifier) return undefined;
+  if (repositoryRootSpecifier || absoluteSpecifier) return DEPENDENCY_RULES.crossPackageSourcePath;
+
+  const absoluteTarget = resolve(dirname(resolve(repositoryRoot, reference.sourceFile)), normalized);
+  if (!isPathInside(sourcePackage.directory, absoluteTarget)) return DEPENDENCY_RULES.crossPackageSourcePath;
+  const segments = relative(sourcePackage.directory, absoluteTarget).split(sep).filter(Boolean);
+  if (segments.some((segment) => unscannedPackageDirectories.has(segment))) {
+    return DEPENDENCY_RULES.unscannedSourcePath;
+  }
+  return isAuditableExportTarget(absoluteTarget) ? undefined : DEPENDENCY_RULES.unscannedSourcePath;
 }
 
 function packageForPath(packages: readonly WorkspacePackage[], absolutePath: string): WorkspacePackage | undefined {
@@ -976,9 +1202,10 @@ async function physicalExportViolationRule(
   if (!metadata?.isFile()) return DEPENDENCY_RULES.physicalExportTarget;
   const owner = packageForPhysicalPath(packages, physicalTarget);
   if (owner && owner.name !== targetPackage.name) return DEPENDENCY_RULES.crossPackageExportTarget;
-  return owner?.name === targetPackage.name && isPathInside(targetPackage.physicalDirectory, physicalTarget)
-    ? undefined
-    : DEPENDENCY_RULES.physicalExportTarget;
+  if (owner?.name !== targetPackage.name || !isPathInside(targetPackage.physicalDirectory, physicalTarget)) {
+    return DEPENDENCY_RULES.physicalExportTarget;
+  }
+  return isAuditableExportTarget(physicalTarget) ? undefined : DEPENDENCY_RULES.executableExportTarget;
 }
 
 async function packageExportAudit(
@@ -1035,7 +1262,10 @@ async function sourceViolationRule(
   if (/^[a-z][a-z\d+.-]*:/iu.test(reference.specifier) && !reference.specifier.startsWith("node:")) {
     return DEPENDENCY_RULES.urlModuleSpecifier;
   }
+  if (reference.specifier.includes("%")) return DEPENDENCY_RULES.encodedModuleSpecifier;
   if (reference.specifier.startsWith("#")) return DEPENDENCY_RULES.packageImportAlias;
+  const localRule = localSourceViolationRule(repositoryRoot, sourcePackage, reference);
+  if (localRule) return localRule;
   const target = workspaceImportTarget(
     repositoryRoot,
     sourcePackage,

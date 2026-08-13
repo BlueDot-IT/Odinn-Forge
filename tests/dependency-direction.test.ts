@@ -527,6 +527,99 @@ test("repository file URL imports cannot cross a workspace package boundary", as
   ]);
 });
 
+test("encoded traversal, build-output, repository-tool, and outside-file references fail closed", async (t) => {
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway"),
+    "apps/gateway/src/index.ts": "export const gateway = true;\n",
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/safe.ts": "export const safe = true;\n",
+    "packages/host/src/data.json": "{}\n",
+    "packages/host/dist/hidden.js": 'import "@odinn/gateway";\n',
+    "scripts/repository-tool.ts": 'import "@odinn/gateway";\n',
+  });
+  const outsidePath = join(dirname(root), `${root.split(/[\\/]/u).at(-1)}-outside.mjs`);
+  t.after(() => rm(outsidePath, { force: true }));
+  await writeFile(outsidePath, 'import "@odinn/gateway";\n');
+  await writeFile(join(root, "packages/host/src/index.ts"), [
+    'import "%2e%2e/../../apps/gateway/src/index.ts";',
+    'import "../dist/hidden.js";',
+    'import "../../../scripts/repository-tool.ts";',
+    `import ${JSON.stringify(outsidePath)};`,
+    'import "./safe.ts";',
+    'import data from "./data.json" with { type: "json" };',
+    'import type ts from "typescript";',
+    "export { data };",
+  ].join("\n"));
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/host": [],
+  }, []);
+
+  assert.deepEqual(result.violations.filter(({ sourceFile }) => sourceFile === "packages/host/src/index.ts")
+    .map(({ line, rule }) => ({ line, rule })), [
+    { line: 1, rule: DEPENDENCY_RULES.encodedModuleSpecifier },
+    { line: 2, rule: DEPENDENCY_RULES.unscannedSourcePath },
+    { line: 3, rule: DEPENDENCY_RULES.crossPackageSourcePath },
+    { line: 4, rule: DEPENDENCY_RULES.crossPackageSourcePath },
+  ]);
+});
+
+test("workspace exports reject text and native executable targets while preserving inert JSON", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: {
+        ".": "./src/index.ts",
+        "./data": "./dist/data.json",
+        "./native": "./dist/native.node",
+        "./text-loader": "./dist/loader.txt",
+      },
+    }),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    "packages/host/dist/data.json": "{}\n",
+    "packages/host/dist/loader.txt": 'import "@odinn/gateway";\n',
+    "packages/host/dist/native.node": "not-a-real-native-addon\n",
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+    }),
+    "packages/consumer/src/index.ts": [
+      'import data from "@odinn/host/data" with { type: "json" };',
+      'import "@odinn/host/native";',
+      'import "@odinn/host/text-loader";',
+      "export { data };",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/host": [],
+  }, []);
+
+  assert.deepEqual(result.violations.filter(({ rule }) => rule === DEPENDENCY_RULES.executableExportTarget)
+    .map(({ sourceFile, specifier, kind }) => ({ sourceFile, specifier, kind })), [
+    {
+      sourceFile: "packages/consumer/src/index.ts",
+      specifier: "@odinn/host/native",
+      kind: "import-declaration",
+    },
+    {
+      sourceFile: "packages/consumer/src/index.ts",
+      specifier: "@odinn/host/text-loader",
+      kind: "import-declaration",
+    },
+    {
+      sourceFile: "packages/host/package.json",
+      specifier: "./dist/native.node",
+      kind: "manifest-export",
+    },
+    {
+      sourceFile: "packages/host/package.json",
+      specifier: "./dist/loader.txt",
+      kind: "manifest-export",
+    },
+  ]);
+});
+
 test("computed and private Node module loader primitives fail closed", async (t) => {
   const root = await repositoryFixture(t, {
     "apps/gateway/package.json": manifest("@odinn/gateway"),
@@ -560,6 +653,40 @@ test("computed and private Node module loader primitives fail closed", async (t)
   assert.deepEqual([...loaderLines], [2, 4, 7, 9, 10, 11, 12]);
 });
 
+test("derived Module authority and synchronous loader-hook redirects fail closed", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": [
+      'import { Module, builtinModules, registerHooks as installHooks } from "node:module";',
+      "Reflect.get(Module, '_load')('@odinn/gateway', module, false);",
+      "class DerivedModule extends Module {}",
+      "const instance = new DerivedModule('derived');",
+      "instance.load('@odinn/gateway');",
+      "const ExpressionModule = class extends Module {};",
+      "new ExpressionModule('expression').load('@odinn/gateway');",
+      "const inherited = Object.create(Module.prototype);",
+      "inherited.load('@odinn/gateway');",
+      "Module.registerHooks({ resolve: (specifier) => ({ shortCircuit: true, url: specifier }) });",
+      "installHooks({ load: (url) => ({ format: 'module', shortCircuit: true, source: url }) });",
+      "const safeMetadata = builtinModules.includes('node:fs');",
+      "const safeReflect = Reflect.get({ load: () => true }, 'load');",
+      "safeReflect();",
+      "export { safeMetadata };",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  const loaderLines = new Set(result.violations.filter(({ sourceFile, kind, rule }) =>
+    sourceFile === "packages/host/src/index.ts"
+      && kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader).map(({ line }) => line));
+
+  assert.deepEqual([...loaderLines], [1, 2, 5, 7, 9, 10]);
+  assert(!loaderLines.has(12));
+  assert(!loaderLines.has(13));
+  assert(!loaderLines.has(14));
+});
+
 test("dynamic evaluators and createRequire aliases fail closed at their capability boundary", async (t) => {
   const root = await repositoryFixture(t, {
     "packages/host/package.json": manifest("@odinn/host"),
@@ -588,6 +715,40 @@ test("dynamic evaluators and createRequire aliases fail closed at their capabili
     .map(({ line }) => line);
 
   assert.deepEqual(loaderLines, [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13]);
+});
+
+test("global evaluator aliases remain rejected while lookalike object methods stay ordinary", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": [
+      "const realm = globalThis;",
+      "const evaluate = realm.eval;",
+      'evaluate("import(\\"@odinn/gateway\\")");',
+      "let assigned;",
+      "assigned = Reflect.get(realm, 'eval');",
+      'assigned("require(\\"@odinn/gateway\\")");',
+      "const { eval: destructured } = realm;",
+      'destructured("require(\\"@odinn/gateway\\")");',
+      "const evaluatorKey = 'eval';",
+      "const computed = realm[evaluatorKey];",
+      'computed("require(\\"@odinn/gateway\\")");',
+      "const harmless = { eval: () => true };",
+      "harmless.eval();",
+      "const safeReflect = Reflect.get(harmless, 'eval');",
+      "safeReflect();",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  const loaderLines = new Set(result.violations.filter(({ sourceFile, kind, rule }) =>
+    sourceFile === "packages/host/src/index.ts"
+      && kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader).map(({ line }) => line));
+
+  assert.deepEqual([...loaderLines], [2, 3, 5, 6, 7, 8, 10, 11]);
+  assert(!loaderLines.has(13));
+  assert(!loaderLines.has(14));
+  assert(!loaderLines.has(15));
 });
 
 test("safe conditional exports, extension modes, build targets, and ordinary code remain compatible", async (t) => {
@@ -878,6 +1039,45 @@ test("dependency checker rejects source-only paths across package boundaries", a
   assert.deepEqual(result.violations.map(({ specifier, rule }) => ({ specifier, rule })), [
     { specifier: "../../kernel/src/index.ts", rule: DEPENDENCY_RULES.crossPackageSourcePath },
     { specifier: "packages/kernel/src/index.ts", rule: DEPENDENCY_RULES.crossPackageSourcePath },
+  ]);
+});
+
+test("TypeScript triple-slash path and type references obey the same package boundary", async (t) => {
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway"),
+    "apps/gateway/src/index.ts": "export const gateway = true;\n",
+    "packages/application/package.json": manifest("@odinn/application", {
+      dependencies: { "@odinn/gateway": "workspace:*" },
+      exports: { ".": "./src/index.d.ts" },
+    }),
+    "packages/application/src/local.d.ts": "export interface Local { readonly safe: true }\n",
+    "packages/application/src/index.d.ts": [
+      '/// <reference path="../../../apps/gateway/src/index.ts" />',
+      '/// <reference types="@odinn/gateway" />',
+      '/// <reference path="./local.d.ts" />',
+      '/// <reference types="node" />',
+      "export interface Application {}",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/application": [],
+    "@odinn/gateway": [],
+  }, []);
+
+  assert.deepEqual(result.violations.filter(({ sourceFile, kind }) =>
+    sourceFile === "packages/application/src/index.d.ts" && kind === "triple-slash-reference")
+    .map(({ line, specifier, rule }) => ({ line, specifier, rule })), [
+    {
+      line: 1,
+      specifier: "../../../apps/gateway/src/index.ts",
+      rule: DEPENDENCY_RULES.crossPackageSourcePath,
+    },
+    {
+      line: 2,
+      specifier: "@odinn/gateway",
+      rule: DEPENDENCY_RULES.packageToApp,
+    },
   ]);
 });
 

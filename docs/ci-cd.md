@@ -31,14 +31,16 @@ Node 24 conditional, wildcard, null-exclusion, and array-fallback `exports`
 semantics, including the default `node-addons` and `module-sync` runtime
 conditions. Type-only references activate TypeScript's `types` condition;
 static import/export mode follows `.mts`/`.mjs`, `.cts`/`.cjs`, the package
-module type, and explicit type-resolution attributes. Every executable export
-target in every condition is physically audited even when unreferenced. It
-must remain an existing regular file owned by its declared package, so a parent
-cannot proxy files from a nested workspace or through a symlink. Exported
-JavaScript/TypeScript and extensionless entrypoints remain in the source
-inventory even beneath ignored build-output directories. Relative or
-repository-root cross-package source imports are rejected so production code
-cannot depend on private TypeScript files that are not package API. Explicitly
+module type, and explicit type-resolution attributes. Every export target in
+every condition is physically audited even when unreferenced. It must remain
+an existing regular file owned by its declared package, so a parent cannot
+proxy files from a nested workspace or through a symlink. Only statically
+auditable JavaScript/TypeScript, extensionless entrypoints, and inert JSON may
+be exported; opaque `.node`, `.txt`, and other loader-defined surfaces fail
+closed. Exported source remains in the inventory even beneath ignored
+build-output directories. Relative, absolute, repository-tool, outside-file,
+ignored-output, and percent-encoded traversal references cannot bypass the
+production package boundary. Explicitly
 matched `dist` package roots are included; generated directories must be
 excluded in the workspace globs, while pnpm's `node_modules` and
 `bower_components` exclusions remain intact. Production package roots,
@@ -48,9 +50,12 @@ an independent no-symbolic-link and no-hard-link boundary.
 
 Dynamic `import()`, direct `require()`, and `module.require()` calls in every
 production workspace package must use literal module specifiers. Non-`node:`
-URL modules, indirect or computed loaders, private `Module` entrypoints,
-`createRequire`, dynamic `getBuiltinModule` access, `eval`, `Function`, and
-callable constructor-based code generation fail closed. Package `imports`
+URL modules, indirect or computed loaders, private or derived `Module`
+entrypoints, `Reflect.get` loader authority, loader hook registration,
+`createRequire`, dynamic `getBuiltinModule` access, direct or aliased `eval`,
+`Function`, and callable constructor-based code generation fail closed.
+TypeScript triple-slash path, type, and AMD dependency references are checked
+through the same boundary as imports. Package `imports`
 aliases and effective TypeScript `paths` aliases in production package config
 variants and their inherited chains also fail closed so dependency identities
 and packaged build inputs remain statically enforceable. Tool-only TypeScript
