@@ -187,6 +187,7 @@ jobs:
         env:
           EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ODINN_RELEASE_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
@@ -200,7 +201,7 @@ jobs:
           mkdir -p downloaded-release-assets
           gh release download "$TAG" --dir downloaded-release-assets
           cmp release-assets/SHA256SUMS.txt downloaded-release-assets/SHA256SUMS.txt
-          (cd downloaded-release-assets && sha256sum -c SHA256SUMS.txt)
+          node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
       - name: Publish npm package
         shell: bash
         run: |

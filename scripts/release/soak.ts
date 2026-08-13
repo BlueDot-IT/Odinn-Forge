@@ -11,6 +11,7 @@ const releaseDir = join(root, "dist", "release");
 const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const manifest = JSON.parse(await readFile(join(releaseDir, "release-manifest.json"), "utf8"));
 const archive = join(releaseDir, `odinn-v${pkg.version}.tar.gz`);
+const providerCredentialEnv = "ODINN_SOAK_API_KEY";
 const startedAt = Date.now();
 const steps: any[] = [];
 const soakReleaseA = { commit: "a".repeat(40), artifactSha256: "a".repeat(64) };
@@ -21,7 +22,7 @@ async function run(command: string, args: string[], cwd: string, extraEnv: Recor
     const child = spawn(command, args, {
       cwd,
       env: { ...process.env, ...extraEnv },
-      shell: process.platform === "win32",
+      shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
@@ -171,22 +172,22 @@ await writeFile(planPath, `${JSON.stringify({
 await run(process.execPath, [cliEntry, "init", "--state", state], workspace, { INIT_CWD: workspace });
 
 try {
-  await record("fresh-onboarding-local-provider", () => run(process.execPath, [cliEntry, "onboard", "--provider", "ci", "--auth", "api-key", "--base-url", providerUrl, "--model", "odinn-soak-model", "--api-key-env", "ODINN_SOAK_KEY", "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" }));
-  await record("onboarding-provider-verification", () => run(process.execPath, [cliEntry, "onboard", "--verify", "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" }));
+  await record("fresh-onboarding-local-provider", () => run(process.execPath, [cliEntry, "onboard", "--provider", "ci", "--auth", "api-key", "--base-url", providerUrl, "--model", "odinn-soak-model", "--api-key-env", providerCredentialEnv, "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" }));
+  await record("onboarding-provider-verification", () => run(process.execPath, [cliEntry, "onboard", "--verify", "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" }));
   await record("deterministic-tool", () => run(process.execPath, [cliEntry, "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_SOAK_TOOL" }), "--state", state], workspace, { INIT_CWD: workspace }));
   await record("multi-step-plan", () => run(process.execPath, [cliEntry, "plan", "--file", planPath, "--state", state], workspace, { INIT_CWD: workspace }));
 
   providerMode = "fail-once";
   providerRequests = 0;
   await record("provider-failure-retry-recovery", async () => {
-    const output = await run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ retries: 1, messages: [{ role: "user", content: "retry" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" });
+    const output = await run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ retries: 1, messages: [{ role: "user", content: "retry" }] }), "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" });
     if (!output.includes("ODINN_SOAK_PROVIDER_OK") || providerRequests < 2) throw new Error("provider retry did not recover after a transient failure");
     return { providerAttempts: providerRequests };
   });
   providerMode = "timeout";
   await record("provider-timeout", async () => {
     try {
-      await run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ timeoutMs: 1_000, retries: 0, messages: [{ role: "user", content: "timeout" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" });
+      await run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ timeoutMs: 1_000, retries: 0, messages: [{ role: "user", content: "timeout" }] }), "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" });
       throw new Error("provider timeout did not fail safely");
     } catch (error: any) {
       if (!/timed out|timeout/i.test(error.message)) throw error;
@@ -194,9 +195,9 @@ try {
     return { recovered: true };
   });
   providerMode = "normal";
-  await record("provider-post-timeout-recovery", () => run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ messages: [{ role: "user", content: "recover" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" }));
+  await record("provider-post-timeout-recovery", () => run(process.execPath, [cliEntry, "run", "--tool", "model.chat", "--input-json", JSON.stringify({ messages: [{ role: "user", content: "recover" }] }), "--state", state], workspace, { INIT_CWD: workspace, [providerCredentialEnv]: "odinn-soak-key" }));
 
-  let gateway = await record("gateway-start", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
+  let gateway = await record("gateway-start", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
   await record("gateway-status", async () => { const result = await gatewayRequest(gateway, "/status"); if (!result.response.ok) throw new Error("gateway status failed"); return { status: "healthy" }; });
   const gatewayRun = await record("gateway-provider-run", async () => {
     const result = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: "soak-gateway-run", tool: "model.chat", input: { messages: [{ role: "user", content: "gateway" }] } }) });
@@ -204,7 +205,7 @@ try {
     return { runId: result.body.id };
   });
   await stopGateway(gateway);
-  gateway = await record("gateway-restart", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
+  gateway = await record("gateway-restart", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
   await record("persisted-output-after-restart", async () => {
     const result = await gatewayRequest(gateway, `/runs/${encodeURIComponent(gatewayRun.runId)}`);
     if (!result.response.ok || !result.body.events?.some((event: any) => event.type === "task.completed")) throw new Error("gateway restart lost persisted output");
@@ -224,7 +225,7 @@ try {
   });
   await stopGateway(gateway);
   providerMode = "normal";
-  gateway = await record("queue-stop-restart-recovery", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
+  gateway = await record("queue-stop-restart-recovery", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
   await record("recovered-job-state", async () => {
     for (let attempt = 0; attempt < 50; attempt += 1) {
       const result = await gatewayRequest(gateway, `/jobs/${encodeURIComponent(queuedJob.jobId)}`);

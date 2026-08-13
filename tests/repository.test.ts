@@ -580,6 +580,13 @@ test("release packaging removes stale assets before creating a version", async (
   assert.match(installSmoke, /\/diagnostics/);
 });
 
+test("release soak uses a valid provider credential name and direct Node execution", async () => {
+  const soak = await read("scripts/release/soak.ts");
+  assert.match(soak, /providerCredentialEnv = "ODINN_SOAK_API_KEY"/u);
+  assert.doesNotMatch(soak, /ODINN_SOAK_KEY/u);
+  assert.match(soak, /shell: false/u);
+});
+
 test("release packaging trusts the checked-out tag declaration over ambient GitHub SHA", () => {
   const tagCommit = "a".repeat(40);
   const ambientBranchCommit = "b".repeat(40);
