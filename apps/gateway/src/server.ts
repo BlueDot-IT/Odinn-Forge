@@ -22,6 +22,7 @@ import {
 import { authenticationMode, isMutatingMethod, permitsGatewayTokenBootstrap, validHostHeader, validMutationOrigin } from "./security.ts";
 import { runGatewayEntrypoint } from "./bootstrap.ts";
 import { renderConsoleHtml } from "./public/console.ts";
+import { gatewayTestHooksFor } from "./testing.ts";
 import { runWithWorkflowLeaseHeartbeat } from "./workflow.ts";
 
 declare const __ODINN_COMPILED__: boolean | undefined;
@@ -698,15 +699,17 @@ export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor
   await Promise.allSettled(dispatches);
 }
 
-export async function createGatewayServer({
-  stateDir = resolve(homedir(), ".odinn"),
-  workspaceRoot = process.cwd(),
-  requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
-  quotas = {},
-  hosted = false,
-  hostedUserId,
-  channelPluginLoader = loadChannelPlugin
-}: any = {}) {
+export async function createGatewayServer(options: any = {}) {
+  const {
+    stateDir = resolve(homedir(), ".odinn"),
+    workspaceRoot = process.cwd(),
+    requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
+    quotas = {},
+    hosted = false,
+    hostedUserId,
+    channelPluginLoader = loadChannelPlugin
+  } = options;
+  const testHooks = gatewayTestHooksFor(options);
   const trustedHostedUserId = hosted ? normalizeHostedUserId(hostedUserId) : undefined;
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
@@ -943,8 +946,33 @@ export async function createGatewayServer({
     return supervisor.settleApproval(linkedJob.id, { ...outcome, expectedLeaseToken });
   };
 
-  const recoverGatewayApprovalContinuation = async (id: string, pending: any, linkedJob: any, linkedTask: Record<string, unknown> | undefined) => {
-    const recovered = approvalStore.recover(id);
+  const approvalSettlementError = (error: unknown): unknown => {
+    const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    if (code !== "APPROVAL_STORE_CONTENDED"
+      && code !== "APPROVAL_CONTINUATION_DENIED"
+      && message !== "claimed approval continuation is missing or does not match the exact request") return error;
+    return Object.assign(
+      new Error("claimed approval continuation is missing or does not match the exact request"),
+      { code: "APPROVAL_CONTINUATION_DENIED" }
+    );
+  };
+
+  const listGatewayApprovals = () => typeof approvalStore.listAsync === "function"
+    ? approvalStore.listAsync()
+    : Promise.resolve(approvalStore.list());
+  const claimGatewayApproval = (id: string) => typeof approvalStore.claimAsync === "function"
+    ? approvalStore.claimAsync(id)
+    : Promise.resolve(approvalStore.claim(id));
+  const recoverGatewayApproval = (id: string) => typeof approvalStore.recoverAsync === "function"
+    ? approvalStore.recoverAsync(id)
+    : Promise.resolve(approvalStore.recover(id));
+  const revokeGatewayApproval = (id: string) => typeof approvalStore.revokeAsync === "function"
+    ? approvalStore.revokeAsync(id)
+    : Promise.resolve(approvalStore.revoke(id));
+
+  const recoverGatewayApprovalContinuation = async (id: string, pending: any, linkedTask: Record<string, unknown> | undefined) => {
+    const recovered = await recoverGatewayApproval(id);
     const runId = String(pending?.runId ?? "");
     const tool = String(pending?.tool ?? "");
     const recoveredRunId = String(recovered?.runId ?? "");
@@ -961,12 +989,7 @@ export async function createGatewayServer({
       || Array.isArray(input)
       || (recoveredActor && linkedActor && recoveredActor !== linkedActor);
     if (invalid) {
-      approvalStore.revoke(id);
-      if (linkedJob) {
-        await settleClaimedGatewayApproval(linkedJob, {
-          error: new Error("approved execution continuation could not be recovered exactly")
-        }).catch(() => undefined);
-      }
+      await revokeGatewayApproval(id);
       throw new GatewayError(409, "approved execution input or authority could not be recovered; refusing dispatch");
     }
     return {
@@ -983,60 +1006,83 @@ export async function createGatewayServer({
       throw new GatewayError(409, "approval execution is already in flight");
     }
     activeGatewayApprovalExecutions.add(id);
+    let claimedLinkedJob: any;
     try {
-      const preview = approvalStore.list().find((approval: any) => approval.id === id);
+      const preview = (await listGatewayApprovals()).find((approval: any) => approval.id === id);
       let linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
       if (linkedJob && linkedJob.status !== "awaiting-approval") {
-        if (linkedJob.status !== "running") approvalStore.revoke(id);
+        if (linkedJob.status !== "running") await revokeGatewayApproval(id);
         throw new GatewayError(409, "the originating job is no longer awaiting approval");
       }
       if (linkedJob) {
         try {
           linkedJob = await supervisor.beginApproval(linkedJob.id);
+          claimedLinkedJob = linkedJob;
         } catch {
           const current = await supervisor.get(linkedJob.id);
-          if (current?.status !== "running") approvalStore.revoke(id);
+          if (current?.status !== "running") await revokeGatewayApproval(id);
           throw new GatewayError(409, "the originating job approval was already claimed or cancelled");
         }
+        await testHooks?.afterApprovalJobClaimed?.({ approvalId: id, jobId: linkedJob.id });
       }
-      const pending = approvalStore.claim(id);
+      const pending = await claimGatewayApproval(id);
       if (!pending) {
-        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { error: new Error("approval expired before execution claim") }).catch(() => undefined);
         throw new GatewayError(404, "approval not found or expired");
       }
       if (pending.type === "skill-lifecycle") {
-        return { approvalId: id, result: await skillLifecycle.applyApproved(id, pending) };
+        const result = await skillLifecycle.applyApproved(id, pending);
+        if (linkedJob) {
+          await settleClaimedGatewayApproval(linkedJob, { result });
+          claimedLinkedJob = undefined;
+        }
+        return { approvalId: id, result };
       }
       const linkedTask = linkedJob?.payload?.task && typeof linkedJob.payload.task === "object" && !Array.isArray(linkedJob.payload.task)
         ? linkedJob.payload.task as Record<string, unknown>
         : undefined;
-      const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedJob, linkedTask);
-      try {
-        const result = await isolatedTaskExecutor({
-          approvalId: id,
-          approvalRunId: continuation.runId,
-          durableExecution: continuation.tool === "process.exec" || continuation.tool === "mcp.invoke",
-          task: {
-            id: continuation.runId,
-            tool: continuation.tool,
-            input: continuation.input,
-            actor: continuation.actor,
-            reason: "explicit user approval"
-          }
-        });
-        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { result });
-        return { approvalId: id, result };
-      } catch (error) {
-        if (linkedJob) await settleClaimedGatewayApproval(linkedJob, { error }).catch(() => undefined);
-        throw error;
+      const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask);
+      const result = await isolatedTaskExecutor({
+        approvalId: id,
+        approvalRunId: continuation.runId,
+        durableExecution: continuation.tool === "process.exec" || continuation.tool === "mcp.invoke",
+        task: {
+          id: continuation.runId,
+          tool: continuation.tool,
+          input: continuation.input,
+          actor: continuation.actor,
+          reason: "explicit user approval"
+        }
+      });
+      if (linkedJob) {
+        await settleClaimedGatewayApproval(linkedJob, { result });
+        claimedLinkedJob = undefined;
       }
+      return { approvalId: id, result };
+    } catch (error) {
+      if (claimedLinkedJob) {
+        const settlementError = approvalSettlementError(error);
+        await settleClaimedGatewayApproval(claimedLinkedJob, { error: settlementError }).catch(() => undefined);
+        if ((settlementError as { code?: unknown } | undefined)?.code === "APPROVAL_CONTINUATION_DENIED") {
+          await auditStore.append({
+            at: new Date().toISOString(),
+            runId: claimedLinkedJob.id,
+            type: "operator.approval_continuation_denied",
+            actor: "operator",
+            tool: String(claimedLinkedJob.payload?.task?.tool || "approval"),
+            decision: "deny",
+            message: "claimed approval continuation is missing or does not match the exact request",
+            data: { code: "APPROVAL_CONTINUATION_DENIED", dispatchStarted: false }
+          }).catch(() => undefined);
+        }
+      }
+      throw error;
     } finally {
       activeGatewayApprovalExecutions.delete(id);
     }
   };
 
   const denyGatewayApproval = async (id: string) => {
-    const pending = approvalStore.list().find((approval: any) => approval.id === id);
+    const pending = (await listGatewayApprovals()).find((approval: any) => approval.id === id);
     if (!pending) throw new GatewayError(404, "approval not found or expired");
     const linkedJob = pending.runId ? await supervisor.get(String(pending.runId)) : undefined;
     const auditContext = {
@@ -1056,7 +1102,7 @@ export async function createGatewayServer({
       throw new GatewayError(503, "approval denial could not be recorded; no approval state was changed");
     }
     if (linkedJob && linkedJob.status !== "awaiting-approval") {
-      if (!approvalStore.revoke(id)) throw new GatewayError(404, "approval not found or expired");
+      if (!await revokeGatewayApproval(id)) throw new GatewayError(404, "approval not found or expired");
       await auditStore.append({
         ...auditContext,
         type: "operator.approval_denial_stale",
@@ -1065,7 +1111,7 @@ export async function createGatewayServer({
       }).catch(() => undefined);
       throw new GatewayError(409, "the originating job is no longer awaiting approval");
     }
-    if (!approvalStore.revoke(id)) throw new GatewayError(404, "approval not found or expired");
+    if (!await revokeGatewayApproval(id)) throw new GatewayError(404, "approval not found or expired");
     try {
       if (linkedJob) await supervisor.cancel(linkedJob.id);
     } catch (error) {
@@ -1987,11 +2033,11 @@ export async function createGatewayServer({
         return json(response, 200, { ok: true, subscriber, sequence: await auditStore.getCursor(subscriber) });
       }
       if (request.method === "GET" && url.pathname === "/approvals") {
-        return json(response, 200, validatePendingApprovalSummariesV1(approvalStore.list()));
+        return json(response, 200, validatePendingApprovalSummariesV1(await listGatewayApprovals()));
       }
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/approve")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/approve".length));
-        const preview = approvalStore.list().find((approval: any) => approval.id === id);
+        const preview = (await listGatewayApprovals()).find((approval: any) => approval.id === id);
         const approved = await approveGatewayApproval(id);
         return json(response, 200, preview?.type === "skill-lifecycle"
           ? { ok: true, ...approved }

@@ -61,7 +61,7 @@ export function registerChannelAgentTools(
               summary: binding.summary,
               input,
               executionInput: input,
-            });
+            }, { signal: context.signal });
             return {
               type: "approval.required",
               approvalId,
@@ -70,14 +70,13 @@ export function registerChannelAgentTools(
               expiresInSeconds: 300,
             };
           }
-          const approved = approvalStore.consume(context.trustedApprovalId, {
+          const authorized = context.trustedApprovalContinuation ?? approvalStore.consume(context.trustedApprovalId, {
             tool: name,
             runId: context.trustedApprovalRunId ?? context.request?.id,
             accountId: binding.accountId,
             actor: context.request?.actor,
             input,
-          });
-          const authorized = approved ?? context.trustedApprovalContinuation;
+          }, { signal: context.signal });
           if (!authorized) {
             throw new Error(definition.approvalFailureMessage
               ?? "Channel action approval is missing, expired, already used, or does not match this action");

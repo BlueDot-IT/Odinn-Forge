@@ -202,7 +202,9 @@ export class SkillLifecycleService {
 
   async applyApproved(approvalId: string, pending?: ApprovalAction) {
     this.assertWritable();
-    const candidate = pending ?? this.approvalStore.claim(approvalId);
+    const candidate = pending ?? (typeof this.approvalStore.claimAsync === "function"
+      ? await this.approvalStore.claimAsync(approvalId)
+      : this.approvalStore.claim(approvalId));
     if (!candidate || candidate.tool !== "skill.lifecycle" || candidate.type !== "skill-lifecycle") {
       throw new SkillLifecycleError("SKILL_APPROVAL_INVALID", "skill lifecycle approval is missing or has the wrong type", 409);
     }
@@ -218,11 +220,14 @@ export class SkillLifecycleService {
     if (expected.requestDigest !== recomputed || expected.action !== "enable") {
       throw new SkillLifecycleError("SKILL_APPROVAL_INVALID", "skill lifecycle approval binding is invalid", 409);
     }
-    const consumed = this.approvalStore.consume(approvalId, {
+    const expectedApproval = {
       tool: "skill.lifecycle",
       runId: candidate.runId,
       input
-    });
+    };
+    const consumed = typeof this.approvalStore.consumeAsync === "function"
+      ? await this.approvalStore.consumeAsync(approvalId, expectedApproval)
+      : this.approvalStore.consume(approvalId, expectedApproval);
     if (!consumed) throw new SkillLifecycleError("SKILL_APPROVAL_CONSUMED", "skill lifecycle approval is expired, already used, or does not match", 409);
     const record = await this.findRecord(expected.id);
     if (!record || record.version !== expected.version || record.integrity !== expected.integrity) {
