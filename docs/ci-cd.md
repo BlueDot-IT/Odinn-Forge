@@ -66,8 +66,9 @@ added to the source inventory even when they live in build output.
 Package `bin` entrypoints follow the same inventory boundary through a stricter
 manifest grammar: string and object forms must name unique portable commands
 and exact package-owned JS/TS files with the canonical `#!/usr/bin/env node`
-shebang. Explicit `dist` bins are scanned; links, package escapes, ambiguous or
-opaque paths, command collisions, and non-Node shebangs fail closed.
+shebang. Explicit `dist` bins are scanned; symbolic links, junctions, package
+escapes, ambiguous or opaque paths, command collisions, and non-Node shebangs
+fail closed. Release archive verification separately rejects hard links.
 `directories.bin` is rejected rather than turning a directory into an
 unenumerated executable surface.
 TypeScript triple-slash path, type, and AMD dependency references are checked
