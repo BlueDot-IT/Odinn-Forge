@@ -19,7 +19,7 @@ import { withStateMutationLock } from "./state-mutation.ts";
 import { createWorkspaceMutationTools } from "./workspace-mutations.ts";
 import { appendSessionMessage, assignSessionProject, createGoal, createProject, createSession, DEFAULT_PROJECT_ID, deleteSession, listGoals, listProjects, listSessions, readSession, renameSession, resolveSession, updateGoal, updateProject, updateSession } from "./workspace-records.ts";
 import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, formatMemoryContext, learnFromConversation, listMemoryCandidates, normalizeMemoryOptions, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
-import { approvalActionForExecution, createApprovalStore, normalizeApprovalExecutionInput } from "./approvals.ts";
+import { approvalActionForExecution, createApprovalStore, isApprovalStoreContentionError, normalizeApprovalExecutionInput } from "./approvals.ts";
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
 import { browserAction, browserOpen, browserRecoveryResolve, browserRecoveryStatus, browserSnapshot, browserTabs, closeBrowserManagers } from "./browser.ts";
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
@@ -77,7 +77,7 @@ export type { GoalCommandInput, GoalView, ProjectCommandInput, ProjectView, Sess
 export { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, listMemoryCandidates, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
 export type { MemoryCommandInput, MemoryRecordStore } from "./memory.ts";
 export { createApprovalStore } from "./approvals.ts";
-export type { ApprovalAction, ApprovalEffect, ApprovalStore } from "./approvals.ts";
+export type { ApprovalAction, ApprovalEffect, ApprovalStore, ApprovalStoreListOptions, ApprovalStoreOperationOptions } from "./approvals.ts";
 export { SkillLifecycleError, SkillLifecycleService } from "./skill-lifecycle.ts";
 export type { SkillLifecycleContext, SkillLifecycleTransition } from "./skill-lifecycle.ts";
 export { ProgressiveSkillDisclosure, SkillDisclosureError } from "./skill-disclosure.ts";
@@ -222,16 +222,15 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
             summary,
             input: normalizedInput,
             executionInput: normalizedInput
-          });
+          }, { signal: context.signal });
           return { type: "approval.required", approvalId, tool: "process.exec", summary, expiresInSeconds: 300 };
         }
-        const approved = approvalStore.consume(context.trustedApprovalId, {
+        const authorized = context.trustedApprovalContinuation ?? approvalStore.consume(context.trustedApprovalId, {
           tool: "process.exec",
           runId: context.trustedApprovalRunId ?? context.request?.id,
           actor: context.request?.actor,
           input: normalizedInput
-        });
-        const authorized = approved ?? context.trustedApprovalContinuation;
+        }, { signal: context.signal });
         if (!authorized) throw new Error("process execution approval is missing, expired, already used, or does not match this action");
         return processExecutor(authorized.input ?? normalizedInput, {
           signal: context.signal,
@@ -292,7 +291,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       approvalInputNoopKeys: ["confirmed", "approvalId"],
       description: "Click a browser control after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor })
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor, signal: context.signal })
     }],
     ["browser.type", {
       capability: "browser.act",
@@ -300,7 +299,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       approvalInputNoopKeys: ["confirmed", "approvalId"],
       description: "Fill a browser field after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor })
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor, signal: context.signal })
     }],
     ["browser.press", {
       capability: "browser.act",
@@ -308,7 +307,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       approvalInputNoopKeys: ["confirmed", "approvalId"],
       description: "Press a browser key after explicit user approval.",
       inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor })
+      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor, signal: context.signal })
     }],
     ["browser.recovery.status", {
       capability: "browser.read",
@@ -856,16 +855,15 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
             summary: "Invoke one approved MCP tool on a configured server",
             input: approvalInput,
             executionInput: { ...input }
-          });
+          }, { signal: context.signal });
           return { type: "approval.required", approvalId, tool: "mcp.invoke", summary: "Invoke one approved MCP tool on a configured server", expiresInSeconds: 300 };
         }
-        const approved = approvalStore.consume(context.trustedApprovalId, {
+        const authorized = context.trustedApprovalContinuation ?? approvalStore.consume(context.trustedApprovalId, {
           tool: "mcp.invoke",
           runId: context.trustedApprovalRunId ?? context.request?.id,
           actor: context.request?.actor,
           input
-        });
-        const authorized = approved ?? context.trustedApprovalContinuation;
+        }, { signal: context.signal });
         if (!authorized) throw new Error("MCP invocation approval is missing, expired, already used, or does not match this pinned request");
         return ownedMcpRuntime.invoke(authorized.input ?? input, {
           request: context.request,
@@ -1339,23 +1337,39 @@ function canonicalTaskInput(toolName: string, input: any, tool?: AnyRecord): Rec
   return normalized;
 }
 
-function consumeClaimedApprovalContinuation({
+function approvalContinuationDeniedError(): NodeError {
+  const error = new Error("claimed approval continuation is missing or does not match the exact request") as NodeError;
+  error.code = "APPROVAL_CONTINUATION_DENIED";
+  return error;
+}
+
+async function consumeClaimedApprovalContinuation({
   approvalStore,
   trustedApprovalId,
   trustedApprovalRunId,
   request,
-  tool
-}: AnyRecord): AnyRecord | undefined {
+  tool,
+  signal
+}: AnyRecord): Promise<AnyRecord | undefined> {
   if (typeof trustedApprovalId !== "string" || !trustedApprovalId.trim()) return undefined;
   if (typeof trustedApprovalRunId !== "string" || trustedApprovalRunId !== request.id) return undefined;
   if (!approvalStore || typeof approvalStore.recover !== "function" || typeof approvalStore.consume !== "function") return undefined;
-  const recovered = approvalStore.recover(trustedApprovalId);
-  if (!recovered || typeof recovered !== "object" || Array.isArray(recovered)) return undefined;
-  if (String(recovered.runId ?? "") !== request.id) return undefined;
-  if (String(recovered.tool ?? "") !== request.tool) return undefined;
-  if (String(recovered.actor ?? "").trim() !== request.actor) return undefined;
-  if (stableTaskValue(canonicalTaskInput(request.tool, recovered.input, tool)) !== stableTaskValue(canonicalTaskInput(request.tool, request.input, tool))) return undefined;
-  return approvalStore.consume(trustedApprovalId, approvalActionForExecution(recovered));
+  try {
+    const recovered = typeof approvalStore.recoverAsync === "function"
+      ? await approvalStore.recoverAsync(trustedApprovalId, { signal })
+      : approvalStore.recover(trustedApprovalId, { signal });
+    if (!recovered || typeof recovered !== "object" || Array.isArray(recovered)) return undefined;
+    if (String(recovered.runId ?? "") !== request.id) return undefined;
+    if (String(recovered.tool ?? "") !== request.tool) return undefined;
+    if (String(recovered.actor ?? "").trim() !== request.actor) return undefined;
+    if (stableTaskValue(canonicalTaskInput(request.tool, recovered.input, tool)) !== stableTaskValue(canonicalTaskInput(request.tool, request.input, tool))) return undefined;
+    return typeof approvalStore.consumeAsync === "function"
+      ? await approvalStore.consumeAsync(trustedApprovalId, approvalActionForExecution(recovered), { signal })
+      : approvalStore.consume(trustedApprovalId, approvalActionForExecution(recovered), { signal });
+  } catch (error) {
+    if (isApprovalStoreContentionError(error)) return undefined;
+    throw error;
+  }
 }
 
 function taskRequestDigest(request: any, tool?: AnyRecord): string {
@@ -1689,17 +1703,16 @@ async function executeTaskThroughAdmission({
   const tool = registeredTool && declaredCapabilities
     ? { ...registeredTool, capability: declaredCapabilities[0], capabilities: declaredCapabilities }
     : registeredTool;
-  const approvalContinuation = consumeClaimedApprovalContinuation({
+  const approvalContinuation = await consumeClaimedApprovalContinuation({
     approvalStore,
     trustedApprovalId,
     trustedApprovalRunId,
     request,
-    tool
+    tool,
+    signal
   });
   if (trustedApprovalId !== undefined && !approvalContinuation) {
-    const error = new Error("claimed approval continuation is missing or does not match the exact request") as NodeError;
-    error.code = "APPROVAL_CONTINUATION_DENIED";
-    throw error;
+    throw approvalContinuationDeniedError();
   }
   if (approvalContinuation && !supportsCapabilityApprovalContinuation(tool, policy)) {
     const error = new Error("tool does not support approval continuation authority") as NodeError;

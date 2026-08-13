@@ -5,12 +5,78 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { assertGatewayBinding } from "../apps/gateway/src/security.ts";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
-import { createApprovalStore, isOwnerOnlyPath } from "../packages/kernel/src/index.ts";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createRunLedger, isOwnerOnlyPath, runTask } from "../packages/kernel/src/index.ts";
+import { createApprovalStoreWithTestHooks } from "../packages/kernel/src/approvals.ts";
+import { createDefaultPolicy } from "../packages/policy/src/index.ts";
+import { createRuntimeIsolatedTaskExecutor } from "../packages/runtime/src/index.ts";
+
+test("approval fault-injection hooks are absent from the kernel package root", async () => {
+  const kernel = await import("../packages/kernel/src/index.ts") as Record<string, unknown>;
+  assert.equal("createApprovalStoreWithTestHooks" in kernel, false);
+  assert.equal("isApprovalStoreContentionError" in kernel, false);
+});
+
+type ApprovalContentionChildResult = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  stdout: string;
+  value?: { code?: string; message?: string; outcome?: string };
+};
+
+const RAW_APPROVAL_CONTENTION = /APPROVAL_STORE_(?:BUSY|CONTENDED)|approval store is busy|approval state (?:is temporarily unavailable|could not be accessed before the bounded deadline)/iu;
+
+function spawnApprovalContentionWorker(input: Record<string, unknown>) {
+  const worker = join(process.cwd(), "tests/fixtures/approval-contention-worker.ts");
+  const child = spawn(process.execPath, [worker, JSON.stringify(input)], { stdio: ["ignore", "pipe", "pipe"] });
+  const result = new Promise<ApprovalContentionChildResult>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      let value;
+      try { value = stdout.trim() ? JSON.parse(stdout.trim()) : undefined; }
+      catch { value = undefined; }
+      resolve({ code, signal, stdout, stderr, value });
+    });
+  });
+  return { child, result };
+}
+
+async function waitForApprovalBarrier(path: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for approval test barrier: ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function activeApprovalLockArtifacts(approvalPath: string, files: string[]): string[] {
+  return files.filter((name) => name === `${basename(approvalPath)}.lock` || name.startsWith(".odinn-approval-lock-recovery."));
+}
+
+async function approvalFileIdentity(path: string): Promise<string> {
+  const value = await stat(path);
+  return `${value.dev}:${value.ino}:${value.mtimeMs}:${value.size}`;
+}
+
+function waitForChild(child: ReturnType<typeof spawn>) {
+  return new Promise<{ code: number | null; signal: NodeJS.Signals | null; stderr: string; stdout: string }>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr!.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal, stderr, stdout }));
+  });
+}
 
 test("gateway control surfaces require bootstrap authentication and reject cross-origin mutations", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-security-"));
@@ -185,38 +251,404 @@ test("approval records survive restart and consume exactly once for the bound ac
   assert.deepEqual(createApprovalStore({ path }).list(), []);
 });
 
-test("separate processes atomically serialize one approval continuation owner", async (t) => {
+test("separate processes wait on the real approval lock and dispatch exactly once", async (t) => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-process-race-"));
   t.after(() => rm(stateDir, { recursive: true, force: true }));
   const path = join(stateDir, "approvals.json");
-  const barrier = join(stateDir, "start");
+  const ownerReadyPath = join(stateDir, "owner-ready");
+  const contentionReadyPath = join(stateDir, "contender-collided");
+  const releasePath = join(stateDir, "release-owner");
+  const dispatchPath = join(stateDir, "dispatches.log");
   const action = { tool: "process.exec", runId: "cross-process-continuation", actor: "operator", input: { command: "/bin/true", args: [], cwd: "." } };
   const id = createApprovalStore({ path }).create(action);
   assert.ok(createApprovalStore({ path }).claim(id));
-  const moduleUrl = pathToFileURL(join(process.cwd(), "packages/kernel/src/approvals.ts")).href;
-  const childCode = [
-    `import { existsSync } from "node:fs";`,
-    `import { createApprovalStore } from ${JSON.stringify(moduleUrl)};`,
-    `while (!existsSync(${JSON.stringify(barrier)})) await new Promise((resolve) => setTimeout(resolve, 5));`,
-    `const result = createApprovalStore({ path: ${JSON.stringify(path)} }).consume(${JSON.stringify(id)}, ${JSON.stringify(action)});`,
-    `process.stdout.write(result ? "won" : "lost");`
-  ].join("\n");
-  const execute = () => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(process.execPath, ["--input-type=module", "-e", childCode], { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
-    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (code) => resolve({ code, stdout, stderr }));
-  });
-  const left = execute();
-  const right = execute();
-  await writeFile(barrier, "start\n", { mode: 0o600 });
-  const results = await Promise.all([left, right]);
+  const owner = spawnApprovalContentionWorker({ action, barrierTimeoutMs: 60_000, dispatchPath, id, operation: "consume", ownerReadyPath, path, releasePath });
+  t.after(() => { if (owner.child.exitCode === null) owner.child.kill(); });
+  await waitForApprovalBarrier(ownerReadyPath);
+  const contender = spawnApprovalContentionWorker({ action, contentionReadyPath, dispatchPath, id, operation: "consume", path });
+  t.after(() => { if (contender.child.exitCode === null) contender.child.kill(); });
+  await waitForApprovalBarrier(contentionReadyPath);
+  await writeFile(releasePath, "release\n", { mode: 0o600 });
+  const results = await Promise.all([owner.result, contender.result]);
   assert.ok(results.every(({ code }) => code === 0), results.map(({ stderr }) => stderr).join("\n"));
-  assert.deepEqual(results.map(({ stdout }) => stdout).sort(), ["lost", "won"]);
+  assert.deepEqual(results.map(({ value }) => value?.outcome).sort(), ["approved", "denied"]);
+  assert.doesNotMatch(JSON.stringify(results), RAW_APPROVAL_CONTENTION);
+  assert.equal((await readFile(dispatchPath, "utf8")).trim().split("\n").length, 1);
   assert.deepEqual(createApprovalStore({ path }).list(), []);
+  assert.deepEqual(activeApprovalLockArtifacts(path, await readdir(stateDir)), []);
+});
+
+test("live approval lock timeout denies safely, observes interruption, and permits one retry after release", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-approval-live-timeout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const path = join(stateDir, "approvals.json");
+  const ownerReadyPath = join(stateDir, "owner-ready");
+  const releasePath = join(stateDir, "release-owner");
+  const action = { tool: "process.exec", runId: "live-timeout-continuation", actor: "operator", input: { command: "/bin/true", args: [], cwd: "." } };
+  const id = createApprovalStore({ path }).create(action);
+  assert.ok(createApprovalStore({ path }).claim(id));
+  const owner = spawnApprovalContentionWorker({ action, barrierTimeoutMs: 60_000, id, operation: "list", ownerReadyPath, path, releasePath });
+  t.after(() => { if (owner.child.exitCode === null) owner.child.kill(); });
+  await waitForApprovalBarrier(ownerReadyPath);
+
+  const interrupted = new AbortController();
+  const interruption = new Error("approval wait cancelled by caller");
+  let observeContention!: () => void;
+  const contentionObserved = new Promise<void>((resolve) => { observeContention = resolve; });
+  const interruptible = createApprovalStoreWithTestHooks({
+    path,
+    lockTimeoutMs: 1_000,
+    __testOnlyOnLockContention: observeContention
+  });
+  const interruptedRecovery = interruptible.recoverAsync!(id, { signal: interrupted.signal });
+  await contentionObserved;
+  interrupted.abort(interruption);
+  await assert.rejects(interruptedRecovery, (error) => error === interruption);
+
+  let contentionObservations = 0;
+  const contendedStore = createApprovalStoreWithTestHooks({
+    path,
+    lockTimeoutMs: 75,
+    __testOnlyOnLockContention: () => { contentionObservations += 1; }
+  });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  let dispatches = 0;
+  const registry = createBuiltInRegistry({
+    workspaceRoot: root,
+    stateDir,
+    approvalStore: contendedStore,
+    auditStore,
+    processExecutor: async () => { dispatches += 1; return { exitCode: 0 }; }
+  });
+  t.after(() => { registry.close(); auditStore.close(); });
+  const execution = {
+    task: { id: action.runId, tool: action.tool, input: action.input, actor: action.actor },
+    auditStore,
+    approvalStore: contendedStore,
+    policy: createDefaultPolicy({ allowedCapabilities: ["process.exec"] }),
+    registry,
+    durableExecution: true,
+    trustedApprovalId: id,
+    trustedApprovalRunId: action.runId
+  };
+  await assert.rejects(
+    runTask(execution),
+    (error: any) => error?.code === "APPROVAL_CONTINUATION_DENIED"
+      && !RAW_APPROVAL_CONTENTION.test(`${error?.code} ${error?.message}`)
+  );
+  assert.ok(contentionObservations > 0);
+  assert.equal(dispatches, 0);
+
+  await writeFile(releasePath, "release\n", { mode: 0o600 });
+  const ownerResult = await owner.result;
+  assert.equal(ownerResult.value?.outcome, "listed", ownerResult.stderr);
+  const restartedStore = createApprovalStore({ path });
+  const restartedRegistry = createBuiltInRegistry({
+    workspaceRoot: root,
+    stateDir,
+    approvalStore: restartedStore,
+    auditStore,
+    processExecutor: async () => { dispatches += 1; return { exitCode: 0 }; }
+  });
+  t.after(() => restartedRegistry.close());
+  const retryExecution = { ...execution, approvalStore: restartedStore, registry: restartedRegistry };
+  const retry = await runTask(retryExecution);
+  assert.equal(retry.ok, true);
+  await assert.rejects(runTask(retryExecution), (error: any) => error?.code === "APPROVAL_CONTINUATION_DENIED");
+  assert.equal(dispatches, 1);
+  assert.deepEqual(createApprovalStore({ path }).list(), []);
+  assert.deepEqual(activeApprovalLockArtifacts(path, await readdir(stateDir)), []);
+});
+
+test("Gateway, CLI, worker, and durable-job continuations hide live approval lock contention", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-surface-timeout-"));
+  const approvalPath = join(stateDir, "approvals.json");
+  const ownerReadyPath = join(stateDir, "owner-ready");
+  const releasePath = join(stateDir, "release-owner");
+  const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(server.address() as any).port}`;
+  const token = (await readFile(join(stateDir, "gateway.token"), "utf8")).trim();
+  const authorization = { authorization: `Bearer ${token}` };
+  const workerAction = {
+    tool: "process.exec",
+    runId: "surface-timeout-worker",
+    actor: "operator",
+    input: { command: "/bin/true", args: [], cwd: "." }
+  };
+  const workerApprovalId = createApprovalStore({ path: approvalPath }).create(workerAction);
+  assert.ok(createApprovalStore({ path: approvalPath }).claim(workerApprovalId));
+  const workerExecutor = createRuntimeIsolatedTaskExecutor({
+    stateDir,
+    workspaceRoot: stateDir,
+    policy: createDefaultPolicy({ allowedCapabilities: ["process.exec"] })
+  });
+  let owner: ReturnType<typeof spawnApprovalContentionWorker> | undefined;
+  let cli: ReturnType<typeof spawn> | undefined;
+  t.after(async () => {
+    await writeFile(releasePath, "release\n", { mode: 0o600 }).catch(() => undefined);
+    if (cli?.exitCode === null) cli.kill();
+    if (owner?.child.exitCode === null) owner.child.kill();
+    await workerExecutor.shutdown();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  const submitApprovalJob = async (id: string) => {
+    const submitted = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json", "idempotency-key": id },
+      body: JSON.stringify({ task: { tool: "browser.click", input: { tabId: "tab_fixture", selector: "#apply" } } })
+    });
+    assert.equal(submitted.status, 202, await submitted.text());
+    const deadline = Date.now() + 10_000;
+    let job: any;
+    while (Date.now() < deadline) {
+      const response = await fetch(`${base}/jobs/${id}`, { headers: authorization });
+      job = await response.json();
+      if (job.status === "awaiting-approval" || job.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(job?.status, "awaiting-approval", JSON.stringify(job));
+    return job;
+  };
+
+  const [httpJob, cliJob] = await Promise.all([
+    submitApprovalJob("surface-timeout-http-job"),
+    submitApprovalJob("surface-timeout-cli-job")
+  ]);
+  const approvalsResponse = await fetch(`${base}/approvals`, { headers: authorization });
+  assert.equal(approvalsResponse.status, 200);
+  const approvals = await approvalsResponse.json() as any[];
+  const httpApproval = approvals.find((approval) => approval.runId === httpJob.id);
+  const cliApproval = approvals.find((approval) => approval.runId === cliJob.id);
+  assert.ok(httpApproval?.id);
+  assert.ok(cliApproval?.id);
+
+  owner = spawnApprovalContentionWorker({
+    action: workerAction,
+    barrierTimeoutMs: 60_000,
+    id: workerApprovalId,
+    operation: "list",
+    ownerReadyPath,
+    path: approvalPath,
+    releasePath
+  });
+  await waitForApprovalBarrier(ownerReadyPath);
+
+  const httpContinuation = fetch(`${base}/approvals/${httpApproval.id}/approve`, {
+    method: "POST",
+    headers: { ...authorization, "content-type": "application/json" },
+    body: "{}"
+  }).then(async (response) => ({ body: await response.text(), status: response.status }));
+  cli = spawn(process.execPath, [
+    join(process.cwd(), "apps/cli/src/cli.ts"),
+    "operator", "action", "approve",
+    "--target", cliApproval.id,
+    "--confirm",
+    "--gateway-url", base,
+    "--state", stateDir
+  ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  const cliContinuation = waitForChild(cli);
+  const workerContinuation = workerExecutor({
+    approvalId: workerApprovalId,
+    approvalRunId: workerAction.runId,
+    durableExecution: true,
+    task: { id: workerAction.runId, tool: workerAction.tool, input: workerAction.input, actor: workerAction.actor }
+  }).then(
+    (value) => ({ status: "fulfilled" as const, value }),
+    (error) => ({ error, status: "rejected" as const })
+  );
+
+  const [httpResult, cliResult, workerResult] = await Promise.all([httpContinuation, cliContinuation, workerContinuation]);
+  const exposed = `${httpResult.body}\n${cliResult.stdout}\n${cliResult.stderr}\n${workerResult.status === "rejected" ? workerResult.error?.message : JSON.stringify(workerResult.value)}`;
+  assert.equal(httpResult.status, 400, httpResult.body);
+  assert.match(httpResult.body, /blocked by policy or approval state/iu);
+  assert.equal(cliResult.code, 1, cliResult.stderr || cliResult.stdout);
+  assert.match(cliResult.stderr, /blocked by policy or approval state/iu);
+  assert.equal(workerResult.status, "rejected");
+  if (workerResult.status === "rejected") assert.match(workerResult.error?.message ?? "", /claimed approval continuation is missing/iu);
+  assert.doesNotMatch(exposed, RAW_APPROVAL_CONTENTION);
+
+  const ledger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+  try {
+    for (const job of [httpJob, cliJob]) {
+      const current = await (await fetch(`${base}/jobs/${job.id}`, { headers: authorization })).json();
+      assert.equal(current.status, "awaiting-approval", JSON.stringify(current));
+      assert.equal(ledger.getExecutionAttempt(job.executionAttemptId)?.state, "awaiting-approval");
+    }
+  } finally {
+    ledger.close();
+  }
+  const persisted = JSON.parse(await readFile(approvalPath, "utf8"));
+  assert.equal(persisted.approvals.find((approval: any) => approval.id === httpApproval.id)?.status, "pending");
+  assert.equal(persisted.approvals.find((approval: any) => approval.id === cliApproval.id)?.status, "pending");
+  assert.equal(persisted.approvals.find((approval: any) => approval.id === workerApprovalId)?.status, "approved");
+  assert.equal(existsSync(join(stateDir, "process-recovery.json")), false);
+  assert.equal(existsSync(join(stateDir, "sandbox-recovery.json")), false);
+
+  await writeFile(releasePath, "release\n", { mode: 0o600 });
+  const ownerResult = await owner.result;
+  assert.equal(ownerResult.value?.outcome, "listed", ownerResult.stderr);
+  for (const job of [httpJob, cliJob]) {
+    const cancelled = await fetch(`${base}/jobs/${job.id}/cancel`, { method: "POST", headers: authorization });
+    assert.equal(cancelled.status, 200, await cancelled.text());
+  }
+  assert.equal(createApprovalStore({ path: approvalPath }).revoke(workerApprovalId), true);
+  assert.deepEqual(activeApprovalLockArtifacts(approvalPath, await readdir(stateDir)), []);
+});
+
+test("Gateway sanitizes contention acquired after a durable approval job is claimed", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-post-claim-contention-"));
+  const approvalPath = join(stateDir, "approvals.json");
+  const ownerReadyPath = join(stateDir, "owner-ready");
+  const releasePath = join(stateDir, "release-owner");
+  const watcherReadyPath = join(stateDir, "watcher-ready");
+  const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(server.address() as any).port}`;
+  const token = (await readFile(join(stateDir, "gateway.token"), "utf8")).trim();
+  const authorization = { authorization: `Bearer ${token}` };
+  let owner: ReturnType<typeof spawnApprovalContentionWorker> | undefined;
+  t.after(async () => {
+    await writeFile(releasePath, "release\n", { mode: 0o600 }).catch(() => undefined);
+    if (owner?.child.exitCode === null) owner.child.kill();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  const jobId = "post-claim-contention-job";
+  const submitted = await fetch(`${base}/jobs`, {
+    method: "POST",
+    headers: { ...authorization, "content-type": "application/json", "idempotency-key": jobId },
+    body: JSON.stringify({ task: { tool: "browser.click", input: { tabId: "tab_fixture", selector: "#apply" } } })
+  });
+  assert.equal(submitted.status, 202, await submitted.text());
+  const deadline = Date.now() + 10_000;
+  let awaiting: any;
+  while (Date.now() < deadline) {
+    awaiting = await (await fetch(`${base}/jobs/${jobId}`, { headers: authorization })).json();
+    if (awaiting.status === "awaiting-approval" || awaiting.status === "failed") break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(awaiting?.status, "awaiting-approval", JSON.stringify(awaiting));
+  const approvals = await (await fetch(`${base}/approvals`, { headers: authorization })).json() as any[];
+  const approval = approvals.find((entry) => entry.runId === jobId);
+  assert.ok(approval?.id);
+
+  owner = spawnApprovalContentionWorker({
+    action: { tool: "browser.click", runId: jobId, input: { tabId: "tab_fixture", selector: "#apply" } },
+    barrierTimeoutMs: 60_000,
+    id: approval.id,
+    operation: "list",
+    ownerReadyPath,
+    path: approvalPath,
+    releasePath,
+    waitForApprovalIdentityChange: await approvalFileIdentity(approvalPath),
+    watcherReadyPath
+  });
+  await waitForApprovalBarrier(watcherReadyPath);
+  const responsePromise = fetch(`${base}/operator/actions`, {
+    method: "POST",
+    headers: { ...authorization, "content-type": "application/json" },
+    body: JSON.stringify({ action: "approve", targetId: approval.id, confirm: true, surface: "http" })
+  }).then(async (response) => ({ body: await response.text(), status: response.status }));
+  await waitForApprovalBarrier(ownerReadyPath);
+
+  let claimed: any;
+  const claimDeadline = Date.now() + 5_000;
+  while (Date.now() < claimDeadline) {
+    claimed = await (await fetch(`${base}/jobs/${jobId}`, { headers: authorization })).json();
+    if (claimed.status === "running") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(claimed?.status, "running", JSON.stringify(claimed));
+  const response = await responsePromise;
+  assert.equal(response.status, 400, response.body);
+  assert.match(response.body, /blocked by policy or approval state/iu);
+  assert.doesNotMatch(response.body, RAW_APPROVAL_CONTENTION);
+
+  const settled = await (await fetch(`${base}/jobs/${jobId}`, { headers: authorization })).json();
+  assert.equal(settled.status, "needs-review", JSON.stringify(settled));
+  assert.equal(settled.dispatchLease, undefined);
+  assert.match(settled.error, /claimed approval continuation is missing or does not match the exact request/iu);
+  assert.doesNotMatch(JSON.stringify(settled), RAW_APPROVAL_CONTENTION);
+  const ledger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+  try {
+    const attempt = ledger.getExecutionAttempt(awaiting.executionAttemptId);
+    assert.equal(attempt?.state, "needs-review");
+    assert.equal(attempt?.errorCode, "EXECUTION_OUTCOME_UNCERTAIN");
+    assert.doesNotMatch(JSON.stringify(attempt), RAW_APPROVAL_CONTENTION);
+  } finally {
+    ledger.close();
+  }
+  const audit = createAuditStore(join(stateDir, "audit.jsonl"));
+  try {
+    const run = await audit.readRun(jobId);
+    const denial = run?.events?.find((event: any) => event.type === "operator.approval_continuation_denied");
+    assert.equal(denial?.decision, "deny");
+    assert.equal(denial?.data?.code, "APPROVAL_CONTINUATION_DENIED");
+    assert.equal(denial?.data?.dispatchStarted, false);
+    assert.doesNotMatch(JSON.stringify(run), RAW_APPROVAL_CONTENTION);
+  } finally {
+    audit.close();
+  }
+  assert.equal(existsSync(join(stateDir, "process-recovery.json")), false);
+  assert.equal(existsSync(join(stateDir, "sandbox-recovery.json")), false);
+
+  await writeFile(releasePath, "release\n", { mode: 0o600 });
+  const ownerResult = await owner.result;
+  assert.equal(ownerResult.value?.outcome, "listed", ownerResult.stderr);
+  const retry = await fetch(`${base}/operator/actions`, {
+    method: "POST",
+    headers: { ...authorization, "content-type": "application/json" },
+    body: JSON.stringify({ action: "approve", targetId: approval.id, confirm: true, surface: "http" })
+  });
+  const retryBody = await retry.text();
+  assert.equal(retry.status, 409, retryBody);
+  assert.doesNotMatch(retryBody, RAW_APPROVAL_CONTENTION);
+  const afterRetry = await (await fetch(`${base}/jobs/${jobId}`, { headers: authorization })).json();
+  assert.equal(afterRetry.status, "needs-review", JSON.stringify(afterRetry));
+  const remainingApprovals = await (await fetch(`${base}/approvals`, { headers: authorization })).json() as any[];
+  assert.equal(remainingApprovals.some((entry) => entry.id === approval.id), false);
+  assert.deepEqual(activeApprovalLockArtifacts(approvalPath, await readdir(stateDir)), []);
+});
+
+test("a contender recovers a killed approval-lock owner and a restarted retry stays denied", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-owner-crash-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const path = join(stateDir, "approvals.json");
+  const ownerReadyPath = join(stateDir, "owner-ready");
+  const contentionReadyPath = join(stateDir, "contender-collided");
+  const releasePath = join(stateDir, "never-release-owner");
+  const dispatchPath = join(stateDir, "dispatches.log");
+  const action = { tool: "process.exec", runId: "crashed-owner-continuation", actor: "operator", input: { command: "/bin/true", args: [], cwd: "." } };
+  const id = createApprovalStore({ path }).create(action);
+  assert.ok(createApprovalStore({ path }).claim(id));
+  const owner = spawnApprovalContentionWorker({ action, ageOwnedLock: true, barrierTimeoutMs: 60_000, id, operation: "list", ownerReadyPath, path, releasePath });
+  t.after(() => { if (owner.child.exitCode === null) owner.child.kill(); });
+  await waitForApprovalBarrier(ownerReadyPath);
+  const contender = spawnApprovalContentionWorker({ action, contentionReadyPath, dispatchPath, id, lockTimeoutMs: 2_000, operation: "consume", path });
+  t.after(() => { if (contender.child.exitCode === null) contender.child.kill(); });
+  await waitForApprovalBarrier(contentionReadyPath);
+  owner.child.kill("SIGKILL");
+  const ownerResult = await owner.result;
+  assert.ok(ownerResult.signal || ownerResult.code !== 0);
+  const contenderResult = await contender.result;
+  assert.equal(contenderResult.code, 0, contenderResult.stderr);
+  assert.equal(contenderResult.value?.outcome, "approved", contenderResult.stdout);
+
+  const restarted = spawnApprovalContentionWorker({ action, dispatchPath, id, operation: "consume", path });
+  t.after(() => { if (restarted.child.exitCode === null) restarted.child.kill(); });
+  const restartedResult = await restarted.result;
+  assert.equal(restartedResult.code, 0, restartedResult.stderr);
+  assert.equal(restartedResult.value?.outcome, "denied", restartedResult.stdout);
+  assert.equal((await readFile(dispatchPath, "utf8")).trim().split("\n").length, 1);
+  assert.deepEqual(createApprovalStore({ path }).list(), []);
+  const files = await readdir(stateDir);
+  assert.deepEqual(activeApprovalLockArtifacts(path, files), []);
+  assert.equal(files.some((name) => name.startsWith(".odinn-approval-stale-lock.")), true);
 });
 
 test("claimed approvals expire and release durable capacity after an interrupted claim", async () => {
@@ -364,8 +796,10 @@ test("approval stale-lock recovery never removes a lock while another recovery o
   await writeFile(`${path}.lock`, JSON.stringify(lock), { mode: 0o600 });
   await writeFile(recoveryPath, JSON.stringify({ pid: process.pid, token: "live-recovery" }), { mode: 0o600 });
   assert.throws(
-    () => createApprovalStore({ path }).create({ tool: "browser.click", input: { selector: "#send" } }),
-    (error: any) => error?.code === "APPROVAL_STORE_BUSY"
+    () => createApprovalStore({ path, lockTimeoutMs: 50 }).create({ tool: "browser.click", input: { selector: "#send" } }),
+    (error: any) => error?.code === "APPROVAL_STORE_CONTENDED"
+      && /approval state could not be accessed before the bounded deadline/iu.test(error?.message)
+      && !/APPROVAL_STORE_BUSY|approval store is busy|approval state is temporarily unavailable/iu.test(`${error?.code} ${error?.message}`)
   );
   assert.deepEqual(JSON.parse(await readFile(`${path}.lock`, "utf8")), lock);
   assert.equal((await readdir(stateDir)).some((name) => name.startsWith(".odinn-approval-stale-lock.")), false);

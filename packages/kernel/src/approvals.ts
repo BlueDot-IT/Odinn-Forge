@@ -1,10 +1,19 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { redactDurableValue } from "@odinn/protocol";
 import { approvalEffectPolicyForTool } from "@odinn/policy";
 
 type NodeError = Error & { code?: string };
+
+class ApprovalStoreContentionError extends Error {
+  readonly code = "APPROVAL_STORE_CONTENDED";
+
+  constructor() {
+    super("approval state could not be accessed before the bounded deadline");
+  }
+}
 
 type StoredApprovalAction = ApprovalAction & {
   bindingTag?: string;
@@ -22,6 +31,10 @@ const durableApprovalKeys = new Map<string, Buffer>();
 const volatileApprovalActions = new Map<string, Map<string, ApprovalAction>>();
 const MAX_PENDING_APPROVALS = 500;
 const MAX_APPROVAL_FILE_BYTES = 4 * 1024 * 1024;
+const DEFAULT_APPROVAL_LOCK_TIMEOUT_MS = 10_000;
+const MAX_SYNCHRONOUS_APPROVAL_LOCK_WAIT_MS = 250;
+const APPROVAL_LOCK_RETRY_MS = 25;
+const approvalLockWait = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 export type ApprovalAction = {
   id?: string;
@@ -52,33 +65,80 @@ export type ApprovalEffect = {
   [key: string]: unknown;
 };
 
+export type ApprovalStoreOperationOptions = {
+  signal?: AbortSignal;
+};
+
+export type ApprovalStoreListOptions = ApprovalStoreOperationOptions & {
+  limit?: number;
+  offset?: number;
+};
+
+type ApprovalStoreOptions = {
+  path?: string;
+  lockTimeoutMs?: number;
+};
+
+type ApprovalStoreTestHooks = {
+  /** @internal Test-only barrier after this store owns the file lock. */
+  __testOnlyAfterLockAcquired?: () => void;
+  /** @internal Test-only observation point after a live lock collision. */
+  __testOnlyOnLockContention?: () => void;
+};
+
 export interface ApprovalStore {
-  create(action: ApprovalAction): string;
-  claim(id: unknown): ApprovalAction | undefined;
+  create(action: ApprovalAction, options?: ApprovalStoreOperationOptions): string;
+  claim(id: unknown, options?: ApprovalStoreOperationOptions): ApprovalAction | undefined;
+  claimAsync?(id: unknown, options?: ApprovalStoreOperationOptions): Promise<ApprovalAction | undefined>;
   /** Recover the exact approved action without consuming it; never exposes sealed storage. */
-  recover(id: unknown): ApprovalAction | undefined;
-  consume(id: unknown, action: ApprovalAction): ApprovalAction | undefined;
-  take(id: unknown): ApprovalAction | undefined;
-  revoke(id: unknown): boolean;
-  list(options?: { limit?: number; offset?: number }): ApprovalAction[];
+  recover(id: unknown, options?: ApprovalStoreOperationOptions): ApprovalAction | undefined;
+  recoverAsync?(id: unknown, options?: ApprovalStoreOperationOptions): Promise<ApprovalAction | undefined>;
+  consume(id: unknown, action: ApprovalAction, options?: ApprovalStoreOperationOptions): ApprovalAction | undefined;
+  consumeAsync?(id: unknown, action: ApprovalAction, options?: ApprovalStoreOperationOptions): Promise<ApprovalAction | undefined>;
+  take(id: unknown, options?: ApprovalStoreOperationOptions): ApprovalAction | undefined;
+  revoke(id: unknown, options?: ApprovalStoreOperationOptions): boolean;
+  revokeAsync?(id: unknown, options?: ApprovalStoreOperationOptions): Promise<boolean>;
+  list(options?: ApprovalStoreListOptions): ApprovalAction[];
+  listAsync?(options?: ApprovalStoreListOptions): Promise<ApprovalAction[]>;
 }
 
 export function approvalActionForExecution(action: ApprovalAction): ApprovalAction {
   return normalizeApprovalAction(action);
 }
 
-export function createApprovalStore({ path }: { path?: string } = {}): ApprovalStore {
+/** @internal Continuation admission uses this to deny only lock contention. */
+export function isApprovalStoreContentionError(error: unknown): boolean {
+  return error instanceof ApprovalStoreContentionError;
+}
+
+export function createApprovalStore(options: ApprovalStoreOptions = {}): ApprovalStore {
+  return createApprovalStoreInternal({ path: options.path, lockTimeoutMs: options.lockTimeoutMs });
+}
+
+/** @internal Test-only factory; deliberately excluded from the kernel package root. */
+export function createApprovalStoreWithTestHooks(options: ApprovalStoreOptions & ApprovalStoreTestHooks): ApprovalStore {
+  const { __testOnlyAfterLockAcquired, __testOnlyOnLockContention, ...storeOptions } = options;
+  return createApprovalStoreInternal(storeOptions, { __testOnlyAfterLockAcquired, __testOnlyOnLockContention });
+}
+
+function createApprovalStoreInternal(options: ApprovalStoreOptions, hooks: ApprovalStoreTestHooks = {}): ApprovalStore {
+  const { path } = options;
+  const { __testOnlyAfterLockAcquired, __testOnlyOnLockContention } = hooks;
+  const lockTimeoutMs = positiveApprovalLockTimeout(options.lockTimeoutMs);
+  const synchronousLockTimeoutMs = Math.min(lockTimeoutMs, MAX_SYNCHRONOUS_APPROVAL_LOCK_WAIT_MS);
   const pending = new Map<string, StoredApprovalAction>();
   const storeKey = path ?? `memory:${randomUUID()}`;
   const bindingKey = durableApprovalKeys.get(storeKey) ?? (path ? loadDurableApprovalKey(path) : randomBytes(32));
   durableApprovalKeys.set(storeKey, bindingKey);
   const volatile = volatileApprovalActions.get(storeKey) ?? new Map<string, ApprovalAction>();
   volatileApprovalActions.set(storeKey, volatile);
-  const withLock = <T>(operation: () => T): T => {
+  const withLock = <T>(operation: () => T, operationOptions: ApprovalStoreOperationOptions = {}): T => {
+    throwIfApprovalOperationAborted(operationOptions.signal);
     if (!path) return operation();
     const lockPath = `${path}.lock`;
     const token = randomUUID();
-    const acquire = (allowRecovery: boolean): void => {
+    const deadline = performance.now() + synchronousLockTimeoutMs;
+    while (true) {
       try {
         const descriptor = openSync(lockPath, "wx", 0o600);
         try {
@@ -86,27 +146,58 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         } finally {
           closeSync(descriptor);
         }
+        break;
       } catch (error) {
         const failure = error as NodeError;
         if (failure.code !== "EEXIST") throw error;
-        if (allowRecovery && quarantineStaleApprovalLock(lockPath)) {
-          return acquire(false);
-        }
-        const busy = new Error("approval store is busy; refusing an unsafe concurrent claim") as NodeError;
-        busy.code = "APPROVAL_STORE_BUSY";
-        throw busy;
+        if (quarantineStaleApprovalLock(lockPath)) continue;
+        __testOnlyOnLockContention?.();
+        throwIfApprovalOperationAborted(operationOptions.signal);
+        const remainingMs = deadline - performance.now();
+        if (remainingMs <= 0) throw approvalStoreContentionError();
+        Atomics.wait(approvalLockWait, 0, 0, Math.min(APPROVAL_LOCK_RETRY_MS, remainingMs));
       }
-    };
-    acquire(true);
+    }
     try {
+      __testOnlyAfterLockAcquired?.();
+      throwIfApprovalOperationAborted(operationOptions.signal);
       return operation();
     } finally {
+      releaseOwnedApprovalLock(lockPath, token);
+    }
+  };
+  const withLockAsync = async <T>(operation: () => T, operationOptions: ApprovalStoreOperationOptions = {}): Promise<T> => {
+    throwIfApprovalOperationAborted(operationOptions.signal);
+    if (!path) return operation();
+    const lockPath = `${path}.lock`;
+    const token = randomUUID();
+    const deadline = performance.now() + lockTimeoutMs;
+    while (true) {
       try {
-        const lease = JSON.parse(readFileSync(lockPath, "utf8"));
-        if (lease?.token === token) unlinkSync(lockPath);
+        const descriptor = openSync(lockPath, "wx", 0o600);
+        try {
+          writeFileSync(descriptor, JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }));
+        } finally {
+          closeSync(descriptor);
+        }
+        break;
       } catch (error) {
-        if ((error as NodeError).code !== "ENOENT") throw error;
+        const failure = error as NodeError;
+        if (failure.code !== "EEXIST") throw error;
+        if (quarantineStaleApprovalLock(lockPath)) continue;
+        __testOnlyOnLockContention?.();
+        throwIfApprovalOperationAborted(operationOptions.signal);
+        const remainingMs = deadline - performance.now();
+        if (remainingMs <= 0) throw approvalStoreContentionError();
+        await waitForApprovalLockRetry(Math.min(APPROVAL_LOCK_RETRY_MS, remainingMs), operationOptions.signal);
       }
+    }
+    try {
+      __testOnlyAfterLockAcquired?.();
+      throwIfApprovalOperationAborted(operationOptions.signal);
+      return operation();
+    } finally {
+      releaseOwnedApprovalLock(lockPath, token);
     }
   };
   const refresh = () => {
@@ -153,8 +244,82 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
       }
     }
   };
+  const recoverApproval = (id: unknown): ApprovalAction | undefined => {
+    refresh();
+    expire();
+    persist();
+    const key = String(id ?? "");
+    const action = pending.get(key);
+    if (!action || action.status !== "approved" || Number(action.expiresAt) <= Date.now()) return undefined;
+    const exact = volatile.get(key) ?? recoverSealedApprovalAction(bindingKey, key, action);
+    if (!exact || !action.bindingTag || !safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, exact))) return undefined;
+    return { ...publicApprovalAction(action), ...exact };
+  };
+  const claimApproval = (id: unknown): ApprovalAction | undefined => {
+    refresh();
+    expire();
+    const key = String(id ?? "");
+    const action = pending.get(key);
+    if (!action || Number(action.expiresAt) <= Date.now()) {
+      volatile.delete(key);
+      persist();
+      return undefined;
+    }
+    if (action.status === "approved") return publicApprovalAction(action);
+    pending.set(key, { ...action, status: "approved", approvedAt: new Date().toISOString() });
+    persist();
+    return publicApprovalAction(pending.get(key)!);
+  };
+  const consumeApproval = (id: unknown, expected: ApprovalAction): ApprovalAction | undefined => {
+    refresh();
+    expire();
+    const key = String(id ?? "");
+    const action = pending.get(key);
+    if (!action || Number(action.expiresAt) <= Date.now()) {
+      volatile.delete(key);
+      persist();
+      return undefined;
+    }
+    if (action.status !== "approved") {
+      persist();
+      return undefined;
+    }
+    const normalized = normalizeApprovalAction(expected);
+    const exact = volatile.get(key) ?? recoverSealedApprovalAction(bindingKey, key, action);
+    if (!exact || !action.bindingTag || !safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, exact))) return undefined;
+    const exactMatch = safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, normalized));
+    const redactedMatch = stableApprovalValue(normalizeApprovalAction(action)) === stableApprovalValue(normalized);
+    if (!exactMatch && !redactedMatch) return undefined;
+    pending.delete(key);
+    volatile.delete(key);
+    persist();
+    return { ...publicApprovalAction(action), ...exact };
+  };
+  const revokeApproval = (id: unknown): boolean => {
+    refresh();
+    const key = String(id ?? "");
+    const removed = pending.delete(key);
+    volatile.delete(key);
+    persist();
+    return removed;
+  };
+  const listApprovals = (options: ApprovalStoreListOptions = {}): ApprovalAction[] => {
+    refresh();
+    expire();
+    persist();
+    const limit = Math.min(MAX_PENDING_APPROVALS, Math.max(0, Number.isSafeInteger(Number(options.limit)) ? Number(options.limit) : MAX_PENDING_APPROVALS));
+    const offset = Math.max(0, Number.isSafeInteger(Number(options.offset)) ? Number(options.offset) : 0);
+    return Array.from(pending.values())
+      .filter((action) => action.status === "pending" || action.status === "approved")
+      .map(({ input, bindingTag: _bindingTag, sealedInput: _sealedInput, ...action }) => ({
+        ...action,
+        ...(action.status === "approved" ? { status: "claimed", recovery: "execution claim is in flight; inspect before retrying" } : {}),
+        input: redactBrowserInput(input)
+      }))
+      .slice(offset, offset + limit);
+  };
   return {
-    create(action) {
+    create(action, options) {
       return withLock(() => {
         refresh();
         expire();
@@ -176,97 +341,91 @@ export function createApprovalStore({ path }: { path?: string } = {}): ApprovalS
         });
         persist();
         return id;
-      });
+      }, options);
     },
-    claim(id) {
-      return withLock(() => {
-        refresh();
-        expire();
-        const key = String(id ?? "");
-        const action = pending.get(key);
-        if (!action || Number(action.expiresAt) <= Date.now()) {
-          volatile.delete(key);
-          persist();
-          return undefined;
-        }
-        if (action.status === "approved") return publicApprovalAction(action);
-        pending.set(key, { ...action, status: "approved", approvedAt: new Date().toISOString() });
-        persist();
-        return publicApprovalAction(pending.get(key)!);
-      });
+    claim(id, options) {
+      return withLock(() => claimApproval(id), options);
     },
-    recover(id) {
-      return withLock(() => {
-        refresh();
-        expire();
-        persist();
-        const key = String(id ?? "");
-        const action = pending.get(key);
-        if (!action || action.status !== "approved" || Number(action.expiresAt) <= Date.now()) return undefined;
-        const exact = volatile.get(key) ?? recoverSealedApprovalAction(bindingKey, key, action);
-        if (!exact || !action.bindingTag || !safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, exact))) return undefined;
-        return { ...publicApprovalAction(action), ...exact };
-      });
+    claimAsync(id, options) {
+      return withLockAsync(() => claimApproval(id), options);
     },
-    consume(id, expected) {
-      return withLock(() => {
-        refresh();
-        expire();
-        const key = String(id ?? "");
-        const action = pending.get(key);
-        if (!action || Number(action.expiresAt) <= Date.now()) {
-          volatile.delete(key);
-          persist();
-          return undefined;
-        }
-        if (action.status !== "approved") {
-          persist();
-          return undefined;
-        }
-        const normalized = normalizeApprovalAction(expected);
-        const exact = volatile.get(key) ?? recoverSealedApprovalAction(bindingKey, key, action);
-        if (!exact || !action.bindingTag || !safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, exact))) return undefined;
-        const exactMatch = safeEqualTag(action.bindingTag, approvalBindingTag(bindingKey, normalized));
-        const redactedMatch = stableApprovalValue(normalizeApprovalAction(action)) === stableApprovalValue(normalized);
-        if (!exactMatch && !redactedMatch) return undefined;
-        pending.delete(key);
-        volatile.delete(key);
-        persist();
-        return { ...publicApprovalAction(action), ...exact };
-      });
+    recover(id, options) {
+      return withLock(() => recoverApproval(id), options);
     },
-    take(id) {
-      const action = this.claim(id);
-      return action ? this.consume(id, action) : undefined;
+    recoverAsync(id, options) {
+      return withLockAsync(() => recoverApproval(id), options);
     },
-    revoke(id) {
-      return withLock(() => {
-        refresh();
-        const key = String(id ?? "");
-        const removed = pending.delete(key);
-        volatile.delete(key);
-        persist();
-        return removed;
-      });
+    consume(id, expected, options) {
+      return withLock(() => consumeApproval(id, expected), options);
     },
-    list(options: { limit?: number; offset?: number } = {}) {
-      return withLock(() => {
-        refresh();
-        expire();
-        persist();
-        const limit = Math.min(MAX_PENDING_APPROVALS, Math.max(0, Number.isSafeInteger(Number(options.limit)) ? Number(options.limit) : MAX_PENDING_APPROVALS));
-        const offset = Math.max(0, Number.isSafeInteger(Number(options.offset)) ? Number(options.offset) : 0);
-        return Array.from(pending.values())
-          .filter((action) => action.status === "pending" || action.status === "approved")
-          .map(({ input, bindingTag: _bindingTag, sealedInput: _sealedInput, ...action }) => ({
-            ...action,
-            ...(action.status === "approved" ? { status: "claimed", recovery: "execution claim is in flight; inspect before retrying" } : {}),
-            input: redactBrowserInput(input)
-          }))
-          .slice(offset, offset + limit);
-      });
+    consumeAsync(id, expected, options) {
+      return withLockAsync(() => consumeApproval(id, expected), options);
+    },
+    take(id, options) {
+      const action = this.claim(id, options);
+      return action ? this.consume(id, action, options) : undefined;
+    },
+    revoke(id, options) {
+      return withLock(() => revokeApproval(id), options);
+    },
+    revokeAsync(id, options) {
+      return withLockAsync(() => revokeApproval(id), options);
+    },
+    list(options: ApprovalStoreListOptions = {}) {
+      return withLock(() => listApprovals(options), options);
+    },
+    listAsync(options: ApprovalStoreListOptions = {}) {
+      return withLockAsync(() => listApprovals(options), options);
     }
   };
+}
+
+function positiveApprovalLockTimeout(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_APPROVAL_LOCK_TIMEOUT_MS;
+  if (!Number.isInteger(timeout) || timeout < 1) throw new Error("approval store lock timeout must be a positive integer");
+  return timeout;
+}
+
+function throwIfApprovalOperationAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw approvalOperationAbortReason(signal);
+}
+
+function approvalOperationAbortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error("approval store operation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function waitForApprovalLockRetry(delayMs: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(approvalOperationAbortReason(signal));
+    const finish = () => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    };
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(approvalOperationAbortReason(signal!));
+    };
+    const timer = setTimeout(finish, delayMs);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function approvalStoreContentionError(): Error {
+  return new ApprovalStoreContentionError();
+}
+
+function releaseOwnedApprovalLock(lockPath: string, token: string): void {
+  try {
+    const lease = JSON.parse(readFileSync(lockPath, "utf8"));
+    if (lease?.token === token) unlinkSync(lockPath);
+  } catch (error) {
+    if ((error as NodeError).code !== "ENOENT") throw error;
+  }
 }
 
 type ApprovalLockSnapshot = {

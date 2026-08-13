@@ -348,17 +348,16 @@ export async function browserAction(stateDir: any, approvalStore: ApprovalStore,
       snapshotId: input.snapshotId,
       input: normalizedInput,
       executionInput: normalizedInput
-    });
+    }, { signal: execution?.signal });
     return { type: "approval.required", approvalId, tool, summary: browserActionSummary(tool, input), expiresInSeconds: 300 };
   }
   if (security.requireApproval !== false) {
-    const approved = approvalStore.consume(execution.approvalId, {
+    const authorized = execution.approvalContinuation ?? approvalStore.consume(execution.approvalId, {
       tool,
       runId: execution.runId,
       actor: execution.actor,
       input: normalizedInput
-    });
-    const authorized = approved ?? execution.approvalContinuation;
+    }, { signal: execution?.signal });
     if (!authorized) {
       throw new Error("browser action approval is missing, expired, already used, or does not match this action");
     }
