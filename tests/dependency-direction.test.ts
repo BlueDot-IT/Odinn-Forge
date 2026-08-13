@@ -84,6 +84,20 @@ function runNodeProbe(root: string, file: string): string {
   }).trim();
 }
 
+function runPnpm(root: string, args: string[]): string {
+  const windows = process.platform === "win32";
+  const command = windows ? process.env.ComSpec ?? "cmd.exe" : "pnpm";
+  const commandArgs = windows
+    ? ["/d", "/s", "/c", "pnpm.cmd", ...args]
+    : args;
+  return execFileSync(command, commandArgs, {
+    cwd: root,
+    encoding: "utf8",
+    windowsHide: true,
+    shell: false,
+  });
+}
+
 async function repositoryFixture(t: test.TestContext, files: Record<string, string>): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "odinn-dependency-direction-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -572,7 +586,12 @@ test("encoded traversal, build-output, repository-tool, and outside-file referen
     { line: 1, rule: DEPENDENCY_RULES.encodedModuleSpecifier },
     { line: 2, rule: DEPENDENCY_RULES.unscannedSourcePath },
     { line: 3, rule: DEPENDENCY_RULES.crossPackageSourcePath },
-    { line: 4, rule: DEPENDENCY_RULES.crossPackageSourcePath },
+    {
+      line: 4,
+      rule: process.platform === "win32"
+        ? DEPENDENCY_RULES.ambiguousModuleSpecifier
+        : DEPENDENCY_RULES.crossPackageSourcePath,
+    },
   ]);
 });
 
@@ -2109,16 +2128,8 @@ test("installed package bins cannot hide forbidden imports in ignored build outp
       && specifier === "@odinn/gateway"
       && rule === DEPENDENCY_RULES.packageToApp));
 
-  execFileSync("pnpm", ["install", "--ignore-scripts", "--offline"], {
-    cwd: root,
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  const runtime = execFileSync("pnpm", ["--filter", "@odinn/consumer", "exec", "host-hidden"], {
-    cwd: root,
-    encoding: "utf8",
-    windowsHide: true,
-  }).trim();
+  runPnpm(root, ["install", "--ignore-scripts", "--offline"]);
+  const runtime = runPnpm(root, ["--filter", "@odinn/consumer", "exec", "host-hidden"]).trim();
   assert.equal(runtime, "INSTALLED_HIDDEN_BIN_EXECUTED");
 });
 
