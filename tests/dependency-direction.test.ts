@@ -880,7 +880,7 @@ test("global evaluator aliases remain rejected while lookalike object methods st
       && kind === "module-loader"
       && rule === DEPENDENCY_RULES.unsupportedModuleLoader).map(({ line }) => line));
 
-  assert.deepEqual([...loaderLines], [2, 3, 5, 6, 7, 8, 10, 11]);
+  assert.deepEqual([...loaderLines], [1, 2, 3, 5, 6, 7, 8, 10, 11]);
   assert(!loaderLines.has(13));
   assert(!loaderLines.has(14));
   assert(!loaderLines.has(15));
@@ -934,6 +934,18 @@ test("runtime Module and VM authority is rejected before capability-preserving t
       "const hiddenBuiltin = process.getBuiltinModule;",
       "const RuntimeCtor = hiddenBuiltin('node:module').Module;",
       "RuntimeCtor._load('@odinn/gateway', module, false);",
+    ].join("\n"),
+    "process-default-import.ts": [
+      "import runtime from 'node:process';",
+      "runtime.getBuiltinModule('module');",
+    ].join("\n"),
+    "process-forbidden-named-import.ts": [
+      "import { getBuiltinModule } from 'node:process';",
+      "getBuiltinModule('module');",
+    ].join("\n"),
+    "process-namespace-import.ts": [
+      "import * as runtime from 'node:process';",
+      "runtime.getBuiltinModule('module');",
     ].join("\n"),
     "proxy-load.cjs": [
       "const { Module: RuntimeCtor } = require('node:module');",
@@ -1137,7 +1149,7 @@ test("ordinary reflection aliases and shadowed authority lookalikes remain compa
       "class Module { load() { return 2; } }",
       "const registry = { getBuiltinModule() { return 3; } };",
       "const localFunction = { constructor() { return 4; } };",
-      "function reflectedGlobal() { const realm = globalThis; return realm.Math; }",
+      "function reflectedGlobal() { return globalThis.Math; }",
       "function shadowedRealm(realm: { eval(): boolean }) { return realm.eval(); }",
       "function reflectedValue() { const get = Reflect.get; return get(input, 'value'); }",
       "function shadowedGet(get: () => number) { return get(); }",
@@ -1211,169 +1223,424 @@ test("ambient module and process authority reject transformed loaders and direct
   assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
 });
 
-test("ambient process authority stays rejected across explicit capability transfers", async (t) => {
-  const hostileSources: Record<string, { output: string; source: string }> = {
-    "process-callback.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const transfer = (runtime, target) => runtime.getBuiltinModule('module')._load(target, undefined, false);",
-        "console.log(transfer(process, resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
-      ].join("\n"),
-    },
-    "process-nested-callback.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const load = (runtime, target) => runtime.getBuiltinModule('module')._load(target, undefined, false);",
-        "const pass = (runtime, callback, target) => callback(runtime, target);",
-        "console.log(pass(process, load, resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
-      ].join("\n"),
-    },
-    "process-identity-return.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const identity = (runtime) => runtime;",
-        "const runtime = identity(process);",
-        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "process-callback-call.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const transfer = (runtime, target) => runtime.getBuiltinModule('module')._load(target, undefined, false);",
-        "console.log(transfer.call(undefined, process, resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
-      ].join("\n"),
-    },
-    "process-callback-apply.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const transfer = (runtime, target) => runtime.getBuiltinModule('module')._load(target, undefined, false);",
-        "console.log(transfer.apply(undefined, [process, resolve(process.cwd(), 'apps/gateway/src/index.cjs')]));",
-      ].join("\n"),
-    },
-    "process-alias-mainmodule.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const runtime = process;",
-        "console.log(runtime.mainModule.require(resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
-      ].join("\n"),
-    },
-    "global-process-mainmodule.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "console.log(globalThis.process.mainModule.require(resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
-      ].join("\n"),
-    },
-    "process-container.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const holder = { runtime: process };",
-        "console.log(holder.runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "process-container-alias.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const holder = { runtime: process };",
-        "const runtime = holder.runtime;",
-        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "process-container-destructure.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const { runtime } = { runtime: process };",
-        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "process-spread.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const runtime = { ...process };",
-        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "process-object-assign.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const runtime = Object.assign({}, process);",
-        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "process-prototype.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const runtime = Object.setPrototypeOf({}, process);",
-        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "process-proxy.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const runtime = new Proxy(process, {});",
-        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "process-proxy-revocable.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "const { proxy: runtime } = Proxy.revocable(process, {});",
-        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "direct-process-control.cjs": {
-      output: "gateway-cjs",
-      source: [
-        "const { resolve } = require('node:path');",
-        "console.log(process.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
-      ].join("\n"),
-    },
-    "direct-reflect-control.mjs": {
-      output: "7",
-      source: [
-        "const HiddenFunction = Reflect.get(() => undefined, 'constructor');",
-        "console.log(HiddenFunction('return 7')());",
-      ].join("\n"),
-    },
+test("ambient process authority cannot escape its closed direct-use grammar", async (t) => {
+  const withTarget = (...lines: string[]) => [
+    "const { resolve } = require('node:path');",
+    "const target = resolve(__dirname, '../../../apps/gateway/src/index.cjs');",
+    ...lines,
+  ].join("\n");
+  const hostileSources: Record<string, string> = {
+    "01-original-callback.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "console.log(transfer(process, target));",
+    ),
+    "02-original-alias-mainmodule.cjs": withTarget(
+      "const runtime = process;",
+      "console.log(runtime.mainModule.require(target));",
+    ),
+    "03-original-global-mainmodule.cjs": withTarget(
+      "console.log(globalThis.process.mainModule.require(target));",
+    ),
+    "04-original-container.cjs": withTarget(
+      "const holder = { runtime: process };",
+      "console.log(holder.runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "05-original-spread.cjs": withTarget(
+      "const runtime = { ...process };",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "06-original-prototype.cjs": withTarget(
+      "const runtime = Object.setPrototypeOf({}, process);",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "07-original-proxy.cjs": withTarget(
+      "const runtime = new Proxy(process, {});",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "08-nested-forwarding.cjs": withTarget(
+      "const load = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const inner = (runtime, callback, destination) => callback(runtime, destination);",
+      "const outer = (runtime, callback, destination) => inner(runtime, callback, destination);",
+      "console.log(outer(process, load, target));",
+    ),
+    "09-deep-forwarding.cjs": withTarget(
+      "const sink = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const hop3 = (runtime, callback, destination) => callback(runtime, destination);",
+      "const hop2 = (runtime, callback, destination) => hop3(runtime, callback, destination);",
+      "const hop1 = (runtime, callback, destination) => hop2(runtime, callback, destination);",
+      "console.log(hop1(process, sink, target));",
+    ),
+    "10-identity-expression.cjs": withTarget(
+      "const identity = (runtime) => runtime;",
+      "const runtime = identity(process);",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "11-identity-block.cjs": withTarget(
+      "function identity(runtime) { return runtime; }",
+      "const runtime = identity(process);",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "12-callback-call.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "console.log(transfer.call(undefined, process, target));",
+    ),
+    "13-callback-apply.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "console.log(transfer.apply(undefined, [process, target]));",
+    ),
+    "14-callback-reflect-apply.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "console.log(Reflect.apply(transfer, undefined, [process, target]));",
+    ),
+    "15-container-member-alias.cjs": withTarget(
+      "const holder = { runtime: process };",
+      "const runtime = holder.runtime;",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "16-container-destructure.cjs": withTarget(
+      "const { runtime } = { runtime: process };",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "17-callback-member-call.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const callbacks = { transfer };",
+      "console.log(callbacks.transfer(process, target));",
+    ),
+    "18-callback-member-alias.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const callbacks = { transfer };",
+      "const alias = callbacks.transfer;",
+      "console.log(alias(process, target));",
+    ),
+    "19-callback-destructured-alias.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const { transfer: alias } = { transfer };",
+      "console.log(alias(process, target));",
+    ),
+    "20-object-method-forwarder.cjs": withTarget(
+      "const callbacks = { transfer(runtime, destination) { return runtime.getBuiltinModule('module')._load(destination, undefined, false); } };",
+      "console.log(callbacks.transfer(process, target));",
+    ),
+    "21-object-assign-process.cjs": withTarget(
+      "const runtime = Object.assign({}, process);",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "22-object-assign-container.cjs": withTarget(
+      "const holder = Object.assign({}, { runtime: process });",
+      "console.log(holder.runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "23-object-assign-mutation.cjs": withTarget(
+      "const holder = {};",
+      "Object.assign(holder, { runtime: process });",
+      "console.log(holder.runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "24-object-assign-callback.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const callbacks = Object.assign({}, { transfer });",
+      "console.log(callbacks.transfer(process, target));",
+    ),
+    "25-proxy-revocable-process.cjs": withTarget(
+      "const { proxy: runtime } = Proxy.revocable(process, {});",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "26-proxy-revocable-container.cjs": withTarget(
+      "const holder = Proxy.revocable({ runtime: process }, {}).proxy;",
+      "console.log(holder.runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "27-proxy-revocable-callback.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const callback = Proxy.revocable(transfer, {}).proxy;",
+      "console.log(callback(process, target));",
+    ),
+    "28-composed-spread-container.cjs": withTarget(
+      "const inner = { runtime: process };",
+      "const outer = { ...inner };",
+      "const { runtime } = outer;",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "29-composed-identity-container.cjs": withTarget(
+      "const identity = (value) => value;",
+      "const holder = identity({ runtime: process });",
+      "console.log(holder.runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "30-composed-assign-revocable.cjs": withTarget(
+      "const holder = Object.assign({}, { runtime: process });",
+      "const { proxy } = Proxy.revocable(holder, {});",
+      "console.log(proxy.runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "31-composed-callback-holder.cjs": withTarget(
+      "const sink = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const callbacks = { sink };",
+      "const forward = (runtime, holder, destination) => holder.sink(runtime, destination);",
+      "console.log(forward(process, callbacks, target));",
+    ),
+    "32-bound-callback.cjs": withTarget(
+      "const transfer = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "const bound = transfer.bind(undefined, process, target);",
+      "console.log(bound());",
+    ),
+    "33-default-parameter.cjs": withTarget(
+      "const transfer = (runtime = process, destination = target) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "console.log(transfer());",
+    ),
+    "34-destructured-parameter.cjs": withTarget(
+      "const transfer = ({ runtime }, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "console.log(transfer({ runtime: process }, target));",
+    ),
+    "35-rest-parameter.cjs": withTarget(
+      "const transfer = (...values) => values[0].getBuiltinModule('module')._load(values[1], undefined, false);",
+      "console.log(transfer(process, target));",
+    ),
+    "36-fixed-point-return-chain.cjs": withTarget(
+      "const first = () => second();",
+      "const second = () => third();",
+      "const third = () => process;",
+      "const runtime = first();",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "37-callback-arguments.cjs": withTarget(
+      "function inspect(runtime, destination) { void runtime.pid; return arguments[0].getBuiltinModule('module')._load(arguments[1], undefined, false); }",
+      "console.log(inspect(process, target));",
+    ),
+    "38-reassigned-callback.cjs": withTarget(
+      "let inspect = (runtime) => runtime.pid;",
+      "inspect = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "console.log(inspect(process, target));",
+    ),
+    "39-reflect-process.cjs": withTarget(
+      "const runtime = Reflect.get(globalThis, 'process');",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "40-descriptor-process.cjs": withTarget(
+      "const runtime = Object.getOwnPropertyDescriptor(globalThis, 'process').get();",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "41-imported-process.cjs": withTarget(
+      "const runtime = require('node:process');",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "42-event-return.cjs": withTarget(
+      "const runtime = process.on('unused', () => undefined);",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "43-global-destructure.cjs": withTarget(
+      "const { process: runtime } = globalThis;",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "44-global-assignment.cjs": withTarget(
+      "let runtime;",
+      "({ process: runtime } = globalThis);",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "45-reflect-descriptor.cjs": withTarget(
+      "const runtime = Reflect.getOwnPropertyDescriptor(globalThis, 'process').get();",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "46-reassigned-callback-alias.cjs": withTarget(
+      "const safe = (runtime) => runtime.pid;",
+      "let inspect = safe;",
+      "inspect = (runtime, destination) => runtime.getBuiltinModule('module')._load(destination, undefined, false);",
+      "console.log(inspect(process, target));",
+    ),
+    "47-global-lookup-getter.cjs": withTarget(
+      "const runtime = globalThis.__lookupGetter__('process').call(globalThis);",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "48-global-callback.cjs": withTarget(
+      "const select = (scope) => scope.process;",
+      "const runtime = select(globalThis);",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "49-global-container.cjs": withTarget(
+      "const holder = { scope: globalThis };",
+      "const runtime = holder.scope.process;",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "50-callback-this.cjs": withTarget(
+      "function inspect(runtime) { void runtime.pid; return this.process.getBuiltinModule('module')._load(target, undefined, false); }",
+      "console.log(inspect(process));",
+    ),
+    "51-container-method.cjs": withTarget(
+      "const holder = { runtime: process, load() { return this.runtime.getBuiltinModule('module')._load(target, undefined, false); } };",
+      "void (holder.runtime === process);",
+      "console.log(holder.load());",
+    ),
+    "52-container-prototype.cjs": withTarget(
+      "const proto = { load() { return this.runtime.getBuiltinModule('module')._load(target, undefined, false); } };",
+      "const holder = { __proto__: proto, runtime: process, label: 'safe' };",
+      "void (holder.runtime === process); void holder.label;",
+      "console.log(holder.load());",
+    ),
+    "53-declaration-own-arguments.cjs": withTarget(
+      "function inspect(runtime) { void runtime.pid; return inspect.arguments[0].getBuiltinModule('module')._load(target, undefined, false); }",
+      "console.log(inspect(process));",
+    ),
+    "54-expression-own-arguments.cjs": withTarget(
+      "const inspect = function internal(runtime) { void runtime.pid; return internal.arguments[0].getBuiltinModule('module')._load(target, undefined, false); };",
+      "console.log(inspect(process));",
+    ),
+    "55-inherited-container-getter.cjs": withTarget(
+      "Object.defineProperty(Object.prototype, 'runtimeAlias', { configurable: true, get() { return this.runtime; } });",
+      "const holder = { runtime: process, label: 'safe' };",
+      "void (holder.runtime === process); void holder.label;",
+      "const runtime = holder.runtimeAlias;",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "56-global-self-callback.cjs": withTarget(
+      "const identity = (value) => value;",
+      "const realm = identity(globalThis['global']);",
+      "console.log(realm.process.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "57-global-self-container.cjs": withTarget(
+      "const holder = { realm: globalThis['global'] };",
+      "console.log(holder.realm.process.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "58-global-self-return.cjs": withTarget(
+      "const realm = (() => globalThis['global'])();",
+      "console.log(realm.process.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "59-process-member-mutation.cjs": withTarget(
+      "const original = process.cwd;",
+      "let loaded;",
+      "process.cwd = new Proxy(original, { apply(targetFunction, receiver) { loaded = receiver.getBuiltinModule('module')._load(target, undefined, false); return Reflect.apply(targetFunction, receiver, []); } });",
+      "process.cwd();",
+      "process.cwd = original;",
+      "console.log(loaded);",
+    ),
+    "60-global-member-mutation.cjs": withTarget(
+      "const original = globalThis.fetch;",
+      "let loaded;",
+      "globalThis.fetch = new Proxy(original, { apply(_targetFunction, receiver) { loaded = receiver.process.getBuiltinModule('module')._load(target, undefined, false); return Promise.resolve(); } });",
+      "globalThis.fetch('data:,safe');",
+      "globalThis.fetch = original;",
+      "console.log(loaded);",
+    ),
+    "61-dynamic-process-import.cjs": withTarget(
+      "import('node:process').then((runtime) => console.log(runtime.getBuiltinModule('module')._load(target, undefined, false)));",
+    ),
+    "62-process-require-alias.cjs": withTarget(
+      "const runtime = require('process');",
+      "console.log(runtime.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "63-reflected-global-self.cjs": withTarget(
+      "const realm = Reflect.get(globalThis, 'global');",
+      "console.log(realm.process.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "64-global-self-descriptor.cjs": withTarget(
+      "const realm = Object.getOwnPropertyDescriptor(globalThis, 'global').value;",
+      "console.log(realm.process.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "65-global-self-descriptor-map.cjs": withTarget(
+      "const realm = Object.getOwnPropertyDescriptors(globalThis).global.value;",
+      "console.log(realm.process.getBuiltinModule('module')._load(target, undefined, false));",
+    ),
+    "66-process-destructuring-mutation.cjs": withTarget(
+      "const original = process.cwd;",
+      "let loaded;",
+      "({ replacement: process.cwd } = { replacement: new Proxy(original, { apply(_targetFunction, receiver) { loaded = receiver.getBuiltinModule('module')._load(target, undefined, false); return '/tmp'; } }) });",
+      "process.cwd();",
+      "process.cwd = original;",
+      "console.log(loaded);",
+    ),
+    "67-global-destructuring-mutation.cjs": withTarget(
+      "const original = globalThis.fetch;",
+      "let loaded;",
+      "({ replacement: globalThis.fetch } = { replacement: new Proxy(original, { apply(_targetFunction, receiver) { loaded = receiver.process.getBuiltinModule('module')._load(target, undefined, false); return Promise.resolve(); } }) });",
+      "globalThis.fetch('data:,safe');",
+      "globalThis.fetch = original;",
+      "console.log(loaded);",
+    ),
   };
-  const compatibleSources: Record<string, { output: string; source: string }> = {
-    "shadowed-process-control.cjs": {
-      output: "safe",
-      source: [
-        "function ordinary(process) { return process.getBuiltinModule(); }",
-        "console.log(ordinary({ getBuiltinModule: () => 'safe' }));",
-      ].join("\n"),
-    },
-    "ordinary-reflect-callback.mjs": {
-      output: "safe",
-      source: [
-        "const transfer = (get, target, key) => get(target, key);",
-        "console.log(transfer(Reflect.get, { value: 'safe' }, 'value'));",
-      ].join("\n"),
-    },
-    "nested-arguments-control.cjs": {
-      output: "safe",
-      source: [
-        "function ordinary() { return arguments[1]; }",
-        "console.log(ordinary('left', 'safe'));",
-      ].join("\n"),
-    },
+  const compatibleSources: Record<string, string> = {
+    "p01-shadowed-process.cjs": [
+      "function ordinary(process) { return process.getBuiltinModule(); }",
+      "console.log(ordinary({ getBuiltinModule: () => 'safe' }));",
+    ].join("\n"),
+    "p02-ordinary-callback.cjs": [
+      "const read = (object) => object.value;",
+      "console.log(read({ value: 'safe' }));",
+    ].join("\n"),
+    "p03-ordinary-nested-forward.cjs": [
+      "const read = (object) => object.value;",
+      "const inner = (object, callback) => callback(object);",
+      "const outer = (object, callback) => inner(object, callback);",
+      "console.log(outer({ value: 'safe' }, read));",
+    ].join("\n"),
+    "p04-ordinary-identity.cjs": [
+      "const identity = (value) => value;",
+      "console.log(identity({ value: 'safe' }).value);",
+    ].join("\n"),
+    "p05-ordinary-member-callback.cjs": [
+      "const callbacks = { read: (object) => object.value };",
+      "console.log(callbacks.read({ value: 'safe' }));",
+    ].join("\n"),
+    "p06-ordinary-destructured-callback.cjs": [
+      "const read = (object) => object.value;",
+      "const { read: alias } = { read };",
+      "console.log(alias({ value: 'safe' }));",
+    ].join("\n"),
+    "p07-ordinary-object-assign.cjs": [
+      "const holder = Object.assign({}, { runtime: { getBuiltinModule: () => 'safe' } });",
+      "console.log(holder.runtime.getBuiltinModule());",
+    ].join("\n"),
+    "p08-ordinary-proxy-revocable.cjs": [
+      "const { proxy } = Proxy.revocable({ value: 'safe' }, {});",
+      "console.log(proxy.value);",
+    ].join("\n"),
+    "p09-ordinary-call.cjs": [
+      "const read = (object) => object.value;",
+      "console.log(read.call(undefined, { value: 'safe' }));",
+    ].join("\n"),
+    "p10-ordinary-apply.cjs": [
+      "const read = (object) => object.value;",
+      "console.log(read.apply(undefined, [{ value: 'safe' }]));",
+    ].join("\n"),
+    "p11-process-nonauthority.cjs": [
+      "const inspect = (runtime) => typeof runtime.pid === 'number' ? 'safe' : 'bad';",
+      "console.log(inspect(process));",
+    ].join("\n"),
+    "p12-process-container-nonauthority.cjs": [
+      "const holder = { runtime: process };",
+      "console.log(holder.runtime === process ? 'safe' : 'bad');",
+    ].join("\n"),
+    "p13-ordinary-require-method.cjs": [
+      "const service = { require: () => 'safe' };",
+      "console.log(service.require());",
+    ].join("\n"),
+    "p14-shadowed-object-assign.cjs": [
+      "const Object = { assign: (_target, source) => source };",
+      "console.log(Object.assign({}, { value: 'safe' }).value);",
+    ].join("\n"),
+    "p15-shadowed-proxy.cjs": [
+      "const Proxy = function(value) { return value; };",
+      "console.log(new Proxy({ value: 'safe' }, {}).value);",
+    ].join("\n"),
   };
-  const allSources = { ...hostileSources, ...compatibleSources };
+  const staticCompatibleSources: Record<string, string> = {
+    "p16-process-namespace.ts": [
+      "namespace process { export const pid = 'safe'; }",
+      "console.log(process.pid);",
+    ].join("\n"),
+    "p17-process-enum-member.ts": [
+      "enum Ordinary { process = 'safe' }",
+      "console.log(Ordinary.process);",
+    ].join("\n"),
+    "p18-process-jsx-attribute.tsx": [
+      "declare namespace JSX { interface IntrinsicElements { widget: { process: string } } }",
+      "const View = () => <widget process='safe' />;",
+      "export { View };",
+    ].join("\n"),
+    "p19-global-jsx-tags.tsx": [
+      "declare namespace JSX { interface IntrinsicElements { process: object; globalThis: object } }",
+      "const View = () => <><process /><globalThis /></>;",
+      "export { View };",
+    ].join("\n"),
+    "p20-global-property-names.ts": [
+      "const config = { global: 'safe', window: 'safe', self: 'safe', globalThis: 'safe' };",
+      "console.log(config.global, config.window, config.self, config.globalThis);",
+    ].join("\n"),
+  };
+  const allSources = { ...hostileSources, ...compatibleSources, ...staticCompatibleSources };
   const root = await repositoryFixture(t, {
     "apps/gateway/package.json": manifest("@odinn/gateway", {
       exports: { ".": "./src/index.cjs" },
@@ -1384,20 +1651,86 @@ test("ambient process authority stays rejected across explicit capability transf
     }),
     "packages/host/src/index.cjs": "module.exports = { host: true };\n",
     ...Object.fromEntries(Object.entries(allSources)
-      .map(([name, { source }]) => [`packages/host/src/${name}`, `${source}\n`])),
+      .map(([name, source]) => [`packages/host/src/${name}`, `${source}\n`])),
   });
 
-  for (const [name, { output }] of Object.entries(allSources)) {
-    assert.equal(runNodeProbe(root, `packages/host/src/${name}`), output, name);
+  for (const name of Object.keys(hostileSources)) {
+    assert.equal(runNodeProbe(root, `packages/host/src/${name}`), "gateway-cjs", name);
+  }
+  for (const name of Object.keys(compatibleSources)) {
+    assert.equal(runNodeProbe(root, `packages/host/src/${name}`), "safe", name);
   }
 
   const result = await checkFixture(root, { "@odinn/gateway": [], "@odinn/host": [] }, []);
-  const rejectedFiles = new Set(result.violations
-    .filter(({ kind, rule }) => kind === "module-loader"
-      && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
+  const authorityViolations = result.violations.filter(({ kind, rule }) => kind === "module-loader"
+    && rule === DEPENDENCY_RULES.unsupportedModuleLoader);
+  const rejectedFiles = new Set(authorityViolations
     .map(({ sourceFile }) => sourceFile.replace("packages/host/src/", "")));
   assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
-  for (const name of Object.keys(compatibleSources)) assert(!rejectedFiles.has(name), name);
+  for (const [name, source] of Object.entries(hostileSources)) {
+    const sourceLines = source.split("\n");
+    assert(authorityViolations.some(({ sourceFile, line, column }) => {
+      if (sourceFile !== `packages/host/src/${name}`) return false;
+      const suffix = sourceLines[line - 1]?.slice(column - 1) ?? "";
+      return /^(?:process\b|globalThis\b|Reflect\.(?:get|getOwnPropertyDescriptor)\b|Object\.getOwnPropertyDescriptors?\b|(?:import|require)\(['"](?:node:)?process['"]\)|['"]node:process['"]|(?:\(?\{\s*)?process:\s*runtime\b)/u
+        .test(suffix);
+    }), `expected ${name} to fail at its ambient process origin`);
+  }
+  for (const name of [...Object.keys(compatibleSources), ...Object.keys(staticCompatibleSources)]) {
+    assert(!rejectedFiles.has(name), name);
+  }
+});
+
+test("repository ambient process inventory and nested closed reads remain compatible", async (t) => {
+  const auditedProperties = [
+    "arch",
+    "argv",
+    "cwd",
+    "env",
+    "execPath",
+    "exit",
+    "exitCode",
+    "getuid",
+    "kill",
+    "on",
+    "once",
+    "pid",
+    "platform",
+    "removeListener",
+    "send",
+    "stdin",
+    "stdout",
+    "version",
+  ];
+  const operationalMethods = new Set(["on", "once", "removeListener", "send"]);
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": [
+      "import { cwd as currentWorkingDirectory, exit as exitProcess, kill as killProcess } from 'node:process';",
+      `const direct = [${auditedProperties.filter((name) => !operationalMethods.has(name))
+        .map((name) => `process.${name}`).join(", ")}];`,
+      "const getProcessUserId = process.getuid;",
+      "const namedCalls = [currentWorkingDirectory(), getProcessUserId?.()];",
+      "if (false) { exitProcess(0); killProcess(0, 0); }",
+      "const readPid = (runtime) => runtime.pid;",
+      "const inner = (runtime, callback) => callback(runtime);",
+      "const outer = (runtime, callback) => inner(runtime, callback);",
+      "const holder = { runtime: process };",
+      "const environment = { runtime: process, label: 'safe' };",
+      "const listener = () => undefined;",
+      "process.on('odinn-test', listener);",
+      "process.removeListener('odinn-test', listener);",
+      "process.once('odinn-test', listener);",
+      "process.removeListener('odinn-test', listener);",
+      "if (false) process.send?.({ type: 'odinn-test' });",
+      "process.exitCode = 0;",
+      "console.log(direct.length, namedCalls.length, outer(process, readPid), holder.runtime === process);",
+      "console.log(environment.runtime.pid, environment.label);",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  assert.deepEqual(result.violations, []);
 });
 
 test("runtime authority wrappers and transparent transforms cannot load forbidden code", async (t) => {

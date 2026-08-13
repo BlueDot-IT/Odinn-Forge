@@ -5,6 +5,7 @@ import { createServer as createHttpsServer } from "node:https";
 import { realpathSync } from "node:fs";
 import { chmod, lstat, readFile, realpath, readdir, rename, writeFile } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
+import { exit as exitProcess } from "node:process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { ensureSecureStateDirectory } from "@odinn/store-file";
@@ -526,7 +527,7 @@ if (isMain) {
     const value = (name: any) => { const index = process.argv.indexOf(name); return index >= 0 ? process.argv[index + 1] : ""; };
     const result = await addHostUser({ stateDir, id: value("--id"), password: process.env.ODINN_USER_PASSWORD, workspaceRoot: value("--workspace") });
     console.log(JSON.stringify({ ok: true, ...result }, null, 2));
-    process.exit(0);
+    exitProcess(0);
   }
   const host = process.env.ODINN_HOST || "127.0.0.1";
   const port = Number(process.env.ODINN_PORT || 18791);

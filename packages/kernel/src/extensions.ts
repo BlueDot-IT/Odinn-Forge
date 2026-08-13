@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
 import { redact } from "./run-ledger.ts";
 import { materializeSandboxBundle } from "./sandbox-bundle.ts";
@@ -176,7 +177,7 @@ export class ExtensionExecutor {
   readonly defaultTimeoutMs: number;
   readonly sandboxConfig: SandboxConfig;
 
-  constructor(registry: ExtensionRegistry, { workspaceRoot = process.cwd(), defaultTimeoutMs = 30_000, config = {} }: ExtensionExecutorOptions = {}) {
+  constructor(registry: ExtensionRegistry, { workspaceRoot = currentWorkingDirectory(), defaultTimeoutMs = 30_000, config = {} }: ExtensionExecutorOptions = {}) {
     if (!registry || typeof registry.get !== "function") throw new Error("ExtensionExecutor requires an ExtensionRegistry");
     this.registry = registry;
     this.workspaceRoot = resolve(workspaceRoot);

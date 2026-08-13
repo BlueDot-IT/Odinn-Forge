@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import type { JsonObject } from "@odinn/protocol";
 import { configuredCredentialEnvironmentKeys, sanitizedChildEnvironment } from "./environment.ts";
 
@@ -503,7 +504,7 @@ function isWorkerResponse(message: unknown): message is WorkerResponse {
 
 export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): TaskExecutor {
   const { stateDir, workspaceRoot, config, policy } = options;
-  const authoritativeRoot = resolve(workspaceRoot ?? process.cwd());
+  const authoritativeRoot = resolve(workspaceRoot ?? currentWorkingDirectory());
   const workerPath = options.taskWorkerPath ?? fileURLToPath(new URL(
     typeof __ODINN_COMPILED__ !== "undefined" ? "../workers/task-worker.js" : "./task-worker.ts",
     import.meta.url

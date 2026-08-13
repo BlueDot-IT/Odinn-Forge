@@ -4,6 +4,7 @@ import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { exit as exitProcess } from "node:process";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const mode = process.argv[2];
@@ -98,7 +99,7 @@ async function lintRepository() {
   const eslint = runPnpm(["exec", "eslint", "."]);
   if (eslint.stdout) process.stdout.write(eslint.stdout);
   if (eslint.stderr) process.stderr.write(eslint.stderr);
-  if (eslint.status !== 0) process.exit(eslint.status ?? 1);
+  if (eslint.status !== 0) exitProcess(eslint.status ?? 1);
 }
 
 async function workspacePackageCount() {
@@ -131,7 +132,7 @@ async function runWorkspaceScript(script: any) {
   ]);
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
-  if (result.status !== 0) process.exit(result.status ?? 1);
+  if (result.status !== 0) exitProcess(result.status ?? 1);
 }
 
 async function typecheck() {
@@ -142,7 +143,7 @@ async function typecheck() {
     const tools = runPnpm(["exec", "tsc", "-p", config]);
     if (tools.stdout) process.stdout.write(tools.stdout);
     if (tools.stderr) process.stderr.write(tools.stderr);
-    if (tools.status !== 0) process.exit(tools.status ?? 1);
+    if (tools.status !== 0) exitProcess(tools.status ?? 1);
   }
   if (!process.exitCode) console.log("typecheck contract passed");
 }
@@ -156,7 +157,7 @@ async function build() {
   });
   if (production.stdout) process.stdout.write(production.stdout);
   if (production.stderr) process.stderr.write(production.stderr);
-  if (production.status !== 0) process.exit(production.status ?? 1);
+  if (production.status !== 0) exitProcess(production.status ?? 1);
   const result = spawnSync("git", ["ls-files", "-z"], { cwd: root, encoding: "buffer" });
   if (result.status !== 0) throw new Error("git ls-files failed");
   const files = result.stdout.toString("utf8").split("\0").filter(Boolean).sort();

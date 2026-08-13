@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { parseEnv } from "node:util";
 
 export type EnvironmentLoadOptions = {
@@ -110,7 +111,7 @@ const environmentFileEntries = (workspaceRoot: string, stateDir: string) => {
  * apply only the values allowed at their trust boundary.
  */
 export function readEnvironmentFiles({
-  workspaceRoot = process.cwd(),
+  workspaceRoot = currentWorkingDirectory(),
   stateDir = ".odinn"
 }: Pick<EnvironmentLoadOptions, "workspaceRoot" | "stateDir"> = {}): ParsedEnvironmentFiles {
   const workspace: NodeJS.ProcessEnv = {};
@@ -162,7 +163,7 @@ export function assertPhysicalDirectory(path: string): void {
  * over workspace values, and duplicate paths are loaded only once.
  */
 export function loadEnvironmentFiles({
-  workspaceRoot = process.cwd(),
+  workspaceRoot = currentWorkingDirectory(),
   stateDir = ".odinn",
   environment = process.env,
   protectedKeys = Object.keys(environment),

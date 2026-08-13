@@ -3,6 +3,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { Unzip, UnzipInflate, zipSync } from "fflate";
 import { createRunLedger, redact } from "./run-ledger.ts";
 import { ProofVerifier, proofEvidenceView } from "./proof.ts";
@@ -311,7 +312,7 @@ export class ProofEngine {
     this.includeRawEvidence = includeRawEvidence === true;
     this.verifierOptions = { allowedCommands, maxOutputBytes, maxFileBytes, commandEnvironment, includeRawEvidence: this.includeRawEvidence };
   }
-  async run(runId: string, contract: AnyRecord, { workspaceRoot = process.cwd() }: AnyRecord = {}) {
+  async run(runId: string, contract: AnyRecord, { workspaceRoot = currentWorkingDirectory() }: AnyRecord = {}) {
     if (contract?.schemaVersion === 1) {
       const verifierOptions = Object.fromEntries(Object.entries(this.verifierOptions).filter(([, value]) => value !== undefined));
       return new ProofVerifier({
@@ -383,7 +384,7 @@ export class ProofEngine {
 export class Sentinel {
   [key: string]: any;
   constructor({ ledger, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
-  evaluate({ runId, stepId, toolName, input, policy, workspaceRoot = process.cwd() }: AnyRecord) {
+  evaluate({ runId, stepId, toolName, input, policy, workspaceRoot = currentWorkingDirectory() }: AnyRecord) {
     const normalizedPolicy = validatePolicy(policy);
     const policyId = policy.id ?? `policy_${runId}_${hash(json(redact(policy))).slice(0, 16)}`;
     const evaluations = evaluatePolicyInvariants({
@@ -478,7 +479,7 @@ export class SnapshotManager {
     this.maxFiles = maxFiles;
     this.maxBytes = maxBytes;
   }
-  create({ runId, stepId, paths = [], label, workspaceRoot = process.cwd() }: AnyRecord = {}) {
+  create({ runId, stepId, paths = [], label, workspaceRoot = currentWorkingDirectory() }: AnyRecord = {}) {
     if (!this.ledger.getRun(runId)) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot run not found", { runId });
     if (!Array.isArray(paths) || paths.length === 0 || paths.some((path) => typeof path !== "string" || !path.trim())) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths must contain at least one non-empty path");
     const requestedPaths = [...new Set(paths)];
@@ -988,7 +989,7 @@ function validateCounterfactualPlans(plans: unknown): AnyRecord[] {
 export class CounterfactualManager {
   [key: string]: any;
   constructor({ ledger, stateDir, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.stateDir = resolve(stateDir ?? ".odinn"); this.featureFlags = featureFlags; }
-  async create({ sourceRunId, sourceStepId, plans = [], workspaceRoot = process.cwd() }: AnyRecord = {}) {
+  async create({ sourceRunId, sourceStepId, plans = [], workspaceRoot = currentWorkingDirectory() }: AnyRecord = {}) {
     requireExperimental(this.featureFlags, "counterfactual", this.ledger);
     const normalizedPlans = validateCounterfactualPlans(plans);
     if (typeof sourceRunId !== "string" || !sourceRunId || typeof sourceStepId !== "string" || !sourceStepId) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual sourceRunId and sourceStepId are required");
@@ -1130,7 +1131,7 @@ async function syncWorkspace(source: string, destination: string) {
   }
 }
 
-export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {}, proofOptions = {} }: AnyRecord = {}) {
+export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = currentWorkingDirectory(), featureFlags = {}, proofOptions = {} }: AnyRecord = {}) {
   const ledger = createRunLedger({ stateDir, workspaceRoot, featureFlags });
   const runtimeFlags = { ...featureFlags, __ledger: ledger };
   const plugins = loadRuntimePlugins({

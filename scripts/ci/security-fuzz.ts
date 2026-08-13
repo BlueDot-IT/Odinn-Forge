@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { arch, platform, release } from "node:os";
 import { join } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { performance } from "node:perf_hooks";
 import fc from "fast-check";
 import { validateSkillPackage } from "../../packages/kernel/src/index.ts";
@@ -13,7 +14,7 @@ const MAX_RUNS = 100_000;
 const MAX_SECONDS = 300;
 const DEFAULT_RUNS = process.env.CI ? 20_000 : 4_000;
 const DEFAULT_SECONDS = process.env.CI ? 240 : 60;
-const artifactDirectory = join(process.cwd(), "artifacts", "fuzz");
+const artifactDirectory = join(currentWorkingDirectory(), "artifacts", "fuzz");
 
 function boundedInteger(name: string, fallback: number, maximum: number) {
   const raw = process.env[name];

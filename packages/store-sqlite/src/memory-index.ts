@@ -224,7 +224,8 @@ function ensureSecureDatabasePath(input: string): string {
   const parentInformation = lstatSync(parent);
   if (process.platform !== "win32") {
     if ((parentInformation.mode & 0o077) !== 0) throw new Error("memory index parent must be owner-only (mode 0700)");
-    const currentUser = process.getuid?.();
+    const getProcessUserId = process.getuid;
+    const currentUser = getProcessUserId?.();
     if (currentUser !== undefined && parentInformation.uid !== currentUser) throw new Error("memory index parent must be owned by the current user");
   }
   if (existsSync(path)) {

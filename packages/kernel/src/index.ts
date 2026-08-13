@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
 import { createRunId, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
@@ -119,7 +120,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -1634,7 +1635,7 @@ export function previewExecutionAdmission({
   task,
   policy = createDefaultPolicy(),
   registry,
-  workspaceRoot = process.cwd(),
+  workspaceRoot = currentWorkingDirectory(),
   parentCapabilities,
   requestedCapabilities,
   skillCapabilities,

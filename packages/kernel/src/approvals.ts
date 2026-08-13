@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
+import { kill as killProcess } from "node:process";
 import { redactDurableValue } from "@odinn/protocol";
 import { approvalEffectPolicyForTool } from "@odinn/policy";
 
@@ -499,7 +500,7 @@ function staleApprovalSnapshot(snapshot: ApprovalLockSnapshot): boolean {
   if (ageMs < 5_000) return false;
   if (!snapshot.token || !Number.isInteger(snapshot.pid) || Number(snapshot.pid) < 1) return true;
   try {
-    process.kill(Number(snapshot.pid), 0);
+    killProcess(Number(snapshot.pid), 0);
     return false;
   } catch (error) {
     return (error as NodeError).code === "ESRCH";

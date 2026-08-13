@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync, type Stats } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { basename, dirname, isAbsolute, posix, resolve } from "node:path";
+import { kill as killProcess } from "node:process";
 import { platform } from "node:os";
 import { SandboxRecoveryCoordinator, SandboxRecoveryError, type SandboxRecoveryIdentity, type SandboxRecoverySession } from "./sandbox-recovery.ts";
 
@@ -1183,7 +1184,7 @@ function terminateProcessTree(child: any): void {
     spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).unref();
     return;
   }
-  try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill?.("SIGKILL"); }
+  try { killProcess(-child.pid, "SIGKILL"); } catch { child.kill?.("SIGKILL"); }
 }
 
 function backendFromCommand(command: string): OciBackendId {

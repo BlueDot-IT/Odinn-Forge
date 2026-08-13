@@ -1,4 +1,5 @@
 import { resolve, sep } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import {
   CAPABILITY_REGISTRY_VERSION,
   DEFAULT_ALLOWED_CAPABILITIES,
@@ -276,7 +277,7 @@ export function previewGatewatchDecision({
   requestedCapabilities,
   skillCapabilities = [],
   mcpCapabilities = [],
-  workspaceRoot = process.cwd()
+  workspaceRoot = currentWorkingDirectory()
 }: {
   policy?: RuntimePolicy;
   request: PolicyRequest;
@@ -367,7 +368,7 @@ export function normalizePolicyInvariants(value: unknown): PolicyInvariant[] {
 export function evaluatePolicyInvariants({
   policy = createDefaultPolicy(),
   request,
-  workspaceRoot = process.cwd()
+  workspaceRoot = currentWorkingDirectory()
 }: {
   policy?: RuntimePolicy;
   request: PolicyRequest;

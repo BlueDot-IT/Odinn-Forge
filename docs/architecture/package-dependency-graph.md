@@ -138,6 +138,27 @@ both source references and package manifests. It enforces all of the following:
    classes and instances, `Reflect.get` loader authority, synchronous or
    asynchronous loader registration, unresolved module loader properties, and
    runtime `getBuiltinModule` access and direct `process.dlopen` fail closed.
+   The ambient `process` object is governed at its origin by a closed grammar.
+   Direct reads are limited to `arch`, `argv`, `cwd`, `env`, `execPath`,
+   `exit`, `exitCode`, `getuid`, `kill`, `pid`, `platform`, `stdin`, `stdout`,
+   and `version`; only direct `exitCode = ...` assignment is writable.
+   Receiver-independent calls use named `node:process` imports limited to
+   `cwd`, `exit`, and `kill`; optional platform APIs such as `getuid` are read
+   and invoked unbound. Default, namespace, dynamic, CommonJS,
+   and all other runtime `node:process` acquisitions fail closed. The Node
+   operations that have no receiver-independent named export are limited to
+   direct expression-statement calls of `process.on`, `process.once`,
+   `process.removeListener`, and `process.send`; event listeners must resolve
+   to stable local arrow functions. Computed access, extraction of these four
+   operations, member mutation, or any unsupported transfer of the whole
+   `process` object is rejected at the origin. A process-bearing local object
+   is accepted only when every use resolves to an exact own data property and
+   the process member itself stays within this grammar.
+   The ambient global object likewise cannot be passed, stored, returned, or
+   wrapped. Its `global`, `globalThis`, `self`, and `window` properties retain
+   global authority recursively; only read-only `fetch` and `Math` terminals
+   are ordinary, while evaluators and `Proxy` remain governed by their
+   dedicated restrictions.
    The ambient CommonJS `module` object is limited to the exact
    `module.exports` surface; `_compile`, `require`, computed properties,
    CommonJS wrapper `arguments`, destructuring, and capability-preserving
@@ -145,9 +166,10 @@ both source references and package manifests. It enforces all of the following:
    Production source cannot
    acquire the runtime `node:module`/`module` namespace (apart from type-only
    use and the static `builtinModules` metadata export) or `node:vm`/`vm` at
-   all. This acquisition boundary remains effective across descriptors,
-   spreads, bound constructors, proxies, prototype mutation, callbacks, and
-   other capability-preserving JavaScript transforms. Direct, global, or
+   all. For the enumerated acquisition grammar, this boundary remains
+   effective across descriptors, spreads, bound constructors, proxies,
+   prototype-derived containers, callbacks, and the other covered
+   capability-preserving transforms. Direct, global, or
    aliased `eval`, `Function` construction, evaluator
    call/apply/bind forms, and callable `.constructor` code generation are also
    rejected because their later imports cannot be bound to package identities.
@@ -210,6 +232,13 @@ checks are platform-neutral.
   proof over arbitrary execution primitives such as approved worker or child
   process creation; those remain governed by their dedicated runtime and
   sandbox boundaries.
+- The four allowed receiver-bound `process` operations above are operational
+  compatibility points, not a proof that a mutated Node.js prototype or
+  runtime dispatch table is trustworthy. Nor does the checker claim to model
+  arbitrary recovery of the global object through engine-specific call-stack
+  reflection. Dependency review, runtime tests, and the trusted Node.js
+  boundary govern those semantics; the checker enforces the documented
+  syntactic origins and transfers.
 - The graph describes the current migration state. As additional vertical
   slices move behind `@odinn/application`, old app-to-kernel edges should be
   removed from the allowlist in the same change that removes the imports and

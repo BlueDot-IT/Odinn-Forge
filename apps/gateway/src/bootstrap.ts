@@ -2,6 +2,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, readEnvironmentFiles } from "@odinn/kernel";
 import { assertGatewayBinding } from "./security.ts";
@@ -18,7 +19,7 @@ export async function runGatewayEntrypoint({ createGatewayServer, compiledRuntim
   if (!isGatewayEntrypoint({ argv, compiledRuntime, moduleUrl })) return false;
   const parentEnvironment = { ...environment };
   const parentEnvironmentKeys = new Set(Object.keys(parentEnvironment));
-  const workspaceRoot = resolve(parentEnvironment.INIT_CWD ?? process.cwd());
+  const workspaceRoot = resolve(parentEnvironment.INIT_CWD ?? currentWorkingDirectory());
   const stateDir = parentEnvironment.ODINN_STATE_DIR
     ? resolve(workspaceRoot, parentEnvironment.ODINN_STATE_DIR)
     : resolve(homedir(), ".odinn");

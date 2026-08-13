@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import {
   MAX_EXECUTION_ENVELOPE_BYTES,
   canonicalizeExecutionEnvelopeV1,
@@ -637,7 +638,7 @@ export class RunLedger {
     if (!database || !artifacts) throw new Error("RunLedger requires database and artifacts");
     this.database = database;
     this.artifacts = artifacts;
-    this.workspaceRoot = resolve(workspaceRoot ?? process.cwd());
+    this.workspaceRoot = resolve(workspaceRoot ?? currentWorkingDirectory());
     this.stateDir = resolve(stateDir ?? dirname(database.path));
     this.featureFlags = { ...featureFlags };
   }
@@ -1271,7 +1272,7 @@ export class RunLedger {
   }
 }
 
-export function createRunLedger({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {} }: { stateDir?: string; workspaceRoot?: string; featureFlags?: FeatureFlags } = {}) {
+export function createRunLedger({ stateDir = ".odinn", workspaceRoot = currentWorkingDirectory(), featureFlags = {} }: { stateDir?: string; workspaceRoot?: string; featureFlags?: FeatureFlags } = {}) {
   const state = resolve(stateDir);
   const database = new SqliteStore(join(state, "db", "odinn.sqlite"));
   const artifacts = new ArtifactStore(join(state, "artifacts"));

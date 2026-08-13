@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
+import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateRuntimeSecuritySummaryV1, type CliStatusSnapshotV1, type DiagnosticsReportV1 } from "@odinn/application";
@@ -585,7 +586,7 @@ function readBootstrapJsonIfPresent(path: string): unknown {
 }
 
 function invocationRoot(environment: NodeJS.ProcessEnv = process.env) {
-  return resolve(environment.INIT_CWD ?? process.cwd());
+  return resolve(environment.INIT_CWD ?? currentWorkingDirectory());
 }
 
 function resolveInvocationPath(path: any) {
