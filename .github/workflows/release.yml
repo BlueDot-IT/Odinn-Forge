@@ -297,6 +297,8 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - name: Publish npm package
         shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version="$(node -p "require('./package.json').version")"
           package="@bluedot-it/odinn@$version"
