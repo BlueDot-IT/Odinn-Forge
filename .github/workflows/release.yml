@@ -7,18 +7,23 @@ on:
         description: Existing draft release tag to verify and publish
         required: true
         type: string
+      release_id:
+        description: Numeric GitHub draft release ID to verify and publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.event.release.tag_name }}
+  group: release-${{ inputs.tag || github.event.release.tag_name }}-${{ inputs.release_id || 'event' }}
   cancel-in-progress: false
 
 env:
   NODE_VERSION: "24"
   PNPM_VERSION: "10.14.0"
   RELEASE_TAG: ${{ inputs.tag }}
+  RELEASE_ID: ${{ inputs.release_id }}
 
 jobs:
   verify:
@@ -68,18 +73,19 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ env.RELEASE_ID }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           test -n "$TAG"
+          test -n "$RELEASE_ID"
           tag_commit="$(git rev-list -n 1 "refs/tags/$TAG")"
           test "$tag_commit" = "$(git rev-parse HEAD)"
-          release="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -c --arg tag "$TAG" 'add | map(select(.tag_name == $tag)) | first // empty')"
-          test -n "$release"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
           expected_prerelease=false
           [[ "$TAG" == *-* ]] && expected_prerelease=true
-          jq -e --arg tag "$TAG" \
+          jq -e --arg releaseId "$RELEASE_ID" --arg tag "$TAG" \
             --argjson expectedPrerelease "$expected_prerelease" \
-            '.tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' \
+            '(.id | tostring) == $releaseId and .tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' \
             <<<"$release"
           echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
 
@@ -171,15 +177,16 @@ jobs:
         env:
           EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ env.RELEASE_ID }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
-          release="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -c --arg tag "$TAG" 'add | map(select(.tag_name == $tag)) | first // empty')"
-          test -n "$release"
+          test -n "$RELEASE_ID"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
           expected_prerelease=false
           [[ "$TAG" == *-* ]] && expected_prerelease=true
-          jq -e --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
-            '.tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' <<<"$release"
+          jq -e --arg releaseId "$RELEASE_ID" --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
+            '(.id | tostring) == $releaseId and .tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' <<<"$release"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
@@ -277,15 +284,16 @@ jobs:
         env:
           EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ env.RELEASE_ID }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
-          release="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -c --arg tag "$TAG" 'add | map(select(.tag_name == $tag)) | first // empty')"
-          test -n "$release"
+          test -n "$RELEASE_ID"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
           expected_prerelease=false
           [[ "$TAG" == *-* ]] && expected_prerelease=true
-          jq -e --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
-            '.tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' <<<"$release"
+          jq -e --arg releaseId "$RELEASE_ID" --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
+            '(.id | tostring) == $releaseId and .tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' <<<"$release"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - name: Publish npm package
         shell: bash

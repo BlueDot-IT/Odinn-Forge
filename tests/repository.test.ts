@@ -143,17 +143,19 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.doesNotMatch(release, /^\s{2}release:/m);
   assert.match(release, /^\s{2}workflow_dispatch:/m);
   assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/);
+  assert.match(release, /RELEASE_ID: \$\{\{ inputs\.release_id \}\}/);
+  assert.match(release, /description: Numeric GitHub draft release ID to verify and publish/);
   assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}contents: read/m);
-  assert.match(release, /\.tag_name == \$tag and \.draft == true and \.prerelease == \$expectedPrerelease/);
+  assert.match(release, /\(\.id \| tostring\) == \$releaseId and \.tag_name == \$tag and \.draft == true and \.prerelease == \$expectedPrerelease/);
   assert.equal(
-    (release.match(/gh api --paginate --slurp "repos\/\$\{GITHUB_REPOSITORY\}\/releases\?per_page=100"/g) ?? []).length,
+    (release.match(/gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{RELEASE_ID\}"/g) ?? []).length,
     3,
-    "all release gates must find draft releases through the list API"
+    "all release gates must validate the exact draft release ID"
   );
   assert.equal(
-    (release.match(/test -n "\$release"/g) ?? []).length,
+    (release.match(/test -n "\$RELEASE_ID"/g) ?? []).length,
     3,
-    "all release gates must fail closed when the draft release is absent"
+    "all release gates must fail closed when the release ID is absent"
   );
   assert.match(release, /persist-credentials: false/);
   assert.doesNotMatch(release.match(/^  release-policy:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /^\s+needs:/m);
