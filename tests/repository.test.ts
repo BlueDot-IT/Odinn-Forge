@@ -145,7 +145,7 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/);
   assert.match(release, /RELEASE_ID: \$\{\{ inputs\.release_id \}\}/);
   assert.match(release, /description: Numeric GitHub draft release ID to verify and publish/);
-  assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}contents: read/m);
+  assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}contents: write/m);
   assert.match(release, /\(\.id \| tostring\) == \$releaseId and \.tag_name == \$tag and \.draft == true and \.prerelease == \$expectedPrerelease/);
   assert.equal(
     (release.match(/gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{RELEASE_ID\}"/g) ?? []).length,
