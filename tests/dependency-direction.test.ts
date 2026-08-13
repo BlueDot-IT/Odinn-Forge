@@ -418,7 +418,251 @@ test("Node 24 active export conditions and the checker select the same nested wo
     { specifier: "@odinn/host/sync", kind: "import-declaration", rule: crossPackageExportTargetRule },
     { specifier: "@odinn/host", kind: "require-call", rule: crossPackageExportTargetRule },
     { specifier: "@odinn/host/sync", kind: "require-call", rule: crossPackageExportTargetRule },
+    { specifier: "./nested/src/addons.js", kind: "manifest-export", rule: crossPackageExportTargetRule },
+    { specifier: "./nested/src/sync.js", kind: "manifest-export", rule: crossPackageExportTargetRule },
   ]);
+});
+
+test("type-only imports select the TypeScript types condition before physical ownership checks", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": { types: "./nested/src/index.d.ts", import: "./src/index.js" } },
+    }),
+    "packages/host/src/index.js": "export const safe = true;\n",
+    "packages/host/nested/package.json": manifest("@odinn/nested"),
+    "packages/host/nested/src/index.d.ts": "export interface Nested { readonly value: string }\n",
+    "packages/host/nested/src/index.ts": "export const nested = true;\n",
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+    }),
+    "packages/consumer/src/index.ts": 'import type { Nested } from "@odinn/host"; export type Value = Nested["value"];\n',
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/host": [],
+    "@odinn/nested": [],
+  }, []);
+
+  assert(result.violations.some(({ sourceFile, rule }) =>
+    sourceFile === "packages/consumer/src/index.ts" && rule === crossPackageExportTargetRule),
+  JSON.stringify(result.violations));
+});
+
+test("static imports in cts files select the Node require export condition", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": { import: "./src/safe.js", require: "./nested/src/index.cjs" } },
+    }),
+    "packages/host/src/safe.js": "export const selected = 'safe';\n",
+    "packages/host/nested/package.json": manifest("@odinn/nested"),
+    "packages/host/nested/src/index.cjs": "exports.selected = 'nested';\n",
+    "packages/host/nested/src/index.ts": "export const nested = true;\n",
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+      exports: { ".": "./src/index.cts" },
+    }),
+    "packages/consumer/src/index.cts": 'import { selected } from "@odinn/host"; export { selected };\n',
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/host": [],
+    "@odinn/nested": [],
+  }, []);
+
+  assert(result.violations.some(({ sourceFile, rule }) =>
+    sourceFile === "packages/consumer/src/index.cts" && rule === crossPackageExportTargetRule),
+  JSON.stringify(result.violations));
+});
+
+test("executable export targets in dist remain in the architecture source inventory", async (t) => {
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway"),
+    "apps/gateway/src/index.ts": "export const gateway = true;\n",
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": "./dist/index.mjs", "./extensionless": "./dist/runner" },
+    }),
+    "packages/host/src/source.ts": "export const source = true;\n",
+    "packages/host/dist/index.mjs": 'import "@odinn/gateway"; export const host = true;\n',
+    "packages/host/dist/runner": 'import "@odinn/gateway"; export const runner = true;\n',
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/host": [],
+  }, []);
+
+  assert.deepEqual(result.violations.filter(({ rule }) => rule === DEPENDENCY_RULES.packageToApp)
+    .map(({ sourceFile }) => sourceFile), [
+    "packages/host/dist/index.mjs",
+    "packages/host/dist/runner",
+  ]);
+});
+
+test("repository file URL imports cannot cross a workspace package boundary", async (t) => {
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway", { exports: { ".": "./src/index.mjs" } }),
+    "apps/gateway/src/index.mjs": "export const gateway = true;\n",
+    "packages/host/package.json": manifest("@odinn/host", { exports: { ".": "./src/index.mjs" } }),
+    "packages/host/src/index.mjs": "export const host = true;\n",
+  });
+  await writeFile(
+    join(root, "packages/host/src/index.mjs"),
+    [
+      'import "file:///proc/self/cwd/apps/gateway/src/index.mjs";',
+      'import "data:text/javascript,import%20%22@odinn/gateway%22";',
+    ].join("\n"),
+  );
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/host": [],
+  }, []);
+
+  assert.deepEqual(result.violations.filter(({ sourceFile }) => sourceFile === "packages/host/src/index.mjs")
+    .map(({ line, rule }) => ({ line, rule })), [
+    { line: 1, rule: DEPENDENCY_RULES.urlModuleSpecifier },
+    { line: 2, rule: DEPENDENCY_RULES.urlModuleSpecifier },
+  ]);
+});
+
+test("computed and private Node module loader primitives fail closed", async (t) => {
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway"),
+    "apps/gateway/src/index.ts": "export const gateway = true;\n",
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": [
+      "const loaderName = 'require';",
+      "module[loaderName].bind(module)('@odinn/gateway');",
+      'import { Module } from "node:module";',
+      "Module._load('@odinn/gateway', module, false);",
+      'const moduleObject = require("node:module");',
+      "const moduleAlias = moduleObject;",
+      "moduleAlias._load('@odinn/gateway', module, false);",
+      'const { Module: RenamedModule } = require("node:module");',
+      "RenamedModule._load('@odinn/gateway', module, false);",
+      'require("node:module")._load("@odinn/gateway", module, false);',
+      'process.getBuiltinModule("module")._load("@odinn/gateway", module, false);',
+      "process.getBuiltinModule(loaderName);",
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/gateway": [],
+    "@odinn/host": [],
+  }, []);
+
+  const loaderLines = new Set(result.violations.filter(({ sourceFile, kind, rule }) =>
+    sourceFile === "packages/host/src/index.ts"
+      && kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader).map(({ line }) => line));
+  assert.deepEqual([...loaderLines], [2, 4, 7, 9, 10, 11, 12]);
+});
+
+test("dynamic evaluators and createRequire aliases fail closed at their capability boundary", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host"),
+    "packages/host/src/index.ts": [
+      'import * as nodeModule from "node:module";',
+      'eval("require(\\"@odinn/gateway\\")");',
+      '(0, eval)("import(\\"@odinn/gateway\\")");',
+      'globalThis.eval("require(\\"@odinn/gateway\\")");',
+      'Function("return import(\\"@odinn/gateway\\")")();',
+      'new Function("return require(\\"@odinn/gateway\\")");',
+      'Function.call(null, "return require(\\"@odinn/gateway\\")");',
+      'Reflect.construct(Function, ["return require(\\"@odinn/gateway\\")"]);',
+      '(() => undefined).constructor("return require(\\"@odinn/gateway\\")")();',
+      'const loaderName = "createRequire";',
+      'const computedFactory = nodeModule[loaderName];',
+      'const staticFactory = nodeModule["create" + "Require"];',
+      'const { createRequire: destructuredFactory } = nodeModule;',
+    ].join("\n"),
+  });
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  const loaderLines = result.violations
+    .filter(({ sourceFile, kind, rule }) => sourceFile === "packages/host/src/index.ts"
+      && kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
+    .map(({ line }) => line);
+
+  assert.deepEqual(loaderLines, [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13]);
+});
+
+test("safe conditional exports, extension modes, build targets, and ordinary code remain compatible", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/protocol/package.json": manifest("@odinn/protocol"),
+    "packages/protocol/src/index.ts": "export interface Protocol {}\n",
+    "packages/host/package.json": manifest("@odinn/host", {
+      dependencies: { "@odinn/protocol": "workspace:*" },
+      exports: {
+        ".": {
+          types: "./src/index.d.ts",
+          import: "./src/index.mjs",
+          require: "./src/index.cjs",
+        },
+        "./dist": "./dist/tool.mjs",
+        "./features/*": "./dist/features/*.mjs",
+        "./unused": { custom: "./src/custom.mjs", default: "./src/index.mjs" },
+      },
+    }),
+    "packages/host/src/index.d.ts": "export interface HostType { readonly value: string }\n",
+    "packages/host/src/index.mjs": "export const mode = 'import';\n",
+    "packages/host/src/index.cjs": "exports.mode = 'require';\n",
+    "packages/host/src/custom.mjs": "export const custom = true;\n",
+    "packages/host/dist/tool.mjs": 'import "@odinn/protocol"; export const tool = true;\n',
+    "packages/host/dist/features/one.mjs": "export const one = true;\n",
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+      exports: { ".": "./src/index.cts" },
+    }),
+    "packages/consumer/src/index.cts": [
+      'import type { HostType } from "@odinn/host";',
+      'import { mode } from "@odinn/host";',
+      'import "@odinn/host/dist";',
+      'import "@odinn/host/features/one";',
+      'import "./local.cjs";',
+      'const evaluatorName = "eval";',
+      'const FunctionName = () => true;',
+      'FunctionName();',
+      'export type Value = HostType["value"];',
+      'export { mode, evaluatorName };',
+    ].join("\n"),
+    "packages/consumer/src/importer.mts": 'import { mode } from "@odinn/host"; export { mode };\n',
+    "packages/consumer/src/local.cjs": "exports.local = true;\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/host": ["@odinn/protocol"],
+    "@odinn/protocol": [],
+  }, []);
+
+  assert.deepEqual(result.violations, []);
+});
+
+test("unreferenced conditional export targets cannot redirect into a nested workspace", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: {
+        ".": "./src/index.ts",
+        "./unused": { "custom-condition": "./nested/src/index.ts", default: "./src/index.ts" },
+      },
+    }),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    "packages/host/nested/package.json": manifest("@odinn/nested"),
+    "packages/host/nested/src/index.ts": "export const nested = true;\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/host": [],
+    "@odinn/nested": [],
+  }, []);
+
+  assert(result.violations.some(({ sourceFile, rule }) =>
+    sourceFile === "packages/host/package.json" && rule === crossPackageExportTargetRule),
+  JSON.stringify(result.violations));
 });
 
 test("package exports cannot hide a transition into a nested workspace package", async (t) => {
@@ -449,11 +693,18 @@ test("package exports cannot hide a transition into a nested workspace package",
     "@odinn/nested": [],
   }, []);
 
-  assert.deepEqual(result.violations.map(({ specifier, kind, rule }) => ({ specifier, kind, rule })), [{
-    specifier: "@odinn/host/nested",
-    kind: "import-declaration",
-    rule: crossPackageExportTargetRule,
-  }]);
+  assert.deepEqual(result.violations.map(({ specifier, kind, rule }) => ({ specifier, kind, rule })), [
+    {
+      specifier: "@odinn/host/nested",
+      kind: "import-declaration",
+      rule: crossPackageExportTargetRule,
+    },
+    {
+      specifier: "./nested/src/index.ts",
+      kind: "manifest-export",
+      rule: crossPackageExportTargetRule,
+    },
+  ]);
 });
 
 test("Node-resolved symlink exports cannot cross physical workspace ownership", {
@@ -464,7 +715,7 @@ test("Node-resolved symlink exports cannot cross physical workspace ownership", 
       exports: { ".": "./src/index.js", "./escape": "./src/escape.js" },
     }),
     "packages/host/src/index.js": 'export const selected = "host";\n',
-    "packages/host/nested/package.json": manifest("@odinn/nested"),
+    "packages/host/nested/package.json": manifest("@odinn/nested", { exports: { ".": "./src/index.js" } }),
     "packages/host/nested/src/index.js": 'export const selected = "nested";\n',
     "packages/consumer/package.json": manifest("@odinn/consumer", {
       dependencies: { "@odinn/host": "workspace:*" },
@@ -496,6 +747,12 @@ test("Node-resolved symlink exports cannot cross physical workspace ownership", 
       sourceFile: "packages/consumer/src/index.ts",
       specifier: "@odinn/host/escape",
       kind: "import-declaration",
+      rule: crossPackageExportTargetRule,
+    },
+    {
+      sourceFile: "packages/host/package.json",
+      specifier: "./src/escape.js",
+      kind: "manifest-export",
       rule: crossPackageExportTargetRule,
     },
     {
@@ -534,10 +791,12 @@ test("broken and repository-escaping production symlinks fail closed", {
     "@odinn/host": [],
   }, []);
 
-  assert.equal(result.violations.length, 4);
+  assert.equal(result.violations.length, 6);
   assert.deepEqual(
     result.violations.map(({ rule }) => rule),
     [
+      physicalExportTargetRule,
+      physicalExportTargetRule,
       physicalExportTargetRule,
       physicalExportTargetRule,
       productionSymlinkRule,

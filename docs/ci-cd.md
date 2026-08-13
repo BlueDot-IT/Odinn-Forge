@@ -29,9 +29,14 @@ local-path and npm aliases, rejects package-to-app and adapter-to-adapter edges,
 and requires source imports to be declared. Package subpaths are evaluated with
 Node 24 conditional, wildcard, null-exclusion, and array-fallback `exports`
 semantics, including the default `node-addons` and `module-sync` runtime
-conditions. A selected export target is physically resolved to an existing
-regular file that must remain owned by its declared package, so a parent cannot
-proxy files from a nested workspace or through a symlink. Relative or
+conditions. Type-only references activate TypeScript's `types` condition;
+static import/export mode follows `.mts`/`.mjs`, `.cts`/`.cjs`, the package
+module type, and explicit type-resolution attributes. Every executable export
+target in every condition is physically audited even when unreferenced. It
+must remain an existing regular file owned by its declared package, so a parent
+cannot proxy files from a nested workspace or through a symlink. Exported
+JavaScript/TypeScript and extensionless entrypoints remain in the source
+inventory even beneath ignored build-output directories. Relative or
 repository-root cross-package source imports are rejected so production code
 cannot depend on private TypeScript files that are not package API. Explicitly
 matched `dist` package roots are included; generated directories must be
@@ -42,12 +47,14 @@ broken links and repository escapes fail closed. Archive verification retains
 an independent no-symbolic-link and no-hard-link boundary.
 
 Dynamic `import()`, direct `require()`, and `module.require()` calls in every
-production workspace package must use literal module specifiers. Indirect
-`require`, computed loader properties, `createRequire` re-exports, package
-`imports` aliases, and effective TypeScript `paths` aliases in production
-package config variants and their inherited chains fail closed so dependency
-identities and packaged build inputs remain statically enforceable. Tool-only
-TypeScript configurations are outside this production-package rule.
+production workspace package must use literal module specifiers. Non-`node:`
+URL modules, indirect or computed loaders, private `Module` entrypoints,
+`createRequire`, dynamic `getBuiltinModule` access, `eval`, `Function`, and
+callable constructor-based code generation fail closed. Package `imports`
+aliases and effective TypeScript `paths` aliases in production package config
+variants and their inherited chains also fail closed so dependency identities
+and packaged build inputs remain statically enforceable. Tool-only TypeScript
+configurations are outside this production-package rule.
 
 Diagnostics name the source file or manifest, import/dependency specifier, and
 violated rule. The dependency-direction check has no legacy exemptions.

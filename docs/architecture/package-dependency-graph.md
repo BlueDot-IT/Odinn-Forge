@@ -76,14 +76,20 @@ both source references and package manifests. It enforces all of the following:
    patterns, the most-specific wildcard wins, and active conditions are
    evaluated in declaration order. Runtime imports and requires include Node
    24's default `node-addons` and `module-sync` conditions in addition to
-   `node`, `import`, or `require`; type imports retain TypeScript's `types`,
-   `node`, and `import` conditions. `default` remains the fallback condition,
+   `node`, `import`, or `require`. Static imports and exports select `import` or
+   `require` from the source extension (`.mts`/`.mjs` or `.cts`/`.cjs`) and the
+   package module type; TypeScript-only imports also activate `types` and honor
+   an explicit `resolution-mode`. `default` remains the fallback condition,
    and a selected exact or wildcard `null` target excludes the subpath.
    Inside an exports fallback array, `null`, unmatched conditions, and invalid
    targets may fall through to a later valid target as they do in Node 24.
-   The selected target is resolved physically and must be an existing regular
-   file owned by the exporting package. Broken targets, repository escapes,
-   and transitions into a separately discovered nested workspace fail closed.
+   Every syntactically executable target in every condition and fallback is
+   audited even when no current source import selects it. Concrete targets and
+   existing wildcard matches are resolved physically and must be regular files
+   owned by the exporting package. Broken targets, repository escapes, and
+   transitions into a separately discovered nested workspace fail closed.
+   Exported JavaScript/TypeScript targets under otherwise ignored build output,
+   including extensionless Node entrypoints, are added to the source inventory.
    Public subpaths such as `@odinn/kernel/browser-worker-host` and
    `@odinn/store-sqlite/memory-index` remain valid.
 7. Relative, absolute, or repository-root paths that cross a workspace package
@@ -94,12 +100,18 @@ both source references and package manifests. It enforces all of the following:
    or repository ownership. The release verifier independently rejects
    symbolic and hard links in extracted production archives.
 8. Dynamic `import()`, direct `require()`, and `module.require()` calls in
-   production workspace packages use literal specifiers. Indirect `require`
-   references and `createRequire` loaders are rejected because the checker
-   cannot soundly bind their later calls to module identities. This includes
-   statically computed `require` properties, computed destructuring, and
-   re-exports that expose `createRequire` or its containing module namespace;
-   unrelated string construction remains ordinary source text.
+   production workspace packages use literal specifiers. Non-`node:` URL
+   module specifiers are rejected, including `file:` paths whose physical
+   meaning can change through `/proc`, symlinks, or the process working
+   directory and executable `data:` modules. Indirect `require` references,
+   `createRequire`, computed or private `Module` loaders, unresolved module
+   loader properties, and runtime `getBuiltinModule("module")` access fail
+   closed. Direct or global `eval`, `Function` construction, evaluator
+   call/apply/bind forms, and callable `.constructor` code generation are also
+   rejected because their later imports cannot be bound to package identities.
+   Statically computed loader properties, computed destructuring, and
+   re-exports that expose loader authority are covered; unrelated string
+   construction and ordinary function calls remain ordinary source text.
 9. The `@odinn/*` namespace and `workspace:` dependency protocol resolve only
    to packages present in this workspace.
 10. `package.json#imports` aliases and effective TypeScript `paths` aliases in
