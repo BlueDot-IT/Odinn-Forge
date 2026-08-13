@@ -1211,6 +1211,195 @@ test("ambient module and process authority reject transformed loaders and direct
   assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
 });
 
+test("ambient process authority stays rejected across explicit capability transfers", async (t) => {
+  const hostileSources: Record<string, { output: string; source: string }> = {
+    "process-callback.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const transfer = (runtime, target) => runtime.getBuiltinModule('module')._load(target, undefined, false);",
+        "console.log(transfer(process, resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
+      ].join("\n"),
+    },
+    "process-nested-callback.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const load = (runtime, target) => runtime.getBuiltinModule('module')._load(target, undefined, false);",
+        "const pass = (runtime, callback, target) => callback(runtime, target);",
+        "console.log(pass(process, load, resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
+      ].join("\n"),
+    },
+    "process-identity-return.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const identity = (runtime) => runtime;",
+        "const runtime = identity(process);",
+        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "process-callback-call.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const transfer = (runtime, target) => runtime.getBuiltinModule('module')._load(target, undefined, false);",
+        "console.log(transfer.call(undefined, process, resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
+      ].join("\n"),
+    },
+    "process-callback-apply.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const transfer = (runtime, target) => runtime.getBuiltinModule('module')._load(target, undefined, false);",
+        "console.log(transfer.apply(undefined, [process, resolve(process.cwd(), 'apps/gateway/src/index.cjs')]));",
+      ].join("\n"),
+    },
+    "process-alias-mainmodule.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const runtime = process;",
+        "console.log(runtime.mainModule.require(resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
+      ].join("\n"),
+    },
+    "global-process-mainmodule.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "console.log(globalThis.process.mainModule.require(resolve(process.cwd(), 'apps/gateway/src/index.cjs')));",
+      ].join("\n"),
+    },
+    "process-container.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const holder = { runtime: process };",
+        "console.log(holder.runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "process-container-alias.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const holder = { runtime: process };",
+        "const runtime = holder.runtime;",
+        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "process-container-destructure.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const { runtime } = { runtime: process };",
+        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "process-spread.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const runtime = { ...process };",
+        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "process-object-assign.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const runtime = Object.assign({}, process);",
+        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "process-prototype.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const runtime = Object.setPrototypeOf({}, process);",
+        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "process-proxy.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const runtime = new Proxy(process, {});",
+        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "process-proxy-revocable.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "const { proxy: runtime } = Proxy.revocable(process, {});",
+        "console.log(runtime.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "direct-process-control.cjs": {
+      output: "gateway-cjs",
+      source: [
+        "const { resolve } = require('node:path');",
+        "console.log(process.getBuiltinModule('module')._load(resolve(process.cwd(), 'apps/gateway/src/index.cjs'), undefined, false));",
+      ].join("\n"),
+    },
+    "direct-reflect-control.mjs": {
+      output: "7",
+      source: [
+        "const HiddenFunction = Reflect.get(() => undefined, 'constructor');",
+        "console.log(HiddenFunction('return 7')());",
+      ].join("\n"),
+    },
+  };
+  const compatibleSources: Record<string, { output: string; source: string }> = {
+    "shadowed-process-control.cjs": {
+      output: "safe",
+      source: [
+        "function ordinary(process) { return process.getBuiltinModule(); }",
+        "console.log(ordinary({ getBuiltinModule: () => 'safe' }));",
+      ].join("\n"),
+    },
+    "ordinary-reflect-callback.mjs": {
+      output: "safe",
+      source: [
+        "const transfer = (get, target, key) => get(target, key);",
+        "console.log(transfer(Reflect.get, { value: 'safe' }, 'value'));",
+      ].join("\n"),
+    },
+    "nested-arguments-control.cjs": {
+      output: "safe",
+      source: [
+        "function ordinary() { return arguments[1]; }",
+        "console.log(ordinary('left', 'safe'));",
+      ].join("\n"),
+    },
+  };
+  const allSources = { ...hostileSources, ...compatibleSources };
+  const root = await repositoryFixture(t, {
+    "apps/gateway/package.json": manifest("@odinn/gateway", {
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "apps/gateway/src/index.cjs": "module.exports = 'gateway-cjs';\n",
+    "packages/host/package.json": manifest("@odinn/host", {
+      exports: { ".": "./src/index.cjs" },
+    }),
+    "packages/host/src/index.cjs": "module.exports = { host: true };\n",
+    ...Object.fromEntries(Object.entries(allSources)
+      .map(([name, { source }]) => [`packages/host/src/${name}`, `${source}\n`])),
+  });
+
+  for (const [name, { output }] of Object.entries(allSources)) {
+    assert.equal(runNodeProbe(root, `packages/host/src/${name}`), output, name);
+  }
+
+  const result = await checkFixture(root, { "@odinn/gateway": [], "@odinn/host": [] }, []);
+  const rejectedFiles = new Set(result.violations
+    .filter(({ kind, rule }) => kind === "module-loader"
+      && rule === DEPENDENCY_RULES.unsupportedModuleLoader)
+    .map(({ sourceFile }) => sourceFile.replace("packages/host/src/", "")));
+  assert.deepEqual([...rejectedFiles].sort(), Object.keys(hostileSources).sort());
+  for (const name of Object.keys(compatibleSources)) assert(!rejectedFiles.has(name), name);
+});
+
 test("runtime authority wrappers and transparent transforms cannot load forbidden code", async (t) => {
   const hostileSources: Record<string, { output: string; source: string }> = {
     "array-global.mjs": {

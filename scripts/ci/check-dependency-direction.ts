@@ -926,6 +926,7 @@ function moduleLoaderAuthorityName(name: string | undefined): boolean {
 interface ModuleLoaderRoots {
   aliases: Set<string>;
   bindings: LexicalBindings;
+  processRoots: DynamicCodeRoots;
 }
 
 function bindingExposesModuleLoader(node: ts.BindingElement, roots: ModuleLoaderRoots): boolean {
@@ -978,7 +979,7 @@ function isModuleLoaderObject(node: ts.Expression, roots: ModuleLoaderRoots): bo
       && nodeModuleSpecifier(node.arguments[0])) return true;
     if ((ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
       && propertyName(node.expression) === "getBuiltinModule"
-      && unshadowedAmbientIdentifier(unwrapExpression(node.expression.expression), "process", roots.bindings)) {
+      && processObjectTarget(node.expression.expression, roots.processRoots)) {
       return nodeModuleSpecifier(node.arguments[0]);
     }
     if ((callTargetNamed(node, "Object", "create", roots.bindings)
@@ -994,8 +995,7 @@ function isModuleLoaderObject(node: ts.Expression, roots: ModuleLoaderRoots): bo
   }
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = propertyName(node);
-    if (name === "mainModule"
-      && unshadowedAmbientIdentifier(unwrapExpression(node.expression), "process", roots.bindings)) return true;
+    if (name === "mainModule" && processObjectTarget(node.expression, roots.processRoots)) return true;
     return (name === "Module" || name === "constructor" || name === "default" || name === "prototype")
       && isModuleLoaderObject(node.expression, roots);
   }
@@ -1018,9 +1018,13 @@ function moduleLoaderCapability(node: ts.Expression, roots: ModuleLoaderRoots): 
   return false;
 }
 
-function moduleLoaderRoots(source: ts.SourceFile, bindings: LexicalBindings): ModuleLoaderRoots {
+function moduleLoaderRoots(
+  source: ts.SourceFile,
+  bindings: LexicalBindings,
+  processRoots: DynamicCodeRoots,
+): ModuleLoaderRoots {
   const aliases = new Set<string>();
-  const roots: ModuleLoaderRoots = { aliases, bindings };
+  const roots: ModuleLoaderRoots = { aliases, bindings, processRoots };
   for (const statement of source.statements) {
     if (ts.isImportDeclaration(statement) && nodeModuleSpecifier(statement.moduleSpecifier)) {
       if (statement.importClause?.name) {
@@ -1092,11 +1096,17 @@ function moduleLoaderRoots(source: ts.SourceFile, bindings: LexicalBindings): Mo
   return roots;
 }
 
+type LocalAuthorityCallback = ts.ArrowFunction | ts.FunctionDeclaration | ts.FunctionExpression;
+
 interface DynamicCodeRoots {
+  callbackAliases: Map<string, Set<LocalAuthorityCallback>>;
+  callbacks: ReadonlyMap<string, LocalAuthorityCallback>;
   evaluators: Set<string>;
   globals: Set<string>;
   proxies: Set<string>;
   processes: Set<string>;
+  processMembers: Map<string, Set<string | undefined>>;
+  processReturningCallbacks: Set<LocalAuthorityCallback>;
   reflectGets: Set<string>;
   descriptorGets: Set<string>;
   descriptorMaps: Set<string>;
@@ -1221,6 +1231,60 @@ function globalObjectTarget(node: ts.Expression, roots: DynamicCodeRoots): boole
       && globalObjectTarget(revocableCall.arguments[0], roots));
 }
 
+function processMemberNames(
+  node: ts.Expression,
+  roots: DynamicCodeRoots,
+): ReadonlySet<string | undefined> | undefined {
+  node = unwrapExpression(node);
+  if (ts.isIdentifier(node)) {
+    return roots.processMembers.get(scopedIdentifierKey(node, roots.bindings));
+  }
+  if (ts.isConditionalExpression(node)) {
+    const names = new Set<string | undefined>();
+    for (const branch of [node.whenTrue, node.whenFalse]) {
+      for (const name of processMemberNames(branch, roots) ?? []) names.add(name);
+    }
+    return names.size > 0 ? names : undefined;
+  }
+  if (ts.isBinaryExpression(node)
+    && (node.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      || node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+      || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) {
+    const names = new Set<string | undefined>();
+    for (const branch of [node.left, node.right]) {
+      for (const name of processMemberNames(branch, roots) ?? []) names.add(name);
+    }
+    return names.size > 0 ? names : undefined;
+  }
+  if (ts.isCallExpression(node)
+    && propertyName(node.expression) === "revocable"
+    && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+    && proxyTarget(node.expression.expression, roots)
+    && node.arguments[0]
+    && processObjectTarget(node.arguments[0], roots)) return new Set(["proxy"]);
+  if (!ts.isObjectLiteralExpression(node)) return undefined;
+  const names = new Set<string | undefined>();
+  for (const property of node.properties) {
+    if (ts.isPropertyAssignment(property) && processObjectTarget(property.initializer, roots)) {
+      names.add(bindingPropertyName(property.name));
+    } else if (ts.isShorthandPropertyAssignment(property)
+      && processObjectTarget(property.name, roots)) {
+      names.add(property.name.text);
+    } else if (ts.isSpreadAssignment(property)) {
+      for (const name of processMemberNames(property.expression, roots) ?? []) names.add(name);
+    }
+  }
+  return names.size > 0 ? names : undefined;
+}
+
+function processMemberTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  const names = processMemberNames(node.expression, roots);
+  if (!names) return false;
+  const name = propertyName(node);
+  return name === undefined ? names.size > 0 : names.has(name) || names.has(undefined);
+}
+
 function processObjectTarget(node: ts.Expression, roots: DynamicCodeRoots): boolean {
   node = unwrapExpression(node);
   if (ambientOrAliasTarget(node, roots.processes, new Set(["process"]), roots.bindings)) return true;
@@ -1242,9 +1306,40 @@ function processObjectTarget(node: ts.Expression, roots: DynamicCodeRoots): bool
       || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) {
     return processObjectTarget(node.left, roots) || processObjectTarget(node.right, roots);
   }
-  return (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
-    && propertyName(node) === "process"
-    && globalObjectTarget(node.expression, roots);
+  if (ts.isObjectLiteralExpression(node)) {
+    return node.properties.some((property) => (ts.isSpreadAssignment(property)
+      && processObjectTarget(property.expression, roots))
+      || (ts.isPropertyAssignment(property)
+        && bindingPropertyName(property.name) === "__proto__"
+        && processObjectTarget(property.initializer, roots)));
+  }
+  if (ts.isCallExpression(node)) {
+    if ((callTargetNamed(node, "Object", "create", roots.bindings)
+      && node.arguments[0]
+      && processObjectTarget(node.arguments[0], roots))
+      || (callTargetNamed(node, "Object", "setPrototypeOf", roots.bindings)
+        && node.arguments[1]
+        && processObjectTarget(node.arguments[1], roots))
+      || (callTargetNamed(node, "Object", "assign", roots.bindings)
+        && node.arguments.slice(1).some((argument) => processObjectTarget(argument, roots)))) return true;
+    if (localCallbackInvocations(node, roots).some(({ callback }) =>
+      roots.processReturningCallbacks.has(callback))) return true;
+  }
+  if ((ts.isCallExpression(node) || ts.isNewExpression(node))
+    && proxyTarget(node.expression, roots)
+    && Boolean(node.arguments?.[0] && processObjectTarget(node.arguments[0], roots))) return true;
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  if (processMemberTarget(node, roots)) return true;
+  if (propertyName(node) === "process" && globalObjectTarget(node.expression, roots)) return true;
+  const revocableCall = unwrapExpression(node.expression);
+  return propertyName(node) === "proxy"
+    && ts.isCallExpression(revocableCall)
+    && propertyName(revocableCall.expression) === "revocable"
+    && (ts.isPropertyAccessExpression(revocableCall.expression)
+      || ts.isElementAccessExpression(revocableCall.expression))
+    && proxyTarget(revocableCall.expression.expression, roots)
+    && Boolean(revocableCall.arguments[0]
+      && processObjectTarget(revocableCall.arguments[0], roots));
 }
 
 function objectAssignmentBinding(
@@ -1354,12 +1449,174 @@ function dynamicCodeTarget(node: ts.Expression, roots: DynamicCodeRoots): boolea
   return false;
 }
 
+function localAuthorityCallbacks(
+  source: ts.SourceFile,
+  bindings: LexicalBindings,
+): ReadonlyMap<string, LocalAuthorityCallback> {
+  const callbacks = new Map<string, LocalAuthorityCallback>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      callbacks.set(scopedIdentifierKey(node.name, bindings), node);
+    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const initializer = unwrapExpression(node.initializer);
+      if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)) {
+        callbacks.set(scopedIdentifierKey(node.name, bindings), initializer);
+      }
+    } else if (ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(node.left)) {
+      const value = unwrapExpression(node.right);
+      if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) {
+        callbacks.set(scopedIdentifierKey(node.left, bindings), value);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return callbacks;
+}
+
+function localCallbackTargets(
+  node: ts.Expression,
+  roots: DynamicCodeRoots,
+): ReadonlySet<LocalAuthorityCallback> {
+  node = unwrapExpression(node);
+  if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) return new Set([node]);
+  if (!ts.isIdentifier(node)) return new Set();
+  const key = scopedIdentifierKey(node, roots.bindings);
+  const targets = new Set(roots.callbackAliases.get(key) ?? []);
+  const direct = roots.callbacks.get(key);
+  if (direct) targets.add(direct);
+  return targets;
+}
+
+function localCallbackInvocations(
+  node: ts.CallExpression,
+  roots: DynamicCodeRoots,
+): readonly { callback: LocalAuthorityCallback; arguments: readonly ts.Expression[] }[] {
+  const invocations: { callback: LocalAuthorityCallback; arguments: readonly ts.Expression[] }[] = [];
+  const direct = localCallbackTargets(node.expression, roots);
+  for (const callback of direct) invocations.push({ callback, arguments: node.arguments });
+  if (invocations.length > 0) return invocations;
+  const target = unwrapExpression(node.expression);
+  if ((ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target))
+    && (propertyName(target) === "call" || propertyName(target) === "apply")) {
+    const callbacks = localCallbackTargets(target.expression, roots);
+    if (propertyName(target) === "call") {
+      for (const callback of callbacks) {
+        invocations.push({ callback, arguments: node.arguments.slice(1) });
+      }
+      return invocations;
+    }
+    const values = unwrapExpression(node.arguments[1] ?? ts.factory.createArrayLiteralExpression());
+    if (ts.isArrayLiteralExpression(values)
+      && values.elements.every((element) => !ts.isSpreadElement(element))) {
+      for (const callback of callbacks) {
+        invocations.push({ callback, arguments: values.elements as readonly ts.Expression[] });
+      }
+      return invocations;
+    }
+  }
+  if (callTargetNamed(node, "Reflect", "apply", roots.bindings) && node.arguments[0]) {
+    const callbacks = localCallbackTargets(node.arguments[0], roots);
+    const values = unwrapExpression(node.arguments[2] ?? ts.factory.createArrayLiteralExpression());
+    if (ts.isArrayLiteralExpression(values)
+      && values.elements.every((element) => !ts.isSpreadElement(element))) {
+      for (const callback of callbacks) {
+        invocations.push({ callback, arguments: values.elements as readonly ts.Expression[] });
+      }
+    }
+  }
+  return invocations;
+}
+
+function mergeCallbackAliases(
+  identifier: ts.Identifier,
+  value: ts.Expression,
+  roots: DynamicCodeRoots,
+): boolean {
+  const targets = localCallbackTargets(value, roots);
+  if (targets.size === 0) return false;
+  const key = scopedIdentifierKey(identifier, roots.bindings);
+  const known = roots.callbackAliases.get(key) ?? new Set<LocalAuthorityCallback>();
+  let changed = false;
+  for (const target of targets) {
+    if (!known.has(target)) {
+      known.add(target);
+      changed = true;
+    }
+  }
+  if (changed) roots.callbackAliases.set(key, known);
+  return changed;
+}
+
+function callbackReturnsProcessAuthority(
+  callback: LocalAuthorityCallback,
+  roots: DynamicCodeRoots,
+): boolean {
+  if (ts.isArrowFunction(callback) && !ts.isBlock(callback.body)) {
+    return processObjectTarget(callback.body, roots);
+  }
+  let returnsProcess = false;
+  const visit = (node: ts.Node): void => {
+    if (returnsProcess || (node !== callback && ts.isFunctionLike(node))) return;
+    if (ts.isReturnStatement(node) && node.expression && processObjectTarget(node.expression, roots)) {
+      returnsProcess = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  if (!callback.body) return false;
+  visit(callback.body);
+  return returnsProcess;
+}
+
+function mergeProcessMembers(
+  identifier: ts.Identifier,
+  value: ts.Expression,
+  roots: DynamicCodeRoots,
+): boolean {
+  const names = processMemberNames(value, roots);
+  if (!names) return false;
+  const key = scopedIdentifierKey(identifier, roots.bindings);
+  const known = roots.processMembers.get(key) ?? new Set<string | undefined>();
+  let changed = false;
+  for (const name of names) {
+    if (!known.has(name)) {
+      known.add(name);
+      changed = true;
+    }
+  }
+  if (changed) roots.processMembers.set(key, known);
+  return changed;
+}
+
+function addProcessMember(
+  target: ts.Expression,
+  name: string | undefined,
+  roots: DynamicCodeRoots,
+): boolean {
+  target = unwrapExpression(target);
+  if (!ts.isIdentifier(target)) return false;
+  const key = scopedIdentifierKey(target, roots.bindings);
+  const known = roots.processMembers.get(key) ?? new Set<string | undefined>();
+  if (known.has(name)) return false;
+  known.add(name);
+  roots.processMembers.set(key, known);
+  return true;
+}
+
 function dynamicCodeRoots(source: ts.SourceFile, bindings: LexicalBindings): DynamicCodeRoots {
+  const callbacks = localAuthorityCallbacks(source, bindings);
   const roots: DynamicCodeRoots = {
+    callbackAliases: new Map(),
+    callbacks,
     evaluators: new Set(),
     globals: new Set(),
     proxies: new Set(),
     processes: new Set(),
+    processMembers: new Map(),
+    processReturningCallbacks: new Set(),
     reflectGets: new Set(),
     descriptorGets: new Set(),
     descriptorMaps: new Set(),
@@ -1383,6 +1640,12 @@ function dynamicCodeRoots(source: ts.SourceFile, bindings: LexicalBindings): Dyn
   while (changed) {
     changed = false;
     const collectAliases = (node: ts.Node): void => {
+      if ((ts.isArrowFunction(node) || ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node))
+        && !roots.processReturningCallbacks.has(node)
+        && callbackReturnsProcessAuthority(node, roots)) {
+        roots.processReturningCallbacks.add(node);
+        changed = true;
+      }
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
         const key = scopedIdentifierKey(node.name, bindings);
         if (globalObjectTarget(node.initializer, roots) && !globals.has(key)) {
@@ -1424,6 +1687,23 @@ function dynamicCodeRoots(source: ts.SourceFile, bindings: LexicalBindings): Dyn
         ) && !descriptorMaps.has(key)) {
           descriptorMaps.add(key);
           changed = true;
+        }
+        if (mergeProcessMembers(node.name, node.initializer, roots)) changed = true;
+        if (mergeCallbackAliases(node.name, node.initializer, roots)) changed = true;
+      } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
+        && processMemberNames(node.initializer, roots)) {
+        const names = processMemberNames(node.initializer, roots)!;
+        for (const element of node.name.elements) {
+          const property = bindingPropertyName(element.propertyName)
+            ?? (ts.isIdentifier(element.name) ? element.name.text : undefined);
+          if (property !== undefined && !names.has(property) && !names.has(undefined)) continue;
+          for (const identifier of bindingIdentifiers(element.name)) {
+            const key = scopedIdentifierKey(identifier, bindings);
+            if (!processes.has(key)) {
+              processes.add(key);
+              changed = true;
+            }
+          }
         }
       } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer
         && globalObjectTarget(node.initializer, roots)) {
@@ -1505,6 +1785,28 @@ function dynamicCodeRoots(source: ts.SourceFile, bindings: LexicalBindings): Dyn
         } else if (processObjectTarget(node.right, roots) && !processes.has(key)) {
           processes.add(key);
           changed = true;
+        }
+        if (mergeProcessMembers(node.left, node.right, roots)) changed = true;
+        if (mergeCallbackAliases(node.left, node.right, roots)) changed = true;
+      } else if (ts.isBinaryExpression(node)
+        && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))
+        && processObjectTarget(node.right, roots)
+        && addProcessMember(node.left.expression, propertyName(node.left), roots)) {
+        changed = true;
+      } else if (ts.isCallExpression(node)) {
+        for (const invocation of localCallbackInvocations(node, roots)) {
+          for (let index = 0; index < invocation.callback.parameters.length; index += 1) {
+            const parameter = invocation.callback.parameters[index];
+            const argument = invocation.arguments[index];
+            if (!parameter || !argument || !ts.isIdentifier(parameter.name)) continue;
+            const key = scopedIdentifierKey(parameter.name, bindings);
+            if (processObjectTarget(argument, roots) && !processes.has(key)) {
+              processes.add(key);
+              changed = true;
+            }
+            if (mergeCallbackAliases(parameter.name, argument, roots)) changed = true;
+          }
         }
       }
       ts.forEachChild(node, collectAliases);
@@ -1641,8 +1943,8 @@ function extractImportReferences(
 ): ImportReference[] {
   const source = ts.createSourceFile(absolutePath, content, ts.ScriptTarget.Latest, true);
   const lexicalBindings = runtimeLexicalBindings(source);
-  const loaderRoots = moduleLoaderRoots(source, lexicalBindings);
   const evaluatorRoots = dynamicCodeRoots(source, lexicalBindings);
+  const loaderRoots = moduleLoaderRoots(source, lexicalBindings, evaluatorRoots);
   const commonJsSource = sourceResolutionMode(absolutePath, moduleType) === "require";
   const sourceFile = repositoryPath(repositoryRoot, absolutePath);
   const references: ImportReference[] = [];
