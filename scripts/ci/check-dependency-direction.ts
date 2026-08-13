@@ -61,6 +61,7 @@ export const DEPENDENCY_RULES = {
   executableExportTarget: "workspace exports must use statically auditable source or inert JSON targets",
   missingGraphPackage: "allowed dependency graph packages must be discovered from pnpm-workspace.yaml",
   moduleHookScript: "production workspace scripts must be closed-form typechecks or package-owned audited Node entrypoints",
+  packageBinEntrypoint: "workspace package bins must be uniquely named package-owned audited Node entrypoints",
   packageImportAlias: "package.json imports aliases are unsupported in production workspace packages",
   packageToApp: "packages and adapters cannot depend on apps",
   physicalExportTarget: "workspace exports must resolve to an existing regular file inside their package",
@@ -89,6 +90,7 @@ export type ImportKind =
   | "import-equals"
   | "import-type"
   | "manifest-dependency"
+  | "manifest-bin"
   | "manifest-export"
   | "manifest-script"
   | "module-loader"
@@ -163,6 +165,14 @@ interface ManifestScript {
   column: number;
 }
 
+interface ManifestBin {
+  command: string;
+  target: string;
+  line: number;
+  column: number;
+  shape: "entry" | "invalid" | "directories";
+}
+
 interface WorkspacePackage {
   name: string;
   kind: WorkspacePackageKind;
@@ -172,6 +182,7 @@ interface WorkspacePackage {
   moduleType: "commonjs" | "module";
   exports: unknown;
   exportTargets: readonly ManifestExportTarget[];
+  bins: readonly ManifestBin[];
   scripts: readonly ManifestScript[];
   scriptSourceFiles: ReadonlySet<string>;
   dependencies: readonly ManifestDependency[];
@@ -191,6 +202,11 @@ interface SourceInventory {
 }
 
 interface PackageExportAudit {
+  files: ReadonlySet<string>;
+  violations: readonly DependencyViolation[];
+}
+
+interface PackageBinAudit {
   files: ReadonlySet<string>;
   violations: readonly DependencyViolation[];
 }
@@ -461,6 +477,50 @@ function manifestScripts(content: string, manifest: Record<string, unknown>): Ma
       || left.name.localeCompare(right.name));
 }
 
+function manifestBins(
+  content: string,
+  manifest: Record<string, unknown>,
+  packageName: string,
+): ManifestBin[] {
+  const bins: ManifestBin[] = [];
+  const directories = manifest.directories;
+  if (directories && typeof directories === "object" && !Array.isArray(directories)
+    && Object.hasOwn(directories, "bin")) {
+    bins.push({
+      command: "<directories.bin>",
+      target: "<directories.bin>",
+      ...manifestStringLocation(content, "directories"),
+      shape: "directories",
+    });
+  }
+
+  const bin = manifest.bin;
+  if (bin === undefined) return bins;
+  if (typeof bin === "string") {
+    const command = packageName.startsWith("@") ? packageName.split("/")[1] ?? "" : packageName;
+    bins.push({ command, target: bin, ...manifestStringLocation(content, bin), shape: "entry" });
+  } else if (bin && typeof bin === "object" && !Array.isArray(bin)) {
+    for (const [command, target] of Object.entries(bin as Record<string, unknown>)) {
+      bins.push({
+        command,
+        target: typeof target === "string" ? target : "<invalid bin target>",
+        ...manifestStringLocation(content, command),
+        shape: typeof target === "string" ? "entry" : "invalid",
+      });
+    }
+  } else {
+    bins.push({
+      command: "<invalid bin declaration>",
+      target: "<invalid bin declaration>",
+      ...manifestStringLocation(content, "bin"),
+      shape: "invalid",
+    });
+  }
+  return bins.sort((left, right) => left.line - right.line
+    || left.column - right.column
+    || left.command.localeCompare(right.command));
+}
+
 function manifestScriptSourceFiles(directory: string, scripts: readonly ManifestScript[]): ReadonlySet<string> {
   const files = new Set<string>();
   for (const script of scripts) {
@@ -507,6 +567,7 @@ async function workspacePackages(repositoryRoot: string): Promise<WorkspacePacka
       moduleType: record.type === "module" ? "module" : "commonjs",
       exports: record.exports,
       exportTargets: manifestExportTargets(content, record.exports),
+      bins: manifestBins(content, record, record.name),
       scripts,
       scriptSourceFiles: manifestScriptSourceFiles(directory, scripts),
       dependencies,
@@ -759,6 +820,7 @@ function runtimeAuthorityModuleSpecifier(node: ts.Node | undefined): boolean {
 function importExposesModuleLoader(node: ts.ImportDeclaration, source: ts.SourceFile): boolean {
   if (importDeclarationIsTypeOnly(node, source)) return false;
   if (nodeProcessSpecifier(node.moduleSpecifier)) {
+    if (stringSpecifier(node.moduleSpecifier) !== "node:process") return true;
     const clause = node.importClause;
     if (!clause || clause.name || !clause.namedBindings || !ts.isNamedImports(clause.namedBindings)) return true;
     return clause.namedBindings.elements.some((element) =>
@@ -2801,6 +2863,101 @@ async function packageExportAudit(
   return { files, violations };
 }
 
+function validBinCommand(command: string): boolean {
+  if (!/^[A-Za-z\d][A-Za-z\d._-]{0,213}$/u.test(command) || command.endsWith(".")) return false;
+  const portableBase = command.split(".", 1)[0]!.toLowerCase();
+  return !/^(?:aux|con|nul|prn|com[1-9]|lpt[1-9])$/u.test(portableBase);
+}
+
+function portableBinPathSegment(segment: string): boolean {
+  if (segment === "" || segment === "." || segment === ".." || segment.endsWith(".")) return false;
+  if (segment.toLowerCase() === "bower_components" || segment.toLowerCase() === "node_modules") return false;
+  const portableBase = segment.split(".", 1)[0]!.toLowerCase();
+  return !/^(?:aux|con|nul|prn|com[1-9]|lpt[1-9])$/u.test(portableBase);
+}
+
+function normalizedBinTarget(target: string): string | undefined {
+  if (!/^\.\/[A-Za-z\d_./-]+\.(?:cjs|cts|js|jsx|mjs|mts|ts|tsx)$/u.test(target)) return undefined;
+  const segments = target.slice(2).split("/");
+  if (!segments.every(portableBinPathSegment)) return undefined;
+  return target;
+}
+
+function binSpecifier(bin: ManifestBin): string {
+  return bin.shape === "entry" ? `${bin.command} -> ${bin.target}` : bin.target;
+}
+
+async function packageBinAudit(
+  repositoryRoot: string,
+  workspacePackage: WorkspacePackage,
+  packages: readonly WorkspacePackage[],
+): Promise<PackageBinAudit> {
+  const files = new Set<string>();
+  const violations: DependencyViolation[] = [];
+  for (const bin of workspacePackage.bins) {
+    const normalizedTarget = bin.shape === "entry" && validBinCommand(bin.command)
+      ? normalizedBinTarget(bin.target)
+      : undefined;
+    let valid = normalizedTarget !== undefined;
+    let physicalTarget: string | undefined;
+    if (normalizedTarget) {
+      const lexicalTarget = resolve(workspacePackage.directory, normalizedTarget);
+      try {
+        physicalTarget = await physicalPathWithoutLinks(
+          repositoryRoot,
+          lexicalTarget,
+          `${workspacePackage.repositoryManifestPath} bin target`,
+        );
+        const metadata = await lstat(physicalTarget);
+        valid = metadata.isFile()
+          && packageForPhysicalPath(packages, physicalTarget)?.name === workspacePackage.name
+          && isPathInside(workspacePackage.physicalDirectory, physicalTarget);
+        if (valid) {
+          const firstLine = (await readFile(physicalTarget, "utf8")).split(/\r?\n/u, 1)[0];
+          valid = firstLine === "#!/usr/bin/env node";
+        }
+      } catch {
+        valid = false;
+      }
+    }
+    if (valid && physicalTarget) {
+      files.add(physicalTarget);
+    } else {
+      violations.push({
+        sourceFile: workspacePackage.repositoryManifestPath,
+        line: bin.line,
+        column: bin.column,
+        specifier: binSpecifier(bin),
+        kind: "manifest-bin",
+        rule: DEPENDENCY_RULES.packageBinEntrypoint,
+      });
+    }
+  }
+  return { files, violations };
+}
+
+function packageBinCollisionViolations(packages: readonly WorkspacePackage[]): DependencyViolation[] {
+  const commands = new Map<string, { workspacePackage: WorkspacePackage; bin: ManifestBin }[]>();
+  for (const workspacePackage of packages) {
+    for (const bin of workspacePackage.bins) {
+      if (bin.shape !== "entry" || !validBinCommand(bin.command)) continue;
+      const key = bin.command.toLowerCase();
+      const entries = commands.get(key) ?? [];
+      entries.push({ workspacePackage, bin });
+      commands.set(key, entries);
+    }
+  }
+  return [...commands.values()].filter((entries) => entries.length > 1).flatMap((entries) =>
+    entries.map(({ workspacePackage, bin }) => ({
+      sourceFile: workspacePackage.repositoryManifestPath,
+      line: bin.line,
+      column: bin.column,
+      specifier: binSpecifier(bin),
+      kind: "manifest-bin" as const,
+      rule: DEPENDENCY_RULES.packageBinEntrypoint,
+    })));
+}
+
 async function sourceViolationRule(
   repositoryRoot: string,
   sourcePackage: WorkspacePackage,
@@ -3083,6 +3240,10 @@ export async function checkDependencyDirection(
     workspacePackage.name,
     await packageExportAudit(repositoryRoot, workspacePackage, packages),
   ] as const)));
+  const binAudits = new Map(await Promise.all(packages.map(async (workspacePackage) => [
+    workspacePackage.name,
+    await packageBinAudit(repositoryRoot, workspacePackage, packages),
+  ] as const)));
   const packageFiles = await Promise.all(packages.map(async (workspacePackage) => ({
     workspacePackage,
     inventory: await sourceInventory(
@@ -3092,6 +3253,7 @@ export async function checkDependencyDirection(
         && isPathInside(workspacePackage.directory, directory))),
       new Set([
         ...(exportAudits.get(workspacePackage.name)?.files ?? []),
+        ...(binAudits.get(workspacePackage.name)?.files ?? []),
         ...workspacePackage.scriptSourceFiles,
       ]),
     ),
@@ -3133,11 +3295,13 @@ export async function checkDependencyDirection(
   );
   const sortedCandidates = [
     ...graphIntegrityViolations(packages, allowedGraph),
+    ...packageBinCollisionViolations(packages),
     ...packageManifestViolations,
     ...packageNodeModulesViolations,
     ...resolverNodeModulesViolations,
     ...await typescriptPathViolations(repositoryRoot, packages),
     ...[...exportAudits.values()].flatMap(({ violations }) => violations),
+    ...[...binAudits.values()].flatMap(({ violations }) => violations),
     ...packageFiles.flatMap(({ inventory }) => inventory.violations),
     ...sourceViolations,
   ].sort((left, right) => left.sourceFile.localeCompare(right.sourceFile)
@@ -3188,7 +3352,7 @@ export function formatDependencyViolation(violation: DependencyViolation): strin
     || violation.kind === "workspace-graph"
     || violation.kind === "workspace-package"
     ? "dependency"
-    : violation.kind === "manifest-script" || violation.kind === "module-loader"
+    : violation.kind === "manifest-bin" || violation.kind === "manifest-script" || violation.kind === "module-loader"
       || violation.kind === "typescript-path-alias"
       ? "construct"
       : violation.kind === "workspace-symlink"

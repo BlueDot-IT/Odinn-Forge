@@ -14,8 +14,10 @@ import {
 } from "../scripts/ci/check-dependency-direction.ts";
 
 interface ManifestOptions {
+  bin?: unknown;
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+  directories?: unknown;
   exports?: unknown;
   imports?: unknown;
   optionalDependencies?: Record<string, string>;
@@ -29,6 +31,8 @@ function manifest(name: string, options: ManifestOptions = {}): string {
     private: true,
     type: "module",
     exports: options.exports === undefined ? { ".": "./src/index.ts" } : options.exports,
+    ...(options.bin === undefined ? {} : { bin: options.bin }),
+    ...(options.directories === undefined ? {} : { directories: options.directories }),
     ...(options.imports === undefined ? {} : { imports: options.imports }),
     ...(options.dependencies ? { dependencies: options.dependencies } : {}),
     ...(options.devDependencies ? { devDependencies: options.devDependencies } : {}),
@@ -942,6 +946,10 @@ test("runtime Module and VM authority is rejected before capability-preserving t
     "process-forbidden-named-import.ts": [
       "import { getBuiltinModule } from 'node:process';",
       "getBuiltinModule('module');",
+    ].join("\n"),
+    "process-bare-named-import.ts": [
+      "import { cwd as currentWorkingDirectory } from 'process';",
+      "currentWorkingDirectory();",
     ].join("\n"),
     "process-namespace-import.ts": [
       "import * as runtime from 'node:process';",
@@ -2044,6 +2052,216 @@ test("production package scripts use only closed-form audited entrypoints and ty
   ]);
   assert(result.violations.some(({ sourceFile, rule }) =>
     sourceFile === "packages/host/dist/start.js" && rule === DEPENDENCY_RULES.unknownWorkspaceTarget));
+});
+
+test("package bins accept both manifest forms and audit explicit build-output entrypoints", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/string-bin/package.json": manifest("@odinn/string-tool", {
+      bin: "./src/tool.ts",
+    }),
+    "packages/string-bin/src/index.ts": "export const stringTool = true;\n",
+    "packages/string-bin/src/tool.ts": "#!/usr/bin/env node\nconsole.log('string-tool');\n",
+    "packages/object-bin/package.json": manifest("@odinn/object-bin", {
+      bin: { "object-tool": "./dist/tool.mjs" },
+    }),
+    "packages/object-bin/src/index.ts": "export const objectTool = true;\n",
+    "packages/object-bin/dist/tool.mjs": "#!/usr/bin/env node\nconsole.log('object-tool');\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/object-bin": [],
+    "@odinn/string-tool": [],
+  }, []);
+
+  assert.deepEqual(result.violations, []);
+  assert.equal(result.scannedFileCount, 4);
+});
+
+test("installed package bins cannot hide forbidden imports in ignored build output", async (t) => {
+  const root = await repositoryFixture(t, {
+    "package.json": `${JSON.stringify({ name: "bin-install-fixture", private: true }, null, 2)}\n`,
+    "apps/gateway/package.json": manifest("@odinn/gateway", {
+      exports: { ".": "./src/index.mjs" },
+    }),
+    "apps/gateway/src/index.mjs": "console.log('INSTALLED_HIDDEN_BIN_EXECUTED');\n",
+    "packages/host/package.json": manifest("@odinn/host", {
+      bin: { "host-hidden": "./dist/hidden.mjs" },
+      dependencies: { "@odinn/gateway": "workspace:*" },
+      exports: { ".": "./src/index.mjs" },
+    }),
+    "packages/host/src/index.mjs": "export const host = true;\n",
+    "packages/host/dist/hidden.mjs": "#!/usr/bin/env node\nimport '@odinn/gateway';\n",
+    "packages/consumer/package.json": manifest("@odinn/consumer", {
+      dependencies: { "@odinn/host": "workspace:*" },
+      exports: { ".": "./src/index.mjs" },
+    }),
+    "packages/consumer/src/index.mjs": "export const consumer = true;\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/consumer": ["@odinn/host"],
+    "@odinn/gateway": [],
+    "@odinn/host": ["@odinn/gateway"],
+  }, []);
+  assert(result.violations.some(({ sourceFile, kind, specifier, rule }) =>
+    sourceFile === "packages/host/dist/hidden.mjs"
+      && kind === "import-declaration"
+      && specifier === "@odinn/gateway"
+      && rule === DEPENDENCY_RULES.packageToApp));
+
+  execFileSync("pnpm", ["install", "--ignore-scripts", "--offline"], {
+    cwd: root,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  const runtime = execFileSync("pnpm", ["--filter", "@odinn/consumer", "exec", "host-hidden"], {
+    cwd: root,
+    encoding: "utf8",
+    windowsHide: true,
+  }).trim();
+  assert.equal(runtime, "INSTALLED_HIDDEN_BIN_EXECUTED");
+});
+
+test("package bins reject malformed surfaces, unsafe shebangs, and portable command collisions", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      bin: {
+        "Host-Tool": "./src/good.mjs",
+        CON: "./src/good.mjs",
+        "trailing.": "./src/good.mjs",
+        "nested/tool": "./src/good.mjs",
+        "missing-shebang": "./src/missing.mjs",
+        "env-options": "./src/env-options.mjs",
+        shell: "./src/shell.mjs",
+        traversal: "../outside.mjs",
+        encoded: "./src/%2e%2e/hidden.mjs",
+        url: "file:./src/good.mjs",
+        absolute: "/tmp/tool.mjs",
+        backslash: ".\\src\\good.mjs",
+        query: "./src/good.mjs?hidden",
+        dependency: "./node_modules/tool/index.mjs",
+        reservedPath: "./src/NUL.mjs",
+        opaque: "./src/native.node",
+        text: "./src/tool.txt",
+        extensionless: "./src/extensionless",
+        malformed: 42,
+      },
+    }),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    "packages/host/src/good.mjs": "#!/usr/bin/env node\nconsole.log('good');\n",
+    "packages/host/src/missing.mjs": "console.log('missing');\n",
+    "packages/host/src/env-options.mjs": "#!/usr/bin/env -S node --no-warnings\nconsole.log('options');\n",
+    "packages/host/src/shell.mjs": "#!/bin/sh\necho shell\n",
+    "packages/host/src/native.node": "opaque\n",
+    "packages/host/src/tool.txt": "#!/usr/bin/env node\nconsole.log('text');\n",
+    "packages/host/src/extensionless": "#!/usr/bin/env node\nconsole.log('extensionless');\n",
+    ...(process.platform === "win32" ? {} : {
+      "packages/host/src/good.mjs?hidden": "#!/usr/bin/env node\nconsole.log('query');\n",
+    }),
+    "packages/invalid-array/package.json": manifest("@odinn/invalid-array", { bin: ["./src/tool.mjs"] }),
+    "packages/invalid-array/src/index.ts": "export const invalidArray = true;\n",
+    "packages/invalid-array/src/tool.mjs": "#!/usr/bin/env node\nconsole.log('array');\n",
+    "packages/invalid-number/package.json": manifest("@odinn/invalid-number", { bin: 42 }),
+    "packages/invalid-number/src/index.ts": "export const invalidNumber = true;\n",
+    "packages/other/package.json": manifest("@odinn/other", {
+      bin: { "host-tool": "./src/tool.mjs" },
+    }),
+    "packages/other/src/index.ts": "export const other = true;\n",
+    "packages/other/src/tool.mjs": "#!/usr/bin/env node\nconsole.log('other');\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/host": [],
+    "@odinn/invalid-array": [],
+    "@odinn/invalid-number": [],
+    "@odinn/other": [],
+  }, []);
+  const binViolations = result.violations.filter(({ kind }) => kind === "manifest-bin");
+  assert.deepEqual(binViolations.map(({ sourceFile, specifier }) => ({ sourceFile, specifier })), [
+    { sourceFile: "packages/host/package.json", specifier: "Host-Tool -> ./src/good.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "CON -> ./src/good.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "trailing. -> ./src/good.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "nested/tool -> ./src/good.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "missing-shebang -> ./src/missing.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "env-options -> ./src/env-options.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "shell -> ./src/shell.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "traversal -> ../outside.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "encoded -> ./src/%2e%2e/hidden.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "url -> file:./src/good.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "absolute -> /tmp/tool.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "backslash -> .\\src\\good.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "query -> ./src/good.mjs?hidden" },
+    { sourceFile: "packages/host/package.json", specifier: "dependency -> ./node_modules/tool/index.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "reservedPath -> ./src/NUL.mjs" },
+    { sourceFile: "packages/host/package.json", specifier: "opaque -> ./src/native.node" },
+    { sourceFile: "packages/host/package.json", specifier: "text -> ./src/tool.txt" },
+    { sourceFile: "packages/host/package.json", specifier: "extensionless -> ./src/extensionless" },
+    { sourceFile: "packages/host/package.json", specifier: "<invalid bin target>" },
+    { sourceFile: "packages/invalid-array/package.json", specifier: "<invalid bin declaration>" },
+    { sourceFile: "packages/invalid-number/package.json", specifier: "<invalid bin declaration>" },
+    { sourceFile: "packages/other/package.json", specifier: "host-tool -> ./src/tool.mjs" },
+  ]);
+});
+
+test("package bin targets cannot traverse symbolic links", {
+  skip: process.platform === "win32" ? "unprivileged Windows CI cannot reliably create file symlinks" : false,
+}, async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/host/package.json": manifest("@odinn/host", {
+      bin: { "host-tool": "./src/tool.mjs" },
+    }),
+    "packages/host/src/index.ts": "export const host = true;\n",
+    "packages/host/src/real.mjs": "#!/usr/bin/env node\nconsole.log('real');\n",
+  });
+  await symlink("real.mjs", join(root, "packages/host/src/tool.mjs"), "file");
+
+  const result = await checkFixture(root, { "@odinn/host": [] }, []);
+  assert(result.violations.some(({ sourceFile, kind, specifier, rule }) =>
+    sourceFile === "packages/host/package.json"
+      && kind === "manifest-bin"
+      && specifier === "host-tool -> ./src/tool.mjs"
+      && rule === DEPENDENCY_RULES.packageBinEntrypoint));
+});
+
+test("directories.bin is rejected alone and alongside an explicit audited bin", async (t) => {
+  const root = await repositoryFixture(t, {
+    "packages/only-directory/package.json": manifest("@odinn/only-directory", {
+      directories: { bin: "./commands" },
+    }),
+    "packages/only-directory/src/index.ts": "export const onlyDirectory = true;\n",
+    "packages/only-directory/commands/hidden.mjs": "#!/usr/bin/env node\nconsole.log('hidden');\n",
+    "packages/combined/package.json": manifest("@odinn/combined", {
+      bin: { combined: "./src/tool.mjs" },
+      directories: { bin: "./commands" },
+    }),
+    "packages/combined/src/index.ts": "export const combined = true;\n",
+    "packages/combined/src/tool.mjs": "#!/usr/bin/env node\nconsole.log('combined');\n",
+    "packages/combined/commands/hidden.mjs": "#!/usr/bin/env node\nconsole.log('hidden');\n",
+  });
+
+  const result = await checkFixture(root, {
+    "@odinn/combined": [],
+    "@odinn/only-directory": [],
+  }, []);
+  assert.deepEqual(result.violations.map(({ sourceFile, kind, specifier, rule }) => ({
+    sourceFile,
+    kind,
+    specifier,
+    rule,
+  })), [
+    {
+      sourceFile: "packages/combined/package.json",
+      kind: "manifest-bin",
+      specifier: "<directories.bin>",
+      rule: DEPENDENCY_RULES.packageBinEntrypoint,
+    },
+    {
+      sourceFile: "packages/only-directory/package.json",
+      kind: "manifest-bin",
+      specifier: "<directories.bin>",
+      rule: DEPENDENCY_RULES.packageBinEntrypoint,
+    },
+  ]);
 });
 
 test("safe conditional exports, extension modes, build targets, and ordinary code remain compatible", async (t) => {

@@ -206,6 +206,19 @@ both source references and package manifests. It enforces all of the following:
     environment injection such as `NODE_OPTIONS`, shell wrappers, URLs, and
     package/repository escapes are rejected. Accepted Node entrypoints are
     added to the source inventory, including explicit build-output targets.
+13. Package executable declarations use a separate closed grammar. The
+    `package.json#bin` value may be either a string, deriving the command from
+    the package name, or an object of explicit command-to-target entries.
+    Commands use portable ASCII names, cannot collide after case folding, and
+    cannot use Windows device names. Each target is an explicit `./` path to a
+    package-owned regular JavaScript or TypeScript file, traverses no links or
+    nested package/dependency boundary, and begins with exactly
+    `#!/usr/bin/env node` without flags. Accepted targets are added to the AST
+    source inventory, including explicit `dist` entrypoints. Absolute, URL,
+    encoded, backslash, query/fragment, traversal, opaque-extension, and
+    extensionless targets fail closed. `directories.bin` is rejected because
+    it creates an open-ended executable surface that the manifest does not
+    enumerate.
 
 There are no legacy exemptions.
 

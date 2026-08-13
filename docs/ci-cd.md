@@ -63,6 +63,13 @@ package-owned audited `node ./entrypoint` without runtime options or
 `tsc -p tsconfig*.json` is accepted. Loader/preload/eval flags, `NODE_OPTIONS`,
 shell wrappers, and path escapes fail closed. Accepted Node entrypoints are
 added to the source inventory even when they live in build output.
+Package `bin` entrypoints follow the same inventory boundary through a stricter
+manifest grammar: string and object forms must name unique portable commands
+and exact package-owned JS/TS files with the canonical `#!/usr/bin/env node`
+shebang. Explicit `dist` bins are scanned; links, package escapes, ambiguous or
+opaque paths, command collisions, and non-Node shebangs fail closed.
+`directories.bin` is rejected rather than turning a directory into an
+unenumerated executable surface.
 TypeScript triple-slash path, type, and AMD dependency references are checked
 through the same boundary as imports. Package `imports`
 aliases and effective TypeScript `paths` aliases in production package config
