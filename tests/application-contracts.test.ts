@@ -927,6 +927,16 @@ test("session page contract rejects projection drift, content leakage, and incon
   assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [missingSession] }), /missing required field: title/u);
   assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [{ ...session, messages: [{ content: "not part of summary" }] }] }), /unknown field: messages/u);
   assert.throws(() => validateSessionPageV1({ ...fixture, sessions: [{ ...session, messageCount: -1 }] }), /messageCount must be a non-negative safe integer/u);
+  for (const field of ["createdAt", "updatedAt", "lastEventAt"] as const) {
+    const invalid = `NOT_A_TIMESTAMP_${field}\0SENTINEL`;
+    assert.throws(
+      () => validateSessionPageV1({ ...fixture, sessions: [{ ...session, [field]: invalid }] }),
+      (error: any) => error instanceof ApplicationContractValidationError
+        && error.code === "INVALID_APPLICATION_READ_CONTRACT"
+        && error.path === `session page.sessions[0].${field}`
+        && !error.message.includes(invalid)
+    );
+  }
   assert.throws(() => validateSessionPageV1({ sessions: fixture.sessions, nextCursor: fixture.nextCursor }), /cursor and hasMore must appear together/u);
   assert.throws(
     () => validateSessionPageV1({ ...fixture, authToken: "Bearer abcdefghijklmnop" }),

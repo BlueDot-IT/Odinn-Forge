@@ -604,7 +604,7 @@ function assertSessionPageV1(input: JsonObject): SessionPageV1 {
   objectList(input.sessions, "session page.sessions", (value, path) => {
     object(value, path, ["id", "title", "status", "createdAt", "updatedAt", "lastEventAt", "messageCount", "tags", "actor", "source", "projectId", "lastMessageRole"], ["id", "title", "status", "createdAt", "updatedAt", "lastEventAt", "messageCount", "tags", "actor", "source", "projectId"]);
     text(value.id, `${path}.id`); text(value.title, `${path}.title`, true); oneOf(value.status, `${path}.status`, ["open", "closed"]);
-    text(value.createdAt, `${path}.createdAt`, true); text(value.updatedAt, `${path}.updatedAt`, true); text(value.lastEventAt, `${path}.lastEventAt`, true);
+    timestamp(value.createdAt, `${path}.createdAt`); timestamp(value.updatedAt, `${path}.updatedAt`); timestamp(value.lastEventAt, `${path}.lastEventAt`);
     count(value.messageCount, `${path}.messageCount`); stringList(value.tags, `${path}.tags`); text(value.actor, `${path}.actor`); text(value.source, `${path}.source`); text(value.projectId, `${path}.projectId`); optionalText(value.lastMessageRole, `${path}.lastMessageRole`, true);
   });
   optionalText(input.nextCursor, "session page.nextCursor");
@@ -771,6 +771,10 @@ function optionalText(input: unknown, path: string, allowEmpty = false): void {
 
 function optionalTimestamp(input: unknown, path: string): void {
   if (input === undefined) return;
+  timestamp(input, path);
+}
+
+function timestamp(input: unknown, path: string): void {
   text(input, path);
   const value = input as string;
   const parsed = Date.parse(value);
