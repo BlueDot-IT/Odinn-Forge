@@ -15,7 +15,7 @@ import {
 export { SQLITE_AUDIT_SCHEMA_VERSION, SqliteAuditStore, auditMigrationStatus, inspectExistingSqliteAuditSchema, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
 export type { AuditIntegrityStatus, AuditPage } from "./audit.ts";
 
-export const SQLITE_SCHEMA_VERSION = 7;
+export const SQLITE_SCHEMA_VERSION = 8;
 export type SqliteStoreOptions = { targetVersion?: number };
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
@@ -499,7 +499,31 @@ const MIGRATIONS = [
   );
   CREATE INDEX IF NOT EXISTS idx_agent_graph_runs_parent ON agent_graph_runs(parent_run_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_agent_graph_runs_status ON agent_graph_runs(status, created_at);
-  CREATE INDEX IF NOT EXISTS idx_agent_graph_nodes_status ON agent_graph_nodes(status, created_at);`
+  CREATE INDEX IF NOT EXISTS idx_agent_graph_nodes_status ON agent_graph_nodes(status, created_at);`,
+  `PRAGMA defer_foreign_keys = ON;
+  CREATE TABLE agent_graph_runs_v8 (
+    id TEXT PRIMARY KEY,
+    parent_run_id TEXT NOT NULL REFERENCES runs(id),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    graph_digest TEXT NOT NULL CHECK(length(graph_digest) = 64),
+    manifests_digest TEXT NOT NULL CHECK(length(manifests_digest) = 64),
+    graph_bytes INTEGER NOT NULL CHECK(graph_bytes >= 0 AND graph_bytes <= 32768),
+    manifests_bytes INTEGER NOT NULL CHECK(manifests_bytes >= 0 AND manifests_bytes <= 32768),
+    principal_namespace TEXT NOT NULL CHECK(length(principal_namespace) = 71 AND substr(principal_namespace, 1, 7) = 'sha256:' AND substr(principal_namespace, 8) NOT GLOB '*[^0-9a-f]*'),
+    request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+    status TEXT NOT NULL CHECK(status IN ('validated', 'running', 'publishing', 'completed', 'failed', 'cancelled', 'needs-review')),
+    max_concurrency INTEGER NOT NULL CHECK(max_concurrency >= 1 AND max_concurrency <= 4),
+    max_run_ms INTEGER NOT NULL CHECK(max_run_ms > 0),
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    error_code TEXT
+  );
+  INSERT INTO agent_graph_runs_v8 SELECT * FROM agent_graph_runs;
+  DROP TABLE agent_graph_runs;
+  ALTER TABLE agent_graph_runs_v8 RENAME TO agent_graph_runs;
+  CREATE INDEX idx_agent_graph_runs_parent ON agent_graph_runs(parent_run_id, created_at);
+  CREATE INDEX idx_agent_graph_runs_status ON agent_graph_runs(status, created_at);`
 ];
 
 export class SqliteStore {
@@ -558,14 +582,19 @@ export class SqliteStore {
       throw new Error(`invalid SQLite migration target ${String(targetVersion)} from schema ${String(current)}`);
     }
     for (let version = Number(current) + 1; version <= targetVersion; version += 1) {
+      const rebuildsReferencedTables = version === 8;
+      if (rebuildsReferencedTables) this.db.exec("PRAGMA foreign_keys = OFF");
       this.db.exec("BEGIN IMMEDIATE");
       try {
         this.db.exec(MIGRATIONS[version - 1]!);
+        if (rebuildsReferencedTables && this.db.prepare("PRAGMA foreign_key_check").get()) throw new Error("runtime schema v8 migration produced invalid foreign keys");
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(version, new Date().toISOString());
         this.db.exec("COMMIT");
       } catch (error) {
         this.db.exec("ROLLBACK");
         throw error;
+      } finally {
+        if (rebuildsReferencedTables) this.db.exec("PRAGMA foreign_keys = ON");
       }
     }
   }
@@ -1010,6 +1039,7 @@ export class RunLedger {
     manifestsBytes,
     principalNamespace,
     requestDigest,
+    maxConcurrency = 1,
     maxRunMs,
     nodes
   }: {
@@ -1021,20 +1051,22 @@ export class RunLedger {
     manifestsBytes: number;
     principalNamespace: string;
     requestDigest: string;
+    maxConcurrency?: number;
     maxRunMs: number;
     nodes: readonly { nodeId: string; manifestId: string; manifestDigest: string; inputRef: string; inputDigest: string; resultRef: string; dependsOn: readonly string[] }[];
   }) {
     if (!/^[a-f0-9]{64}$/u.test(graphDigest) || !/^[a-f0-9]{64}$/u.test(manifestsDigest) || !/^[a-f0-9]{64}$/u.test(requestDigest)) throw new Error("agent graph digests must be lowercase SHA-256 values");
     if (!Number.isSafeInteger(graphBytes) || graphBytes < 0 || graphBytes > 32_768 || !Number.isSafeInteger(manifestsBytes) || manifestsBytes < 0 || manifestsBytes > 32_768) throw new Error("agent graph byte metadata is invalid");
     if (!Number.isSafeInteger(maxRunMs) || maxRunMs < 1 || maxRunMs > 300_000) throw new Error("agent graph maxRunMs is invalid");
+    if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 4) throw new Error("agent graph maxConcurrency is invalid");
     if (typeof principalNamespace !== "string" || !principalNamespace || Buffer.byteLength(principalNamespace, "utf8") > 256) throw new Error("agent graph principal metadata is invalid");
     const durablePrincipalNamespace = /^sha256:[a-f0-9]{64}$/u.test(principalNamespace)
       ? principalNamespace
       : `sha256:${digest(principalNamespace)}`;
     return this.database.transaction((db) => {
-      const existing = db.prepare("SELECT graph_digest, manifests_digest, request_digest, max_run_ms FROM agent_graph_runs WHERE id = ?").get(graphRunId) as SqlRow | undefined;
+      const existing = db.prepare("SELECT graph_digest, manifests_digest, request_digest, max_concurrency, max_run_ms FROM agent_graph_runs WHERE id = ?").get(graphRunId) as SqlRow | undefined;
       if (existing) {
-        if (String(existing.graph_digest) !== graphDigest || String(existing.manifests_digest) !== manifestsDigest || String(existing.request_digest) !== requestDigest || Number(existing.max_run_ms) !== maxRunMs) {
+        if (String(existing.graph_digest) !== graphDigest || String(existing.manifests_digest) !== manifestsDigest || String(existing.request_digest) !== requestDigest || Number(existing.max_concurrency) !== maxConcurrency || Number(existing.max_run_ms) !== maxRunMs) {
           const error = new Error(`agent graph run ${graphRunId} conflicts with an existing durable request`) as Error & { code?: string };
           error.code = "AGENT_GRAPH_IDEMPOTENCY_CONFLICT";
           throw error;
@@ -1045,8 +1077,8 @@ export class RunLedger {
       const now = new Date().toISOString();
       db.prepare(`INSERT INTO agent_graph_runs
         (id, parent_run_id, schema_version, graph_digest, manifests_digest, graph_bytes, manifests_bytes, principal_namespace, request_digest, status, max_concurrency, max_run_ms, created_at)
-        VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'validated', 1, ?, ?)`).run(
-        graphRunId, parentRunId, graphDigest, manifestsDigest, graphBytes, manifestsBytes, durablePrincipalNamespace, requestDigest, maxRunMs, now
+        VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'validated', ?, ?, ?)`).run(
+        graphRunId, parentRunId, graphDigest, manifestsDigest, graphBytes, manifestsBytes, durablePrincipalNamespace, requestDigest, maxConcurrency, maxRunMs, now
       );
       const insertNode = db.prepare(`INSERT INTO agent_graph_nodes
         (graph_run_id, node_id, manifest_id, manifest_digest, input_ref, input_digest, result_ref, status, created_at)
@@ -1109,7 +1141,16 @@ export class RunLedger {
       if (["completed", "failed", "cancelled", "needs-review", "blocked"].includes(currentStatus) || ["publishing", "completed", "failed", "cancelled", "needs-review"].includes(String(row.graph_status))) {
         return { graphRunId, nodeId, status: currentStatus, ignored: true };
       }
-      if (currentStatus === "queued") return { graphRunId, nodeId, status: currentStatus, ignored: true, stale: true };
+      if (currentStatus === "queued") {
+        const isPreDispatchSettlement = ["blocked", "cancelled"].includes(status)
+          && !nodeCallId && !requestDigest && !executionRunId && !executionAttemptId && !resultDigest && !auditRef
+          && (!resultRef || String(row.result_ref) === resultRef);
+        if (!isPreDispatchSettlement) return { graphRunId, nodeId, status: currentStatus, ignored: true, stale: true };
+        const now = new Date().toISOString();
+        db.prepare("UPDATE agent_graph_nodes SET status=?, error_code=COALESCE(?, error_code), settled_at=? WHERE graph_run_id=? AND node_id=? AND status='queued'")
+          .run(status, errorCode ?? null, now, graphRunId, nodeId);
+        return { graphRunId, nodeId, status, settledAt: now };
+      }
       if (currentStatus !== "running") throw new Error(`agent graph node ${graphRunId}/${nodeId} cannot settle from ${currentStatus}`);
       if (!nodeCallId || String(row.node_call_id) !== nodeCallId || !requestDigest || String(row.request_digest) !== requestDigest
         || !executionRunId || String(row.execution_run_id) !== executionRunId

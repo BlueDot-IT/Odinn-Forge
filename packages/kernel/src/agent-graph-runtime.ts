@@ -13,6 +13,10 @@ import {
 
 export const AGENT_GRAPH_TOOL = "agent.delegate" as const;
 export const AGENT_GRAPH_REGISTRY_REF = "registry:agent-runner.v1" as const;
+export const AGENT_RUNTIME_REGISTRY_PREFIX = "registry:agent." as const;
+
+const MAX_LIVE_AGENT_GRAPH_NODES = 8;
+const MAX_LIVE_AGENT_GRAPH_CONCURRENCY = 4;
 
 const CHILD_TOOL_ALLOWLIST = new Set([
   "job.healthcheck",
@@ -68,6 +72,7 @@ export type AgentGraphExecutorOptions = {
       manifestsBytes: number;
       principalNamespace: string;
       requestDigest: string;
+      maxConcurrency: number;
       maxRunMs: number;
       nodes: readonly { nodeId: string; manifestId: string; manifestDigest: string; inputRef: string; inputDigest: string; resultRef: string; dependsOn: readonly string[] }[];
     }): void | Promise<void>;
@@ -172,6 +177,16 @@ function graphInputs(input: AgentGraphTaskInput, graphNodes: readonly { inputRef
   return result;
 }
 
+function runtimeAgentId(registryRef: string): string | undefined {
+  if (registryRef === AGENT_GRAPH_REGISTRY_REF) return undefined;
+  if (!registryRef.startsWith(AGENT_RUNTIME_REGISTRY_PREFIX)) {
+    throw new Error(`live child dispatch requires ${AGENT_GRAPH_REGISTRY_REF} or ${AGENT_RUNTIME_REGISTRY_PREFIX}<id>`);
+  }
+  const agentId = registryRef.slice(AGENT_RUNTIME_REGISTRY_PREFIX.length);
+  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/u.test(agentId)) throw new Error("live child registry reference has an invalid runtime agent id");
+  return agentId;
+}
+
 async function append(options: AgentGraphExecutorOptions, type: string, payload: JsonObject) {
   const auditType = type === "agent-graph-validated" ? "agent.graph.validated"
     : type === "agent-graph-node-dispatch" ? "agent.graph.node.started"
@@ -224,17 +239,15 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
   // projection, receipt, or graph result may carry the raw principal.
   const principalNamespaceInput = normalizeAgentPrincipalNamespace(input?.principalNamespace);
   const principalNamespace = `sha256:${digestAgentRunValue(principalNamespaceInput)}`;
-  if (graph.nodes.length !== 1 || manifests.length !== 1) {
-    throw new Error("the active agent graph profile permits exactly one read-only child node");
+  if (graph.nodes.length > MAX_LIVE_AGENT_GRAPH_NODES || manifests.length > MAX_LIVE_AGENT_GRAPH_NODES) {
+    throw new Error(`the active agent graph profile permits at most ${MAX_LIVE_AGENT_GRAPH_NODES} child nodes and manifests`);
   }
-  if (input.maxConcurrency !== undefined && input.maxConcurrency !== 1) {
-    throw new Error("the active agent graph profile permits maxConcurrency=1 only");
+  if (input.maxConcurrency !== undefined && (!Number.isSafeInteger(input.maxConcurrency) || input.maxConcurrency < 1 || input.maxConcurrency > MAX_LIVE_AGENT_GRAPH_CONCURRENCY)) {
+    throw new Error(`the active agent graph profile permits maxConcurrency from 1 to ${MAX_LIVE_AGENT_GRAPH_CONCURRENCY}`);
   }
   const inputs = graphInputs(input, graph.nodes);
-  if (manifests.some((manifest) => manifest.registryRef !== AGENT_GRAPH_REGISTRY_REF)) {
-    throw new Error(`live child dispatch requires ${AGENT_GRAPH_REGISTRY_REF}`);
-  }
   for (const manifest of manifests) {
+    runtimeAgentId(manifest.registryRef);
     if (!manifest.requestedTools.length) throw new Error(`manifest ${manifest.id} must request at least one read-only tool`);
     for (const toolName of manifest.requestedTools) {
       if (!CHILD_TOOL_ALLOWLIST.has(toolName)) throw new Error(`manifest ${manifest.id} requests a non-read-only tool`);
@@ -247,6 +260,8 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
     });
   }
   const manifestsById = new Map(manifests.map((manifest) => [manifest.id, manifest]));
+  const usedManifestIds = new Set(graph.nodes.map((node) => node.manifestId));
+  for (const manifest of manifests) if (!usedManifestIds.has(manifest.id)) throw new Error(`manifest ${manifest.id} is not used by the graph`);
   for (const node of graph.nodes) {
     const manifest = manifestsById.get(node.manifestId);
     if (!manifest || manifest.manifestDigest !== node.manifestDigest) throw new Error(`node ${node.id} manifest identity does not match`);
@@ -263,7 +278,7 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
     graphDigest: graph.graphDigest,
     manifestsDigest,
     principalNamespace,
-    maxConcurrency: input.maxConcurrency ?? 1,
+    maxConcurrency: input.maxConcurrency ?? Math.min(graph.nodes.length, MAX_LIVE_AGENT_GRAPH_CONCURRENCY),
     maxRunMs: input.maxRunMs ?? 300_000,
     inputDigests
   });
@@ -279,6 +294,7 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
         // Durable graph state retains a digest marker, never the principal.
         principalNamespace,
         requestDigest: graphRequestDigest,
+        maxConcurrency: input.maxConcurrency ?? Math.min(graph.nodes.length, MAX_LIVE_AGENT_GRAPH_CONCURRENCY),
         maxRunMs: input.maxRunMs ?? 300_000,
         nodes: graph.nodes.map((node) => ({
           nodeId: node.id,
@@ -402,10 +418,11 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
     }
     let childResult: any;
     try {
+      const agentId = runtimeAgentId(manifest.registryRef);
       childResult = await options.runChild({
         id: childId,
         tool: "agent.run",
-        input: resolved,
+        input: { ...resolved, ...(agentId ? { agentId } : {}) },
         actor: `child-agent:${request.principalNamespace}`,
         reason: `agent-graph:${request.graphRunId}:${request.nodeId}`,
         registry: registries.execution,
@@ -463,7 +480,7 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
       graph,
       manifests,
       parentCapabilities: options.parentCapabilities,
-      maxConcurrency: input.maxConcurrency,
+      maxConcurrency: input.maxConcurrency ?? Math.min(graph.nodes.length, MAX_LIVE_AGENT_GRAPH_CONCURRENCY),
       maxRunMs: input.maxRunMs,
       signal: options.signal
     });

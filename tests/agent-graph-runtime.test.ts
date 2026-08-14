@@ -91,6 +91,42 @@ test("live graph dispatch validates capabilities, owns child registry scope, and
   assert.equal(JSON.stringify(events).includes("PRIVATE_CHILD"), false);
 });
 
+test("live graph dispatch runs multiple installed agent identities with bounded concurrency", async () => {
+  const manifests = ["researcher", "reviewer"].map((agentId, index) => {
+    const value = { ...manifest(), id: agentId, revision: index + 1, registryRef: `registry:agent.${agentId}`, defaultTimeoutMs: 1_000 };
+    return { ...value, manifestDigest: digest({ ...value, requestedTools: [...value.requestedTools].sort(), requestedCapabilities: [...value.requestedCapabilities].sort() }) };
+  });
+  const graphInput = {
+    schemaVersion: 1,
+    id: "multi-agent",
+    nodes: manifests.map((item, index) => ({
+      id: `node-${index + 1}`, manifestId: item.id, manifestDigest: item.manifestDigest,
+      inputRef: `input:${item.id}`, resultRef: `result:${item.id}`, dependsOn: []
+    }))
+  };
+  let active = 0;
+  let peak = 0;
+  const agentIds: string[] = [];
+  const report = await executeAgentGraph({
+    graph: JSON.stringify(graphInput), manifests: JSON.stringify(manifests), principalNamespace: "operator",
+    inputs: { "input:researcher": { prompt: "research" }, "input:reviewer": { prompt: "review" } }, maxConcurrency: 2
+  }, {
+    registry: new Map([["agent.run", { execute: async () => undefined }], ["text.echo", { execute: async () => undefined }]]),
+    policy: createDefaultPolicy(), parentCapabilities: createDefaultPolicy().allowedCapabilities, runId: "multi-agent-job",
+    runChild: async (task: any) => {
+      agentIds.push(task.input.agentId);
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setImmediate(resolve));
+      active -= 1;
+      return { ok: true, output: { content: "done" } };
+    }
+  });
+  assert.equal(report.status, "completed");
+  assert.deepEqual(agentIds.sort(), ["researcher", "reviewer"]);
+  assert.equal(peak, 2);
+});
+
 test("graph dispatch rejects capability escalation and unsupported registry claims", async () => {
   const manifestInput = manifest(["web.fetch"], ["network.access"]);
   const normalizedManifest = {

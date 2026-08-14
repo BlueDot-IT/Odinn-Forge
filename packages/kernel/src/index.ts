@@ -100,9 +100,9 @@ export { SqliteRecordStore } from "@odinn/store-sqlite";
 export { SqliteOperatorReadStore, SqliteWorkflowStore } from "@odinn/store-sqlite";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
-export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, validateAgentManifest } from "./agents.ts";
+export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, provisionRuntimeAgent, validateAgentManifest } from "./agents.ts";
 export type { AgentManifest } from "./agents.ts";
-export { AGENT_GRAPH_REGISTRY_REF, AGENT_GRAPH_TOOL, executeAgentGraph } from "./agent-graph-runtime.ts";
+export { AGENT_GRAPH_REGISTRY_REF, AGENT_GRAPH_TOOL, AGENT_RUNTIME_REGISTRY_PREFIX, executeAgentGraph } from "./agent-graph-runtime.ts";
 export type { AgentGraphExecutorOptions, AgentGraphTaskInput } from "./agent-graph-runtime.ts";
 
 
@@ -1001,8 +1001,9 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   else messages.unshift({ role: "system", content: systemMessage });
   if (recalled.memories.length) messages.splice(1, 0, { role: "system", content: formatMemoryContext(recalled.memories) });
   const maxTurns = Math.min(Math.max(Number(input.maxTurns) || 6, 1), 8);
+  const declaredTools = new Set(agent.manifest.tools);
   const availableTools = modelVisibleAgentToolSchemas(registry).filter((schema: any) => {
-    return policyAllows(schema.function.name);
+    return policyAllows(schema.function.name) && (agent.manifest.primary || declaredTools.has(schema.function.name));
   });
   let aggregateUsage;
   let toolRepairUsed = false;

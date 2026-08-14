@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/teams/src/index.ts";
-import { createApprovalStore, createRunLedger } from "../packages/kernel/src/index.ts";
+import { createApprovalStore, createRunLedger, loadAgent } from "../packages/kernel/src/index.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
@@ -945,6 +945,28 @@ test("gateway backs cron, Agent SDK packages, skills, and workshop with persiste
     assert.equal((await postJson(`${base}/agents/validate`, manifest)).manifest.validation.valid, true);
     assert.equal((await postJson(`${base}/agents`, manifest)).agent.status, "disabled");
     assert.equal((await postJson(`${base}/agents/fixture-agent/lifecycle`, { action: "enable" })).agent.status, "enabled");
+
+    const runtimeManifest = {
+      sdkVersion: "1.0", id: "researcher", version: "1.0.0", name: "Researcher", kind: "runtime", primary: false,
+      identity: { files: ["IDENTITY.md", "SOUL.md"] }, tools: ["web.search"], model: { default: "", fallbacks: [] }
+    };
+    assert.equal((await postJson(`${base}/agents`, runtimeManifest)).agent.status, "disabled");
+    await assert.rejects(() => loadAgent(stateDir, "researcher"), /not enabled/u);
+    assert.equal((await postJson(`${base}/agents/researcher/lifecycle`, { action: "enable" })).agent.status, "enabled");
+    const runtimeAgent = await loadAgent(stateDir, "researcher");
+    assert.equal(runtimeAgent.manifest.id, "researcher");
+    assert.deepEqual(runtimeAgent.manifest.tools, ["web.search"]);
+    await postJson(`${base}/agents/researcher/lifecycle`, { action: "quarantine" });
+    await assert.rejects(() => loadAgent(stateDir, "researcher"), /not enabled/u);
+
+    const concurrentRuntime = { ...runtimeManifest, id: "concurrent-runtime", name: "Concurrent Runtime" };
+    await Promise.all([
+      postJson(`${base}/agents`, { ...concurrentRuntime, version: "1.0.0" }),
+      postJson(`${base}/agents`, { ...concurrentRuntime, version: "1.1.0" })
+    ]);
+    await postJson(`${base}/agents/concurrent-runtime/lifecycle`, { action: "enable" });
+    const concurrentAgent = await loadAgent(stateDir, "concurrent-runtime");
+    assert.ok(["1.0.0", "1.1.0"].includes(concurrentAgent.manifest.version));
 
     const skills = await getJson(`${base}/skills`);
     assert.ok(skills.skills.some((skill: any) => skill.name === "fixture-skill"));
