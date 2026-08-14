@@ -4,14 +4,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
-import { createRunId, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
+import { createRunId, isEmailTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isAllowedCredentialEnvironmentKey, isCredentialEnvironmentName, isPhysicalPathInside, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile, ParsedEnvironmentFiles } from "./environment.ts";
-export { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
-export type { LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
+export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+export type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool, LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, DarwinRouter, OdinnRuntimeError, Sentinel } from "./differentiated-runtime.ts";
@@ -22,7 +22,9 @@ import { appendSessionMessage, assignSessionProject, createGoal, createProject, 
 import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryCandidate, forgetMemory, formatMemoryContext, learnFromConversation, listMemoryCandidates, normalizeMemoryOptions, openMemory, recallMemory, remember, searchMemory, suggestMemory } from "./memory.ts";
 import { approvalActionForExecution, createApprovalStore, isApprovalStoreContentionError, normalizeApprovalExecutionInput } from "./approvals.ts";
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
-import { browserAction, browserOpen, browserRecoveryResolve, browserRecoveryStatus, browserSnapshot, browserTabs, closeBrowserManagers } from "./browser.ts";
+import { closeBrowserManagers } from "./browser.ts";
+import { browserHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+import type { EmailReadProvider } from "./email.ts";
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
@@ -48,6 +50,12 @@ export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
 export { ProcessSupervisor, ProcessRecoveryError, createProcessExecutionDescriptor, digestProcessValue, reconcileProcessRecovery } from "./process-supervisor.ts";
 export type { ProcessExecutionDescriptor, ProcessExecutionSession, ProcessRecoveryAdapter, ProcessRecoveryPhase, ProcessRecoveryRecord, ProcessPresence, ProcessSupervisorOptions } from "./process-supervisor.ts";
 export { ExtensionRegistry, ExtensionExecutor, extensionIdentityFingerprint, resolveConfiguredOciBackend } from "./extensions.ts";
+export { PLUGIN_CONTRACT_SCHEMA_VERSION, pluginIdentityFingerprint, validatePluginManifest } from "./plugin-contracts.ts";
+export type { PluginKind, PluginManifest, PluginRuntime, PluginToolContract, PluginToolIdempotency } from "./plugin-contracts.ts";
+export { captureComputerScreen } from "./computer.ts";
+export type { ComputerScreenCaptureRequest, ComputerScreenProvider, ComputerScreenResult, ComputerScreenTarget } from "./computer.ts";
+export { listEmailAccounts, readEmail, searchEmail, threadEmail } from "./email.ts";
+export type { EmailAccount, EmailAttachment, EmailMessage, EmailMessageSummary, EmailProviderHealth, EmailProviderTarget, EmailReadProvider, EmailSearchResponse, EmailThreadResponse } from "./email.ts";
 export { DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, normalizeSandboxConfig, summarizeSandboxRisk, validateSandboxConfig } from "./sandbox-config.ts";
 export type { SandboxConfig, SandboxConfigInput, SandboxRiskSummary } from "./sandbox-config.ts";
 export { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, attestContainerConfiguration, buildNetworkDeniedOciArgs, compileSandboxProfile, detectOciBackend, probeOciBackend, reconcileSandboxRecovery, selectOciBackend, validateDigestPinnedOciImage, validateTrustedOciExecutable } from "./sandbox-backend.ts";
@@ -122,7 +130,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -269,59 +277,6 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
       description: "Fetch and extract readable content from a public web page.",
       inputSchema: { type: "object", properties: { url: { type: "string" }, maxChars: { type: "integer" } }, required: ["url"] },
       execute: async (input: any, context: any) => withWebRequestSlot(() => fetchWebPage(input, context.policy?.security?.web, resolveNetworkAddresses))
-    }],
-    ["browser.tabs", {
-      capability: "browser.read",
-      description: "List tabs in Ódinn Forge's persistent browser profile.",
-      inputSchema: { type: "object", properties: {} },
-      execute: async (_input: any, context: any) => browserTabs(stateDir, context.policy?.security?.browser)
-    }],
-    ["browser.open", {
-      capability: "browser.read",
-      description: "Open a URL and return its title, URL, visible text, links, and snapshot id. Use browser.snapshot only after the page changes.",
-      inputSchema: { type: "object", properties: { url: { type: "string" }, tabId: { type: "string" } }, required: ["url"] },
-      execute: async (input: any, context: any) => browserOpen(stateDir, input, context.policy?.security?.browser, resolveNetworkAddresses)
-    }],
-    ["browser.snapshot", {
-      capability: "browser.read",
-      description: "Read the visible page, title, and links from a browser tab.",
-      inputSchema: { type: "object", properties: { tabId: { type: "string" } } },
-      execute: async (input: any, context: any) => browserSnapshot(stateDir, input, context.policy?.security?.browser)
-    }],
-    ["browser.click", {
-      capability: "browser.act",
-      capabilityApprovalContinuation: "browser-policy",
-      approvalInputNoopKeys: ["confirmed", "approvalId"],
-      description: "Click a browser control after explicit user approval.",
-      inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.click", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor, signal: context.signal })
-    }],
-    ["browser.type", {
-      capability: "browser.act",
-      capabilityApprovalContinuation: "browser-policy",
-      approvalInputNoopKeys: ["confirmed", "approvalId"],
-      description: "Fill a browser field after explicit user approval.",
-      inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.type", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor, signal: context.signal })
-    }],
-    ["browser.press", {
-      capability: "browser.act",
-      capabilityApprovalContinuation: "browser-policy",
-      approvalInputNoopKeys: ["confirmed", "approvalId"],
-      description: "Press a browser key after explicit user approval.",
-      inputSchema: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] },
-      execute: async (input: any, context: any) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser, { approvalId: context.trustedApprovalId, approvalContinuation: context.trustedApprovalContinuation, runId: context.trustedApprovalRunId ?? context.request.id, actor: context.request?.actor, signal: context.signal })
-    }],
-    ["browser.recovery.status", {
-      capability: "browser.read",
-      description: "Inspect unresolved browser mutations after a crash, tab loss, or uncertain action outcome.",
-      inputSchema: { type: "object", properties: {} },
-      execute: async () => browserRecoveryStatus(stateDir)
-    }],
-    ["browser.recovery.resolve", {
-      capability: "browser.act",
-      description: "Resolve an uncertain browser mutation after operator inspection.",
-      execute: async (input: any) => browserRecoveryResolve(stateDir, input)
     }],
     ["agent.run", {
       capability: "agent.run",
@@ -880,12 +835,101 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
       }
     });
   }
+  registerHostCapabilityPlugin(registry, browserHostCapabilityPlugin, {
+    stateDir,
+    approvalStore,
+    resolveNetworkAddresses
+  });
+  let closeComputerScreen = () => {};
+  if (enableComputerScreen === true && computerScreenProvider) {
+    let active = true;
+    const guardedComputerScreenProvider = {
+      get target() {
+        if (!active) throw new Error("computer screen provider is closed");
+        return computerScreenProvider.target;
+      },
+      capture(request: any) {
+        if (!active) throw new Error("computer screen provider is closed");
+        return computerScreenProvider.capture(request);
+      }
+    };
+    registerHostCapabilityPlugin(registry, computerScreenHostCapabilityPlugin, {
+      stateDir,
+      approvalStore,
+      computerScreenProvider: guardedComputerScreenProvider
+    });
+    closeComputerScreen = () => {
+      if (!active) return;
+      active = false;
+      const close = computerScreenProvider.close;
+      if (typeof close === "function") {
+        try {
+          const result = close.call(computerScreenProvider);
+          if (result && typeof result.then === "function") void result.catch(() => undefined);
+        } catch {
+          // Provider shutdown is best-effort; the guarded provider is already closed.
+        }
+      }
+    };
+  }
+  let closeEmailRead = () => {};
+  if (enableEmail === true && emailReadProvider) {
+    let active = true;
+    const guardedEmailReadProvider: EmailReadProvider = {
+      get target() {
+        if (!active) throw new Error("email provider is closed");
+        return emailReadProvider.target;
+      },
+      accounts(request) {
+        if (!active) throw new Error("email provider is closed");
+        return emailReadProvider.accounts.call(emailReadProvider, request);
+      },
+      search(request) {
+        if (!active) throw new Error("email provider is closed");
+        return emailReadProvider.search.call(emailReadProvider, request);
+      },
+      read(request) {
+        if (!active) throw new Error("email provider is closed");
+        return emailReadProvider.read.call(emailReadProvider, request);
+      },
+      thread(request) {
+        if (!active) throw new Error("email provider is closed");
+        return emailReadProvider.thread.call(emailReadProvider, request);
+      },
+      ...(typeof emailReadProvider.health === "function" ? {
+        health(request: { signal?: AbortSignal }) {
+          if (!active) throw new Error("email provider is closed");
+          return emailReadProvider.health!.call(emailReadProvider, request);
+        }
+      } : {})
+    };
+    registerHostCapabilityPlugin(registry, emailReadHostCapabilityPlugin, {
+      stateDir,
+      approvalStore,
+      emailReadProvider: guardedEmailReadProvider
+    });
+    closeEmailRead = () => {
+      if (!active) return;
+      active = false;
+      const close = emailReadProvider.close;
+      if (typeof close === "function") {
+        try {
+          const result = close.call(emailReadProvider);
+          if (result && typeof result.then === "function") void result.catch(() => undefined);
+        } catch {
+          // Provider shutdown is best-effort; the guarded provider is already closed.
+        }
+      }
+    };
+  }
   let closed = false;
   Object.defineProperty(registry, "close", {
     enumerable: false,
     value: () => {
       if (closed) return;
       closed = true;
+      closeComputerScreen();
+      closeEmailRead();
       void ownedMcpRuntime?.close();
       recordStore.close();
     }
@@ -1377,10 +1421,11 @@ async function consumeClaimedApprovalContinuation({
 
 function taskRequestDigest(request: any, tool?: AnyRecord): string {
   const requestInput = canonicalTaskInput(request.tool, request.input, tool);
-  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke"
+  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke" || isEmailTool(request.tool)
     ? projectDurableToolInput(request.tool, requestInput)
     : requestInput;
-  return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown" })).digest("hex");
+  const resource = request.tool === "computer.screen" || isEmailTool(request.tool) ? executionResourceForRequest(request.tool, requestInput, tool) : undefined;
+  return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown", ...(resource ? { resource } : {}) })).digest("hex");
 }
 
 function supportsCapabilityApprovalContinuation(tool: AnyRecord, policy: RuntimePolicy): boolean {
@@ -1759,7 +1804,7 @@ async function executeTaskThroughAdmission({
       capabilities: tool?.capabilities ?? [],
       ok: true,
       replayed: true,
-      ...(isWorkspaceContentTool(request.tool) ? { contentUnavailableOnReplay: true } : {}),
+      ...(isWorkspaceContentTool(request.tool) || isReplayUnavailableTool(request.tool) ? { contentUnavailableOnReplay: true } : {}),
       output: completed?.data?.output
     };
   }

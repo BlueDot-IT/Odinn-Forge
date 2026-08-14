@@ -89,9 +89,19 @@ const SKILL_HYDRATE_TOOLS = new Set(["skill.hydrate"]);
 const SKILL_LIFECYCLE_TOOLS = new Set(["skill.install", "skill.lifecycle"]);
 const MCP_DISCOVER_TOOLS = new Set(["mcp.discover"]);
 const MCP_INVOKE_TOOLS = new Set(["mcp.invoke"]);
+const EMAIL_TOOLS = new Set(["email.accounts", "email.search", "email.read", "email.thread"]);
+const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", ...EMAIL_TOOLS]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
+}
+
+export function isEmailTool(toolName: unknown): boolean {
+  return typeof toolName === "string" && EMAIL_TOOLS.has(toolName);
+}
+
+export function isReplayUnavailableTool(toolName: unknown): boolean {
+  return typeof toolName === "string" && REPLAY_UNAVAILABLE_TOOLS.has(toolName);
 }
 
 /**
@@ -108,6 +118,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleInput(input);
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverInput(input);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeInput(input);
+  if (EMAIL_TOOLS.has(toolName)) return projectEmailInput(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
   if (typeof projected.before === "string") {
@@ -133,6 +144,8 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleOutput(output);
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverOutput(output);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeOutput(output);
+  if (EMAIL_TOOLS.has(toolName)) return projectEmailOutput(toolName, output);
+  if (REPLAY_UNAVAILABLE_TOOLS.has(toolName)) return projectComputerScreenOutput(output);
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
   const record = output as JsonObject;
   if (toolName === "workspace.read" || toolName === "workspace.readText") {
@@ -161,6 +174,119 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
     return pickWorkspaceMetadata(record, ["path", "resolvedPath", "type", "binary", "bytes", "modifiedAt", "mode", "digest", "digestComplete"]);
   }
   return output;
+}
+
+function projectComputerScreenOutput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { type: "computer.screen", contentUnavailableOnReplay: true };
+  const record = value as JsonObject;
+  const target = record.target && typeof record.target === "object" && !Array.isArray(record.target) ? record.target as JsonObject : {};
+  const projected: JsonObject = {
+    type: "computer.screen",
+    contentUnavailableOnReplay: true
+  };
+  for (const key of ["frameId", "capturedAt"] as const) {
+    if (typeof record[key] === "string" && record[key].length <= 256) projected[key] = record[key];
+  }
+  const nodeId = typeof target.nodeId === "string" && target.nodeId.length <= 128 ? target.nodeId : undefined;
+  const displayId = typeof target.displayId === "string" && target.displayId.length <= 128 ? target.displayId : undefined;
+  if (nodeId !== undefined && displayId !== undefined) projected.target = { nodeId, displayId };
+  for (const key of ["width", "height"] as const) {
+    if (Number.isSafeInteger(record[key]) && Number(record[key]) > 0) projected[key] = record[key];
+  }
+  if (record.mimeType === "image/png" || record.mimeType === "image/jpeg") projected.mimeType = record.mimeType;
+  if (typeof record.imageBase64 === "string") {
+    projected.imageDigest = sha256Reference(record.imageBase64);
+    projected.imageBytes = Buffer.byteLength(record.imageBase64, "base64");
+  }
+  return projected;
+}
+
+function boundedEmailString(value: unknown, maximum: number): string | undefined {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= maximum ? value : undefined;
+}
+
+function projectEmailInput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const source = value as JsonObject;
+  const projected: JsonObject = {};
+  for (const key of ["accountId", "messageId", "threadId", "limit"] as const) {
+    if (typeof source[key] === "string" || Number.isSafeInteger(source[key])) projected[key] = source[key];
+  }
+  for (const [sourceKey, digestKey] of [["query", "queryDigest"], ["cursor", "cursorDigest"]] as const) {
+    const raw = boundedEmailString(source[sourceKey], 4_096);
+    const existingDigest = boundedEmailString(source[digestKey], 128);
+    if (raw !== undefined) {
+      projected[digestKey] = sha256Reference(raw);
+      projected[`${sourceKey}Bytes`] = Buffer.byteLength(raw, "utf8");
+    } else if (existingDigest !== undefined) {
+      projected[digestKey] = existingDigest;
+      if (Number.isSafeInteger(source[`${sourceKey}Bytes`])) projected[`${sourceKey}Bytes`] = source[`${sourceKey}Bytes`];
+    }
+  }
+  return projected;
+}
+
+function projectEmailMessageMetadata(value: unknown): JsonObject {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const record = value as JsonObject;
+  const projected: JsonObject = {};
+  for (const key of ["messageId", "threadId", "receivedAt"] as const) {
+    const item = boundedEmailString(record[key], 256);
+    if (item !== undefined) projected[key] = item;
+  }
+  for (const [sourceKey, digestKey] of [["subject", "subjectDigest"], ["from", "fromDigest"], ["snippet", "snippetDigest"], ["bodyText", "bodyDigest"]] as const) {
+    const raw = boundedEmailString(record[sourceKey], 128 * 1024);
+    if (raw !== undefined) {
+      projected[digestKey] = sha256Reference(raw);
+      projected[`${sourceKey}Bytes`] = Buffer.byteLength(raw, "utf8");
+    }
+  }
+  if (typeof record.hasAttachments === "boolean") projected.hasAttachments = record.hasAttachments;
+  if (Array.isArray(record.to)) projected.toCount = record.to.length;
+  if (Array.isArray(record.cc)) projected.ccCount = record.cc.length;
+  if (Array.isArray(record.attachments)) projected.attachmentCount = record.attachments.length;
+  return projected;
+}
+
+function projectEmailOutput(toolName: string, value: unknown): unknown {
+  const base: JsonObject = { type: toolName, contentUnavailableOnReplay: true };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return base;
+  const record = value as JsonObject;
+  for (const key of ["providerId", "accountId", "threadId"] as const) {
+    const item = boundedEmailString(record[key], 256);
+    if (item !== undefined) base[key] = item;
+  }
+  if (typeof record.contentTrust === "string" && record.contentTrust.length <= 64) base.contentTrust = record.contentTrust;
+  if (toolName === "email.accounts") {
+    const health = record.health && typeof record.health === "object" && !Array.isArray(record.health) ? record.health as JsonObject : {};
+    if (typeof health.status === "string" && health.status.length <= 32) base.health = { status: health.status };
+    const accounts = Array.isArray(record.accounts) ? record.accounts.slice(0, 32).flatMap((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const account = value as JsonObject;
+      const accountId = boundedEmailString(account.accountId, 256);
+      const provider = boundedEmailString(account.provider, 128);
+      const status = boundedEmailString(account.status, 32);
+      return accountId === undefined ? [] : [{ accountId, ...(provider === undefined ? {} : { provider }), ...(status === undefined ? {} : { status }) }];
+    }) : [];
+    base.accounts = accounts;
+    base.accountCount = accounts.length;
+  } else if (toolName === "email.search") {
+    const nextCursor = boundedEmailString(record.nextCursor, 4_096);
+    if (nextCursor !== undefined) {
+      base.nextCursorDigest = sha256Reference(nextCursor);
+      base.nextCursorBytes = Buffer.byteLength(nextCursor, "utf8");
+    }
+    const messages = Array.isArray(record.messages) ? record.messages.slice(0, 100).map(projectEmailMessageMetadata) : [];
+    base.messages = messages;
+    base.messageCount = messages.length;
+  } else if (toolName === "email.read") {
+    Object.assign(base, projectEmailMessageMetadata(record));
+  } else if (toolName === "email.thread") {
+    const messages = Array.isArray(record.messages) ? record.messages.slice(0, 100).map(projectEmailMessageMetadata) : [];
+    base.messages = messages;
+    base.messageCount = messages.length;
+  }
+  return base;
 }
 
 function sha256Reference(value: string) {
