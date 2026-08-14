@@ -12,6 +12,8 @@ export const CAPABILITY_REGISTRY = Object.freeze([
   capability("network.access", "Access a configured network service or public network resource."),
   capability("browser.read", "Inspect browser tabs, pages, and recovery state."),
   capability("browser.mutate", "Change browser or remote page state."),
+  capability("computer.read", "Inspect a paired computer display."),
+  capability("email.read", "Read bounded content from explicitly selected email accounts."),
   capability("agent.delegate", "Delegate bounded work to a child agent."),
   capability("mcp.discover", "Discover tools from a configured MCP server."),
   capability("mcp.invoke", "Invoke a tool on a configured MCP server."),
@@ -170,7 +172,36 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
   tool("browser.click", ["browser.mutate", "network.access"], ["browser.act"]),
   tool("browser.type", ["browser.mutate", "network.access"], ["browser.act"]),
   tool("browser.press", ["browser.mutate", "network.access"], ["browser.act"]),
-  tool("browser.recovery.resolve", ["browser.mutate"], ["browser.act"]),
+  tool("browser.recovery.resolve", ["browser.mutate"], ["browser.act"], {
+    approval: "not-required",
+    safety: Object.freeze({
+      effects: Object.freeze(["filesystem-write", "external-state"] as const),
+      reversibility: "compensatable",
+      requiresCapability: true,
+      requiresApproval: false,
+      retrySafe: false
+    })
+  }),
+  tool("computer.screen", ["computer.read"], ["computer.screen"], {
+    approval: "not-required",
+    safety: Object.freeze({
+      effects: Object.freeze(["read", "credential"] as const),
+      reversibility: "pure",
+      requiresCapability: true,
+      requiresApproval: false,
+      retrySafe: false
+    })
+  }),
+  ...["email.accounts", "email.search", "email.read", "email.thread"].map((name) => tool(name, ["email.read", "network.access"], [], {
+    approval: "not-required",
+    safety: Object.freeze({
+      effects: Object.freeze(["read", "network", "credential"] as const),
+      reversibility: "pure",
+      requiresCapability: true,
+      requiresApproval: false,
+      retrySafe: false
+    })
+  })),
   tool("agent.run", ["agent.delegate", "network.access"], ["agent.run"]),
   tool("model.chat", ["network.access"], ["model.chat"]),
   tool("mcp.discover", ["mcp.discover"], []),
