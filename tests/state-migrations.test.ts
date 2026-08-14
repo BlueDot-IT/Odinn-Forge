@@ -96,11 +96,11 @@ test("release-candidate SQLite state migrates transactionally and preserves its 
     } }, null, 2)}\n`;
     await writeFile(join(candidate.state, "jobs.json"), legacyJobs);
     const plan = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4", "runtime-database-v4-to-v5", "runtime-database-v5-to-v6", "runtime-database-v6-to-v7"]);
+    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4", "runtime-database-v4-to-v5", "runtime-database-v5-to-v6", "runtime-database-v6-to-v7", "runtime-database-v7-to-v8"]);
     assert.equal(plan.rollbackCompatible, false);
     const report = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(report?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 7);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 8);
     assert.equal(inspectExistingSqliteSchema(join(report.backupLocation!, "db", "odinn.sqlite")), 2);
     const migratedDatabase = new DatabaseSync(databasePath, { readOnly: true });
     assert.equal((migratedDatabase.prepare("SELECT status FROM runtime_jobs WHERE id = 'migrated_job'").get() as { status: string }).status, "queued");
@@ -109,7 +109,7 @@ test("release-candidate SQLite state migrates transactionally and preserves its 
     const manifest = JSON.parse(await readFile(join(candidate.state, "state-schema.json"), "utf8"));
     assert.equal(manifest.minimumApplicationVersion, "1.0.0");
     assert.equal(manifest.applicationVersion, "1.0.0");
-    assert.equal(manifest.storeVersions.runtimeDatabase, 7);
+    assert.equal(manifest.storeVersions.runtimeDatabase, 8);
   } finally {
     await rm(candidate.temporary, { recursive: true, force: true });
   }
@@ -123,10 +123,10 @@ test("release-candidate migration from runtime schema 5 persists checkpoint jour
     const database = new SqliteStore(databasePath, { targetVersion: 5 });
     database.close();
     const report = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(report.steps.map((step) => step.id), ["runtime-database-v5-to-v6", "runtime-database-v6-to-v7"]);
+    assert.deepEqual(report.steps.map((step) => step.id), ["runtime-database-v5-to-v6", "runtime-database-v6-to-v7", "runtime-database-v7-to-v8"]);
     const migration = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(migration?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 7);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 8);
     const sqlite = new DatabaseSync(databasePath);
     try {
       const tables = (sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('mutation_groups','mutation_checkpoints','mutation_journal_entries','checkpoint_manifest_artifacts','agent_graph_runs','agent_graph_nodes','agent_graph_edges')").all() as Array<{ name: string }>).map((row) => row.name).sort();
@@ -139,7 +139,7 @@ test("release-candidate migration from runtime schema 5 persists checkpoint jour
   }
 });
 
-test("a true runtime schema 6 fixture preserves jobs and supports graph read/write after v7 migration", async () => {
+test("a true runtime schema 6 fixture preserves jobs and supports graph read/write after migration", async () => {
   const candidate = await fixture("release-candidate");
   const databasePath = join(candidate.state, "db", "odinn.sqlite");
   try {
@@ -163,10 +163,10 @@ test("a true runtime schema 6 fixture preserves jobs and supports graph read/wri
     ledger.close();
 
     const plan = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v6-to-v7"]);
+    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v6-to-v7", "runtime-database-v7-to-v8"]);
     const report = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(report?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 7);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 8);
 
     const sqlite = new DatabaseSync(databasePath, { readOnly: true });
     try {
@@ -211,6 +211,30 @@ test("a true runtime schema 6 fixture preserves jobs and supports graph read/wri
     }
   } finally {
     await rm(candidate.temporary, { recursive: true, force: true });
+  }
+});
+
+test("runtime schema 8 preserves schema 7 graph state and admits bounded concurrency", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-schema8-"));
+  const databasePath = join(state, "db", "odinn.sqlite");
+  const digest = "d".repeat(64);
+  const node = { nodeId: "child", manifestId: "reader", manifestDigest: digest, inputRef: "input:child", inputDigest: digest, resultRef: "result:child", dependsOn: [] };
+  try {
+    const database = new SqliteStore(databasePath, { targetVersion: 7 });
+    const ledger = new RunLedger({ database, artifacts: new ArtifactStore(join(state, "artifacts")), workspaceRoot: state, stateDir: state });
+    ledger.ensureRun({ runId: "schema7-parent", objective: "preserve graph" });
+    ledger.createAgentGraphRun({ graphRunId: "schema7-graph", parentRunId: "schema7-parent", graphDigest: digest, manifestsDigest: digest, graphBytes: 12, manifestsBytes: 12, principalNamespace: "operator", requestDigest: digest, maxRunMs: 1_000, nodes: [node] });
+    ledger.close();
+
+    const migrated = createRunLedger({ stateDir: state, workspaceRoot: state });
+    assert.equal(inspectExistingSqliteSchema(databasePath), 8);
+    assert.equal(migrated.getAgentGraphRun("schema7-graph")?.maxConcurrency, 1);
+    migrated.ensureRun({ runId: "schema8-parent", objective: "parallel graph" });
+    migrated.createAgentGraphRun({ graphRunId: "schema8-graph", parentRunId: "schema8-parent", graphDigest: digest, manifestsDigest: digest, graphBytes: 12, manifestsBytes: 12, principalNamespace: "operator", requestDigest: digest, maxConcurrency: 4, maxRunMs: 1_000, nodes: [node] });
+    assert.equal(migrated.getAgentGraphRun("schema8-graph")?.maxConcurrency, 4);
+    migrated.close();
+  } finally {
+    await rm(state, { recursive: true, force: true });
   }
 });
 

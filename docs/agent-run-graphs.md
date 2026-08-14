@@ -80,16 +80,19 @@ or recursively spawns nodes. Unresolved physical calls prevent admission of a
 later run; cancellation and bounded shutdown retain ownership until late
 physical settlement. A stopped instance cannot restart.
 
-The active profile is intentionally smaller than the general graph contract:
-exactly one node and one manifest, `maxConcurrency=1`, bounded graph deadline,
-and a fixed digest-checked registry reference. The manifest may request only
-the read-only child tools listed by the kernel dispatcher. Dynamic fan-out,
-recursive child-agent calls, browser mutations, workspace mutations, process
-execution, approvals, effectful tools, and retries are refused.
+The active profile permits up to eight nodes and eight manifests with at most
+four concurrent children and a bounded graph deadline. Manifests may use the
+compatibility reference `registry:agent-runner.v1` or bind execution to an
+enabled installed runtime identity with `registry:agent.<agent-id>`. Runtime
+identity loading verifies registry status and manifest integrity before model
+execution. The manifest may request only the read-only child tools listed by
+the kernel dispatcher. Dependencies execute in deterministic topological
+waves. Recursive child-agent calls, browser mutations, workspace mutations,
+process execution, approvals, effectful tools, and retries are refused.
 
 Before dispatch, the kernel persists only graph/manifest digests, a principal
 digest marker, and bounded byte metadata, plus one queued node, in runtime
-SQLite schema v7. The child is dispatched through
+SQLite graph state, extended by schema v8 for bounded concurrency. The child is dispatched through
 the existing admission, isolated-worker, ledger, and signed audit paths. A
 receipt is accepted only when the child audit run contains a terminal task
 event; missing or unreadable audit evidence becomes `needs-review`. Graph and

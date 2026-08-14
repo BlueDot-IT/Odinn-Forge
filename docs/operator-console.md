@@ -91,7 +91,7 @@ reversible, allowlisted, digest-bound, and evaluated for regression.
 
 **Experimental interface.** Agent SDK packages are not stable public v1 SDKs.
 
-The Agent SDK page manages declarative Agent SDK v0.3 manifests through `/agents`, `/agents/validate`, and `/agents/<id>/lifecycle`. Installation validates and records package metadata; lifecycle controls enable, disable, or quarantine a package. This surface is a package registry and inspector, not an Agent SDK execution engine. Package metadata is not executable trust, and registration does not bypass extension, sandbox, capability, network, secret, or policy controls.
+The Agent SDK page manages declarative manifests through `/agents`, `/agents/validate`, and `/agents/<id>/lifecycle`. Package manifests remain registry metadata only. A manifest explicitly declared as `kind: "runtime"` provisions a secondary runtime identity under `.odinn/agents/<id>/`; it becomes runnable only after enablement, and execution rechecks lifecycle status plus manifest integrity. Registration never bypasses extension, sandbox, capability, network, secret, or policy controls.
 
 Agent package state is stored in `.odinn/agents.json`. Keep package instructions and integrity metadata reviewable before enablement.
 

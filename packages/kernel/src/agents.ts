@@ -171,9 +171,17 @@ export async function ensureMainAgent(stateDir: string): Promise<AgentManifest &
 export async function loadAgent(stateDir: string, agentId = DEFAULT_AGENT_ID): Promise<{ manifest: AgentManifest & { integrity: string }; systemPrompt: string; bootstrapPending: boolean }> {
   const state = resolve(stateDir);
   if (agentId === DEFAULT_AGENT_ID) await ensureMainAgent(state);
+  const registry = JSON.parse(await readFile(join(state, "agents.json"), "utf8"));
+  const record = Array.isArray(registry?.agents) ? registry.agents.find((candidate: any) => candidate?.id === agentId) : undefined;
+  if (!record || record.kind !== "runtime") throw new Error(`runtime agent is not installed: ${agentId}`);
+  if (record.status !== "enabled") throw new Error(`runtime agent is not enabled: ${agentId}`);
+  if (agentId !== DEFAULT_AGENT_ID && record.primary === true) throw new Error("only the main runtime agent may be primary");
   const directory = join(state, "agents", agentId);
   assertInside(resolve(state, "agents"), directory);
   const manifest = validateAgentManifest(JSON.parse(await readFile(join(directory, "agent.json"), "utf8")));
+  if (manifest.id !== agentId || manifest.kind !== "runtime" || manifest.integrity !== record.integrity) {
+    throw new Error(`runtime agent registry integrity mismatch: ${agentId}`);
+  }
   const sections: string[] = [];
   const bootstrap = await readOptionalText(join(directory, AGENT_BOOTSTRAP_FILE));
   if (bootstrap.trim()) {
@@ -186,6 +194,25 @@ export async function loadAgent(stateDir: string, agentId = DEFAULT_AGENT_ID): P
   }
   if (manifest.instructions.length) sections.push(`## Manifest instructions\n${manifest.instructions.join("\n")}`);
   return { manifest, systemPrompt: sections.join("\n\n"), bootstrapPending: Boolean(bootstrap.trim()) };
+}
+
+export async function provisionRuntimeAgent(stateDir: string, input: unknown): Promise<AgentManifest & { integrity: string }> {
+  const manifest = validateAgentManifest(input);
+  if (manifest.id === DEFAULT_AGENT_ID) throw new Error("the primary main agent cannot be provisioned through the runtime package path");
+  if (manifest.kind !== "runtime" || manifest.primary) throw new Error("secondary runtime agents must use kind=runtime and primary=false");
+  const state = resolve(stateDir);
+  await ensureSecureStateDirectory(state);
+  const directory = join(state, "agents", manifest.id);
+  assertInside(resolve(state, "agents"), directory);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  await atomicWrite(join(directory, "agent.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  for (const file of manifest.identity.files) {
+    await writeExclusive(join(directory, file), "").catch((error: any) => {
+      if (error?.code !== "EEXIST") throw error;
+    });
+  }
+  return manifest;
 }
 
 function stringArray(value: unknown): string[] {

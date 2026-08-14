@@ -13,7 +13,7 @@
 | Runs, steps, verification, execution intent | Run ledger | `db/odinn.sqlite` | Add execution envelopes, attempts, cancellation controls, and later execution graphs. |
 | Operator audit | Audit store | `db/audit.sqlite` with legacy JSONL compatibility | Remains authoritative; correlate by immutable run and audit IDs. |
 | Projects, sessions, goals, messages, memory | Authoritative record store | `db/records.sqlite` | Remains authoritative. |
-| Runtime jobs, leases, and graph/node state | Run ledger | `db/odinn.sqlite` schema v7 | `runtime_jobs` and the additive `agent_graph_*` tables are live authority; a validated `jobs.json` is imported once and retained as rollback evidence. |
+| Runtime jobs, leases, and graph/node state | Run ledger | `db/odinn.sqlite` schema v8 | `runtime_jobs` and the additive `agent_graph_*` tables are live authority; a validated `jobs.json` is imported once and retained as rollback evidence. |
 | Cron definitions | Gateway cron store | `cron-jobs.json` | Definitions may remain compatible; every occurrence will bind to an envelope. |
 
 ## Execution entry points at the accepted baseline
@@ -28,7 +28,7 @@
 | Browser work | Persistent isolated browser worker | Browser policy plus recovery JSON | Active before browser tool execution; browser recovery remains authoritative for browser uncertainty. |
 | Extension execution | Container extension executor | Extension registry and policy | Reuse as an execution backend behind admission. |
 | MCP discovery/invocation | Fixed `mcp.discover` / `mcp.invoke` wrappers -> governed MCP runtime | Explicit `config.runtime.enableMcp`, trusted OCI manifest, snapshot pins, approval, and capability decision | Active only in the bounded Stage 9 subset; uses `execution.kind: "mcp-tool"`, sealed approval continuation, and `needs-review` for uncertain physical outcomes. |
-| Agent graphs | Kernel graph dispatcher | Explicit `config.runtime.enableAgentGraphs` plus durable `/jobs` | Stage 7 activates one read-only node through admission, isolated workers, runtime SQLite graph/node state, and signed audit correlation. Skills now have a separate explicit disclosure/lifecycle boundary; MCP activation is separately gated and remains default-inert. |
+| Agent graphs | Kernel graph dispatcher | Explicit `config.runtime.enableAgentGraphs` plus durable `/jobs` | Stage 7 activates a bounded DAG of up to eight read-only installed runtime agents (four concurrent) through admission, isolated workers, runtime SQLite graph/node state, and signed audit correlation. Skills have a separate explicit disclosure/lifecycle boundary; MCP activation is separately gated and remains default-inert. |
 
 ## Skill disclosure and lifecycle boundary
 
@@ -69,7 +69,7 @@ Runtime schema v5 adds:
 - `runtime_job_leases`
 - `runtime_job_imports`
 
-Runtime schema v7 adds:
+Runtime schemas v7-v8 add:
 
 - `agent_graph_runs`
 - `agent_graph_nodes`

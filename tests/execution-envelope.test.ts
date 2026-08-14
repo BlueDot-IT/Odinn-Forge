@@ -171,7 +171,7 @@ test("runtime transactions survive a live writer beyond the former contention wi
   }
 });
 
-test("runtime schema v7 migration is additive and the live task path uses admitted envelopes", async () => {
+test("runtime schema migrations are additive and the live task path uses admitted envelopes", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-execution-migration-"));
   const stateDir = join(root, ".odinn");
   const databasePath = join(stateDir, "db", "odinn.sqlite");
@@ -179,7 +179,7 @@ test("runtime schema v7 migration is additive and the live task path uses admitt
   versionThree.close();
   const migrated = new SqliteStore(databasePath);
   migrated.close();
-  assert.equal(inspectExistingSqliteSchema(databasePath), 7);
+  assert.equal(inspectExistingSqliteSchema(databasePath), 8);
 
   const ledger = createRunLedger({ stateDir, workspaceRoot: root });
   const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));

@@ -324,12 +324,13 @@ test("durable graph node transitions cannot be overwritten after quarantine or p
     ledger.ensureRun({ runId: "parent-late", objective: "parent" });
     ledger.createAgentGraphRun({
       graphRunId: "graph:late", parentRunId: "parent-late", graphDigest: digestValue, manifestsDigest: digestValue,
-      graphBytes: 12, manifestsBytes: 12, principalNamespace: "operator", requestDigest: digestValue, maxRunMs: 1_000, nodes: [node]
+      graphBytes: 12, manifestsBytes: 12, principalNamespace: "operator", requestDigest: digestValue, maxConcurrency: 3, maxRunMs: 1_000, nodes: [node]
     });
+    assert.equal(ledger.getAgentGraphRun("graph:late")?.maxConcurrency, 3);
     assert.throws(
       () => ledger.createAgentGraphRun({
         graphRunId: "graph:late", parentRunId: "parent-late", graphDigest: digestValue, manifestsDigest: digestValue,
-        graphBytes: 12, manifestsBytes: 12, principalNamespace: "operator", requestDigest: digestValue, maxRunMs: 2_000, nodes: [node]
+        graphBytes: 12, manifestsBytes: 12, principalNamespace: "operator", requestDigest: digestValue, maxConcurrency: 2, maxRunMs: 1_000, nodes: [node]
       }),
       (error: any) => error?.code === "AGENT_GRAPH_IDEMPOTENCY_CONFLICT"
     );
@@ -392,6 +393,15 @@ test("durable graph node transitions cannot be overwritten after quarantine or p
     ledger.reconcileAgentGraphRuns();
     assert.equal(ledger.getAgentGraphRun("graph:publishing")?.status, "needs-review");
     assert.equal(ledger.getAgentGraphRun("graph:publishing")?.nodes[0]?.status, "needs-review");
+
+    ledger.ensureRun({ runId: "parent-blocked", objective: "parent" });
+    const dependent = { ...node, nodeId: "second", inputRef: "input:second", inputDigest: digestValue, resultRef: "result:second", dependsOn: ["first"] };
+    ledger.createAgentGraphRun({
+      graphRunId: "graph:blocked", parentRunId: "parent-blocked", graphDigest: digestValue, manifestsDigest: digestValue,
+      graphBytes: 12, manifestsBytes: 12, principalNamespace: "operator", requestDigest: digestValue, maxConcurrency: 2, maxRunMs: 1_000, nodes: [node, dependent]
+    });
+    ledger.recordAgentGraphNodeResult({ graphRunId: "graph:blocked", nodeId: "second", status: "blocked", resultRef: "result:second", errorCode: "DEPENDENCY_FAILED" });
+    assert.equal(ledger.getAgentGraphRun("graph:blocked")?.nodes.find((item: any) => item.nodeId === "second")?.status, "blocked");
   } finally {
     ledger.close();
   }
