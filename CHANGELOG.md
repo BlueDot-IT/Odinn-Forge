@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+### Release engineering
+
+* advance the development package identity to `1.1.0-rc.3` after publishing
+  the immutable `v1.1.0-rc.2` candidate so post-release changes build and
+  validate against a distinct version
+
 ## [1.1.0-rc.2](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.1...v1.1.0-rc.2) (2026-08-13)
 
 ### Added
