@@ -36,7 +36,8 @@ const packageTag = `v${pkg.version}`;
 const packageTagCommit = spawnSync("git", ["rev-list", "-n", "1", `refs/tags/${packageTag}`], { cwd: root, encoding: "utf8" });
 const headCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" });
 if (headCommit.status !== 0) throw new Error("release preflight: could not resolve HEAD");
-if (!releaseTag && packageTagCommit.status === 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
+const isPullRequestValidation = process.env.GITHUB_EVENT_NAME === "pull_request";
+if (!releaseTag && !isPullRequestValidation && packageTagCommit.status === 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
   throw new Error(`release preflight: development HEAD is ahead of published ${packageTag}; bump the package version before building`);
 }
 if (releaseTag) {
