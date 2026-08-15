@@ -26,7 +26,7 @@
     "test": "pnpm build:console && node --test --test-concurrency=1 --test-reporter=spec tests/*.test.ts",
     "test:platform": "pnpm build:console && node --test --test-concurrency=1 --test-reporter=spec tests/platform.test.ts tests/resource-limits.test.ts tests/channels.test.ts tests/gateway-product-surfaces.test.ts tests/compiled-inference-smoke.test.ts tests/workspace-inspection.test.ts tests/dependency-direction.test.ts",
     "test:gateway": "pnpm build:console && node --test --test-concurrency=1 --test-reporter=spec tests/gateway.test.ts tests/gateway-product-surfaces.test.ts tests/gateway-read-router.test.ts",
-    "test:integration": "node --test --test-concurrency=1 --test-reporter=spec tests/integration.test.ts",
+    "test:integration": "pnpm build:console && node --test --test-concurrency=1 --test-reporter=spec tests/integration.test.ts",
     "test:invariants": "node --expose-gc --test --test-concurrency=1 --test-reporter=spec tests/invariants/*.test.ts",
     "test:oci": "node --test --test-concurrency=1 --test-reporter=spec tests/sandbox-oci.integration.test.ts tests/extension-oci.integration.test.ts",
     "test:migrations": "node --test --test-concurrency=1 --test-reporter=spec tests/state-migrations.test.ts",
