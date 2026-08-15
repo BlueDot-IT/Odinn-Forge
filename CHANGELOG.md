@@ -6,19 +6,40 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
-### Release engineering
-
-* advance the development package identity to `1.1.0-rc.3` after publishing
-  the immutable `v1.1.0-rc.2` candidate so post-release changes build and
-  validate against a distinct version
+## [1.1.0-rc.3](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.2...v1.1.0-rc.3) (2026-08-15)
 
 ### Added
 
+* add the first application-level multi-tenant hosting control plane with
+  durable users, tenants, memberships, roles, sessions, lifecycle controls,
+  scoped backups, and tenant-bound gateway execution
+* extract the local console into a separately built Vite artifact with hashed
+  assets, manifest validation, and restrictive content security policy
 * add a bounded, jobs-only child-agent graph runtime with explicit parent
   capability intersection, durable recovery, and digest-only projections
 * add the first host-capability plugin foundation for browser, paired screen,
   and provider-injected read-only email seams without granting ambient host
   authority
+
+### Changed
+
+* bind admitted agent graphs to immutable agent, identity, prompt, model, and
+  manifest provenance, and deep-freeze child inputs before dispatch
+* carry trusted tenant scope through gateway jobs, workflows, cron/event
+  ingress, governed execution, and audit projections
+* hash non-opaque provider identifiers before durable email projections
+
+### Fixed
+
+* serialize agent registry read-modify-write operations and make runtime-agent
+  installation crash-consistent through staged directories and reconciliation
+* remove the Linux/macOS/Windows downloaded-artifact matrix from the release
+  publication dependency while retaining ordinary platform CI and single-runner
+  checksum, SBOM, provenance, and downloaded-asset verification
+
+### Release engineering
+
+* publish the exact `v1.1.0-rc.3` candidate from a clean tagged merge commit
 
 ## [1.1.0-rc.2](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.1...v1.1.0-rc.2) (2026-08-13)
 

@@ -66,9 +66,14 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     assert.equal(statusResponse.status, 200);
     const runtimeStatus = await statusResponse.json();
     const inlineScripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/giu)].map((match) => match[1]);
-    assert.equal(inlineScripts.length, 1);
-    assert.doesNotThrow(() => new Script(inlineScripts[0], { filename: "odinn-console.js" }));
-    const script = inlineScripts[0];
+    assert.equal(inlineScripts.length, 0, "the console must not ship inline executable JavaScript");
+    const scriptReference = /<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/iu.exec(html)?.[1];
+    assert.ok(scriptReference, "the console must reference a built JavaScript asset");
+    const scriptResponse = await fetch(`http://127.0.0.1:${address.port}${scriptReference}`);
+    assert.equal(scriptResponse.status, 200);
+    const script = await scriptResponse.text();
+    assert.doesNotThrow(() => new Script(script, { filename: "odinn-console.js" }));
+    const productSource = `${html}\n${script}`;
 
     const navigation = section(html, /<nav class="nav"[^>]*>/, /<\/nav>/);
     assert.match(navigation, /data-view="overview"[\s\S]*data-view="sessions"/, "Sessions must sit directly below Chat");
@@ -142,8 +147,8 @@ test("console presents the human-first product surfaces and dedicated Advanced p
       "audit-page-label"
     ]);
     assert.match(activity, /Latest four conversations/);
-    assert.match(html, /api\("\/audit\/query\?/);
-    assert.match(html, /\.slice\(0,\s*4\)\.map\(renderRun\)/);
+    assert.match(productSource, /api\("\/audit\/query\?/);
+    assert.match(productSource, /\.slice\(0,\s*4\)\.map\(renderRun\)/);
 
     const projects = section(html, /<section id="view-projects"[^>]*>/, /<\/section>/);
     assertIds(projects, ["new-project", "project-list", "project-detail", "project-open-sessions", "project-open-goals", "project-archive", "project-form"]);
@@ -204,13 +209,13 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     assert.match(memory, /Review what Ódinn has noticed/i);
     assert.match(memory, /Review suggestions/i);
     assert.match(memory, /Saved memories/i);
-    assert.match(html, /Keep memory/i);
-    assert.match(html, /Suggestion dismissed/i);
+    assert.match(productSource, /Keep memory/i);
+    assert.match(productSource, /Suggestion dismissed/i);
     assert.doesNotMatch(memory, /Select all|Accept selected|Reject selected|Keep suggested scope/i);
     assert.doesNotMatch(memory, />namespaces</i);
-    assert.match(html, /function setMemoryTab\s*\(/);
-    assert.match(html, /function decideMemoryCandidate\s*\(/);
-    assert.match(html, /data-memory-candidate-destination/);
+    assert.match(productSource, /function setMemoryTab\s*\(/);
+    assert.match(productSource, /function decideMemoryCandidate\s*\(/);
+    assert.match(productSource, /data-memory-candidate-destination/);
 
     const agents = section(html, /<section id="view-agents"[^>]*>/, /<\/section>/);
     assert.match(agents, /<h1>Agent SDK<\/h1>/);
@@ -218,13 +223,13 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     assert.match(agents, /<label class="switch-label"><input type="checkbox" id="agent-advanced-toggle"> Developer setup<\/label>/);
     assertIds(agents, ["manifest-fields", "agent-manifest", "agent-manifest-error"]);
     assert.doesNotMatch(agents, /Register Agent SDK manifest|Package ID|Network allowlist/);
-    assert.match(html, /function readAgentManifestFields\s*\(/);
-    assert.match(html, /function writeAgentManifestFields\s*\(/);
-    assert.match(html, /function setAgentAdvanced\s*\(/);
-    assert.match(html, /setAgentAdvanced\(event\.target\.checked\)/);
-    assert.match(html, /agentManifestDraft/);
-    assert.match(html, /state\.agentManifestDraft = JSON\.parse/);
-    assert.match(html, /\.\.\.\(state\.agentManifestDraft \|\| \{\}\)/);
+    assert.match(productSource, /function readAgentManifestFields\s*\(/);
+    assert.match(productSource, /function writeAgentManifestFields\s*\(/);
+    assert.match(productSource, /function setAgentAdvanced\s*\(/);
+    assert.match(productSource, /setAgentAdvanced\(event\.target\.checked\)/);
+    assert.match(productSource, /agentManifestDraft/);
+    assert.match(productSource, /state\.agentManifestDraft = JSON\.parse/);
+    assert.match(productSource, /\.\.\((?:state\.agentManifestDraft)|\.\.\.state\.agentManifestDraft(?:\?\.|\s*\|\|)/);
 
     const experiments = section(html, /<section id="view-automatic-improvements"[^>]*>/, /<section id="view-usage"[^>]*>/);
     assertIds(experiments, [
@@ -265,7 +270,14 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     assert.match(globalFeedback, /\baria-live=["'](?:polite|assertive)["']/iu);
     assert.doesNotMatch(globalFeedback, /\bhidden\b/iu, "the shared feedback region must remain perceivable");
 
-    const styles = section(html, /<style>/iu, /<\/style>/iu);
+    const inlineStyles = [...html.matchAll(/<style(?:\s|>)/giu)];
+    assert.equal(inlineStyles.length, 0, "the console must not ship inline CSS");
+    const stylesheetReference = /<link\b[^>]*\b(?:rel=["']stylesheet["'][^>]*\bhref|href=["'][^"']+["'][^>]*\brel=["']stylesheet["'])=["']([^"']+)["']/iu.exec(html)?.[1]
+      ?? /<link\b[^>]*\brel=["']stylesheet["'][^>]*\bhref=["']([^"']+)["'][^>]*>/iu.exec(html)?.[1];
+    assert.ok(stylesheetReference, "the console must reference a built stylesheet asset");
+    const stylesheetResponse = await fetch(`http://127.0.0.1:${address.port}${stylesheetReference}`);
+    assert.equal(stylesheetResponse.status, 200);
+    const styles = await stylesheetResponse.text();
     const mobileStyles = cssBlocks(styles, /@media\s*\(max-width:\s*980px\)/iu).join("\n");
     assert.ok(mobileStyles, "missing narrow-screen console styles");
     assertIds(html, ["mobile-scrim"]);
@@ -296,8 +308,8 @@ test("console presents the human-first product surfaces and dedicated Advanced p
       /const detail = await api\("\/sessions\/"/u,
       "rename and delete confirmations must stay directly attached to the click gesture"
     );
-    assert.match(html, /data-session-action="rename"[^>]*type="button"/u);
-    assert.match(html, /data-session-action="delete"[^>]*type="button"/u);
+    assert.match(productSource, /data-session-action=\\?["']rename\\?["'][^>]*type=\\?["']button\\?["']/u);
+    assert.match(productSource, /data-session-action=\\?["']delete\\?["'][^>]*type=\\?["']button\\?["']/u);
     assert.doesNotMatch(
       script,
       /finally\s*\{[^}]*setBusy\(event\.currentTarget,\s*false\)/u,

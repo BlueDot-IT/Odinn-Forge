@@ -22,5 +22,8 @@
     "@odinn/policy": "workspace:*",
     "@odinn/runtime": "workspace:*",
     "@odinn/store-file": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "8.2.1"
   }
 }

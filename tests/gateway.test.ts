@@ -671,7 +671,12 @@ test("gateway serves the local console shell", async () => {
     const response = await fetch(`http://127.0.0.1:${port}/`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get("content-type"), /text\/html/);
-    const html = await response.text();
+    const page = await response.text();
+    const assetPath = /<script[^>]+\bsrc="([^"]+)"/u.exec(page)?.[1];
+    assert.ok(assetPath, "console JavaScript asset must be declared by the shell");
+    const assetResponse = await fetch(`http://127.0.0.1:${port}${assetPath}`);
+    assert.equal(assetResponse.status, 200);
+    const html = `${page}\n${await assetResponse.text()}`;
     assert.match(html, /Odinn Forge Console/);
     assert.match(html, /Ódinn Forge/);
     assert.match(html, /odinn-logo\.png/);
@@ -715,8 +720,8 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /requireApproval/);
     assert.doesNotMatch(html, /catch \(error: any\)/);
     assert.match(html, /sidebar-collapsed/);
-    assert.match(html, /data-session-action="rename"/);
-    assert.match(html, /data-session-action="delete"/);
+    assert.match(html, /data-session-action=\\?"rename\\?"/);
+    assert.match(html, /data-session-action=\\?"delete\\?"/);
     assert.match(html, /method: "PATCH"/);
     const logo = await fetch("http://127.0.0.1:" + port + "/odinn-logo.png");
     assert.equal(logo.status, 200);
@@ -882,9 +887,15 @@ test("assistant Markdown images remain inert for every network-capable URL form"
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   try {
-    const html = await (await fetch(`http://127.0.0.1:${server.address().port}/`)).text();
+    const port = server.address().port;
+    const page = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+    const assetPath = /<script[^>]+\bsrc="([^"]+)"/u.exec(page)?.[1];
+    assert.ok(assetPath, "console JavaScript asset must be declared by the shell");
+    const assetResponse = await fetch(`http://127.0.0.1:${port}${assetPath}`);
+    assert.equal(assetResponse.status, 200);
+    const html = `${page}\n${await assetResponse.text()}`;
     const rendererStart = html.indexOf("function escapeHtml(value)");
-    const rendererEnd = html.indexOf("\n    function compactPath", rendererStart);
+    const rendererEnd = html.indexOf("\nfunction compactPath", rendererStart);
     assert.ok(rendererStart >= 0 && rendererEnd > rendererStart, "console Markdown renderer source must be present");
     const renderer = runInNewContext(`${html.slice(rendererStart, rendererEnd)}\n({ renderMarkdown });`);
     const targets = [

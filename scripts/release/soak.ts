@@ -88,7 +88,10 @@ async function startGateway(packageRoot: string, workspace: string, state: strin
     if (match && Number(match[1]) > 0) {
       const base = `http://127.0.0.1:${match[1]}`;
       const bootstrap = await fetch(`${base}/`);
-      const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
+      const setCookie = typeof bootstrap.headers.getSetCookie === "function"
+        ? bootstrap.headers.getSetCookie()[0]
+        : bootstrap.headers.get("set-cookie");
+      const cookie = setCookie?.split(";", 1)[0];
       if (!cookie) throw new Error("packaged gateway did not issue a bootstrap cookie");
       return { child, base, cookie, output, errorOutput };
     }

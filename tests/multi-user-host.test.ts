@@ -126,12 +126,17 @@ test("multi-user host authenticates and isolates each tenant gateway state", asy
     const aliceConsole = await (await fetch(`${base}/`, { headers: { cookie: aliceCookie } })).text();
     assert.match(aliceConsole, /<button\b[^>]*\bid=["']remote-signout["'][^>]*\bhidden\b[^>]*>/iu, "the shared shell must keep sign out hidden until hosted status is known");
     assert.match(aliceConsole, /id=["']remote-signout["'][\s\S]{0,160}(?:Sign out|Log out)/iu);
+    const consoleScriptReference = /<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/iu.exec(aliceConsole)?.[1];
+    assert.ok(consoleScriptReference, "the hosted console must reference a built script asset");
+    const consoleScriptResponse = await fetch(`${base}${consoleScriptReference}`, { headers: { cookie: aliceCookie } });
+    assert.equal(consoleScriptResponse.status, 200);
+    const consoleScript = await consoleScriptResponse.text();
     assert.match(
-      aliceConsole,
+      consoleScript,
       /remote-signout[\s\S]{0,500}(?:hidden\s*=\s*false|removeAttribute\(["']hidden["']\))|(?:hidden\s*=\s*false|removeAttribute\(["']hidden["']\))[\s\S]{0,500}remote-signout/iu,
       "hosted status must reveal the sign-out control"
     );
-    assert.match(aliceConsole, /\/auth\/logout/u, "the sign-out control must call the host logout route");
+    assert.match(consoleScript, /\/auth\/logout/u, "the sign-out control must call the host logout route");
     const bobLogin = await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "bob", password: "bob-password-longer" }) });
     const bobCookie = bobLogin.headers.get("set-cookie").split(";")[0];
     const bobStatus = await (await fetch(`${base}/status`, { headers: { cookie: bobCookie } })).json();
@@ -211,6 +216,91 @@ test("host derives tenant scope from durable membership and restores revocable s
     assert.equal((await fetch(`${restartedBase}/status`, { headers: { cookie } })).status, 401, "revoking the selected membership must revoke the durable session");
   } finally {
     await new Promise((resolve: any) => restarted.close(() => resolve()));
+  }
+});
+
+test("tenant lifecycle administration is membership-scoped and suspensions fail closed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-tenant-lifecycle-"));
+  const aliceWorkspace = await mkdtemp(join(tmpdir(), "odinn-tenant-lifecycle-alice-"));
+  const alicePassword = await hashPassword("tenant-owner-password-long");
+  const bobPassword = await hashPassword("tenant-member-password-long");
+  const publicOrigin = "https://odinn.test";
+  const config = {
+    schemaVersion: 2,
+    users: [
+      { id: "alice", defaultTenantId: "acme", salt: alicePassword.salt, passwordHash: alicePassword.hash, disabled: false },
+      { id: "bob", defaultTenantId: "acme", salt: bobPassword.salt, passwordHash: bobPassword.hash, disabled: false }
+    ],
+    tenants: [{ id: "acme", name: "Acme", workspaceRoot: aliceWorkspace, stateDirectory: "tenants/acme", status: "active" }],
+    memberships: [
+      { userId: "alice", tenantId: "acme", role: "owner" },
+      { userId: "bob", tenantId: "acme", role: "member" }
+    ],
+    roles: [
+      { id: "owner", permissions: ["tenant.manage", "tenant.use"] },
+      { id: "member", permissions: ["tenant.use"] }
+    ],
+    serviceAccounts: []
+  };
+  await writeFile(join(root, "users.json"), `${JSON.stringify(config)}\n`, { mode: 0o600 });
+  const server = await createMultiUserHost({ stateDir: root, publicOrigin, tenantLimits: { maximumBackups: 1 } });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const login = (userId: string, password: string) => fetch(`${base}/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: publicOrigin },
+    body: JSON.stringify({ userId, password })
+  });
+  const post = (path: string, cookie: string, body: any) => fetch(`${base}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie, origin: publicOrigin },
+    body: JSON.stringify(body)
+  });
+  try {
+    const aliceLogin = await login("alice", "tenant-owner-password-long");
+    const aliceCookie = aliceLogin.headers.get("set-cookie")!.split(";")[0];
+    const bobLogin = await login("bob", "tenant-member-password-long");
+    const bobCookie = bobLogin.headers.get("set-cookie")!.split(";")[0];
+
+    const aliceTenant = await (await fetch(`${base}/auth/tenant`, { headers: { cookie: aliceCookie } })).json();
+    const bobTenant = await (await fetch(`${base}/auth/tenant`, { headers: { cookie: bobCookie } })).json();
+    assert.equal(aliceTenant.status, "active");
+    assert.ok(aliceTenant.permissions.includes("tenant.manage"));
+    assert.equal(bobTenant.permissions.includes("tenant.manage"), false);
+    assert.equal((await post("/auth/tenant/lifecycle", bobCookie, { tenantId: "acme", status: "suspended" })).status, 403);
+    assert.equal((await post("/auth/tenant/lifecycle", aliceCookie, { tenantId: "acme", status: "deleted" })).status, 400);
+
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceCookie } })).status, 200, "initialize tenant state before backup");
+    const suspended = await post("/auth/tenant/lifecycle", aliceCookie, { tenantId: "acme", status: "suspended" });
+    assert.equal(suspended.status, 200);
+    assert.deepEqual(await suspended.json(), { ok: true, tenantId: "acme", status: "suspended", changed: true });
+    const persisted = JSON.parse(await readFile(join(root, "users.json"), "utf8"));
+    assert.equal(persisted.tenants[0].status, "suspended");
+    assert.equal(persisted.tenants[0].disabled, true);
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceCookie } })).status, 423);
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: bobCookie } })).status, 423);
+    assert.equal((await (await fetch(`${base}/auth/tenants`, { headers: { cookie: bobCookie } })).json()).tenants[0].status, "suspended");
+
+    const memberBackup = await post("/auth/tenant/backup", bobCookie, { tenantId: "acme" });
+    assert.equal(memberBackup.status, 403);
+    const ownerBackup = await post("/auth/tenant/backup", aliceCookie, { tenantId: "acme" });
+    assert.equal(ownerBackup.status, 200);
+    const ownerBackupPayload = await ownerBackup.json();
+    assert.equal(ownerBackupPayload.backup.includesSensitiveState, false);
+    assert.match(ownerBackupPayload.backup.backupPath, /^tenant-backups\/acme\/backup-/u);
+    const backupRoot = join(root, ownerBackupPayload.backup.backupPath);
+    const manifest = JSON.parse(await readFile(join(backupRoot, "backup-manifest.json"), "utf8"));
+    assert.equal(manifest.includesSensitiveState, false);
+    assert.ok(manifest.excluded.includes("users.json"));
+    assert.ok(manifest.excluded.includes("gateway.token"));
+    assert.equal(manifest.files.some((file: any) => ["users.json", "session-key", "gateway.token"].includes(file.path)), false);
+    assert.equal((await post("/auth/tenant/backup", aliceCookie, { tenantId: "acme" })).status, 429, "backup count must remain bounded");
+
+    const resumed = await post("/auth/tenant/lifecycle", aliceCookie, { tenantId: "acme", status: "active" });
+    assert.deepEqual(await resumed.json(), { ok: true, tenantId: "acme", status: "active", changed: true });
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceCookie } })).status, 200);
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
   }
 });
 

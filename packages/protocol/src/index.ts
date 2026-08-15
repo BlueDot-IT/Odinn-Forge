@@ -205,13 +205,53 @@ function boundedEmailString(value: unknown, maximum: number): string | undefined
   return typeof value === "string" && Buffer.byteLength(value, "utf8") <= maximum ? value : undefined;
 }
 
+const EMAIL_IDENTIFIER_MAX_BYTES = 256;
+const EMAIL_IDENTIFIER_CONTEXT = "odinn:email-provider-identifier:";
+const OPAQUE_EMAIL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,255}$/u;
+
+/**
+ * Hash a provider identifier for durable use. Callers should normally use
+ * durableEmailProviderIdentifier(), which preserves existing opaque IDs and
+ * hashes identifiers that do not satisfy the opaque provider-reference form.
+ */
+export function hashEmailProviderIdentifier(value: unknown, label = "email provider identifier", maximum = EMAIL_IDENTIFIER_MAX_BYTES): string {
+  if (typeof value !== "string"
+    || value.length === 0
+    || Buffer.byteLength(value, "utf8") > maximum
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(`${label} must be a bounded visible provider identifier`);
+  }
+  return sha256Reference(`${EMAIL_IDENTIFIER_CONTEXT}${value}`);
+}
+
+/**
+ * Keep the established durable projection for opaque provider references,
+ * while preventing address-shaped or otherwise non-opaque identifiers from
+ * crossing the persistence boundary in cleartext.
+ */
+export function durableEmailProviderIdentifier(value: unknown, label = "email provider identifier", maximum = EMAIL_IDENTIFIER_MAX_BYTES): string {
+  const validated = typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= maximum
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? value
+    : undefined;
+  if (validated === undefined) return hashEmailProviderIdentifier(value, label, maximum);
+  return OPAQUE_EMAIL_IDENTIFIER.test(validated) ? validated : hashEmailProviderIdentifier(validated, label, maximum);
+}
+
+function hasOwn(record: JsonObject, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
 function projectEmailInput(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const source = value as JsonObject;
   const projected: JsonObject = {};
-  for (const key of ["accountId", "messageId", "threadId", "limit"] as const) {
-    if (typeof source[key] === "string" || Number.isSafeInteger(source[key])) projected[key] = source[key];
+  for (const key of ["accountId", "messageId", "threadId"] as const) {
+    if (hasOwn(source, key)) projected[key] = durableEmailProviderIdentifier(source[key], `email input ${key}`);
   }
+  if (Number.isSafeInteger(source.limit)) projected.limit = source.limit;
   for (const [sourceKey, digestKey] of [["query", "queryDigest"], ["cursor", "cursorDigest"]] as const) {
     const raw = boundedEmailString(source[sourceKey], 4_096);
     const existingDigest = boundedEmailString(source[digestKey], 128);
@@ -230,10 +270,10 @@ function projectEmailMessageMetadata(value: unknown): JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const record = value as JsonObject;
   const projected: JsonObject = {};
-  for (const key of ["messageId", "threadId", "receivedAt"] as const) {
-    const item = boundedEmailString(record[key], 256);
-    if (item !== undefined) projected[key] = item;
-  }
+  if (hasOwn(record, "messageId")) projected.messageId = durableEmailProviderIdentifier(record.messageId, "email message.messageId");
+  if (hasOwn(record, "threadId")) projected.threadId = durableEmailProviderIdentifier(record.threadId, "email message.threadId");
+  const receivedAt = boundedEmailString(record.receivedAt, 256);
+  if (receivedAt !== undefined) projected.receivedAt = receivedAt;
   for (const [sourceKey, digestKey] of [["subject", "subjectDigest"], ["from", "fromDigest"], ["snippet", "snippetDigest"], ["bodyText", "bodyDigest"]] as const) {
     const raw = boundedEmailString(record[sourceKey], 128 * 1024);
     if (raw !== undefined) {
@@ -253,8 +293,7 @@ function projectEmailOutput(toolName: string, value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return base;
   const record = value as JsonObject;
   for (const key of ["providerId", "accountId", "threadId"] as const) {
-    const item = boundedEmailString(record[key], 256);
-    if (item !== undefined) base[key] = item;
+    if (hasOwn(record, key)) base[key] = durableEmailProviderIdentifier(record[key], `email ${toolName} output.${key}`);
   }
   if (typeof record.contentTrust === "string" && record.contentTrust.length <= 64) base.contentTrust = record.contentTrust;
   if (toolName === "email.accounts") {
@@ -263,10 +302,11 @@ function projectEmailOutput(toolName: string, value: unknown): unknown {
     const accounts = Array.isArray(record.accounts) ? record.accounts.slice(0, 32).flatMap((value) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
       const account = value as JsonObject;
-      const accountId = boundedEmailString(account.accountId, 256);
+      if (!hasOwn(account, "accountId")) return [];
+      const accountId = durableEmailProviderIdentifier(account.accountId, "email account.accountId");
       const provider = boundedEmailString(account.provider, 128);
       const status = boundedEmailString(account.status, 32);
-      return accountId === undefined ? [] : [{ accountId, ...(provider === undefined ? {} : { provider }), ...(status === undefined ? {} : { status }) }];
+      return [{ accountId, ...(provider === undefined ? {} : { provider }), ...(status === undefined ? {} : { status }) }];
     }) : [];
     base.accounts = accounts;
     base.accountCount = accounts.length;

@@ -4,9 +4,13 @@ This roadmap separates post-1.1 work from the active 1.1 release candidate. It
 does not promote experimental surfaces to stable or override the current
 release freeze.
 
+The repository is on the `1.1.0-rc.3` package line. This roadmap records work
+around the release candidate and does not itself establish stable-release
+evidence.
+
 ## Release gate first: stabilization
 
-An independent review of `main` at
+An independent review of the pre-roadmap `main` at
 `85b7ded1b0c9a0238443beb49b5b2eb124d27e5b` rated the project 8.6/10 and
 returned **NO-GO for stable 1.1**. The review reported no critical or
 high-severity vulnerability, but identified state-integrity, provenance, and
@@ -27,7 +31,9 @@ decision:
    adapter.
 7. Freeze feature work, resolve or formally amend the console-extraction
    release criterion, preserve durable review evidence, and perform exact
-   downloaded-artifact acceptance on clean Linux, macOS, and Windows systems.
+   downloaded-artifact verification through the protected release workflow.
+   Linux, macOS, and Windows downloaded-artifact acceptance remains advisory
+   CI evidence rather than a publication gate.
 
 ### Stabilization tranche implemented in the current candidate work
 
@@ -43,22 +49,32 @@ with focused tests:
   live definition no longer matches.
 - Rollback documentation now states the actual backup-first boundary for
   incompatible SQLite migrations.
+- Durable audit projections now hash non-opaque provider identifiers and fail
+  closed on malformed identifiers before a concrete email provider can ship.
+- The local console is now built as a separately validated Vite artifact with
+  a manifest, hashed assets, no inline script/style, and a restrictive CSP.
+- The hosted gateway now carries authenticated tenant scope through ingress,
+  jobs, workflows, governed execution, and audit markers; tenant lifecycle
+  suspension, membership-scoped administration, and bounded backups are
+  covered by focused tests.
 
 These changes have passed focused registry/graph tests, gateway and kernel
 type checks, lint, formatting, architecture checks, and the relevant gateway,
 memory, workspace, and host suites. They do not close the external artifact
-acceptance or release-review gates below.
+verification or release-review gates below.
 
 ### Remaining 1.1 release gates
 
 The stable-release decision remains **NO-GO** until the following evidence is
 recorded:
 
-- complete or formally amend the Vite console-extraction criterion;
+- validate the extracted console through the exact downloaded candidate
+  artifact and retain its manifest/CSP evidence;
 - preserve durable review evidence for the security-sensitive merges;
 - validate rollback with the actual prior binary and restored backup;
-- build a fresh exact candidate from a clean tree and perform downloaded-asset
-  acceptance on clean Linux, macOS, and Windows systems;
+- build a fresh exact candidate from a clean tree and perform protected
+  downloaded-asset verification; platform-specific downloaded acceptance is
+  advisory and is not part of the publication dependency;
 - require opaque provider identifiers before shipping a concrete email adapter.
 
 ## Multi-tenant structure
@@ -80,16 +96,21 @@ operating-system isolation.
    durable revocable sessions, membership-derived tenant scope, and checked
    tenant selection. An identity-provider integration remains future work;
    tenant IDs supplied by clients never grant authority.
-3. **Runtime scope:** require tenant context across records, jobs, workflows,
-   approvals, audit, agents, plugins, channels, secrets, and API contracts.
-   Keep the existing per-tenant state boundary initially rather than rushing
-   into a shared database.
-4. **Multi-agent tenancy:** bind agents, graphs, capabilities, approvals,
-   quotas, and audit receipts to the tenant. Cross-tenant delegation is denied
-   by default and requires a separately designed broker if ever needed.
-5. **Lifecycle and operations:** implement tenant create, suspend, export,
-   backup, restore, delete, migrate, fair scheduling, durable metering,
-   multi-instance leases, and tenant-labelled observability.
+3. **Runtime scope:** ✅ gateway composition-boundary tranche implemented for
+   authenticated ingress claims, durable jobs, cron/event payloads, workflow
+   principals, governed/isolated task execution, and audit markers. Complete
+   the remaining direct store/API scope audit across approvals, agents,
+   plugins, channels, secrets, and any future service boundaries.
+4. **Multi-agent tenancy:** ✅ admitted graph and runtime-agent provenance are
+   immutable; gateway execution carries tenant scope. Add tenant ownership to
+   agent registries, graph admission, capabilities, approvals, quotas, and
+   audit receipts everywhere outside the gateway boundary. Cross-tenant
+   delegation remains denied by default.
+5. **Lifecycle and operations:** ✅ bounded suspension, membership-scoped
+   administration, and verified sensitive-state-excluding backups are
+   implemented. Add tenant create/delete/export/restore/migrate workflows,
+   fair scheduling, durable metering, multi-instance leases, and
+   tenant-labelled observability.
 6. **Isolation hardening:** use per-tenant secret storage and OS-user,
    container, or VM boundaries before claiming support for mutually hostile
    tenants. The current host is application-level isolation only.
@@ -101,10 +122,10 @@ operating-system isolation.
 
 ### Recommended first tranche
 
-The first tranche is now implemented while retaining separate per-tenant
-runtime state. The next tranche is runtime-wide tenant scoping and lifecycle
-operations; do not claim SaaS-grade or hostile-tenant isolation before the
-security and operational evidence exists.
+The first operational tranche is now implemented while retaining separate
+per-tenant runtime state. The remaining work is cross-package scope closure,
+full lifecycle operations, and isolation evidence; do not claim SaaS-grade or
+hostile-tenant isolation before those gates exist.
 
 ## Current classifications
 

@@ -4,12 +4,12 @@ import { createServer as createHttpServer, request as httpRequest } from "node:h
 import { createServer as createHttpsServer } from "node:https";
 import { realpathSync } from "node:fs";
 import { chmod, lstat, readFile, realpath, readdir, rename, writeFile } from "node:fs/promises";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 import { exit as exitProcess } from "node:process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { ensureSecureStateDirectory } from "@odinn/store-file";
-import { withStateMutationLock } from "@odinn/kernel";
+import { createStateBackup, withStateMutationLock } from "@odinn/kernel";
 import { createGatewayServer } from "./server.ts";
 
 const scrypt: any = promisify(scryptCallback);
@@ -56,14 +56,16 @@ export async function createMultiUserHost({
   const sessionsPath = join(root, "sessions.json");
   const sessionKeyPath = join(root, "session-key");
   const sessions: Map<string, any> = new Map();
+  let configuredUsers = users;
   let usersById: Map<string, any> = new Map();
   let tenantsById: Map<string, any> = new Map();
   let membershipsByUser: Map<string, any[]> = new Map();
+  let rolesById: Map<string, any> = new Map();
   let controlPlaneMigrated = false;
-  const loadUsers = async () => {
-    const records: any = users ?? JSON.parse(await readFile(usersPath, "utf8"));
+  const loadUsers = async (override?: any) => {
+    const records: any = override ?? (configuredUsers ?? JSON.parse(await readFile(usersPath, "utf8")));
     const controlPlane = normalizeHostControlPlane(records, root);
-    if (!users && records.schemaVersion !== 2 && !controlPlaneMigrated) {
+    if (!configuredUsers && override === undefined && records.schemaVersion !== 2 && !controlPlaneMigrated) {
       await withStateMutationLock(root, async () => {
         let current: any;
         try { current = JSON.parse(await readFile(usersPath, "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") throw error; current = records; }
@@ -76,21 +78,21 @@ export async function createMultiUserHost({
       controlPlaneMigrated = true;
     }
     const active: any[] = [];
-    const activeTenants: any[] = [];
+    const configuredTenants: any[] = [];
     for (const rawTenant of controlPlane.tenants) {
-      if (rawTenant.disabled) continue;
-    const id = normalizeAcceptedTenantId(rawTenant.id);
-    if (!id || id !== rawTenant.id) throw new Error("host tenant ids must be canonical lowercase identifiers");
-    const workspaceRoot = await realpath(resolve(rawTenant.workspaceRoot));
-    const stateDir = resolve(root, rawTenant.stateDirectory || join("tenants", id));
-    assertInsideRoot(root, stateDir, "tenant state path");
-    await assertPhysicalPathInside(root, stateDir, "tenant state path");
-    if (stateDir === root) throw new Error("tenant state path must not be the host state root");
-    activeTenants.push({ ...rawTenant, id, workspaceRoot, stateDir });
-  }
-  if (new Set(activeTenants.map((tenant: any) => tenant.id)).size !== activeTenants.length) throw new Error("duplicate host tenant id");
-  assertNonOverlappingStateDirectories(root, activeTenants);
-  await assertTenantBoundaries(root, activeTenants);
+      const id = normalizeAcceptedTenantId(rawTenant.id);
+      if (!id || id !== rawTenant.id) throw new Error("host tenant ids must be canonical lowercase identifiers");
+      const workspaceRoot = await realpath(resolve(rawTenant.workspaceRoot));
+      const stateDir = resolve(root, rawTenant.stateDirectory || join("tenants", id));
+      assertInsideRoot(root, stateDir, "tenant state path");
+      await assertPhysicalPathInside(root, stateDir, "tenant state path");
+      if (stateDir === root) throw new Error("tenant state path must not be the host state root");
+      const status = normalizeTenantStatus(rawTenant.status, rawTenant.disabled);
+      configuredTenants.push({ ...rawTenant, id, status, disabled: status === "suspended", workspaceRoot, stateDir });
+    }
+    if (new Set(configuredTenants.map((tenant: any) => tenant.id)).size !== configuredTenants.length) throw new Error("duplicate host tenant id");
+    assertNonOverlappingStateDirectories(root, configuredTenants);
+    await assertTenantBoundaries(root, configuredTenants);
     for (const user of controlPlane.users) {
       if (user.disabled) continue;
       const id = normalizeAcceptedUserId(user.id);
@@ -98,19 +100,40 @@ export async function createMultiUserHost({
       const memberships = controlPlane.memberships
         .filter((membership: any) => membership.userId === id && membership.disabled !== true)
         .map((membership: any) => ({ ...membership, userId: id, tenantId: normalizeAcceptedTenantId(membership.tenantId) }))
-        .filter((membership: any) => membership.tenantId && activeTenants.some((tenant: any) => tenant.id === membership.tenantId));
+        .filter((membership: any) => membership.tenantId && configuredTenants.some((tenant: any) => tenant.id === membership.tenantId));
       if (!memberships.length) continue;
       active.push({ ...user, id, memberships, defaultTenantId: memberships.some((item: any) => item.tenantId === user.defaultTenantId) ? user.defaultTenantId : memberships[0].tenantId });
     }
-    assertNonOverlappingWorkspaces(activeTenants);
+    assertNonOverlappingWorkspaces(configuredTenants);
     if (new Set(active.map((user: any) => user.id)).size !== active.length) throw new Error("duplicate host user id");
     usersById = new Map(active.map((user: any) => [user.id, user]));
-    tenantsById = new Map(activeTenants.map((tenant: any) => [tenant.id, tenant]));
+    tenantsById = new Map(configuredTenants.map((tenant: any) => [tenant.id, tenant]));
     membershipsByUser = new Map(active.map((user: any) => [user.id, user.memberships]));
+    rolesById = new Map(controlPlane.roles.map((role: any) => [role.id, role]));
     for (const [id, session] of sessions) {
       if (!usersById.has(session.userId) || !hasTenantMembership(membershipsByUser, tenantsById, session.userId, session.tenantId)) sessions.delete(id);
     }
     return usersById;
+  };
+  const mutateControlPlane = async <T>(mutator: (controlPlane: any) => Promise<T> | T): Promise<T> => {
+    let result!: T;
+    let next: any;
+    await withStateMutationLock(root, async () => {
+      const current = configuredUsers ?? JSON.parse(await readFile(usersPath, "utf8"));
+      const controlPlane = normalizeHostControlPlane(current, root);
+      result = await mutator(controlPlane);
+      next = normalizeHostControlPlane(controlPlane, root);
+      if (configuredUsers) {
+        configuredUsers = next;
+        return;
+      }
+      const temporary = `${usersPath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
+      await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+      await rename(temporary, usersPath);
+      await chmod(usersPath, 0o600);
+    });
+    await loadUsers(next);
+    return result;
   };
   await loadUsers();
   const sessionKey = await loadOrCreateSessionKey(sessionKeyPath);
@@ -181,6 +204,7 @@ export async function createMultiUserHost({
   const tenantIdleMs = Math.max(30_000, Number(tenantLimits.idleMs ?? 15 * 60 * 1000));
   const maximumTenantStorageBytes = Math.max(1_000_000, Number(tenantLimits.maximumStorageBytes ?? 2 * 1024 * 1024 * 1024));
   const maximumActiveTenants = Math.max(1, Number(tenantLimits.maximumActiveTenants ?? 50));
+  const maximumTenantBackups = boundedInteger(tenantLimits.maximumBackups, 10, 1, 100);
   const attemptsPath = join(root, "login-attempts.json");
   const loginAttempts: Map<string, any> = new Map();
   const maximumLoginAttempts = boundedInteger(loginLimits.maximumAttempts, 5, 1, 1_000);
@@ -282,6 +306,7 @@ export async function createMultiUserHost({
     const key = `${user.id}:${tenantId}`;
     const tenantRecord = tenantsById.get(tenantId);
     if (!tenantRecord || !hasTenantMembership(membershipsByUser, tenantsById, user.id, tenantId)) throw new Error("tenant membership is no longer active");
+    if (tenantRecord.status !== "active") throw hostError("HOST_TENANT_SUSPENDED", "tenant is suspended");
     if (tenants.has(key)) {
       const current = tenants.get(key);
       current.lastUsedAt = Date.now();
@@ -297,6 +322,40 @@ export async function createMultiUserHost({
     tenants.set(key, value);
     return value;
   }
+
+  const tenantAdministration = (userId: string, tenantId: unknown) => {
+    const normalizedTenantId = normalizeAcceptedTenantId(tenantId);
+    if (!normalizedTenantId || !hasTenantMembership(membershipsByUser, tenantsById, userId, normalizedTenantId)) {
+      throw hostError("HOST_TENANT_ADMIN_FORBIDDEN", "tenant administration requires an active membership");
+    }
+    if (!hasTenantPermission(membershipsByUser, tenantsById, rolesById, userId, normalizedTenantId, "tenant.manage")) {
+      throw hostError("HOST_TENANT_ADMIN_FORBIDDEN", "tenant administration permission required");
+    }
+    return tenantsById.get(normalizedTenantId);
+  };
+
+  const createTenantBackup = async (tenantRecord: any) => {
+    const backupParent = join(root, "tenant-backups", tenantRecord.id);
+    const backupId = `backup-${Date.now()}-${randomBytes(6).toString("hex")}`;
+    const destination = join(backupParent, backupId);
+    let report: Awaited<ReturnType<typeof createStateBackup>> | undefined;
+    await withStateMutationLock(root, async () => {
+      if (await countTenantBackups(backupParent) >= maximumTenantBackups) throw hostError("HOST_TENANT_BACKUP_LIMIT", "tenant backup capacity reached");
+      report = await createStateBackup(tenantRecord.stateDir, destination, {
+        applicationVersion: process.env.ODINN_VERSION,
+        applicationCommit: process.env.ODINN_COMMIT
+      });
+    });
+    if (!report) throw hostError("HOST_TENANT_BACKUP_UNAVAILABLE", "tenant backup did not produce a report");
+    return {
+      backupId,
+      backupPath: relative(root, report.destination).replaceAll("\\", "/"),
+      createdAt: report.manifest.createdAt,
+      files: report.manifest.files.length,
+      includesSensitiveState: report.manifest.includesSensitiveState,
+      excluded: report.manifest.excluded
+    };
+  };
 
   const evictionTimer = setInterval(() => {
     const cutoff = Date.now() - tenantIdleMs;
@@ -411,6 +470,20 @@ export async function createMultiUserHost({
       if (request.method === "GET" && request.url === "/auth/tenants") {
         return send(response, 200, { ok: true, userId: user.id, tenantId: session.tenantId, tenants: membershipsForUser(membershipsByUser, tenantsById, user.id) });
       }
+      if (request.method === "GET" && request.url === "/auth/tenant") {
+        const tenantRecord = tenantsById.get(session.tenantId);
+        const membership = tenantMembershipForUser(membershipsByUser, user.id, session.tenantId);
+        if (!tenantRecord || !membership) return send(response, 403, { error: "tenant membership is not active" });
+        return send(response, 200, {
+          ok: true,
+          userId: user.id,
+          tenantId: tenantRecord.id,
+          name: tenantRecord.name,
+          status: tenantRecord.status,
+          role: membership.role,
+          permissions: rolePermissions(rolesById, membership.role)
+        });
+      }
       if (request.method === "POST" && request.url === "/auth/select-tenant") {
         const body = await readBody(request);
         const tenantId = normalizeAcceptedTenantId(body.tenantId);
@@ -421,10 +494,47 @@ export async function createMultiUserHost({
         await persistSessions();
         return send(response, 200, { ok: true, userId: user.id, tenantId, tenants: membershipsForUser(membershipsByUser, tenantsById, user.id) });
       }
+      if (request.method === "POST" && request.url === "/auth/tenant/lifecycle") {
+        const body = await readBody(request);
+        const tenantId = normalizeAcceptedTenantId(body.tenantId ?? session.tenantId);
+        const status = requestedTenantStatus(body.status);
+        if (!tenantId) return send(response, 403, { error: "tenant administration is not permitted" });
+        tenantAdministration(user.id, tenantId);
+        const result = await mutateControlPlane(async (controlPlane) => {
+          if (!hasControlPlaneTenantPermission(controlPlane, user.id, tenantId, "tenant.manage")) {
+            throw hostError("HOST_TENANT_ADMIN_FORBIDDEN", "tenant administration permission required");
+          }
+          const target = controlPlane.tenants.find((tenant: any) => tenant.id === tenantId);
+          if (!target) throw hostError("HOST_TENANT_ADMIN_FORBIDDEN", "tenant administration requires an active membership");
+          const changed = normalizeTenantStatus(target.status, target.disabled) !== status;
+          target.status = status;
+          target.disabled = status === "suspended";
+          return { tenantId, status, changed };
+        });
+        if (result.status === "suspended") await closeTenantInstances(result.tenantId, tenants);
+        return send(response, 200, { ok: true, ...result });
+      }
+      if (request.method === "POST" && request.url === "/auth/tenant/backup") {
+        const body = await readBody(request);
+        const tenantRecord = tenantAdministration(user.id, body.tenantId ?? session.tenantId);
+        try {
+          return send(response, 200, { ok: true, tenantId: tenantRecord.id, status: tenantRecord.status, backup: await createTenantBackup(tenantRecord) });
+        } catch (error: any) {
+          if (error?.code === "ENOENT") throw hostError("HOST_TENANT_BACKUP_UNAVAILABLE", "tenant state is not initialized");
+          throw error;
+        }
+      }
+      const selectedTenant = tenantsById.get(session.tenantId);
+      if (selectedTenant?.status !== "active") return send(response, 423, { error: "tenant is suspended", tenantId: session.tenantId, status: selectedTenant?.status ?? "suspended" });
       const backend = await tenant(user, session.tenantId);
       if (!['GET', 'HEAD'].includes(request.method || 'GET') && await directorySize(backend.stateDir) > maximumTenantStorageBytes) return send(response, 507, { error: "tenant storage quota exceeded" });
       proxy(request, response, backend, session.userId, session.tenantId);
     } catch (error: any) {
+      if (error?.code === "HOST_TENANT_SUSPENDED") return send(response, 423, { error: "tenant is suspended", status: "suspended" });
+      if (error?.code === "HOST_TENANT_ADMIN_FORBIDDEN") return send(response, 403, { error: "tenant administration is not permitted" });
+      if (error?.code === "HOST_TENANT_BACKUP_LIMIT") return send(response, 429, { error: "tenant backup capacity reached" });
+      if (error?.code === "HOST_TENANT_BACKUP_UNAVAILABLE") return send(response, 409, { error: "tenant state is not initialized" });
+      if (error?.code === "HOST_TENANT_STATUS_INVALID") return send(response, 400, { error: "tenant status must be active or suspended" });
       console.error("Odinn host request failed:", error);
       send(response, 500, { error: "internal host error" });
     }
@@ -492,14 +602,17 @@ function normalizeHostControlPlane(input: any, root: string) {
   if (!input || typeof input !== "object" || Array.isArray(input) || !Array.isArray(input.users)) throw new Error("host control plane must contain a users array");
   const explicitTenants = Array.isArray(input.tenants) && input.tenants.length > 0;
   const explicitMemberships = Array.isArray(input.memberships) && input.memberships.length > 0;
-  const tenants = explicitTenants
+  const tenants = (explicitTenants
     ? input.tenants.map((tenant: any) => ({ ...tenant }))
     : input.users.map((user: any) => ({
       id: user.id,
       name: user.id,
       workspaceRoot: user.workspaceRoot,
       stateDirectory: join("users", String(user.id))
-    }));
+    }))).map((tenant: any) => {
+      const status = normalizeTenantStatus(tenant.status, tenant.disabled);
+      return { ...tenant, status, disabled: status === "suspended" };
+    });
   const memberships = explicitMemberships
     ? input.memberships.map((membership: any) => ({ ...membership }))
     : input.users.map((user: any) => ({ userId: user.id, tenantId: user.id, role: "owner", disabled: user.disabled === true }));
@@ -523,11 +636,52 @@ function normalizeHostControlPlane(input: any, root: string) {
   return { schemaVersion: 2, users: input.users.map((user: any) => ({ ...user })), tenants, memberships, roles, serviceAccounts };
 }
 
+function normalizeTenantStatus(value: unknown, legacyDisabled?: unknown): "active" | "suspended" {
+  if (value === undefined || value === null || value === "") return legacyDisabled === true ? "suspended" : "active";
+  if (value === "active" || value === "suspended") {
+    if (value === "active" && legacyDisabled === true) throw new Error("host tenant status conflicts with disabled state");
+    return value;
+  }
+  throw new Error("host tenant status must be active or suspended");
+}
+
+function requestedTenantStatus(value: unknown): "active" | "suspended" {
+  if (value === "active" || value === "suspended") return value;
+  throw hostError("HOST_TENANT_STATUS_INVALID", "tenant status must be active or suspended");
+}
+
 function membershipsForUser(membershipsByUser: Map<string, any[]>, tenantsById: Map<string, any>, userId: string): any[] {
   return (membershipsByUser.get(userId) ?? []).map((membership: any) => {
     const tenant = tenantsById.get(membership.tenantId);
-    return { tenantId: membership.tenantId, role: membership.role, ...(tenant?.name ? { name: tenant.name } : {}) };
+    return {
+      tenantId: membership.tenantId,
+      role: membership.role,
+      status: tenant?.status ?? "suspended",
+      ...(tenant?.name ? { name: tenant.name } : {})
+    };
   });
+}
+
+function tenantMembershipForUser(membershipsByUser: Map<string, any[]>, userId: string, tenantId: string): any | undefined {
+  return (membershipsByUser.get(userId) ?? []).find((membership: any) => membership.tenantId === tenantId && membership.disabled !== true);
+}
+
+function rolePermissions(rolesById: Map<string, any>, roleId: unknown): string[] {
+  const permissions = typeof roleId === "string" ? rolesById.get(roleId)?.permissions : undefined;
+  return Array.isArray(permissions) ? permissions.filter((permission: unknown): permission is string => typeof permission === "string") : [];
+}
+
+function hasTenantPermission(membershipsByUser: Map<string, any[]>, tenantsById: Map<string, any>, rolesById: Map<string, any>, userId: string, tenantId: string, permission: string): boolean {
+  const membership = tenantMembershipForUser(membershipsByUser, userId, tenantId);
+  return Boolean(membership && tenantsById.has(tenantId) && rolePermissions(rolesById, membership.role).includes(permission));
+}
+
+function hasControlPlaneTenantPermission(controlPlane: any, userId: string, tenantId: string, permission: string): boolean {
+  const user = controlPlane.users.find((candidate: any) => candidate.id === userId && candidate.disabled !== true);
+  const tenant = controlPlane.tenants.find((candidate: any) => candidate.id === tenantId);
+  const membership = controlPlane.memberships.find((candidate: any) => candidate.userId === userId && candidate.tenantId === tenantId && candidate.disabled !== true);
+  const role = controlPlane.roles.find((candidate: any) => candidate.id === membership?.role);
+  return Boolean(user && tenant && membership && Array.isArray(role?.permissions) && role.permissions.includes(permission));
 }
 
 function hasTenantMembership(membershipsByUser: Map<string, any[]>, tenantsById: Map<string, any>, userId: string, tenantId: unknown): boolean {
@@ -606,7 +760,7 @@ export async function addHostUser({ stateDir = ".odinn-host", id, password, work
     config = normalizeHostControlPlane(config, root);
     const user = { id, defaultTenantId: id, salt: credentials.salt, passwordHash: credentials.hash, disabled: false };
     config.users = [...config.users.filter((item: any) => item.id !== id), user];
-    config.tenants = [...config.tenants.filter((item: any) => item.id !== id), { id, name: id, workspaceRoot: workspace, stateDirectory: join("users", id), disabled: false }];
+    config.tenants = [...config.tenants.filter((item: any) => item.id !== id), { id, name: id, workspaceRoot: workspace, stateDirectory: join("users", id), status: "active", disabled: false }];
     config.memberships = [...config.memberships.filter((item: any) => !(item.userId === id && item.tenantId === id)), { userId: id, tenantId: id, role: "owner", disabled: false }];
     const temporary = `${path}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
     await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
@@ -713,7 +867,7 @@ export async function addHostTenant({ stateDir = ".odinn-host", id, name, worksp
     let config: any = { schemaVersion: 2, users: [], tenants: [], memberships: [], roles: [], serviceAccounts: [] };
     try { config = JSON.parse(await readFile(path, "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
     config = normalizeHostControlPlane(config, root);
-    config.tenants = [...config.tenants.filter((item: any) => item.id !== tenantId), { id: tenantId, name: String(name || tenantId).slice(0, 120), workspaceRoot: workspace, stateDirectory: join("tenants", tenantId), quotas, disabled: false }];
+    config.tenants = [...config.tenants.filter((item: any) => item.id !== tenantId), { id: tenantId, name: String(name || tenantId).slice(0, 120), workspaceRoot: workspace, stateDirectory: join("tenants", tenantId), quotas, status: "active", disabled: false }];
     const temporary = `${path}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
     await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
     await rename(temporary, path); await chmod(path, 0o600);
@@ -754,6 +908,11 @@ async function closeUserTenants(userId: string, tenants: Map<string, any>) {
   await Promise.allSettled(owned.map(([key, value]) => closeTenant(key, value, tenants)));
 }
 
+async function closeTenantInstances(tenantId: string, tenants: Map<string, any>) {
+  const owned = [...tenants.entries()].filter(([key]) => key.endsWith(`:${tenantId}`));
+  await Promise.allSettled(owned.map(([key, value]) => closeTenant(key, value, tenants)));
+}
+
 async function evictOldestTenant(tenants: Map<string, any>) {
   const oldest = [...tenants.entries()].sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)[0];
   if (oldest) await closeTenant(oldest[0], oldest[1], tenants);
@@ -771,6 +930,33 @@ function authenticate(request: any, sessions: any, key: any) {
     return null;
   }
   return { ...session, id };
+}
+
+function hostError(code: string, message: string): Error & { code: string } {
+  const error = new Error(message) as Error & { code: string };
+  error.code = code;
+  return error;
+}
+
+async function countTenantBackups(path: string): Promise<number> {
+  let entries: any[];
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("tenant backup directory must be a physical directory");
+    entries = await readdir(path, { withFileTypes: true });
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return 0;
+    throw error;
+  }
+  let count = 0;
+  for (const entry of entries) {
+    const child = join(path, entry.name);
+    const metadata = await lstat(child);
+    if (metadata.isSymbolicLink()) throw new Error("tenant backup directory contains a symbolic link");
+    if (metadata.isDirectory()) count += 1;
+    else if (!metadata.isFile()) throw new Error("tenant backup directory contains an unsupported entry");
+  }
+  return count;
 }
 async function readBody(request: any) { const chunks = []; let size = 0; for await (const chunk of request) { size += chunk.length; if (size > 16_384) throw new Error("request too large"); chunks.push(chunk); } return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); }
 function send(response: any, status: any, value: any) { if (response.headersSent) return; response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" }); response.end(`${JSON.stringify(value)}\n`); }

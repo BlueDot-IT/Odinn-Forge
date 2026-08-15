@@ -175,8 +175,10 @@ failed release is corrected with a new version rather than by moving a tag.
 
 ### Release
 
-A `v*` tag starts the release workflow. Manual dispatch can republish an
-existing tag for recovery, but cannot release an untagged branch. The workflow:
+The Release workflow is intentionally `workflow_dispatch` only. A `v*` tag and
+draft release are prerequisites, but pushing a tag does not start publication;
+an operator manually dispatches the workflow for the exact tag and release.
+Manual dispatch cannot release an untagged branch. The workflow:
 
 1. Checks out the exact tag.
 2. Verifies that the tag matches `package.json`.
@@ -268,4 +270,7 @@ Breaking changes use `!` before the colon or a `BREAKING CHANGE:` footer.
 
 ## Future package targets
 
-When native binaries and containers are added, extend the release workflow with platform-specific build jobs. Each job must upload its own checksummed artifact, and the publish job must not run until Windows, macOS, and Linux package smoke tests pass.
+When native binaries and containers are added, extend the release workflow with
+platform-specific build jobs. Each job must upload its own checksummed artifact
+and report its package smoke result; make it a publication dependency only when
+the release scope explicitly requires a platform-specific artifact.

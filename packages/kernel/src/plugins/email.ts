@@ -1,3 +1,4 @@
+import { durableEmailProviderIdentifier } from "@odinn/protocol";
 import { listEmailAccounts, readEmail, searchEmail, threadEmail } from "../email.ts";
 import { validatePluginManifest, type PluginManifest } from "../plugin-contracts.ts";
 import type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool } from "./host-capability.ts";
@@ -52,10 +53,19 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
   manifest: EMAIL_READ_PLUGIN_MANIFEST,
   createTools: (pluginContext: HostCapabilityPluginContext): ReadonlyMap<string, HostCapabilityTool> => {
     if (!pluginContext.emailReadProvider) throw new Error("email read plugin requires a configured provider");
-    const resourceForProvider = () => ({ ...pluginContext.emailReadProvider!.target });
+    const resourceForProvider = () => {
+      const target = pluginContext.emailReadProvider!.target;
+      return {
+        providerId: durableEmailProviderIdentifier(target.providerId, "email provider target.providerId", 128),
+        generation: durableEmailProviderIdentifier(target.generation, "email provider target.generation", 128)
+      };
+    };
     const resourceForAccount = (input: Record<string, unknown>) => {
       if (typeof input.accountId !== "string" || input.accountId.length === 0 || input.accountId.length > 256) throw new Error("email accountId is required for resource binding");
-      return { ...pluginContext.emailReadProvider!.target, accountId: input.accountId };
+      return {
+        ...resourceForProvider(),
+        accountId: durableEmailProviderIdentifier(input.accountId, "email resource accountId")
+      };
     };
     return new Map([
       ["email.accounts", {

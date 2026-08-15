@@ -168,16 +168,22 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
     release,
     /^  stage-release-assets:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- source-package/m
   );
-  assert.match(
-    release,
-    /^  validate-downloaded-release:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- stage-release-assets/m
-  );
-  assert.match(release, /matrix:\s*\n\s+os:\s*\n\s+- ubuntu-latest\s*\n\s+- macos-latest\s*\n\s+- windows-latest/u);
-  assert.match(release, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
+  assert.doesNotMatch(release, /^  validate-downloaded-release:/m);
+  assert.doesNotMatch(release, /name: Validate downloaded release \(\$\{\{ matrix\.os \}\}\)/u);
+  const stageJob = release.match(/^  stage-release-assets:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
+  assert.match(stageJob, /runs-on: ubuntu-latest/u);
+  assert.match(stageJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
+  assert.match(stageJob, /cmp release-assets\/SHA256SUMS\.txt downloaded-release-assets\/SHA256SUMS\.txt/u);
+  assert.match(stageJob, /node scripts\/release\/verify-downloaded-assets\.ts downloaded-release-assets/u);
+  assert.match(stageJob, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
   assert.doesNotMatch(release.match(/^  source-package:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /id-token: write/);
   assert.match(
     release,
     /^  publish-release:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- source-package\s*\n[\s\S]*?^    environment: release\s*\n[\s\S]*?^      id-token: write/m
+  );
+  assert.doesNotMatch(
+    release.match(/^  publish-release:[\s\S]*$/m)?.[0] ?? "",
+    /validate-downloaded-release/u
   );
   assert.match(
     release,
@@ -540,7 +546,7 @@ test("user documentation and reporting surfaces ship in the release tree", async
   assert.match(userGuide, /registration and discovery do not execute or activate/u);
   assert.doesNotMatch(userGuide, /attachments sent to their configured API/u);
   const releaseValidation = await read("docs/release-validation.md");
-  assert.match(releaseValidation, /clean Linux, macOS, and Windows environment/u);
+  assert.match(releaseValidation, /Downloaded-artifact installation on each operating system is\s+advisory evidence, not a publication gate/u);
   assert.match(releaseValidation, /archive checksums,[\s\S]*SBOM,[\s\S]*provenance/u);
   const matrix = await read("docs/surface-matrix.md");
   for (const label of [

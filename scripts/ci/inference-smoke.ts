@@ -67,7 +67,7 @@ export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions =
   const child = spawn(gatewayCommand, gatewayArgs, {
     shell: process.platform === "win32" && gatewayCommand.toLowerCase().endsWith(".cmd"),
     cwd: root,
-    env: { ...process.env, INIT_CWD: root, ODINN_PORT: "0", ODINN_STATE_DIR: stateDir, ODINN_CI_PROVIDER_API_KEY: "ci-provider-key" },
+    env: { ...process.env, INIT_CWD: root, ODINN_HOST: "127.0.0.1", ODINN_PORT: "0", ODINN_STATE_DIR: stateDir, ODINN_CI_PROVIDER_API_KEY: "ci-provider-key" },
     stdio: ["ignore", "pipe", "pipe"]
   });
   let childError = "";
@@ -96,8 +96,13 @@ export async function runInferenceProtocolSmoke(options: InferenceSmokeOptions =
     );
     const gatewayBase = `http://127.0.0.1:${gatewayPort}`;
     const bootstrap = await fetch(`${gatewayBase}/`);
-    const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
-    if (!cookie) throw new Error("packaged gateway did not issue an authentication cookie");
+    const setCookie = typeof bootstrap.headers.getSetCookie === "function"
+      ? bootstrap.headers.getSetCookie()[0]
+      : bootstrap.headers.get("set-cookie");
+    const cookie = setCookie?.split(";", 1)[0];
+    if (!cookie) {
+      throw new Error(`packaged gateway did not issue an authentication cookie: status=${bootstrap.status}; auth=${bootstrap.headers.get("x-odinn-auth") ?? ""}`);
+    }
     await waitForStatus(`${gatewayBase}/status`, cookie, child, () => `${childOutput}${childError}`);
     const response = await fetch(`${gatewayBase}/run`, {
       method: "POST",
