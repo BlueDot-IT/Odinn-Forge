@@ -45,7 +45,11 @@ export function validHostHeader(request: any): boolean {
 export function permitsGatewayTokenBootstrap(request: any, server: any): boolean {
   const address = server.address?.();
   if (!address || typeof address === "string" || !validLoopbackAddress(address.address)) return false;
-  return validLoopbackAddress(request.socket?.localAddress);
+  // Node can expose either endpoint as an IPv4-mapped IPv6 address depending
+  // on how the loopback listener was created. The listener check above keeps
+  // remote bindings from bootstrapping; accept either loopback socket view.
+  return validLoopbackAddress(request.socket?.localAddress)
+    || validLoopbackAddress(request.socket?.remoteAddress);
 }
 
 export function validLoopbackAddress(value: unknown): boolean {
