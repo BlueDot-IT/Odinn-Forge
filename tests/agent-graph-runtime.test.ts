@@ -43,6 +43,18 @@ function stable(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
+function executionBinding(agentId: string) {
+  const seed = digest({ agentId });
+  return {
+    agentId,
+    agentVersion: "1.0.0",
+    manifestIntegrity: seed,
+    identityContentDigest: digest({ seed, identity: true }),
+    resolvedSystemPromptDigest: digest({ seed, prompt: true }),
+    modelConfigurationDigest: digest({ seed, model: true })
+  };
+}
+
 test("live graph dispatch validates capabilities, owns child registry scope, and retains only digests", async () => {
   const manifestInput = manifest();
   const manifestDigest = digest({
@@ -113,8 +125,10 @@ test("live graph dispatch runs multiple installed agent identities with bounded 
   }, {
     registry: new Map([["agent.run", { execute: async () => undefined }], ["text.echo", { execute: async () => undefined }]]),
     policy: createDefaultPolicy(), parentCapabilities: createDefaultPolicy().allowedCapabilities, runId: "multi-agent-job",
+    resolveAgent: async (agentId) => executionBinding(agentId),
     runChild: async (task: any) => {
       agentIds.push(task.input.agentId);
+      assert.equal(task.agentExecutionBinding.agentId, task.input.agentId);
       active += 1;
       peak = Math.max(peak, active);
       await new Promise((resolve) => setImmediate(resolve));
@@ -125,6 +139,57 @@ test("live graph dispatch runs multiple installed agent identities with bounded 
   assert.equal(report.status, "completed");
   assert.deepEqual(agentIds.sort(), ["researcher", "reviewer"]);
   assert.equal(peak, 2);
+});
+
+test("graph admission deep-snapshots nested child input before provenance resolution and dispatch", async () => {
+  const runtimeManifest: any = {
+    ...manifest(), id: "researcher", registryRef: "registry:agent.researcher"
+  };
+  runtimeManifest.manifestDigest = digest({
+    schemaVersion: 1,
+    id: runtimeManifest.id,
+    revision: runtimeManifest.revision,
+    registryRef: runtimeManifest.registryRef,
+    requestedTools: [...runtimeManifest.requestedTools].sort(),
+    requestedCapabilities: [...runtimeManifest.requestedCapabilities].sort(),
+    maxChildren: runtimeManifest.maxChildren,
+    defaultTimeoutMs: runtimeManifest.defaultTimeoutMs
+  });
+  const manifests = [runtimeManifest];
+  const graphInput = {
+    schemaVersion: 1,
+    id: "snapshot-input",
+    nodes: [{ id: "child", manifestId: "researcher", manifestDigest: runtimeManifest.manifestDigest, inputRef: "input:child", resultRef: "result:child", dependsOn: [] }]
+  };
+  const source = { messages: [{ role: "user", content: "original" }] };
+  let resolveAdmission!: () => void;
+  const admission = new Promise<void>((resolve) => { resolveAdmission = resolve; });
+  let resolverEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { resolverEntered = resolve; });
+  let received: any;
+  const execution = executeAgentGraph({
+    graph: JSON.stringify(graphInput), manifests: JSON.stringify(manifests), principalNamespace: "operator", inputs: { "input:child": source }
+  }, {
+    registry: new Map([["agent.run", { execute: async () => undefined }], ["text.echo", { execute: async () => undefined }]]),
+    policy: createDefaultPolicy(), parentCapabilities: createDefaultPolicy().allowedCapabilities, runId: "snapshot-input",
+    resolveAgent: async (agentId) => {
+      assert.equal(agentId, "researcher");
+      resolverEntered();
+      await admission;
+      return executionBinding(agentId);
+    },
+    runChild: async (task: any) => {
+      received = task.input;
+      return { ok: true, output: { content: "done" } };
+    }
+  });
+  await resolverEntered;
+  source.messages[0]!.content = "mutated-after-admission";
+  resolveAdmission();
+  await execution;
+  assert.equal(received.messages[0].content, "original");
+  assert.equal(Object.isFrozen(received.messages), true);
+  assert.equal(Object.isFrozen(received.messages[0]), true);
 });
 
 test("graph dispatch rejects capability escalation and unsupported registry claims", async () => {

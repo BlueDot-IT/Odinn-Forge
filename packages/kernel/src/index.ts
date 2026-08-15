@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { access } from "node:fs/promises";
 import { hostname, platform, release } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
@@ -27,7 +28,7 @@ import { browserHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailR
 import type { EmailReadProvider } from "./email.ts";
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
-import { DEFAULT_AGENT_ID, loadAgent } from "./agents.ts";
+import { DEFAULT_AGENT_ID, ensureMainAgent, loadAgent, type AgentExecutionBinding } from "./agents.ts";
 import { registerChannelAgentTools } from "./channel-agent-tools.ts";
 import { readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 import { AGENT_GRAPH_TOOL, executeAgentGraph, type AgentGraphTaskInput } from "./agent-graph-runtime.ts";
@@ -100,8 +101,8 @@ export { SqliteRecordStore } from "@odinn/store-sqlite";
 export { SqliteOperatorReadStore, SqliteWorkflowStore } from "@odinn/store-sqlite";
 export { closeBrowserManagers } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
-export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, defaultMainAgentManifest, ensureMainAgent, loadAgent, provisionRuntimeAgent, validateAgentManifest } from "./agents.ts";
-export type { AgentManifest } from "./agents.ts";
+export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, AgentRegistryStore, defaultMainAgentManifest, ensureMainAgent, loadAgent, provisionRuntimeAgent, validateAgentManifest } from "./agents.ts";
+export type { AgentExecutionBinding, AgentManifest, AgentRegistry, AgentRegistryMutationOptions, EnsureMainAgentOptions, RuntimeAgentProvisionOptions } from "./agents.ts";
 export { AGENT_GRAPH_REGISTRY_REF, AGENT_GRAPH_TOOL, AGENT_RUNTIME_REGISTRY_PREFIX, executeAgentGraph } from "./agent-graph-runtime.ts";
 export type { AgentGraphExecutorOptions, AgentGraphTaskInput } from "./agent-graph-runtime.ts";
 
@@ -293,6 +294,7 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
         policy: context.policy,
         signal: context.signal,
         allowNestedAgentExecution: context.allowNestedAgentExecution,
+        agentExecutionBinding: context.agentExecutionBinding,
         onModelDelta: context.onModelDelta,
         onProviderAttempt: context.onProviderAttempt,
         onAgentProgress: context.onAgentProgress
@@ -318,6 +320,8 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
           registry: context.registry,
           policy,
           parentCapabilities,
+          defaultAgentId: config.defaultAgentId,
+          resolveAgent: async (agentId) => (await loadAgent(stateDir, agentId)).executionBinding,
           runId: context.request.id,
           signal: context.signal,
           appendEvent: (event) => context.runLedger?.appendEvent({ runId: context.request.id, type: event.type, payload: event.payload }),
@@ -962,9 +966,32 @@ function modelVisibleAgentToolSchemas(registry: any) {
   });
 }
 
-async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, auditStore, runId, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt, onAgentProgress, allowNestedAgentExecution = true }: any = {}) {
+async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAgentId, memoryStore, auditStore, runId, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt, onAgentProgress, allowNestedAgentExecution = true, agentExecutionBinding }: { agentExecutionBinding?: AgentExecutionBinding } & AnyRecord = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
-  const agent = await loadAgent(stateDir, cleanString(input.agentId, defaultAgentId || DEFAULT_AGENT_ID));
+  const selectedAgentId = cleanString(input.agentId, defaultAgentId || DEFAULT_AGENT_ID);
+  // Direct kernel callers may invoke agent.run without a CLI or gateway
+  // startup phase. Bootstrap only a genuinely absent primary registry for
+  // that compatibility path; loadAgent itself remains read-only for every
+  // established registry and lifecycle state.
+  if (selectedAgentId === DEFAULT_AGENT_ID) {
+    const registryPath = join(resolve(stateDir), "agents.json");
+    let registryExists = true;
+    try { await access(registryPath); }
+    catch (error: any) {
+      if (error?.code === "ENOENT") registryExists = false;
+      else throw error;
+    }
+    if (!registryExists) await ensureMainAgent(stateDir);
+  }
+  const agent = await loadAgent(stateDir, selectedAgentId);
+  if (agentExecutionBinding) {
+    const fields = ["agentId", "agentVersion", "manifestIntegrity", "identityContentDigest", "resolvedSystemPromptDigest", "modelConfigurationDigest"] as const;
+    if (fields.some((field) => agent.executionBinding[field] !== agentExecutionBinding[field])) {
+      const error = new Error("runtime agent changed after graph admission; execution provenance no longer matches") as NodeError;
+      error.code = "AGENT_PROVENANCE_MISMATCH";
+      throw error;
+    }
+  }
   const memoryOptions = normalizeMemoryOptions(input.memory);
   const policyAllows = (toolName: string, toolInput: any = {}) => evaluateTaskPolicy({
     policy,
@@ -1738,6 +1765,7 @@ async function executeTaskThroughAdmission({
   parentRunId,
   modelRegistry,
   allowNestedAgentExecution = true,
+  agentExecutionBinding,
   parentCapabilities,
   admissionService
 }: any) {
@@ -1975,6 +2003,7 @@ async function executeTaskThroughAdmission({
       trustedApprovalContinuation: approvalContinuation,
       durableExecution,
       allowNestedAgentExecution,
+      agentExecutionBinding,
       effectiveCapabilities: decision.allowed ? decision.capabilities : [],
       parentCapabilities: admittedParentCapabilities,
       runTool: (nestedTask: any) => {
@@ -1987,8 +2016,11 @@ async function executeTaskThroughAdmission({
         const nestedExecutionAttemptId = nestedTask && typeof nestedTask === "object" && typeof nestedTask.executionAttemptId === "string"
           ? nestedTask.executionAttemptId
           : undefined;
+        const nestedAgentExecutionBinding = nestedTask && typeof nestedTask === "object"
+          ? nestedTask.agentExecutionBinding
+          : undefined;
         const nestedRequest = nestedTask && typeof nestedTask === "object"
-          ? Object.fromEntries(Object.entries(nestedTask).filter(([key]) => key !== "executionAttemptId"))
+          ? Object.fromEntries(Object.entries(nestedTask).filter(([key]) => key !== "executionAttemptId" && key !== "agentExecutionBinding"))
           : nestedTask;
         return runTask({
           task: { ...nestedRequest, actor: nestedTask.actor ?? request.actor },
@@ -2005,6 +2037,7 @@ async function executeTaskThroughAdmission({
           onAgentProgress,
           durableExecution,
           allowNestedAgentExecution: nestedTask.allowNestedAgentExecution ?? allowNestedAgentExecution,
+          agentExecutionBinding: nestedAgentExecutionBinding,
           parentCapabilities: nestedTask.parentCapabilities,
           executionAttemptId: nestedExecutionAttemptId
         });

@@ -1,6 +1,6 @@
 # Multi-user host
 
-The default Ódinn Forge gateway is a single-user loopback service and must not be bound to a public interface. Remote deployments use the separate multi-user host, which terminates TLS and proxies each authenticated user to an independent loopback gateway.
+The default Ódinn Forge gateway is a single-user loopback service and must not be bound to a public interface. Remote deployments use the separate multi-user host, which terminates TLS and proxies each authenticated membership context to an independent loopback gateway.
 
 ## Provision a user
 
@@ -16,6 +16,16 @@ node apps/gateway/src/host.ts user-add \
 
 There is no public signup endpoint. Provisioning is an operator action.
 
+Additional tenants and memberships are operator-managed records. They do not
+grant access until the membership is present and active:
+
+```bash
+ODINN_HOST_STATE=/srv/odinn-host node apps/gateway/src/host.ts tenant-add \
+  --id acme --name "Acme" --workspace /srv/odinn-workspaces/acme
+ODINN_HOST_STATE=/srv/odinn-host node apps/gateway/src/host.ts membership-add \
+  --user alice --tenant acme --role member
+```
+
 ## Start the host
 
 ```bash
@@ -28,7 +38,7 @@ ODINN_TLS_KEY=/etc/letsencrypt/live/odinn.example.com/privkey.pem \
 pnpm host:start
 ```
 
-A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is durably throttled per client address and user across restarts, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Public responses use generic errors while internal details remain in server logs. Sessions are intentionally held in memory, so a host restart signs every user out.
+A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is durably throttled per client address and user across restarts, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Public responses use generic errors while internal details remain in server logs. Host sessions are owner-only, revocable records and are restored across a host restart; disabling a user, tenant, or membership removes access on the next request.
 
 Hosted sessions expire after eight hours and are swept from memory at least
 once per minute. The host retains at most five sessions per user and 500
@@ -42,7 +52,7 @@ is higher, the host clamps it to the global limit.
 
 ## Isolation boundary
 
-Every user receives a separate:
+The host persists a versioned control plane containing users, tenants, memberships, roles, and service-account records. A user may belong to more than one tenant; the active tenant is selected only after the authenticated membership is checked. Each tenant receives a separate:
 
 - state directory and SQLite ledger;
 - workspace root;

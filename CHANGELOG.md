@@ -12,6 +12,14 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
   the immutable `v1.1.0-rc.2` candidate so post-release changes build and
   validate against a distinct version
 
+### Added
+
+* add a bounded, jobs-only child-agent graph runtime with explicit parent
+  capability intersection, durable recovery, and digest-only projections
+* add the first host-capability plugin foundation for browser, paired screen,
+  and provider-injected read-only email seams without granting ambient host
+  authority
+
 ## [1.1.0-rc.2](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.1...v1.1.0-rc.2) (2026-08-13)
 
 ### Added

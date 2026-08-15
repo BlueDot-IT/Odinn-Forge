@@ -74,6 +74,7 @@ function identity(context: AuthenticatedRouteContext) {
   return {
     applicationRequestId: context.applicationRequestId,
     hostedUserId: context.hostedUserId,
+    hostedTenantId: context.hostedTenantId,
     authentication: context.authentication,
   };
 }

@@ -103,10 +103,10 @@ const EXPERIMENTAL_HOME = [
 const DANGEROUS_IMPACT_SUMMARIES = Object.freeze({
   "multi-user-host": {
     title: "Multi-user host impact summary",
-    authority: "Starts a host that accepts multiple authenticated users and creates separate application-level tenant gateways, state roots, workspaces, browser profiles, and quotas.",
+    authority: "Starts a host that accepts multiple authenticated users, resolves durable tenant memberships, and creates separate application-level tenant gateways, state roots, workspaces, browser profiles, and quotas.",
     approvals: "TLS, public-origin, password, session, quota, and tenant routing controls remain active; this does not create hostile-user operating-system isolation.",
     rollback: "Stop the host and remove or disable the host configuration. Tenant application state remains on disk until the operator removes it deliberately.",
-    audit: "Per-tenant audit records are stored under the configured host state directory; host login throttles and sessions are stored there as well."
+    audit: "Per-tenant audit records are stored under the configured host state directory; host login throttles and revocable sessions are stored there as well."
   },
   "unconfined-process": {
     title: "Unconfined extension impact summary",

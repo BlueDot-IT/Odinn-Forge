@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { intersectChildCapabilities, type CapabilityId } from "@odinn/policy";
+import type { AgentExecutionBinding } from "./agents.ts";
 
 export const EXECUTABLE_AGENT_SCHEMA_VERSION = 1 as const;
 export const AGENT_RUN_GRAPH_SCHEMA_VERSION = 1 as const;
@@ -50,6 +51,10 @@ export type AgentDispatchRequest = {
   requestDigest: string;
   nodeId: string;
   manifest: ExecutableAgentManifest;
+  /** The runtime-agent snapshot admitted for this node, when applicable. */
+  agentBinding?: AgentExecutionBinding;
+  /** Digest of the immutable child input snapshot admitted for this node. */
+  inputDigest?: string;
   effectiveCapabilities: readonly CapabilityId[];
   inputRef: string;
   resultRef: string;
@@ -64,6 +69,8 @@ export type AgentDispatchReceipt = {
   graphDigest: string;
   manifestDigest: string;
   requestDigest: string;
+  agentBinding?: AgentExecutionBinding;
+  agentBindingDigest?: string;
   producerNodeId: string;
   resultRef: string;
   resultDigest: string;
@@ -407,6 +414,8 @@ export class AgentRunGraphRunner {
     principalNamespace: string;
     graph: AgentRunGraph;
     manifests: ExecutableAgentManifestCollection;
+    agentBindings?: ReadonlyMap<string, AgentExecutionBinding>;
+    inputDigests?: ReadonlyMap<string, string>;
     parentCapabilities: readonly string[];
     maxConcurrency?: number;
     maxRunMs?: number;
@@ -459,11 +468,16 @@ export class AgentRunGraphRunner {
         return;
       }
       const manifest = byManifest.get(node.manifestId)!;
+      const agentBinding = input.agentBindings?.get(manifest.id);
+      const inputDigest = input.inputDigests?.get(node.inputRef);
       const nodeCallId = `call:${hash({ principalNamespace, graphRunId, graphDigest: graph.graphDigest, nodeId: node.id }).slice(0, 48)}`;
       const requestCore = {
         schemaVersion: 1 as const, graphRunId, nodeCallId, principalNamespace,
         graphDigest: graph.graphDigest, manifestDigest: manifest.manifestDigest,
-        nodeId: node.id, manifest, effectiveCapabilities: authorityByManifest.get(manifest.id)!, inputRef: node.inputRef, resultRef: node.resultRef,
+        nodeId: node.id, manifest,
+        ...(agentBinding ? { agentBinding } : {}),
+        ...(inputDigest ? { inputDigest } : {}),
+        effectiveCapabilities: authorityByManifest.get(manifest.id)!, inputRef: node.inputRef, resultRef: node.resultRef,
         authorized: false as const, requiresAuditedDispatch: true as const
       };
       const request = deepFreeze({ ...requestCore, requestDigest: hash(requestCore) });
@@ -549,16 +563,24 @@ export class AgentRunGraphRunner {
 
   private validateReceipt(request: AgentDispatchRequest, input: unknown): AgentDispatchReceipt {
     const value = object(cleanJson(input, "agent dispatch receipt"), "agent dispatch receipt");
-    exact(value, ["graphRunId", "nodeCallId", "principalNamespace", "graphDigest", "manifestDigest", "requestDigest", "producerNodeId", "resultRef", "resultDigest", "terminalStatus", "auditRef"], "agent dispatch receipt");
+    exact(value, ["graphRunId", "nodeCallId", "principalNamespace", "graphDigest", "manifestDigest", "requestDigest", "agentBinding", "agentBindingDigest", "producerNodeId", "resultRef", "resultDigest", "terminalStatus", "auditRef"], "agent dispatch receipt");
     for (const key of ["graphRunId", "nodeCallId", "principalNamespace", "graphDigest", "manifestDigest", "requestDigest"] as const) {
       if (value[key] !== request[key]) throw new Error(`receipt ${key} mismatch`);
     }
     if (value.producerNodeId !== request.nodeId || value.resultRef !== request.resultRef) throw new Error("receipt node or result reference mismatch");
+    const expectedAgentBindingDigest = request.agentBinding ? hash(request.agentBinding) : undefined;
+    if (expectedAgentBindingDigest) {
+      if (value.agentBindingDigest !== expectedAgentBindingDigest || hash(value.agentBinding) !== expectedAgentBindingDigest) throw new Error("receipt agent binding mismatch");
+    } else if (value.agentBinding !== undefined || value.agentBindingDigest !== undefined) {
+      throw new Error("receipt agent binding is unexpected");
+    }
     if (typeof value.resultDigest !== "string" || !DIGEST.test(value.resultDigest)) throw new Error("receipt resultDigest is invalid");
     if (!["completed", "failed", "cancelled", "needs-review"].includes(String(value.terminalStatus))) throw new Error("receipt terminalStatus is invalid");
     return deepFreeze({
       graphRunId: request.graphRunId, nodeCallId: request.nodeCallId, principalNamespace: request.principalNamespace,
       graphDigest: request.graphDigest, manifestDigest: request.manifestDigest, requestDigest: request.requestDigest,
+      ...(request.agentBinding ? { agentBinding: request.agentBinding } : {}),
+      ...(expectedAgentBindingDigest ? { agentBindingDigest: expectedAgentBindingDigest } : {}),
       producerNodeId: request.nodeId, resultRef: request.resultRef, resultDigest: value.resultDigest,
       terminalStatus: value.terminalStatus as AgentDispatchReceipt["terminalStatus"],
       auditRef: typedReference(value.auditRef, "receipt auditRef", ["audit"])

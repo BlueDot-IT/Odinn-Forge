@@ -51,6 +51,12 @@ test("pending bootstrap is loaded before provider-independent identity context",
 
   const loaded = await loadAgent(state);
   assert.equal(loaded.manifest.model.default, "");
+  assert.equal(loaded.executionBinding.agentId, "main");
+  assert.equal(loaded.executionBinding.agentVersion, loaded.manifest.version);
+  for (const digest of [loaded.executionBinding.manifestIntegrity, loaded.executionBinding.identityContentDigest, loaded.executionBinding.resolvedSystemPromptDigest, loaded.executionBinding.modelConfigurationDigest]) {
+    assert.match(digest, /^[a-f0-9]{64}$/u);
+  }
+  assert.equal(Object.isFrozen(loaded.executionBinding), true);
   assert.equal(loaded.bootstrapPending, true);
   assert.ok(loaded.systemPrompt.indexOf("## BOOTSTRAP.md") < loaded.systemPrompt.indexOf("## IDENTITY.md"));
   assert.match(loaded.systemPrompt, /begin a natural identity conversation/i);
