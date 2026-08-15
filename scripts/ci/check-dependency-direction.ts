@@ -632,8 +632,9 @@ async function packageNodeModulesLinks(
 
   for (const entry of (await readdir(nodeModules, { withFileTypes: true }))
     .sort((left, right) => left.name.localeCompare(right.name))) {
-    if (entry.name === ".bin" || entry.name === ".pnpm") continue;
     const entryPath = resolve(nodeModules, entry.name);
+    if (entry.name === ".bin" || entry.name === ".pnpm") continue;
+    if (entry.name === ".vite-temp" && entry.isDirectory() && (await readdir(entryPath)).length === 0) continue;
     if (entry.name.startsWith("@")) {
       if (entry.isSymbolicLink() || !entry.isDirectory()) {
         violations.push(unmanagedNodeModulesViolation(repositoryRoot, entry.name, entryPath));
@@ -3236,6 +3237,10 @@ export async function checkDependencyDirection(
   const packages = await workspacePackages(repositoryRoot);
   const packagesByName = new Map(packages.map((workspacePackage) => [workspacePackage.name, workspacePackage]));
   const packageDirectories = new Set(packages.map((workspacePackage) => workspacePackage.directory));
+  const architectureExcludedDirectories = [
+    resolve(repositoryRoot, "apps/gateway/src/public/console"),
+    resolve(repositoryRoot, "apps/gateway/public/console"),
+  ];
   const exportAudits = new Map(await Promise.all(packages.map(async (workspacePackage) => [
     workspacePackage.name,
     await packageExportAudit(repositoryRoot, workspacePackage, packages),
@@ -3249,8 +3254,11 @@ export async function checkDependencyDirection(
     inventory: await sourceInventory(
       repositoryRoot,
       workspacePackage.directory,
-      new Set([...packageDirectories].filter((directory) => directory !== workspacePackage.directory
-        && isPathInside(workspacePackage.directory, directory))),
+      new Set([
+        ...[...packageDirectories].filter((directory) => directory !== workspacePackage.directory
+          && isPathInside(workspacePackage.directory, directory)),
+        ...architectureExcludedDirectories.filter((directory) => isPathInside(workspacePackage.directory, directory)),
+      ]),
       new Set([
         ...(exportAudits.get(workspacePackage.name)?.files ?? []),
         ...(binAudits.get(workspacePackage.name)?.files ?? []),

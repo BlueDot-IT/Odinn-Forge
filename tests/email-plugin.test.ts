@@ -12,7 +12,7 @@ import {
   materializeHostCapabilityPlugin
 } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy, evaluateTaskPolicy } from "../packages/policy/src/index.ts";
-import { projectDurableToolInput, projectDurableToolOutput } from "../packages/protocol/src/index.ts";
+import { durableEmailProviderIdentifier, hashEmailProviderIdentifier, projectDurableToolInput, projectDurableToolOutput } from "../packages/protocol/src/index.ts";
 
 const target = Object.freeze({ providerId: "gmail", generation: "oauth-1" });
 const message = Object.freeze({
@@ -97,7 +97,17 @@ test("email read tools are bounded, account-scoped, and redact durable content",
 
 test("email read resources bind provider generation and account identity", async () => {
   const tools = materializeHostCapabilityPlugin(emailReadHostCapabilityPlugin, context(provider()));
-  assert.deepEqual(tools.get("email.search")?.resourceForInput({ accountId: "account-1" }), { ...target, accountId: "account-1" });
+  assert.deepEqual(tools.get("email.search")?.resourceForInput({ accountId: "account-1" }), {
+    providerId: target.providerId,
+    generation: target.generation,
+    accountId: "account-1"
+  });
+  const piiResource = tools.get("email.search")?.resourceForInput?.({ accountId: "operator@example.test" });
+  assert.equal(piiResource?.accountId, hashEmailProviderIdentifier("operator@example.test"));
+  assert.throws(
+    () => tools.get("email.search")?.resourceForInput({ accountId: "unsafe\u0000identifier" }),
+    /bounded visible provider identifier/u
+  );
   await assert.rejects(
     () => tools.get("email.search")?.execute({ accountId: "account-1", query: "" }, { signal: undefined }),
     /query must not be empty/u
@@ -149,4 +159,50 @@ test("email provider target rotation is rejected and close revokes the seam", as
     registry.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("email durable projections hash provider identifiers and reject unsafe values", () => {
+  const accountId = "operator@example.test";
+  const messageId = "operator@example.test/message/123";
+  const threadId = "operator@example.test/thread/456";
+  const input = projectDurableToolInput("email.read", { accountId, messageId }) as Record<string, any>;
+  const output = projectDurableToolOutput("email.thread", {
+    type: "email.thread",
+    providerId: "provider-for-operator@example.test",
+    accountId,
+    threadId,
+    messages: [{ messageId, threadId, receivedAt: "2026-08-14T12:00:00.000Z" }]
+  }) as Record<string, any>;
+  const accounts = projectDurableToolOutput("email.accounts", {
+    type: "email.accounts",
+    providerId: "provider-for-operator@example.test",
+    accounts: [{ accountId, provider: "gmail", status: "ready" }]
+  }) as Record<string, any>;
+
+  assert.equal(input.accountId, hashEmailProviderIdentifier(accountId));
+  assert.equal(input.messageId, hashEmailProviderIdentifier(messageId));
+  assert.equal(output.providerId, hashEmailProviderIdentifier("provider-for-operator@example.test"));
+  assert.equal(output.accountId, hashEmailProviderIdentifier(accountId));
+  assert.equal(output.threadId, hashEmailProviderIdentifier(threadId));
+  assert.equal(output.messages[0].messageId, hashEmailProviderIdentifier(messageId));
+  assert.equal(output.messages[0].threadId, hashEmailProviderIdentifier(threadId));
+  assert.equal(accounts.accounts[0].accountId, hashEmailProviderIdentifier(accountId));
+  assert.doesNotMatch(JSON.stringify({ input, output, accounts }), /operator@example\.test/u);
+  assert.equal(durableEmailProviderIdentifier("account-1"), "account-1");
+  assert.equal(durableEmailProviderIdentifier("message-1"), "message-1");
+
+  assert.throws(
+    () => projectDurableToolInput("email.read", { accountId: "unsafe\u0000identifier", messageId }),
+    /bounded visible provider identifier/u
+  );
+  assert.throws(
+    () => projectDurableToolOutput("email.read", {
+      type: "email.read",
+      providerId: "gmail",
+      accountId,
+      messageId: 42,
+      threadId
+    }),
+    /email message\.messageId must be a bounded visible provider identifier/u
+  );
 });

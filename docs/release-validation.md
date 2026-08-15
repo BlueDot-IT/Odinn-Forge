@@ -9,8 +9,9 @@ being published.
 
 - The package is built from the intended commit and its archive checksums,
   SBOM, and provenance are available.
-- A clean Linux, macOS, and Windows environment can install the package,
-  complete onboarding, and run a deterministic local tool.
+- Platform support is covered by the ordinary Linux, macOS, and Windows CI
+  matrix. Downloaded-artifact installation on each operating system is
+  advisory evidence, not a publication gate.
 - A configured provider can complete a real model request without exposing
   credentials in output or diagnostics.
 - Gateway restart, queued-job recovery, browser-action recovery, audit
@@ -47,15 +48,21 @@ an artifact changes afterward, regenerate the checksums and rerun verification.
 
 ## Published RC2 identity (historical)
 
-The `1.1.0-rc.2` candidate is already published and immutable. Its historical
-reviewed merge commit, source metadata, tag, generated package metadata, and
-release evidence describe one identity:
+The published `1.1.0-rc.2` candidate is immutable historical evidence. Its
+reviewed merge commit, source metadata, generated package metadata, and release
+assets describe one identity. Do not retag RC2, move its Git ref, or reuse its
+release for a later candidate. The current candidate must use a new exact tag
+and a fresh downloaded-asset verification record.
 
-- `package.json` must declare `1.1.0-rc.2` and the annotated tag must be exactly
-  `v1.1.0-rc.2` at the same commit.
-- The GitHub release for that tag must remain a draft prerelease while the
-  protected Release workflow validates it. Do not publish from an untagged
-  branch or move an existing tag.
+- The RC2 package metadata declared `1.1.0-rc.2` and its release assets were
+  generated for the matching `v1.1.0-rc.2` identity.
+- The historical RC2 Git ref resolves to commit
+  `9256e23c1f78b3ab14b51ee72c0d2a4d0fdd769c`; it is not evidence that the
+  current candidate has an annotated release tag. Future candidates must
+  satisfy the annotated-tag policy in [ci-cd](ci-cd.md).
+- RC2 is not evidence that the current `1.1.0-rc.3` line has been published.
+  The current line still requires a fresh candidate tag, draft release, and
+  exact-artifact validation.
 - The source `release-info.json` is an export-substituted template; `pnpm
   release:package` generates the compiled package's release identity with the
   exact version, commit, runtime digest, and state-schema compatibility.
@@ -64,13 +71,9 @@ release evidence describe one identity:
   must agree on version, commit, runtime digest, and archive checksums. The
   workflow's downloaded-asset verification is the authoritative proof that
   published files match the generated set.
-- Build provenance must cover the final release assets, and the evidence record
-  must retain sanitized OS/architecture, toolchain, artifact checksum, SBOM,
-  provenance, and downloaded-asset results for each supported platform.
-
-Do not retag RC2 or reuse its release for a later candidate. The next candidate
-must be built from a clean committed head with a new exact tag and a fresh
-downloaded-asset acceptance record.
+- Build provenance must cover the final release assets. When additional
+  platform-specific validation is performed, retain sanitized OS/architecture,
+  toolchain, artifact checksum, SBOM, provenance, and downloaded-asset results.
 
 ## Schema rollback boundary
 
@@ -89,7 +92,10 @@ dispatch the protected **Release** workflow with that tag. Draft releases do
 not emit the `release.created` workflow event, so the manual dispatch is
 intentional. The workflow verifies the tag commit, builds and soaks the exact
 candidate, refuses asset replacement, downloads the release assets back, and
-checks their checksums before publishing npm or promoting the GitHub release.
+checks their checksums on its staging runner before publishing npm or
+promoting the GitHub release. The separate Linux/macOS/Windows downloaded-
+artifact matrix is not a publication dependency; those platforms remain
+covered by ordinary CI.
 The GitHub release `prerelease` flag must match the tag: tags containing `-`
 must be prereleases, and stable tags must not be. Prerelease packages use the
 npm `next` dist-tag. If the npm version already exists, the workflow downloads
@@ -102,10 +108,10 @@ release; that setting cannot be established by the workflow itself.
 
 ## Evidence record
 
-For each platform and provider path, record the OS, architecture, Node.js and
-package-manager versions, exact artifact checksum, result, and sanitized
-failure evidence. Do not include credentials, prompts containing private data,
-cookies, gateway tokens, or raw runtime state.
+For any platform or provider path that is exercised, record the OS,
+architecture, Node.js and package-manager versions, exact artifact checksum,
+result, and sanitized failure evidence. Do not include credentials, prompts
+containing private data, cookies, gateway tokens, or raw runtime state.
 
 Synthetic providers and hosted CI runners are useful regression coverage, but
 they do not prove the behavior of a live account, external website, or clean

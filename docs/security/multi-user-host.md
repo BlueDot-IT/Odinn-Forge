@@ -26,6 +26,40 @@ ODINN_HOST_STATE=/srv/odinn-host node apps/gateway/src/host.ts membership-add \
   --user alice --tenant acme --role member
 ```
 
+## Tenant lifecycle and operations
+
+Tenant records have an explicit `status`: `active` or `suspended`. Legacy
+`disabled: true` tenant records are treated as suspended. Suspension is a
+fail-closed application control: cached tenant gateways are closed, ordinary
+gateway proxy requests return `423`, and the tenant state remains on disk.
+Active memberships are retained so a member with `tenant.manage` can resume
+the tenant or create a recovery backup. Suspension is not hostile-tenant
+isolation and does not change the operating-system boundary.
+
+After authentication, the host exposes these membership-scoped routes:
+
+- `GET /auth/tenants` lists only the caller's memberships and each tenant's
+  lifecycle status.
+- `GET /auth/tenant` returns the selected tenant, the caller's role, and the
+  permissions resolved from the durable role record.
+- `POST /auth/tenant/lifecycle` accepts `{ "tenantId": "acme", "status":
+  "suspended" }` or `"active"`. The caller must have an active membership in
+  that target tenant and the role must grant `tenant.manage`; a tenant ID in a
+  request does not grant access.
+- `POST /auth/tenant/backup` accepts `{ "tenantId": "acme" }` and creates a
+  verified state backup for a caller with `tenant.manage`. Backups are stored
+  below `tenant-backups/<tenant-id>/` in the owner-only host state directory,
+  are created under the host and tenant state mutation locks, and are capped
+  at ten retained backup directories by default. The existing state-backup
+  verifier excludes host credentials, sessions, OAuth/browser material,
+  gateway tokens, and other protected ephemeral state; the route never accepts
+  an `includeSensitiveState` override. A suspended tenant may be backed up.
+
+This tranche intentionally has no authenticated tenant-deletion endpoint.
+Deletion and retention remain an explicit operator workflow after a verified
+backup; the host does not turn a tenant-controlled request into irreversible
+filesystem removal.
+
 ## Start the host
 
 ```bash
@@ -38,7 +72,7 @@ ODINN_TLS_KEY=/etc/letsencrypt/live/odinn.example.com/privkey.pem \
 pnpm host:start
 ```
 
-A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is durably throttled per client address and user across restarts, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Public responses use generic errors while internal details remain in server logs. Host sessions are owner-only, revocable records and are restored across a host restart; disabling a user, tenant, or membership removes access on the next request.
+A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is durably throttled per client address and user across restarts, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Public responses use generic errors while internal details remain in server logs. Host sessions are owner-only, revocable records and are restored across a host restart; disabling a user or membership removes access on the next request, while suspending a tenant blocks gateway access but retains its membership-scoped administration path.
 
 Hosted sessions expire after eight hours and are swept from memory at least
 once per minute. The host retains at most five sessions per user and 500

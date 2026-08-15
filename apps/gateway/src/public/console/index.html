@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ódinn Forge Console</title>
+  <meta name="application-name" content="Odinn Forge Console">
+  <link rel="icon" type="image/png" href="/odinn-logo.png">
+  <link rel="stylesheet" href="./src/styles.css">
+
+</head>
+<body>
+  <svg aria-hidden="true" width="0" height="0" class="icon-sprite">
+    <symbol id="icon-chat" viewBox="0 0 24 24"><path d="M5 6.5h14v9H9l-4 3v-12z"></path><path d="M8 10h8M8 13h5"></path></symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></symbol>
+    <symbol id="icon-tool" viewBox="0 0 24 24"><path d="m14.5 6.5 3-3 3 3-3 3"></path><path d="m17.5 6.5-7 7"></path><path d="m6 15-3 3 3 3 3-3"></path><path d="m6 18 7-7"></path></symbol>
+    <symbol id="icon-plan" viewBox="0 0 24 24"><path d="M6 4h12v16H6z"></path><path d="M9 8h6M9 12h6M9 16h4"></path></symbol>
+    <symbol id="icon-memory" viewBox="0 0 24 24"><path d="M8 5h8v14H8z"></path><path d="M5 8h3M5 12h3M5 16h3M16 8h3M16 12h3M16 16h3"></path></symbol>
+    <symbol id="icon-session" viewBox="0 0 24 24"><path d="M5 5h14v14H5z"></path><path d="M8 9h8M8 13h6M8 17h4"></path></symbol>
+    <symbol id="icon-goal" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="3"></circle><path d="m17 7 3-3M17 4h3v3"></path></symbol>
+    <symbol id="icon-project" viewBox="0 0 24 24"><path d="M4 7h6l2 2h8v10H4z"></path><path d="M4 7V5h6l2 2"></path></symbol>
+    <symbol id="icon-spark" viewBox="0 0 24 24"><path d="m12 3 1.5 6.5L20 12l-6.5 1.5L12 20l-1.5-6.5L4 12l6.5-2.5z"></path></symbol>
+    <symbol id="icon-audit" viewBox="0 0 24 24"><path d="M6 4h12v16H6z"></path><path d="M9 8h6M9 12h6M9 16h3"></path><path d="m14 16 1.5 1.5L19 14"></path></symbol>
+    <symbol id="icon-runtime" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2"></rect><path d="M8 9h2M14 9h2M8 13h2M14 13h2M8 17h8"></path></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M19 8a7 7 0 0 0-12-1L5 9"></path><path d="M5 5v4h4M5 16a7 7 0 0 0 12 1l2-2"></path><path d="M19 19v-4h-4"></path></symbol>
+    <symbol id="icon-edit" viewBox="0 0 24 24"><path d="m5 16-.7 3.7L8 19l10.5-10.5a2.1 2.1 0 0 0-3-3L5 16z"></path><path d="m14 7 3 3"></path></symbol>
+    <symbol id="icon-trash" viewBox="0 0 24 24"><path d="M5 7h14M10 4h4l1 3H9l1-3zM8 10v7M12 10v7M16 10v7M7 7l1 13h8l1-13"></path></symbol>
+    <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"></path></symbol>
+    <symbol id="icon-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="M4 12h16M12 4c2 2.2 3 4.9 3 8s-1 5.8-3 8c-2-2.2-3-4.9-3-8s1-5.8 3-8z"></path></symbol>
+    <symbol id="icon-activity" viewBox="0 0 24 24"><path d="M4 12h4l2-6 4 12 2-6h4"></path></symbol>
+    <symbol id="icon-servers" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="6" rx="1"></rect><rect x="4" y="14" width="16" height="6" rx="1"></rect><path d="M7 7h.01M7 17h.01M10 7h7M10 17h7"></path></symbol>
+    <symbol id="icon-usage" viewBox="0 0 24 24"><path d="M5 19V9M12 19V5M19 19v-7"></path><path d="M3 19h18"></path></symbol>
+    <symbol id="icon-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="M12 7v5l3 2"></path></symbol>
+    <symbol id="icon-agent" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"></circle><path d="M5 20c.6-3.5 2.9-5 7-5s6.4 1.5 7 5M12 3v2"></path></symbol>
+    <symbol id="icon-skill" viewBox="0 0 24 24"><path d="m12 3 2.2 5.6L20 11l-5.8 2.4L12 19l-2.2-5.6L4 11l5.8-2.4z"></path><path d="m18 16 .8 2.2L21 19l-2.2.8L18 22l-.8-2.2L15 19l2.2-.8z"></path></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"></circle><path d="m15 15 5 5"></path></symbol>
+    <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"></path><circle cx="12" cy="12" r="4"></circle></symbol>
+    <symbol id="icon-monitor" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="12" rx="2"></rect><path d="M9 21h6M12 17v4"></path></symbol>
+    <symbol id="icon-moon" viewBox="0 0 24 24"><path d="M19 15.5A7.5 7.5 0 0 1 8.5 5 7.5 7.5 0 1 0 19 15.5z"></path></symbol>
+  </svg>
+  <div class="shell" id="shell">
+    <aside class="sidebar" id="console-sidebar" aria-label="Primary navigation">
+      <div class="brand">
+        <div class="mark"><img src="/odinn-logo.png" alt="Ódinn Forge logo"></div>
+        <div class="brand-title">
+          <strong>Ódinn Forge</strong>
+          <span>local gateway</span>
+        </div>
+        <div class="brand-tools">
+          <button class="sidebar-icon-button" id="sidebar-search" title="Search sessions" aria-label="Search sessions" type="button"><svg class="icon-svg"><use href="#icon-search"></use></svg></button>
+        </div>
+      </div>
+      <nav class="nav" aria-label="Console views">
+        <button class="active" data-view="overview" data-title="Chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-chat"></use></svg></span><span class="nav-label">Chat</span><span class="badge ok" id="nav-health">...</span></button>
+        <button data-view="operator" data-title="Operator" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-monitor"></use></svg></span><span class="nav-label">Operator</span><span class="badge" id="nav-operator-attention">0</span></button>
+        <button data-view="sessions" data-title="Sessions" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-session"></use></svg></span><span class="nav-label">Sessions</span></button>
+        <div class="menu-chats">
+          <button class="secondary" id="new-chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-plus"></use></svg></span><span class="nav-label">New session</span></button>
+          <div class="session-rail-label"><span>Pinned</span><span class="rail-count" id="pinned-count">0</span></div>
+          <div id="pinned-chat-list" class="session-list pinned-list"></div>
+          <div class="session-rail-label"><span>Recent</span><span class="rail-count" id="chat-session-count">0</span></div>
+          <div id="chat-session-list" class="session-list"></div>
+        </div>
+        <details class="nav-more" open>
+          <summary><span class="nav-group-label">More</span><span class="nav-chevron">⌄</span></summary>
+          <button data-view="capabilities" data-title="Web tools" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-globe"></use></svg></span><span class="nav-label">Web tools</span></button>
+          <button data-view="usage" data-title="Activity" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-usage"></use></svg></span><span class="nav-label">Activity</span></button>
+          <button data-view="cron" data-title="Schedules" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-clock"></use></svg></span><span class="nav-label">Schedules</span></button>
+          <button data-view="tasks" data-title="Tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Tasks</span></button>
+          <button data-view="agents" data-title="Agent SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agent SDK · Experimental</span></button>
+          <button data-view="skills" data-title="Skills SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skills SDK · Experimental</span></button>
+          <button data-view="automatic-improvements" data-title="Automatic improvements" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></span><span class="nav-label">Automatic improvements</span></button>
+          <details class="nav-labs">
+            <summary><span class="nav-group-label"><svg class="icon-svg"><use href="#icon-spark"></use></svg> Advanced</span><span class="badge warn" id="nav-experimental-count">0/3 plugins</span><span class="nav-chevron">⌄</span></summary>
+            <div class="labs-nav">
+
+            <button data-view="lab-run-checks" data-title="Run Checks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Run Checks</span></button>
+            <button data-view="lab-safety-preview" data-title="Safety Preview" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Safety Preview</span></button>
+            <button data-view="lab-temporary-access" data-title="Temporary Access" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Temporary Access</span></button>
+            <button data-view="lab-restore-points" data-title="Restore Points" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Restore Points</span></button>
+            <button data-view="lab-governed-workspace" data-title="Controlled Workspace Governance" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Controlled Workspace Governance</span></button>
+            <button data-view="lab-portable-runs" data-title="Portable Runs" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Portable Runs</span></button>
+            <button data-view="lab-scenario-compare" data-title="Compare Approaches" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Compare Approaches</span></button>
+            <button data-view="lab-model-routing" data-title="Smart Routing" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Smart Routing</span></button>
+            </div>
+          </details>
+        </details>
+        <div class="nav-group-label nav-advanced-label">Workspace</div>
+        <button data-view="projects" data-title="Projects" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-project"></use></svg></span><span class="nav-label">Projects</span></button>
+        <button data-view="memory" data-title="Memory" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-memory"></use></svg></span><span class="nav-label">Memory</span></button>
+        <button data-view="goals" data-title="Goals" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-goal"></use></svg></span><span class="nav-label">Goals</span></button>
+        <button data-view="config" data-title="Configuration" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-settings"></use></svg></span><span class="nav-label">Configuration</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="sidebar-footer-tools">
+          <button class="sidebar-icon-button" id="sidebar-settings" title="Open configuration" aria-label="Open configuration" type="button"><svg class="icon-svg"><use href="#icon-settings"></use></svg></button>
+          <button class="sidebar-icon-button" id="sidebar-console" title="Open Web and browser tools" aria-label="Open Web and browser tools" type="button"><svg class="icon-svg"><use href="#icon-monitor"></use></svg></button>
+          <button class="sidebar-icon-button" id="sidebar-theme" title="Toggle theme" aria-label="Toggle theme" type="button"><svg class="icon-svg"><use href="#icon-moon"></use></svg></button>
+          <button class="sidebar-icon-button" id="refresh" title="Refresh" aria-label="Refresh" type="button"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></button>
+        </div>
+        <div class="sidebar-status"><span class="status-dot"></span><span id="gateway-context">Local gateway</span><span class="sidebar-version" id="product-version">v__ODINN_VERSION__</span></div>
+      </div>
+    </aside>
+    <button class="mobile-scrim" id="mobile-scrim" type="button" aria-label="Close navigation" tabindex="-1"></button>
+
+    <header class="topbar">
+      <button class="sidebar-toggle" id="sidebar-toggle" type="button" title="Collapse navigation" aria-label="Collapse navigation" aria-controls="console-sidebar" aria-expanded="true"><svg class="icon-svg"><use href="#icon-menu"></use></svg></button>
+      <div class="topbar-title">
+        <div class="breadcrumb-line">
+          <strong>Ódinn Forge</strong>
+          <span class="breadcrumb-sep">/</span>
+          <strong id="view-title">Chat</strong>
+          <span class="breadcrumb-sep" id="chat-context-sep">/</span>
+          <span class="current" id="chat-title">New chat</span>
+        </div>
+          <span class="topbar-context" id="chat-subtitle">Your local assistant</span>
+        <span class="topbar-context" id="workspace">Loading your workspace...</span>
+      </div>
+      <div class="row">
+        <button class="secondary" id="remote-signout" type="button" hidden>Sign out</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <section id="view-operator" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Shared control plane</div><h1>Operator</h1><p>One bounded view of runtime health, durable work, approvals, recovery, audit, and every available operator surface.</p></div><div class="row"><span class="chip" id="operator-health">Loading</span><button class="secondary" id="refresh-operator" type="button">Refresh</button></div></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="operator-attention">0</strong><span>need attention</span></div><div class="stat-card"><strong id="operator-work-count">0</strong><span>work items</span></div><div class="stat-card"><strong id="operator-approval-count">0</strong><span>approvals</span></div><div class="stat-card"><strong id="operator-audit-status">—</strong><span>audit</span></div></div>
+          <div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Runtime</h2><span class="muted" id="operator-generated">—</span></div><div id="operator-runtime" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Attention</h2><span class="muted">Bounded, redacted summaries</span></div><div id="operator-attention-list" class="list"></div></div></div>
+          <div class="panel stack"><div class="panel-head"><h2>Recent work</h2><div class="row"><button class="secondary" id="operator-work-prev" type="button" disabled>Previous</button><span class="muted" id="operator-work-page">—</span><button class="secondary" id="operator-work-next" type="button" disabled>Next</button></div></div><div id="operator-work" class="list"></div></div>
+          <details class="panel stack"><summary>Contract payload</summary><pre id="operator-payload" class="output">Loading…</pre></details>
+        </div>
+      </section>
+      <section id="view-overview" class="view active">
+        <div class="chat-shell">
+          <div class="chat-column">
+            <div id="chat-thread" class="chat-thread"></div>
+            <div class="composer">
+              <div class="provider-setup" id="provider-cta" role="status">
+                <span>No connected model provider. Run <code>odinn onboard</code> in a terminal, then refresh this page.</span>
+                <div class="row"><button class="secondary" data-view-jump="usage" type="button">View provider status</button><button class="secondary" id="copy-onboard-command" type="button">Copy command</button></div>
+              </div>
+              <textarea id="chat-input" aria-label="Message Ódinn Forge" placeholder="Connect a provider to start chatting" disabled></textarea>
+              <div class="composer-footer">
+                <div class="row composer-tools">
+                  <button class="secondary" data-view-jump="tasks" title="Open tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span></button>
+                  <select id="model-select" aria-label="Model" disabled>
+                    <option value="">Configure a provider first</option>
+                  </select>
+                  <span class="chip warn" id="model-chip">no model configured</span>
+                </div>
+                <div class="row">
+                  <span class="muted chat-status" id="chat-status" role="status" aria-live="polite">Checking provider</span>
+                  <button class="send-action" id="send-chat" title="Send message" type="button" disabled>Send</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-capabilities" class="view">
+        <div class="page capabilities-page">
+          <div class="page-head"><div><div class="section-kicker">Current information and website work</div><h1>Web tools</h1><p>Use these when Ódinn needs up-to-date public information or has to work on a website for you.</p></div><span class="chip" id="browser-approval-mode">Checking safeguards</span></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="cap-web-status">CHECKING</strong><span>public web</span></div><div class="stat-card"><strong id="cap-browser-status">CHECKING</strong><span>browser workspace</span></div><div class="stat-card"><strong id="cap-approval-count">—</strong><span>waiting for you</span></div><div class="stat-card"><strong id="cap-security-mode">CHECKING</strong><span>action safeguards</span></div></div>
+          <div class="capability-grid">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Public web search</h2><span class="chip ok">read only</span></div><button id="web-search-run" type="button">Search</button></div>
+              <p>Find current facts, documentation, news, and public pages. This does not sign in or change anything.</p>
+              <div class="field"><label for="web-search-query">What do you want to find?</label><input id="web-search-query" placeholder="Search current information..."></div>
+              <div id="web-search-results" class="list"><div class="empty-state"><strong>Nothing searched yet</strong><span>Results will appear here with clear source links.</span></div></div>
+            </div>
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Signed-in browser</h2><span class="chip warn">asks before changes</span></div><button class="secondary" id="browser-refresh" type="button">Refresh</button></div>
+              <p>Open a separate browser workspace for sites that need an account, forms, or multi-step navigation. Ódinn pauses before actions that change an external account.</p>
+              <div class="field"><label for="browser-url">Website address</label><div class="row"><input id="browser-url" placeholder="https://example.com"><button id="browser-open" type="button">Open</button></div></div>
+              <div id="browser-tabs" class="list"><div class="empty-state"><strong>Browser is waiting</strong><span>Open a site to begin.</span></div></div>
+              <div class="panel browser-page-panel"><div class="panel-head"><h3 id="browser-page-title">No page selected</h3><span class="chip" id="browser-page-url">—</span></div><div id="browser-page-text" class="browser-page-text">Open or select a tab to inspect visible content.</div></div>
+            </div>
+          </div>
+          <div class="panel stack" id="gatewatch-preview-panel">
+            <div class="panel-head"><div><h2>Gatewatch admission preview</h2><p>Inspect the complete capability, parent-authority, invariant, approval, and safety decision without executing the tool.</p></div><button id="gatewatch-preview-run" type="button">Preview decision</button></div>
+            <div class="grid-2">
+              <div class="field"><label for="gatewatch-preview-tool">Executable tool</label><select id="gatewatch-preview-tool"><option value="text.echo">text.echo</option></select></div>
+              <div class="field"><label for="gatewatch-preview-input">Input JSON</label><textarea id="gatewatch-preview-input" rows="4">{}</textarea></div>
+              <div class="field"><label for="gatewatch-preview-parent">Parent capabilities</label><textarea id="gatewatch-preview-parent" rows="4" placeholder="Leave blank to use current policy authority"></textarea><span class="config-help">One versioned capability identifier per line.</span></div>
+              <div class="field"><label for="gatewatch-preview-requested">Child-requested capabilities</label><textarea id="gatewatch-preview-requested" rows="4" placeholder="Leave blank to request the tool declaration"></textarea><span class="config-help">Requests are intersected with parent, tool, and policy grants.</span></div>
+              <div class="field"><label for="gatewatch-preview-skill">Skill declaration requests</label><textarea id="gatewatch-preview-skill" rows="3" placeholder="Optional; requests authority but never grants it"></textarea></div>
+              <div class="field"><label for="gatewatch-preview-mcp">MCP declaration requests</label><textarea id="gatewatch-preview-mcp" rows="3" placeholder="Optional; requests authority but never grants it"></textarea></div>
+            </div>
+            <pre id="gatewatch-preview-output" class="code-block">No preview yet.</pre>
+          </div>
+          <div class="panel stack">
+            <div class="panel-head"><div><h2>Actions waiting for you</h2><span class="muted" id="browser-approval-copy">Checking whether a browser action needs your confirmation.</span></div><span class="chip warn">you stay in control</span></div>
+            <div id="approval-list" class="list"><div class="empty-state"><strong>Nothing is waiting</strong><span>Ódinn will pause here before changing an external account.</span></div></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-tasks" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Work in one place</div><h1>Tasks</h1><p>Find, stop, inspect, or run work again. Turn on System activity only when you need routine background updates.</p></div><button class="secondary" id="refresh-tasks" type="button">Refresh</button></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="task-total">0</strong><span>visible tasks</span></div><div class="stat-card"><strong id="task-running">0</strong><span>active or waiting</span></div><div class="stat-card"><strong id="task-passed">0</strong><span>completed</span></div><div class="stat-card"><strong id="task-failed">0</strong><span>need attention</span></div></div>
+          <div class="panel table-panel task-table-panel">
+            <div class="toolbar"><input id="task-query" aria-label="Search tasks" placeholder="Search tasks by name or area"><div class="row"><select id="task-status-filter" aria-label="Task status"><option value="all">All statuses</option><option value="active">Active</option><option value="completed">Completed</option><option value="review">Needs attention</option></select><select id="task-category-filter" aria-label="Task origin"><option value="all">Started by anyone</option><option value="user">You</option><option value="agent">Agent SDK</option><option value="automation">Automatic</option></select><label class="switch-label"><input id="task-system-toggle" type="checkbox"> System activity</label></div></div>
+            <div class="task-management"><label class="switch-label"><input id="task-select-page" type="checkbox"> Select this page</label><span class="muted" id="task-selection-count">No tasks selected</span><div class="row"><button class="secondary" id="task-rerun-selected" type="button" disabled>Run selected again</button><button class="secondary" id="task-cancel-selected" type="button" disabled>Stop selected</button><button class="secondary" id="task-clear-selection" type="button" disabled>Clear</button></div></div>
+            <div class="data-table task-table-shell"><div class="data-row data-head"><span>Task</span><span>Status</span><span>Started by</span><span>Updated</span><span>Updates</span><span>Actions</span></div><div id="task-table"></div></div>
+            <div class="pagination"><span class="muted" id="task-page-label">Page 1 of 1</span><div class="row"><label class="switch-label">Items <select id="task-page-size"><option>10</option><option selected>25</option><option>50</option></select></label><button class="secondary" id="task-prev" type="button">Previous</button><button class="secondary" id="task-next" type="button">Next</button></div></div>
+          </div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Task detail</h2><span class="muted" id="task-detail-label">Select a task for its timeline and outcome.</span></div><div class="row"><button class="secondary" id="task-verify" type="button" disabled>Check record integrity</button><button class="secondary" id="task-cancel" type="button" disabled>Stop</button><button class="secondary" id="task-replay" type="button" disabled>Run again</button></div></div><div id="task-summary" class="record-grid"></div><div id="task-evidence" class="timeline task-timeline"><div class="empty-state"><strong>No task selected</strong><span>Choose Inspect from the history above.</span></div></div></div>
+        </div>
+      </section>
+
+      <section id="view-cron" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Scheduled work</div><h1>Schedules</h1><p>Ask Ódinn to run a recurring action while the local gateway is online.</p></div><div class="row"><button id="new-cron" type="button">New schedule</button><button class="secondary" id="refresh-cron" type="button">Refresh</button></div></div>
+          <div class="summary-bar"><span><small>SCHEDULING</small><strong id="cron-enabled">On</strong></span><span><small>SCHEDULES</small><strong id="cron-count">0</strong></span><span><small>NEXT RUN</small><strong id="cron-next">—</strong></span></div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Recurring actions</h2><p class="muted">Times follow the timezone saved with each schedule.</p></div><span class="muted" id="cron-shown">0 shown</span></div><input id="cron-query" aria-label="Filter schedules" placeholder="Filter schedules"><div id="cron-list" class="list"></div></div>
+          <dialog id="cron-dialog" class="editor-dialog"><form method="dialog" id="cron-form"><div class="panel-head"><h2>Create a schedule</h2><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="cron-name">Name</label><input id="cron-name" placeholder="Monday project check-in" required></div><div class="grid-2"><div class="field"><label for="cron-frequency">Repeat</label><select id="cron-frequency"><option value="daily">Every day</option><option value="weekdays">Weekdays</option><option value="weekly">Every week</option><option value="hourly">Every hour</option><option value="custom">Custom</option></select></div><div class="field" id="cron-time-field"><label for="cron-time">Time</label><input id="cron-time" type="time" value="09:00"></div></div><div class="field" id="cron-weekday-field" hidden><label for="cron-weekday">Day</label><select id="cron-weekday"><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option></select></div><details id="cron-custom-options" class="advanced-options"><summary>Custom timing</summary><div class="field"><label for="cron-schedule">Schedule pattern</label><input id="cron-schedule" value="0 9 * * *" required><span class="muted">Use this only when the common repeat options do not fit.</span></div></details><div class="grid-2"><div class="field"><label for="cron-timezone">Timezone</label><input id="cron-timezone" value="America/New_York"></div><div class="field"><label for="cron-tool">Action</label><select id="cron-tool"></select></div></div><details class="advanced-options"><summary>Advanced action input</summary><div class="field"><label for="cron-input">Structured input</label><textarea id="cron-input">{}</textarea></div></details><div class="row"><button id="save-cron" value="default" type="submit">Save schedule</button></div></form></dialog>
+        </div>
+      </section>
+
+      <section id="view-projects" class="view">
+        <div class="page oc-page projects-page">
+          <div class="page-head"><div><div class="section-kicker">Organized workspaces</div><h1>Projects</h1><p>Group related sessions and goals in one workspace.</p></div><div class="row"><button id="new-project" type="button">New Project</button><button class="secondary" id="refresh-projects" type="button">Refresh</button></div></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="project-total">0</strong><span>active projects</span></div><div class="stat-card"><strong id="project-session-count">0</strong><span>sessions</span></div><div class="stat-card"><strong id="project-goal-count">0</strong><span>goals</span></div><div class="stat-card"><strong id="project-active-goal-count">0</strong><span>active goals</span></div></div>
+          <div class="project-layout"><div class="panel stack"><div class="panel-head"><h2>Projects</h2><input id="project-query" aria-label="Filter projects" placeholder="Filter projects"></div><div id="project-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Project detail</h2><span class="chip" id="project-detail-status">No selection</span></div><div id="project-detail" class="empty-state"><strong>Select a project</strong><span>Its sessions and scoped goals will appear here.</span></div><div class="row"><button class="secondary" id="project-open-sessions" type="button" disabled>Open Sessions</button><button class="secondary" id="project-open-goals" type="button" disabled>Open Goals</button><button class="danger-button" id="project-archive" type="button" disabled>Archive</button></div></div></div>
+          <dialog id="project-dialog" class="editor-dialog"><form method="dialog" id="project-form"><div class="panel-head"><div><h2>Create project</h2><span class="muted">Sessions and goals can be moved here after creation.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="project-name">Project name</label><input id="project-name" placeholder="Website launch" required></div><div class="field"><label for="project-description">Description</label><textarea id="project-description" placeholder="What belongs in this project?"></textarea></div><div class="row"><button value="default" type="submit">Create Project</button></div></form></dialog>
+        </div>
+      </section>
+
+      <section id="view-memory" class="view">
+        <div class="page oc-page memory-page">
+          <div class="page-head"><div><div class="section-kicker">Context that improves with you</div><h1>Memory</h1><p>Review what Ódinn has noticed and manage the details it can use in future conversations.</p></div><div class="row"><button id="memory-new-toggle" type="button">Add memory</button><button class="secondary" id="refresh-memory-tree" type="button">Refresh</button></div></div>
+          <div class="panel memory-status-bar">
+            <div class="memory-status-icon" aria-hidden="true">✓</div>
+            <div class="memory-status-copy"><div class="row"><strong>Automatic memory</strong><span class="chip" id="memory-health">Checking</span></div><p id="memory-status-copy">Checking what Ódinn can remember and recall.</p></div>
+            <div class="memory-status-summary" aria-label="Memory summary"><span><strong id="memory-record-count">0</strong> saved</span><span><strong id="memory-candidate-count">0</strong> suggestions</span><span><strong id="memory-recall-status">Recall off</strong></span><span id="memory-last-update">No updates yet</span></div>
+          </div>
+          <div class="memory-tabs" role="tablist" aria-label="Memory views"><button id="memory-tab-suggestions" class="active" type="button" role="tab" tabindex="0" aria-selected="true" aria-controls="memory-suggestions-panel" data-memory-tab="suggestions">Suggestions <span class="count-badge" id="memory-tab-suggestions-count">0</span></button><button id="memory-tab-saved" type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="memory-saved-panel" data-memory-tab="saved">Saved memories <span class="count-badge" id="memory-tab-saved-count">0</span></button></div>
+          <div id="memory-suggestions-panel" class="memory-tab-panel" role="tabpanel" aria-labelledby="memory-tab-suggestions">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Review suggestions</h2><p class="muted">Keep useful details. Dismiss anything temporary, incorrect, or too personal.</p></div><span class="chip" id="memory-candidate-badge">0 to review</span></div>
+              <div id="memory-candidate-list" class="memory-candidate-list"><div class="empty-state memory-empty"><strong>You are all caught up</strong><span>New suggestions will appear here after Ódinn notices something useful in a conversation.</span></div></div>
+            </div>
+          </div>
+          <div id="memory-saved-panel" class="memory-tab-panel" role="tabpanel" aria-labelledby="memory-tab-saved" hidden>
+            <div class="memory-management-layout">
+              <div class="panel stack"><div class="panel-head"><div><h2>Saved memories</h2><span class="muted" id="memory-result-count">0 saved</span></div></div><div class="filter-grid"><input id="memory-query" aria-label="Search saved memories" placeholder="Search saved memories"><select id="memory-kind-filter" aria-label="Filter saved memories by type"><option value="">All types</option><option value="preference">Preferences</option><option value="project">Project details</option><option value="person">People</option><option value="artifact">Resources</option><option value="procedure">Routines</option><option value="decision">Decisions</option><option value="system">System settings</option></select><select id="memory-scope-filter" aria-label="Filter saved memories by where they apply"><option value="">All locations</option><option value="global">Available everywhere</option><option value="project">One project</option><option value="session">One conversation</option></select></div><div id="memory-list" class="list"></div></div>
+              <div class="panel stack" id="memory-detail-panel"><div class="panel-head"><h2>Selected memory</h2><span class="chip" id="memory-detail-kind">No selection</span></div><div id="memory-detail" class="empty-state"><strong>Choose a saved memory</strong><span>You will see what Ódinn remembers and where it can use it.</span></div><div class="row"><button class="secondary" id="memory-correct" type="button" disabled>Edit memory</button><button class="secondary" id="memory-recall-test" type="button">Test recall</button><button class="danger-button" id="memory-forget" type="button" disabled>Forget memory</button></div><div id="memory-recall-result" class="result-summary" role="status" aria-live="polite" hidden></div></div>
+            </div>
+            <details class="panel stack memory-organization"><summary><strong>Memory organization</strong><span class="muted">See how saved context is grouped</span></summary><div id="memory-tree" class="record-grid"></div></details>
+          </div>
+          <dialog id="memory-dialog" class="editor-dialog"><form method="dialog" id="memory-form"><div class="panel-head"><div><h2>Add a memory</h2><span class="muted">Save a lasting detail that will be useful in future conversations.</span></div><button class="secondary" id="memory-dialog-close" type="button">Close</button></div><div class="grid-2"><div class="field"><label for="memory-kind">What kind of detail is this?</label><select id="memory-kind"><option value="preference">Preference</option><option value="project">Project detail</option><option value="person">Person</option><option value="artifact">Resource</option><option value="procedure">Routine</option><option value="decision">Decision</option><option value="system">System setting</option></select></div><div class="field"><label for="memory-subject">Short title</label><input id="memory-subject" placeholder="Deployment preferences" required></div></div><div class="grid-2"><div class="field"><label for="memory-scope-type">Where can Ódinn use it?</label><select id="memory-scope-type"><option value="global">Everywhere</option><option value="project">One project</option><option value="session">One conversation</option></select></div><div class="field" id="memory-scope-target-field" hidden><label for="memory-scope-id">Choose the project or conversation</label><select id="memory-scope-id" disabled><option value="">Available everywhere</option></select></div></div><div class="field"><label for="memory-text">What should Ódinn remember?</label><textarea id="memory-text" placeholder="Write the preference, fact, or decision in plain language." required></textarea></div><details><summary>Advanced organization</summary><div class="grid-2"><div class="field"><label for="memory-namespace">Group</label><input id="memory-namespace" placeholder="preferences/development"></div><div class="field"><label for="memory-tier">Level of detail</label><select id="memory-tier"><option value="l0">Summary</option><option value="l1" selected>Key detail</option><option value="l2">Supporting detail</option></select></div></div><div class="field"><label for="memory-tags">Labels</label><input id="memory-tags" placeholder="typescript, workflow"></div></details><div class="row"><button value="default" type="submit">Save memory</button></div></form></dialog>
+          <dialog id="memory-correction-dialog" class="editor-dialog"><form method="dialog" id="memory-correction-form"><div class="panel-head"><div><h2>Edit saved memory</h2><span class="muted">Ódinn keeps the previous version in its private history.</span></div><button class="secondary" id="memory-correction-dialog-close" type="button">Close</button></div><div class="field"><label for="memory-correction-text">What should Ódinn remember instead?</label><textarea id="memory-correction-text" required></textarea></div><div class="field"><label for="memory-correction-reason">Why did this change? <span class="muted">(optional)</span></label><input id="memory-correction-reason" placeholder="The earlier detail is out of date"></div><div class="row"><button value="default" type="submit">Save change</button></div></form></dialog>
+        </div>
+      </section>
+
+      <section id="view-sessions" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Conversation archive</div><h1>Sessions</h1><p>Browse conversations, move them between projects, and see which model was used.</p></div><div class="row"><button id="create-session" type="button">New Session</button><button class="secondary" id="refresh-sessions" type="button">Refresh</button></div></div>
+          <div class="panel table-panel"><div class="panel-head"><div><h2>Sessions <span class="count-badge" id="session-count-badge">0</span></h2><span class="muted" id="session-page-count">Loading</span></div></div><div class="session-filters"><input id="session-query" aria-label="Filter sessions" placeholder="Filter by title or source"><select id="session-project-filter" aria-label="Filter sessions by project"><option value="all">All projects</option></select><select id="session-status-filter" aria-label="Filter sessions by status"><option value="all">All statuses</option><option value="open">Open</option><option value="closed">Closed</option></select><select id="session-group" aria-label="Group sessions"><option value="none">No grouping</option><option value="project">Group by project</option><option value="source">Group by source</option><option value="status">Group by status</option></select></div><div class="data-table session-table"><div class="data-row data-head"><span>Session</span><span>Project</span><span>Source</span><span>Status</span><span>Updated</span><span>Messages</span><span>Actions</span></div><div id="session-list"></div></div></div>
+          <div class="panel stack session-detail"><div class="panel-head"><h2>Selected transcript</h2><span class="chip" id="selected-session-route">No session selected</span></div><div id="session-transcript" class="timeline"><div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div></div></div>
+        </div>
+      </section>
+
+      <section id="view-goals" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Outcomes you care about</div><h1>Goals</h1><p>Keep important outcomes visible, update progress quickly, and pause work without losing context.</p></div><div class="row"><button id="new-goal" type="button">New goal</button><button class="secondary" id="refresh-goals" type="button">Refresh</button></div></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="goal-active-count">0</strong><span>active</span></div><div class="stat-card"><strong id="goal-paused-count">0</strong><span>paused</span></div><div class="stat-card"><strong id="goal-blocked-count">0</strong><span>blocked</span></div><div class="stat-card"><strong id="goal-completed-count">0</strong><span>completed</span></div></div>
+          <div class="panel goal-filter-bar"><input id="goal-query" aria-label="Search goals" placeholder="Search goals"><select id="goal-status-filter" aria-label="Filter goals by status"><option value="all">All statuses</option><option value="active">Active</option><option value="paused">Paused</option><option value="blocked">Blocked</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option></select><select id="goal-project-filter" aria-label="Filter goals by project"><option value="all">All projects</option></select></div>
+          <div id="goal-list" class="goal-board"></div>
+          <dialog id="goal-dialog" class="editor-dialog">
+            <form method="dialog" id="goal-form">
+              <div class="panel-head"><div><h2 id="goal-editor-title">Create goal</h2><span class="muted">Write a clear outcome and where it belongs.</span></div><button class="secondary" id="goal-cancel-edit" value="cancel" type="submit">Close</button></div>
+              <div class="field"><label for="goal-title">Objective</label><input id="goal-title" placeholder="Finish the onboarding flow" required></div>
+              <div class="grid-2"><div class="field"><label for="goal-scope-type">Belongs to</label><select id="goal-scope-type"><option value="project">Project</option><option value="session">Session</option></select></div><div class="field"><label for="goal-scope-id">Target</label><select id="goal-scope-id"></select></div></div>
+              <div class="field"><label for="goal-description">Success looks like</label><textarea id="goal-description" placeholder="Define the concrete outcome."></textarea></div>
+              <div id="goal-status-field" class="grid-2" hidden><div class="field"><label for="goal-status">Status</label><select id="goal-status"><option>active</option><option>completed</option><option>blocked</option><option>paused</option><option>cancelled</option></select></div><div class="field" id="goal-note-field"><label for="goal-note">Progress update</label><input id="goal-note" placeholder="What changed?"></div></div>
+              <div class="row"><button id="create-goal" value="default" type="submit">Create goal</button><button class="secondary" id="update-goal" value="default" type="submit" hidden>Save changes</button></div>
+            </form>
+          </dialog>
+        </div>
+      </section>
+
+      <section id="view-config" class="view">
+        <div class="page oc-page config-page">
+          <div class="page-head">
+            <div>
+              <div class="section-kicker">Everything Ódinn can configure</div>
+              <h1>Configuration</h1>
+              <p>Set up providers, safety rules, optional plugin modules, memory, and runtime behavior without editing JSON by hand.</p>
+            </div>
+            <span class="chip" id="config-state">Not loaded</span>
+          </div>
+          <div class="config-actions">
+            <div class="row"><span class="muted">Saved to the selected state <code>config.json</code> (default <code>~/.odinn/config.json</code>)</span><span class="muted" id="config-field-count"></span></div>
+            <div class="row"><button class="secondary" id="reload-config" type="button">Reload from disk</button><button class="button-primary" id="save-config" type="button">Save configuration</button></div>
+          </div>
+          <div id="config-error" class="inline-error" role="alert" aria-live="assertive"></div>
+          <form id="config-form" class="stack" novalidate>
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>General</h2><p class="config-help">The basic identity and default behavior for this workspace.</p></div></div>
+              <div class="grid-2">
+                <div class="field"><label for="config-version">Configuration version</label><input id="config-version" data-config-field="version" type="number" min="1" max="1" readonly><span class="config-help">The current format is version 1.</span></div>
+                <div class="field"><label for="config-audit-log">Audit log filename</label><input id="config-audit-log" data-config-field="auditLog" autocomplete="off"><span class="config-help">Use <code>audit.jsonl</code> or an <code>audit-*.jsonl</code> filename.</span></div>
+              </div>
+              <div class="field"><label for="config-default-model">Default model</label><input id="config-default-model" data-config-field="defaultModel" placeholder="provider:model" autocomplete="off"><span class="config-help">Used when a chat does not choose a model explicitly.</span></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Model providers</h2><p class="config-help">Connect one or more OpenAI-compatible providers. API keys and OAuth tokens stay outside this file.</p></div><button class="secondary" id="config-add-provider" type="button">Add provider</button></div>
+              <div id="config-providers" class="config-list"></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Messaging channels</h2><p class="config-help">Connect Ódinn to approved chat accounts. Bot tokens stay in environment variables and changes require a restart.</p></div><button class="secondary" id="config-add-channel" type="button">Add channel</button></div>
+              <div id="config-channels" class="config-list"></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Policy and safety</h2><p class="config-help">Choose which capabilities are available and how web and browser access behave.</p></div></div>
+              <div class="grid-2">
+                <div class="field"><label for="config-policy-max-input">Maximum input bytes</label><input id="config-policy-max-input" data-config-policy="maxInputBytes" type="number" min="1" step="1"><span class="config-help">Requests above this size are rejected.</span></div>
+                <div class="field"><label for="config-policy-id">Policy name</label><input id="config-policy-id" data-config-policy="id" placeholder="Optional policy identifier" autocomplete="off"></div>
+              </div>
+              <div class="grid-2">
+                <div class="field"><label for="config-policy-allowed">Allowed capabilities</label><textarea id="config-policy-allowed" data-config-policy="allowedCapabilities" rows="7" placeholder="model.chat&#10;web.read"></textarea><span class="config-help">One capability per line.</span></div>
+                <div class="field"><label for="config-policy-denied">Denied tools</label><textarea id="config-policy-denied" data-config-policy="deniedTools" rows="7" placeholder="browser.click"></textarea><span class="config-help">One tool name per line.</span></div>
+              </div>
+              <div class="config-subsection">
+                <div><h3>Public web reading</h3><p class="config-help">These rules apply to web search and webpage reading.</p></div>
+                <div class="config-check-grid"><label class="switch-label"><input type="checkbox" data-config-security="web.enabled"> Enabled</label><label class="switch-label"><input type="checkbox" data-config-security="web.allowPrivateNetwork"> Allow private networks</label><label class="switch-label"><input type="checkbox" data-config-security="web.requireApproval"> Require approval</label><label class="switch-label"><input type="checkbox" data-config-security="web.allowDownloads"> Allow downloads</label><label class="switch-label"><input type="checkbox" data-config-security="web.allowUploads"> Allow uploads</label></div>
+                <div class="grid-2"><div class="field"><label for="config-web-allowed">Allowed domains</label><textarea id="config-web-allowed" data-config-security-list="web.allowedDomains" rows="4" placeholder="example.com"></textarea><span class="config-help">Blank allows any public domain.</span></div><div class="field"><label for="config-web-blocked">Blocked domains</label><textarea id="config-web-blocked" data-config-security-list="web.blockedDomains" rows="4" placeholder="example.net"></textarea></div></div>
+              </div>
+              <div class="config-subsection">
+                <div><h3>Browser access</h3><p class="config-help">Browser actions can read pages and, by default, require your approval before changing external state.</p></div>
+                <div class="config-check-grid"><label class="switch-label"><input type="checkbox" data-config-security="browser.enabled"> Enabled</label><label class="switch-label"><input type="checkbox" data-config-security="browser.allowPrivateNetwork"> Allow private networks</label><label class="switch-label"><input type="checkbox" data-config-security="browser.requireApproval"> Require approval for actions</label><label class="switch-label"><input type="checkbox" data-config-security="browser.allowDownloads"> Allow downloads</label><label class="switch-label"><input type="checkbox" data-config-security="browser.allowUploads"> Allow uploads</label></div>
+                <div class="grid-2"><div class="field"><label for="config-browser-allowed">Allowed domains</label><textarea id="config-browser-allowed" data-config-security-list="browser.allowedDomains" rows="4" placeholder="example.com"></textarea></div><div class="field"><label for="config-browser-blocked">Blocked domains</label><textarea id="config-browser-blocked" data-config-security-list="browser.blockedDomains" rows="4" placeholder="example.net"></textarea></div></div>
+              </div>
+              <div class="config-subsection">
+                <div><h3>Gatewatch policy rules</h3><p class="config-help">Optional rules enforced by the core runtime and shown by the safety preview.</p></div>
+                <div class="grid-2"><div class="field"><label for="config-policy-version">Policy version</label><input id="config-policy-version" data-config-policy="version" type="number" min="1" step="1"></div><div class="field"><label for="config-policy-invariants-help">Invariant format</label><input id="config-policy-invariants-help" value="id · type · values · enforcement" readonly></div></div>
+                <div id="config-invariants" class="config-list"></div>
+                <button class="secondary" id="config-add-invariant" type="button">Add invariant</button>
+              </div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Optional plugin modules</h2><p class="config-help">Enable only the additional modules you want this runtime to load.</p></div></div>
+              <div class="config-check-grid">
+                <label class="switch-label"><input type="checkbox" data-config-experimental="capabilities"> Capability tokens</label><label class="switch-label"><input type="checkbox" data-config-experimental="capsules"> Portable runs</label><label class="switch-label"><input type="checkbox" data-config-experimental="counterfactual"> Compare approaches</label>
+              </div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Automatic improvement</h2><p class="config-help">Control how Ódinn observes recurring problems and applies bounded, reversible reliability changes.</p></div></div>
+              <div class="grid-2"><div class="field"><label for="config-self-mode">Mode</label><select id="config-self-mode" data-config-self="mode"><option value="disabled">Disabled</option><option value="propose">Propose changes</option><option value="auto">Apply safe changes automatically</option></select></div><div class="field"><label for="config-self-interval">Check interval (milliseconds)</label><input id="config-self-interval" data-config-self="intervalMs" type="number" min="30000" max="86400000" step="1000"></div><div class="field"><label for="config-self-max">Maximum changes per check</label><input id="config-self-max" data-config-self="maxChangesPerCycle" type="number" min="1" max="3" step="1"></div><label class="switch-label"><input type="checkbox" data-config-self="enabled"> Automatic improvement enabled</label><label class="switch-label"><input type="checkbox" data-config-self="rollbackOnFailure"> Roll back when an improvement fails</label></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Runtime</h2><p class="config-help">Small runtime tuning values. Lower retries fail faster; higher retries tolerate temporary provider failures.</p></div></div>
+              <div class="field"><label for="config-runtime-retries">Model retries</label><input id="config-runtime-retries" data-config-runtime="modelRetries" type="number" min="0" max="4" step="1"></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Runemark command allowlist</h2><p class="config-help">Exact executable argument vectors allowed for Runemark checks. Put one argument on each line; the first line must be an absolute executable path.</p></div><button class="secondary" id="config-add-command" type="button">Add command</button></div>
+              <div id="config-proof-commands" class="config-list"></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Memory behavior</h2><p class="config-help">Choose which automatic memory behaviors agent runs may use when the matching capabilities are allowed.</p></div></div>
+              <div class="config-check-grid"><label class="switch-label"><input type="checkbox" data-config-memory="autoRecall"> Recall relevant memories</label><label class="switch-label"><input type="checkbox" data-config-memory="autoLearn"> Suggest memories from conversations</label><label class="switch-label"><input type="checkbox" data-config-memory="autoCompact"> Compact long sessions</label></div>
+            </div>
+          </form>
+          <div id="config-restart" class="config-restart" role="status" hidden>
+            <strong id="config-restart-title">Restart required</strong>
+            <span id="config-restart-copy">Restart the Ódinn gateway when you are ready to apply these settings.</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-automatic-improvements" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Automatic care</div><h1>Automatic improvements</h1><p>Ódinn watches for recurring reliability problems, asks the connected model for a plain-language assessment, and applies only a small set of reversible reliability adjustments.</p></div><div class="row"><span class="chip warn" id="improvement-mode-chip">Starting</span><button class="secondary" id="refresh-improvements" type="button">Refresh</button><button id="learn-improvements" type="button">Check now</button></div></div>
+          <div class="summary-bar"><span><small>AUTOMATION</small><strong id="improvement-controller-state">ON</strong></span><span><small>MODEL</small><strong id="improvement-mode">CONNECTING</strong></span><span><small>OBSERVATIONS</small><strong id="improvement-count">0</strong></span><span><small>APPLIED</small><strong id="improvement-review-count">0</strong></span></div>
+          <div class="panel detail-grid" id="self-improvement-config"><div class="detail-card"><span>Learning schedule</span><strong>Checking…</strong></div><div class="detail-card"><span>Model</span><strong id="self-improvement-model">Checking…</strong></div><div class="detail-card"><span>Changes per check</span><strong id="self-improvement-limit">1 maximum</strong></div><div class="detail-card"><span>Recovery</span><strong>Keeps a restore point</strong></div></div>
+          <div class="agent-layout">
+            <div class="panel stack"><div class="panel-head"><div><h2>What Ódinn has noticed</h2><span class="muted">Runs quietly in the background.</span></div></div><div id="improvement-list" class="list"><div class="empty-state"><strong>Nothing needs attention</strong><span>Ódinn will keep watching in the background.</span></div></div></div>
+            <div class="panel stack"><div class="panel-head"><h2>Improvement detail</h2><span class="chip" id="improvement-detail-status">No selection</span></div><div id="improvement-detail" class="empty-state"><strong>Select an observation</strong><span>The reason, result, and recovery option will appear here.</span></div><div class="row"><button class="danger" id="improvement-rollback" type="button" disabled>Undo applied change</button></div></div>
+          </div>
+        </div>
+      </section>
+
+
+      <section id="view-lab-run-checks" class="view" data-experimental-page="proof">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Runemark · Core capability</div><h1>Run Checks</h1><p>Confirm that completed work produced the files, responses, or repository state you expected.</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>Use this when an important run needs a clear pass-or-fail check.</h2></div>
+            <ol class="feature-steps"><li><span>1</span>Choose a recent run</li><li><span>2</span>Pick what should be true</li><li><span>3</span>Review the results</li></ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for run checks.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="view-lab-safety-preview" class="view" data-experimental-page="sentinel">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Gatewatch · Core capability</div><h1>Safety Preview</h1><p>Preview whether a planned action fits your safety rules before anything runs.</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>Use this to understand why an action would be allowed or stopped.</h2></div>
+            <ol class="feature-steps"><li><span>1</span>Describe the planned action</li><li><span>2</span>Preview the decision</li><li><span>3</span>Adjust the plan if needed</li></ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for safety preview.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="view-lab-temporary-access" class="view" data-experimental-page="capabilities">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Rune Key · Optional plugin module</div><h1>Temporary Access</h1><p>Grant narrow, short-lived permission for one specific action.</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>Access expires automatically and can be revoked at any time.</h2></div>
+            <ol class="feature-steps"><li><span>1</span>Choose an action</li><li><span>2</span>Set a short expiry</li><li><span>3</span>Copy the access pass once</li></ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for temporary access.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="view-lab-restore-points" class="view" data-experimental-page="rewind">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Norn Restore · Core capability</div><h1>Restore Points</h1><p>Save selected workspace files and preview a restore before changing anything.</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>Use this before risky local work or when you want an easy way back.</h2></div>
+            <ol class="feature-steps"><li><span>1</span>Create a restore point</li><li><span>2</span>Preview what would change</li><li><span>3</span>Restore only when ready</li></ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for restore points.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="view-lab-governed-workspace" class="view" data-experimental-page="governance">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Norn Governance · Core capability</div><h1>Controlled Workspace Governance</h1><p>Run bounded workspace mutations and restore operations through preview/apply governed routes.</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>Use this to stage file-level changes, review expected digests, and apply only when conflicts are clear.</h2></div>
+            <ol class="feature-steps"><li><span>1</span>Choose mutate, patch, or restore</li><li><span>2</span>Run a governed preview</li><li><span>3</span>Apply only after reviewing results</li></ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for controlled workspace governance.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="view-lab-portable-runs" class="view" data-experimental-page="capsules">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Saga Archive · Optional plugin module</div><h1>Portable Runs</h1><p>Package a completed run so it can be checked or replayed without live tools.</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>Useful for sharing, archiving, and reproducing work safely.</h2></div>
+            <ol class="feature-steps"><li><span>1</span>Choose a run</li><li><span>2</span>Create a portable copy</li><li><span>3</span>Check or replay the copy</li></ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for portable runs.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="view-lab-scenario-compare" class="view" data-experimental-page="counterfactual">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Worldtree Paths · Optional plugin module</div><h1>Compare Approaches</h1><p>Try multiple approaches in separate workspace copies and compare the outcomes.</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>See the evidence side by side before choosing which result to keep.</h2></div>
+            <ol class="feature-steps"><li><span>1</span>Create alternatives</li><li><span>2</span>Run each approach</li><li><span>3</span>Preview and choose a result</li></ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for compare approaches.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="view-lab-model-routing" class="view" data-experimental-page="darwin">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Raven Route · Core capability</div><h1>Smart Routing</h1><p>Learn which configured model works best for different kinds of tasks.</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>Recommendations improve as verified outcomes accumulate.</h2></div>
+            <ol class="feature-steps"><li><span>1</span>Record an outcome</li><li><span>2</span>Review what has been learned</li><li><span>3</span>Ask for a recommendation</li></ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for smart routing.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-usage" class="view">
+        <div class="page oc-page activity-page">
+          <div class="page-head"><div><div class="section-kicker">A clear view of what Ódinn has been doing</div><h1>Activity</h1><p>See model use, recent work, and a searchable history in one place. Token totals are recorded activity, not a provider bill.</p></div><span class="pill" id="status-pill">Unknown</span></div>
+          <div class="activity-tabs" role="tablist" aria-label="Activity views"><button id="activity-tab-overview" class="active" role="tab" aria-selected="true" aria-controls="activity-overview" type="button">Overview</button><button id="activity-tab-history" role="tab" aria-selected="false" aria-controls="activity-history" type="button">History</button></div>
+          <div id="activity-overview" class="activity-panel active" role="tabpanel" aria-labelledby="activity-tab-overview">
+            <div class="stat-strip"><div class="stat-card"><strong id="usage-total-tokens">0</strong><span>tokens recorded</span></div><div class="stat-card"><strong id="usage-model-calls">0</strong><span>model conversations</span></div><div class="stat-card"><strong id="metric-runs">0</strong><span>pieces of work</span></div><div class="stat-card"><strong id="usage-errors">0</strong><span>need attention</span></div></div>
+            <div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Activity by day</h2><span class="muted">last 14 days</span></div><div id="usage-chart" class="bar-chart"></div></div><div class="panel stack"><div class="panel-head"><h2>Model connections</h2><span class="muted">Account details stay hidden</span></div><div id="provider-list" class="list"></div></div></div>
+            <div class="panel table-panel"><div class="panel-head"><div><h2>Recent model activity</h2><span class="muted">Latest four conversations</span></div></div><div id="runs" class="list"></div></div>
+          </div>
+          <div id="activity-history" class="activity-panel" role="tabpanel" aria-labelledby="activity-tab-history" hidden>
+            <div class="page-head compact-head"><div><h2>Searchable history</h2><p>Find completed work, automatic actions, and problems that may need attention.</p></div><div class="row"><button class="secondary" id="audit-verify" type="button">Check history integrity</button><button class="secondary" id="refresh-audit" type="button">Refresh</button><button class="secondary" id="copy-audit" type="button">Copy summary</button><button class="secondary" id="export-audit" type="button">Download records</button></div></div>
+            <div class="stat-strip"><div class="stat-card"><strong id="audit-count">0</strong><span>activity updates</span></div><div class="stat-card"><strong id="audit-run-count">0</strong><span>pieces of work</span></div><div class="stat-card"><strong id="audit-model-count">0</strong><span>model conversations</span></div><div class="stat-card"><strong id="audit-error-count">0</strong><span>need attention</span></div></div>
+            <div class="panel audit-filter-panel"><div class="filter-grid"><input id="audit-query" aria-label="Search activity" placeholder="Search activity"><select id="audit-type-filter" aria-label="Filter by activity type"><option value="">All activity types</option></select><select id="audit-tool-filter" aria-label="Filter by area"><option value="">All areas</option></select><select id="audit-actor-filter" aria-label="Filter by who started it"><option value="">Started by anyone</option></select><select id="audit-outcome-filter" aria-label="Filter by result"><option value="">All results</option></select></div><div class="toolbar"><div class="row"><input id="audit-from" type="date" aria-label="From date"><input id="audit-to" type="date" aria-label="To date"><button class="secondary" id="audit-reset" type="button">Reset filters</button></div><span class="chip" id="audit-integrity">Not checked</span></div></div>
+            <div class="panel stack"><div class="panel-head"><h2>History</h2><span class="muted" id="audit-showing">0 updates</span></div><div id="audit-events" class="list"></div><div class="pagination"><span class="muted" id="audit-page-label">Page 1 of 1</span><div class="row"><label class="switch-label">Items <select id="audit-page-size"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label><button class="secondary" id="audit-prev" type="button">Previous</button><button class="secondary" id="audit-next" type="button">Next</button></div></div><pre id="audit-log" class="output" hidden>No history loaded.</pre></div>
+          </div>
+          <div hidden><span id="metric-tools"></span><span id="metric-completed"></span><span id="metric-policy"></span><span id="runtime-chips"></span><span id="status-workspace"></span><span id="status-state"></span><span id="tool-count"></span><select id="tool"></select><div id="tool-list"></div><div id="run-history"></div><span id="plan-run-count"></span><span id="plan-last-status"></span><div id="plan-runs"></div></div><div class="panel" hidden><button id="clear-output" type="button">Clear</button><pre id="output">Ready.</pre></div>
+        </div>
+      </section>
+
+      <section id="view-agents" class="view">
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Experimental package · Build reusable agents</div><h1>Agent SDK</h1><p>Create and manage specialized agents for recurring kinds of work. Making one available does not start work by itself.</p></div><div class="row"><button id="new-agent" type="button">Add agent</button><button class="secondary" id="refresh-agents" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="agent-total">0</strong><span>agent packages</span></div><div class="stat-card"><strong id="agent-enabled">0</strong><span>available</span></div><div class="stat-card"><strong id="agent-quarantined">0</strong><span>set aside</span></div><div class="stat-card"><strong>Local</strong><span>stored in this workspace</span></div></div><div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Your agents</h2><input id="agent-query" aria-label="Filter agents" placeholder="Filter agents"></div><div id="agent-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Agent details</h2><span class="chip" id="agent-detail-status">No selection</span></div><div id="agent-detail" class="empty-state"><strong>Select an agent</strong><span>Its purpose, access, and setup will appear here.</span></div><div class="row"><button id="agent-enable" type="button" disabled>Make available</button><button class="secondary" id="agent-disable" type="button" disabled>Turn off</button><button class="danger-button" id="agent-quarantine" type="button" disabled>Set aside</button></div></div></div>
+          <dialog id="agent-dialog" class="editor-dialog">
+            <form method="dialog" id="agent-form">
+              <div class="panel-head"><div><h2>Add an Agent SDK package</h2><span class="muted">It will stay off until you choose to make it available.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div>
+              <div id="manifest-fields" class="manifest-fields">
+                <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" value="Example Agent" required></div>
+                <div class="field"><label for="agent-identity">Short name</label><input id="agent-identity" value="Example"></div>
+                <details class="advanced-options">
+                  <summary>Advanced setup</summary>
+                  <div class="grid-2"><div class="field"><label for="agent-id">Internal name</label><input id="agent-id" pattern="[a-z0-9][a-z0-9._\-]{1,63}" value="example-agent" required></div><div class="field"><label for="agent-version">Version</label><input id="agent-version" value="1.0.0" required></div></div>
+                  <div class="field"><label for="agent-instructions">Instruction files <span class="muted">separate with commas</span></label><input id="agent-instructions" value="AGENTS.md"></div>
+                  <div class="field"><label for="agent-tools">Things it may use <span class="muted">separate with commas</span></label><input id="agent-tools" value="workspace.readText"></div>
+                  <div class="grid-2"><div class="field"><label for="agent-plugins">Add-ons</label><input id="agent-plugins"></div><div class="field"><label for="agent-secrets">Saved accounts it may request</label><input id="agent-secrets"></div></div>
+                  <div class="grid-2"><div class="field"><label for="agent-sandbox">Workspace access</label><select id="agent-sandbox"><option value="workspace-write">Read and edit</option><option value="workspace-read">Read only</option><option value="container">Separate container</option></select></div><div class="field"><label for="agent-network">Websites it may contact</label><input id="agent-network" placeholder="api.example.com"></div></div>
+                </details>
+              </div>
+              <div class="manifest-advanced"><label class="switch-label"><input type="checkbox" id="agent-advanced-toggle"> Developer setup</label><div id="agent-manifest-error" class="inline-error" role="alert"></div><textarea id="agent-manifest" class="manifest-editor" hidden></textarea></div>
+              <div class="row"><button id="validate-agent" value="default" type="submit">Save agent</button></div>
+            </form>
+          </dialog>
+        </div>
+      </section>
+
+      <section id="view-skills" class="view">
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Experimental package · Build reusable workflows</div><h1>Skills SDK</h1><p>Build, review, and manage reusable instructions that teach Ódinn how to handle repeatable work.</p></div><div class="row"><button id="new-skill" type="button">Create skill</button><button class="secondary" id="refresh-skills" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="skill-total">0</strong><span>skill packages</span></div><div class="stat-card"><strong id="skill-enabled">0</strong><span>available</span></div><div class="stat-card"><strong id="skill-unmanaged">0</strong><span>found locally</span></div><div class="stat-card"><strong id="skill-quarantined">0</strong><span>set aside</span></div></div><div class="agent-layout"><div class="panel stack"><div class="toolbar"><input id="skill-query" aria-label="Filter skills" placeholder="Filter skills"><select id="skill-status-filter" aria-label="Filter skills by status"><option value="all">All statuses</option><option value="enabled">Available</option><option value="disabled">Off</option><option value="unmanaged">Found locally</option><option value="quarantined">Set aside</option></select></div><div id="skills-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Skills SDK details</h2><span class="chip" id="skill-detail-status">No selection</span></div><div id="skill-detail" class="empty-state"><strong>Select a skill</strong><span>Its purpose and requested access will appear here.</span></div><div class="row"><button id="skill-enable" type="button" disabled>Make available</button><button class="secondary" id="skill-disable" type="button" disabled>Turn off</button><button class="secondary" id="skill-verify" type="button" disabled>Check package</button><button class="danger-button" id="skill-quarantine" type="button" disabled>Set aside</button></div></div></div>
+          <dialog id="skill-dialog" class="editor-dialog">
+            <form method="dialog" id="skill-form">
+              <div class="panel-head"><div><h2>Create a Skills SDK package</h2><span class="muted">It will stay off until you choose to make it available.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div>
+              <div class="field"><label for="skill-name">Skill name</label><input id="skill-name" placeholder="Project check" required></div>
+              <div class="field"><label for="skill-description">When should Ódinn use it?</label><textarea id="skill-description" placeholder="Use when a project needs a repeatable check." required></textarea></div>
+              <div class="field"><label for="skill-instructions">What should Ódinn do?</label><textarea id="skill-instructions" class="workshop-editor" placeholder="## Steps&#10;&#10;1. Inspect the project..." required></textarea></div>
+              <details class="advanced-options">
+                <summary>Advanced setup</summary>
+                <div class="grid-2"><div class="field"><label for="skill-id">Internal name</label><input id="skill-id" pattern="[a-z0-9][a-z0-9\-]{1,63}" placeholder="created from the skill name"></div><div class="field"><label for="skill-version">Version</label><input id="skill-version" value="1.0.0" required></div></div>
+                <div class="grid-2"><div class="field"><label for="skill-tools">Things it may use</label><input id="skill-tools" placeholder="workspace.readText"></div><div class="field"><label for="skill-capabilities">Extra permissions</label><input id="skill-capabilities" placeholder="workspace.read"></div></div>
+                <div class="grid-2"><div class="field"><label for="skill-secrets">Saved accounts it may request</label><input id="skill-secrets"></div><div class="field"><label for="skill-network">Websites it may contact</label><input id="skill-network" placeholder="github.com"></div></div>
+              </details>
+              <div class="row"><button value="default" type="submit">Save skill</button></div>
+            </form>
+          </dialog>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="toast-region" id="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+  <script type="module" src="./src/main.js"></script>
+
+</body>
+</html>

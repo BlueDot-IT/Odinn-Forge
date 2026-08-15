@@ -5,6 +5,7 @@ import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promi
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build, version as esbuildVersion } from "esbuild";
+import { buildConsole } from "./build-console.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = join(root, "dist");
@@ -13,6 +14,7 @@ const metaFile = "production-esbuild-meta.json";
 const buildInfoFile = "production-build-info.json";
 const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 
+await buildConsole();
 await mkdir(output, { recursive: true });
 for (const directory of runtimeDirectories) {
   await rm(join(output, directory), { recursive: true, force: true });

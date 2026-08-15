@@ -22,11 +22,12 @@ import {
 } from "@odinn/channels";
 import { authenticationMode, isMutatingMethod, permitsGatewayTokenBootstrap, validHostHeader, validMutationOrigin } from "./security.ts";
 import { runGatewayEntrypoint } from "./bootstrap.ts";
-import { renderConsoleHtml } from "./public/console.ts";
+import { CONSOLE_CSP, readConsoleAsset, renderConsoleHtml } from "./public/console.ts";
 import { gatewayTestHooksFor } from "./testing.ts";
 import { runWithWorkflowLeaseHeartbeat } from "./workflow.ts";
 import { gatewayOperatorSnapshotFailure } from "./http/errors.ts";
 import { createGatewayOperatorSnapshotReadRequest, normalizeHostedUserId } from "./http/request-context.ts";
+import { assertTenantClaims, createGatewayTenantScope, createTenantScopedAuditStore, scopedJobPayload, type GatewayTenantScope } from "./http/tenant-scope.ts";
 import { AuthenticatedRouter } from "./http/router.ts";
 import { registerApplicationReadRoutes } from "./routes/application-reads.ts";
 
@@ -651,12 +652,13 @@ export function nextCronWake(schedule: string, timezone = "UTC", after = new Dat
   return null;
 }
 
-async function runCronJob(store: CronStore, id: string, executor: any) {
+async function runCronJob(store: CronStore, id: string, executor: any, tenantScope?: GatewayTenantScope) {
   const job = (await store.list()).find((item: any) => item.id === id);
   if (!job) throw new GatewayError(404, "cron job not found");
   const startedAt = new Date().toISOString();
   try {
-    const result = await executor({ task: { id: `${job.id}:${Date.now()}`, tool: job.tool, input: job.input, actor: "cron", reason: `cron:${job.id}` } });
+    const task = { id: `${job.id}:${Date.now()}`, tool: job.tool, input: job.input, actor: "cron", reason: `cron:${job.id}` };
+    const result = await executor(tenantScope ? scopedJobPayload({ task }, tenantScope) : { task });
     await store.update(id, { lastRunAt: startedAt, lastStatus: "ok", lastError: "", lastMinuteKey: startedAt.slice(0, 16) });
     return result;
   } catch (error) {
@@ -682,19 +684,18 @@ async function settleCronOccurrence(store: CronStore, supervisor: JobSupervisor,
   }
 }
 
-async function dispatchCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, job: any, retrySafe = false): Promise<void> {
+async function dispatchCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, job: any, retrySafe = false, tenantScope?: GatewayTenantScope): Promise<void> {
+  const payload = { task: {
+    id: claim.occurrenceKey,
+    tool: job.tool,
+    input: job.input,
+    actor: "cron",
+    reason: claim.occurrenceKey,
+    occurrenceKey: claim.occurrenceKey,
+    scheduledFor: claim.scheduledFor
+  } };
   await supervisor.submit(
-    {
-      task: {
-        id: claim.occurrenceKey,
-        tool: job.tool,
-        input: job.input,
-        actor: "cron",
-        reason: claim.occurrenceKey,
-        occurrenceKey: claim.occurrenceKey,
-        scheduledFor: claim.scheduledFor
-      }
-    },
+    tenantScope ? scopedJobPayload(payload, tenantScope) : payload,
     {
       id: claim.occurrenceKey,
       occurrenceKey: claim.occurrenceKey,
@@ -708,13 +709,13 @@ async function dispatchCronOccurrence(store: CronStore, supervisor: JobSuperviso
   await settleCronOccurrence(store, supervisor, claim, job.id);
 }
 
-export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor, now = new Date(), retrySafeFor: (tool: string) => boolean = () => false) {
+export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor, now = new Date(), retrySafeFor: (tool: string) => boolean = () => false, tenantScope?: GatewayTenantScope) {
   const dispatches: Promise<void>[] = [];
   for (const job of await store.list()) {
     if (!job.enabled) continue;
     const claim = await store.claimDueOccurrence(job.id, now);
     if (!claim.claimed) continue;
-    dispatches.push(dispatchCronOccurrence(store, supervisor, claim, job, retrySafeFor(job.tool)));
+    dispatches.push(dispatchCronOccurrence(store, supervisor, claim, job, retrySafeFor(job.tool), tenantScope));
   }
   await Promise.allSettled(dispatches);
 }
@@ -733,6 +734,7 @@ export async function createGatewayServer(options: any = {}) {
   const testHooks = gatewayTestHooksFor(options);
   const trustedHostedUserId = hosted ? normalizeHostedUserId(hostedUserId) : undefined;
   const trustedHostedTenantId = hosted ? normalizeHostedUserId(hostedTenantId ?? hostedUserId) : undefined;
+  const tenantScope = createGatewayTenantScope({ hosted, userId: trustedHostedUserId, tenantId: trustedHostedTenantId });
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
   const version = await productVersion();
@@ -764,7 +766,8 @@ export async function createGatewayServer(options: any = {}) {
   };
   const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags, proofOptions });
   new CheckpointCoordinator({ runLedger: runtime.ledger }).recover();
-  const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  const rawAuditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  const auditStore = createTenantScopedAuditStore(rawAuditStore, tenantScope);
   if (typeof auditStore.verifyIntegrity === "function") await auditStore.verifyIntegrity({ allowUnsigned: true }).catch(() => undefined);
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
@@ -786,7 +789,9 @@ export async function createGatewayServer(options: any = {}) {
   const registry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: runtimeConfig, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const governedRegistry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: { ...runtimeConfig, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const gatewayToken = await loadGatewayToken(state);
-  const isolatedTaskExecutor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
+  const rawIsolatedTaskExecutor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
+  const isolatedTaskExecutor: any = (request: any, options?: { signal?: AbortSignal }) => rawIsolatedTaskExecutor(scopeTaskRequest(request, tenantScope), options);
+  isolatedTaskExecutor.shutdown = rawIsolatedTaskExecutor.shutdown?.bind(rawIsolatedTaskExecutor);
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
   const supervisor = new JobSupervisor({
     store: new SqliteJobStore(runtime.ledger, { legacyPath: join(state, "jobs.json") }),
@@ -802,7 +807,7 @@ export async function createGatewayServer(options: any = {}) {
     }
   });
   const runIsolatedTask = (request: any, options?: { signal?: AbortSignal }): Promise<any> => isolatedTaskExecutor(request, options) as Promise<any>;
-  const runGovernedTask = (request: any): Promise<any> => executeTask({ ...request, auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
+  const runGovernedTask = (request: any): Promise<any> => executeTask({ ...request, task: scopeTask(request.task, tenantScope), auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
   const workflowRuntime = config.runtime?.enableDurableWorkflows === true
     ? new DurableWorkflowRuntime({
       store: new SqliteWorkflowStore(runtime.ledger.database),
@@ -826,7 +831,7 @@ export async function createGatewayServer(options: any = {}) {
     ? new DurableEventIngress({
       database: runtime.ledger.database,
       dispatch: async (candidate) => {
-        const job = await supervisor.submit({ durableExecution: true, task: { id: candidate.candidateId, tool: candidate.actionRef, input: { candidateId: candidate.candidateId, idempotencyKey: candidate.idempotencyKey }, actor: "event-ingress", reason: `automation:${candidate.declarationId}` } }, { id: candidate.idempotencyKey, requestHash: candidate.idempotencyKey, retrySafe: false, idempotent: true });
+        const job = await supervisor.submit(scopedJobPayload({ durableExecution: true, task: { id: candidate.candidateId, tool: candidate.actionRef, input: { candidateId: candidate.candidateId, idempotencyKey: candidate.idempotencyKey }, actor: "event-ingress", reason: `automation:${candidate.declarationId}` } }, tenantScope), { id: candidate.idempotencyKey, requestHash: candidate.idempotencyKey, retrySafe: false, idempotent: true });
         return ["queued", "running", "awaiting-approval", "completed"].includes(job.status) ? "completed" : "needs-review";
       }
     })
@@ -850,7 +855,7 @@ export async function createGatewayServer(options: any = {}) {
     auditStore,
     loadPlugin: channelPluginLoader
   });
-  const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry, runLedger: runtime.ledger });
+  const runControlTask = (task: any) => executeTask({ task: scopeTask(task, tenantScope), auditStore, policy, registry, runLedger: runtime.ledger });
   await supervisor.start();
   await workflowRuntime?.start();
   runtime.ledger.reconcileAgentGraphRuns();
@@ -888,7 +893,8 @@ export async function createGatewayServer(options: any = {}) {
     cronStore,
     supervisor,
     new Date(),
-    (tool) => toolSafetyDescriptor(tool, registry.get(tool)).retrySafe === true
+    (tool) => toolSafetyDescriptor(tool, registry.get(tool)).retrySafe === true,
+    tenantScope
   ).catch(() => undefined), 30_000);
   cronTimer.unref();
   const eventHeartbeatTimer = eventIngress
@@ -1230,6 +1236,14 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "GET" && url.pathname === "/odinn-logo.png") {
         return image(response, 200, await readFile(join(PUBLIC_DIR, "odinn-logo.png")), "image/png");
       }
+      if (request.method === "GET" && url.pathname.startsWith("/console/assets/")) {
+        try {
+          const asset = await readConsoleAsset(url.pathname);
+          return staticAsset(response, 200, asset.body, asset.contentType);
+        } catch {
+          return json(response, 404, { ok: false, error: "console asset not found" });
+        }
+      }
       if (request.method === "GET" && url.pathname === "/") {
         const bootstrapHeaders = permitsGatewayTokenBootstrap(request, server)
           ? {
@@ -1237,7 +1251,7 @@ export async function createGatewayServer(options: any = {}) {
               "x-odinn-auth": "bootstrap-cookie"
             }
           : { "x-odinn-auth": "authentication-required" };
-        return html(response, 200, renderConsoleHtml(version), bootstrapHeaders);
+        return html(response, 200, renderConsoleHtml(version), { ...bootstrapHeaders, "content-security-policy": CONSOLE_CSP });
       }
       if (url.pathname.startsWith("/channels/webhook/")) {
         if (await channelSupervisor.handleWebhook(request, response, url)) return;
@@ -1247,6 +1261,7 @@ export async function createGatewayServer(options: any = {}) {
       if (!authentication) {
         return json(response, 401, { ok: false, error: "gateway authentication required" });
       }
+      request.__odinnTenantScope = tenantScope;
       if (isMutatingMethod(request.method) && !validMutationOrigin(request, authentication)) {
         return json(response, 403, { ok: false, error: "origin rejected for control-plane mutation" });
       }
@@ -1695,7 +1710,7 @@ export async function createGatewayServer(options: any = {}) {
           const run = await workflowRuntime.submit({
             schemaVersion: 1,
             runId: String(body.runId || `workflow_${randomUUID()}`),
-            principalId: "gateway",
+            principalId: tenantScope.hosted ? `${tenantScope.principalId}:${tenantScope.tenantId}` : tenantScope.principalId,
             idempotencyKey: key,
             definition: body.definition,
             input: body.input ?? {}
@@ -1760,7 +1775,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname.startsWith("/cron/") && url.pathname.endsWith("/run")) {
         const id = decodeURIComponent(url.pathname.slice("/cron/".length, -"/run".length));
-        return json(response, 200, { ok: true, result: await runCronJob(cronStore, id, isolatedTaskExecutor) });
+        return json(response, 200, { ok: true, result: await runCronJob(cronStore, id, isolatedTaskExecutor, tenantScope) });
       }
       if (request.method === "GET" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/result")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length, -"/result".length));
@@ -1826,7 +1841,7 @@ export async function createGatewayServer(options: any = {}) {
             ? Math.min(Math.max(requestedGraphTimeout, 1), 300_000) + 30_000
           : body.timeoutMs;
         const job = await supervisor.submit(
-          { durableExecution, ...(parentCapabilities ? { parentCapabilities } : {}), ...(typeof body.executionKey === "string" ? { executionKey: body.executionKey } : {}), task: { ...task, ...(id ? { id: String(id) } : {}) } },
+          scopedJobPayload({ durableExecution, ...(parentCapabilities ? { parentCapabilities } : {}), ...(typeof body.executionKey === "string" ? { executionKey: body.executionKey } : {}), task: { ...task, ...(id ? { id: String(id) } : {}) } }, tenantScope),
           { id: id ? String(id) : undefined, requestHash, timeoutMs: effectiveTimeout, retrySafe: safety.retrySafe === true }
         );
         return json(response, 202, { ok: true, job });
@@ -2205,7 +2220,7 @@ export async function createGatewayServer(options: any = {}) {
         const sendEvent = (event: string, value: any) => response.write(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
         try {
           const result = await executeTask({
-            task: { id: body.id ?? request.headers["idempotency-key"], tool: body.tool, input: body.input, reason: body.reason, actor: "gateway" },
+            task: scopeTask({ id: body.id ?? request.headers["idempotency-key"], tool: body.tool, input: body.input, reason: body.reason, actor: "gateway" }, tenantScope),
             auditStore,
             policy,
             registry,
@@ -2306,6 +2321,40 @@ async function loadGatewayToken(state: any) {
 
 function hashRequest(value: any) {
   return createHash("sha256").update(stableJson(value)).digest("hex");
+}
+
+function scopeTask(task: any, scope: GatewayTenantScope): any {
+  if (!task || typeof task !== "object" || Array.isArray(task)) throw new GatewayError(400, "task must be an object");
+  const existingTenantId = task.tenantId ?? task.scope?.tenantId;
+  if (existingTenantId !== undefined) {
+    try { assertTenantClaims({ tenantId: existingTenantId }, scope, "task"); }
+    catch (error) { throw new GatewayError(403, error instanceof Error ? error.message : "task tenant scope is invalid"); }
+  }
+  return {
+    ...task,
+    actor: scope.hosted ? scope.principalId : task.actor || "gateway",
+    scope: {
+      ...(task.scope && typeof task.scope === "object" && !Array.isArray(task.scope) ? task.scope : {}),
+      tenantId: scope.tenantId,
+      principalId: scope.principalId,
+    },
+  };
+}
+
+function scopeTaskRequest(request: any, scope: GatewayTenantScope): any {
+  if (!request || typeof request !== "object" || Array.isArray(request)) throw new GatewayError(400, "task request must be an object");
+  if (request.task) return { ...request, task: scopeTask(request.task, scope) };
+  if (request.plan && typeof request.plan === "object" && !Array.isArray(request.plan)) {
+    return {
+      ...request,
+      plan: {
+        ...request.plan,
+        actor: scope.hosted ? scope.principalId : request.plan.actor || "gateway",
+        scope: { tenantId: scope.tenantId, principalId: scope.principalId },
+      },
+    };
+  }
+  throw new GatewayError(400, "task request must contain a task or plan");
 }
 
 function stableJson(value: any): any {
@@ -2862,11 +2911,18 @@ async function writeEditableConfig(state: string, input: any, { hosted = false }
 
 async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: any = {}) {
   const raw = (await readRequestBuffer(request, { maxBytes })).toString("utf8");
+  let value: any;
   try {
-    return raw ? JSON.parse(raw) : {};
+    value = raw ? JSON.parse(raw) : {};
   } catch {
     throw new GatewayError(400, "request body must be valid JSON");
   }
+  const scope = request?.__odinnTenantScope as GatewayTenantScope | undefined;
+  if (scope) {
+    try { assertTenantClaims(value, scope); }
+    catch (error) { throw new GatewayError(403, error instanceof Error ? error.message : "request tenant scope is invalid"); }
+  }
+  return value;
 }
 
 async function readRequestBuffer(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: any = {}) {
@@ -2903,6 +2959,15 @@ function image(response: any, status: any, body: any, contentType: any) {
   response.writeHead(status, {
     "content-type": contentType,
     "cache-control": "public, max-age=3600",
+    "x-content-type-options": "nosniff"
+  });
+  response.end(body);
+}
+
+function staticAsset(response: any, status: any, body: any, contentType: any) {
+  response.writeHead(status, {
+    "content-type": contentType,
+    "cache-control": "public, max-age=31536000, immutable",
     "x-content-type-options": "nosniff"
   });
   response.end(body);

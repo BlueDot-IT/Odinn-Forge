@@ -22,9 +22,10 @@
     "format:check": "node scripts/ci/run.ts format",
     "lint": "node scripts/ci/run.ts lint",
     "typecheck": "node scripts/ci/run.ts typecheck",
-    "test": "node --test --test-concurrency=1 --test-reporter=spec tests/*.test.ts",
-    "test:platform": "node --test --test-concurrency=1 --test-reporter=spec tests/platform.test.ts tests/resource-limits.test.ts tests/channels.test.ts tests/gateway-product-surfaces.test.ts tests/compiled-inference-smoke.test.ts tests/workspace-inspection.test.ts tests/dependency-direction.test.ts",
-    "test:gateway": "node --test --test-concurrency=1 --test-reporter=spec tests/gateway.test.ts tests/gateway-product-surfaces.test.ts tests/gateway-read-router.test.ts",
+    "build:console": "node scripts/build-console.ts",
+    "test": "pnpm build:console && node --test --test-concurrency=1 --test-reporter=spec tests/*.test.ts",
+    "test:platform": "pnpm build:console && node --test --test-concurrency=1 --test-reporter=spec tests/platform.test.ts tests/resource-limits.test.ts tests/channels.test.ts tests/gateway-product-surfaces.test.ts tests/compiled-inference-smoke.test.ts tests/workspace-inspection.test.ts tests/dependency-direction.test.ts",
+    "test:gateway": "pnpm build:console && node --test --test-concurrency=1 --test-reporter=spec tests/gateway.test.ts tests/gateway-product-surfaces.test.ts tests/gateway-read-router.test.ts",
     "test:integration": "node --test --test-concurrency=1 --test-reporter=spec tests/integration.test.ts",
     "test:invariants": "node --expose-gc --test --test-concurrency=1 --test-reporter=spec tests/invariants/*.test.ts",
     "test:oci": "node --test --test-concurrency=1 --test-reporter=spec tests/sandbox-oci.integration.test.ts tests/extension-oci.integration.test.ts",
@@ -46,7 +47,7 @@
     "tui": "pnpm --filter @odinn/cli start -- tui",
     "gui:start": "pnpm --filter @odinn/gateway start",
     "host:start": "node apps/gateway/src/host.ts",
-    "smoke:inference": "node scripts/ci/inference-smoke.ts",
+    "smoke:inference": "pnpm build:console && node scripts/ci/inference-smoke.ts",
     "smoke:inference:compiled": "node scripts/ci/compiled-inference-smoke.ts",
     "smoke:onboarding": "node scripts/ci/onboarding-smoke.ts",
     "storage:drill": "node scripts/ci/storage-drill.ts",
@@ -66,6 +67,7 @@
     "fast-check": "4.9.0",
     "fflate": "0.8.3",
     "typescript": "5.9.3",
-    "typescript-eslint": "8.66.0"
+    "typescript-eslint": "8.66.0",
+    "vite": "8.2.1"
   }
 }

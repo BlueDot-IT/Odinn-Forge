@@ -1,5 +1,6 @@
 node_modules/
 dist/
+/apps/gateway/public/console/
 coverage/
 .reports/
 .firecrawl/
