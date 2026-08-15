@@ -6,6 +6,7 @@ export type AuthenticatedRouteContext = Readonly<{
   applicationRequestId: string;
   authentication: string;
   hostedUserId?: string;
+  hostedTenantId?: string;
   signal: AbortSignal;
 }>;
 

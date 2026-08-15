@@ -18,6 +18,8 @@ const DEFAULT_EXCLUSIONS = Object.freeze([
   "gateway.token",
   "capability-signing.key",
   "users.json",
+  "sessions.json",
+  "session-key",
   "login-attempts.json"
 ]);
 const ALWAYS_EXCLUDED = Object.freeze([

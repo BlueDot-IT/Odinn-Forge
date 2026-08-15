@@ -16,9 +16,12 @@ function assertLabeledInput(html: string, name: string) {
 
 test("hosted status application contexts isolate authenticated users", () => {
   const alice = createGatewayStatusReadRequest({ applicationRequestId: "request:alice", hostedUserId: "alice", authentication: "bearer" });
+  const aliceSecondTenant = createGatewayStatusReadRequest({ applicationRequestId: "request:alice-second", hostedUserId: "alice", hostedTenantId: "second", authentication: "bearer" });
   const bob = createGatewayStatusReadRequest({ applicationRequestId: "request:bob", hostedUserId: "bob", authentication: "bearer" });
   assert.equal(alice.context.principal.principalId, "host-user:alice");
   assert.equal(alice.context.scope.tenantId, "tenant:alice");
+  assert.equal(aliceSecondTenant.context.principal.principalId, "host-user:alice");
+  assert.equal(aliceSecondTenant.context.scope.tenantId, "tenant:second");
   assert.equal(bob.context.principal.principalId, "host-user:bob");
   assert.equal(bob.context.scope.tenantId, "tenant:bob");
   assert.notEqual(alice.context.principal.principalId, bob.context.principal.principalId);
@@ -150,6 +153,65 @@ test("multi-user host authenticates and isolates each tenant gateway state", asy
     assert.equal((await fetch(`${base}/auth/logout`, { method: "POST", headers: { cookie: aliceCookie, origin: publicOrigin } })).status, 200);
     assert.equal((await fetch(`${base}/status`, { headers: { cookie: aliceCookie } })).status, 401);
   } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
+});
+
+test("host derives tenant scope from durable membership and restores revocable sessions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-memberships-"));
+  const firstWorkspace = await mkdtemp(join(tmpdir(), "odinn-membership-first-"));
+  const secondWorkspace = await mkdtemp(join(tmpdir(), "odinn-membership-second-"));
+  const password = await hashPassword("multi-tenant-password-long");
+  const publicOrigin = "https://odinn.test";
+  const config = {
+    schemaVersion: 2,
+    users: [{ id: "alice", defaultTenantId: "first", salt: password.salt, passwordHash: password.hash, disabled: false }],
+    tenants: [
+      { id: "first", name: "First tenant", workspaceRoot: firstWorkspace, stateDirectory: "tenants/first" },
+      { id: "second", name: "Second tenant", workspaceRoot: secondWorkspace, stateDirectory: "tenants/second" }
+    ],
+    memberships: [
+      { userId: "alice", tenantId: "first", role: "owner" },
+      { userId: "alice", tenantId: "second", role: "member" }
+    ],
+    roles: [{ id: "owner", permissions: ["tenant.manage", "tenant.use"] }, { id: "member", permissions: ["tenant.use"] }],
+    serviceAccounts: []
+  };
+  await writeFile(join(root, "users.json"), `${JSON.stringify(config)}\n`, { mode: 0o600 });
+  const first = await createMultiUserHost({ stateDir: root, publicOrigin });
+  await new Promise((resolve: any) => first.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${first.address().port}`;
+  let cookie = "";
+  try {
+    const login = await fetch(`${base}/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: publicOrigin },
+      body: JSON.stringify({ userId: "alice", password: "multi-tenant-password-long", tenantId: "first" })
+    });
+    assert.equal(login.status, 200);
+    cookie = login.headers.get("set-cookie")!.split(";")[0];
+    assert.deepEqual((await login.json()).tenants.map((tenant: any) => tenant.tenantId), ["first", "second"]);
+    assert.equal((await (await fetch(`${base}/status`, { headers: { cookie } })).json()).workspaceRoot, firstWorkspace);
+    assert.equal((await fetch(`${base}/auth/tenants`, { headers: { cookie } })).status, 200);
+    const selected = await fetch(`${base}/auth/select-tenant`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: publicOrigin },
+      body: JSON.stringify({ tenantId: "second" })
+    });
+    assert.equal(selected.status, 200);
+    assert.equal((await (await fetch(`${base}/status`, { headers: { cookie } })).json()).workspaceRoot, secondWorkspace);
+  } finally {
+    await new Promise((resolve: any) => first.close(() => resolve()));
+  }
+
+  const restarted = await createMultiUserHost({ stateDir: root, publicOrigin });
+  await new Promise((resolve: any) => restarted.listen(0, "127.0.0.1", resolve));
+  const restartedBase = `http://127.0.0.1:${restarted.address().port}`;
+  try {
+    assert.equal((await fetch(`${restartedBase}/status`, { headers: { cookie } })).status, 200);
+    await writeFile(join(root, "users.json"), `${JSON.stringify({ ...config, memberships: [{ ...config.memberships[0] }, { ...config.memberships[1], disabled: true }] })}\n`, { mode: 0o600 });
+    assert.equal((await fetch(`${restartedBase}/status`, { headers: { cookie } })).status, 401, "revoking the selected membership must revoke the durable session");
+  } finally {
+    await new Promise((resolve: any) => restarted.close(() => resolve()));
+  }
 });
 
 test("multi-user host rate limits repeated authentication failures", async () => {
@@ -471,6 +533,32 @@ test("multi-user host rejects overlapping tenant workspaces", async () => {
     { id: "alice", workspaceRoot: workspace, salt: alice.salt, passwordHash: alice.hash },
     { id: "bob", workspaceRoot: nested, salt: bob.salt, passwordHash: bob.hash }
   ] } }), /workspaces overlap/);
+});
+
+test("multi-user host rejects overlapping tenant state directories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-state-overlap-"));
+  const firstWorkspace = await mkdtemp(join(tmpdir(), "odinn-state-overlap-first-"));
+  const secondWorkspace = await mkdtemp(join(tmpdir(), "odinn-state-overlap-second-"));
+  const alice = await hashPassword("alice-password-long");
+  const config = {
+    schemaVersion: 2,
+    users: [
+      { id: "alice", defaultTenantId: "first", salt: alice.salt, passwordHash: alice.hash },
+      { id: "bob", defaultTenantId: "second", salt: alice.salt, passwordHash: alice.hash }
+    ],
+    tenants: [
+      { id: "first", workspaceRoot: firstWorkspace, stateDirectory: "tenants/shared" },
+      { id: "second", workspaceRoot: secondWorkspace, stateDirectory: "tenants/shared/nested" }
+    ],
+    memberships: [
+      { userId: "alice", tenantId: "first", role: "owner" },
+      { userId: "bob", tenantId: "second", role: "owner" }
+    ],
+    roles: [],
+    serviceAccounts: []
+  };
+  await writeFile(join(root, "users.json"), `${JSON.stringify(config)}\n`, { mode: 0o600 });
+  await assert.rejects(() => createMultiUserHost({ stateDir: root, publicOrigin: "https://odinn.test" }), /state directories overlap/);
 });
 
 test("multi-user host reloads disabled users without restart", async () => {

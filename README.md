@@ -240,8 +240,8 @@ behavior.
   recorded reliability, speed, cost, policy, rollback, and verification
   results.
 
-Three additional features are optional plugin modules and remain disabled
-until enabled individually:
+The following user-facing features are optional plugin modules and remain
+disabled until enabled individually:
 
 - **Rune Key — scoped temporary access** gives one narrowly defined permission
   to one run.
@@ -253,6 +253,23 @@ until enabled individually:
 These tools improve visibility and recovery for local work. They do not make
 outside actions perfectly reversible, and copied workspaces are not security
 sandboxes.
+
+Ódinn also includes opt-in runtime foundations that remain experimental unless
+the [surface matrix](docs/surface-matrix.md) says otherwise:
+
+- **Bounded agent-run graphs** can dispatch up to eight read-only child nodes,
+  with at most four concurrent, through the durable jobs boundary. Child
+  authority is intersected with the parent grants, and durable projections
+  retain digests rather than prompts or model output. See
+  [agent manifests and run graphs](docs/agent-run-graphs.md).
+- **Skills, MCP, durable workflows, event ingress, and project context** are
+  separately gated runtime foundations. They remain disabled by default or
+  require explicit operator activation and do not enlarge the stable local
+  single-user promise.
+- **Host-capability plugin seams** govern paired `computer.screen` and
+  provider-injected read-only email integrations. The current foundation
+  does not bundle ambient desktop access, desktop mutation, or a concrete
+  email provider. See the [plugin system notes](docs/architecture/plugin-system.md).
 
 Use **Advanced** in the console or read the notes under
 [docs/features](docs/features/). Core placement does not make an advanced API
@@ -306,6 +323,37 @@ authenticated loopback gateway. The
 outputs. The [surface matrix](docs/surface-matrix.md) identifies stable,
 experimental, provider-dependent, platform-dependent, internal, and unsupported
 surfaces.
+
+## Benchmark snapshot
+
+The external [BlueDot agent-benchmarks harness](https://github.com/BlueDot-IT/agent-benchmarks)
+checks artifacts and deterministic assertions rather than treating a plausible
+final message as proof. The dated snapshot below is informational: it is not a
+CI gate, a release guarantee, or a model-only score.
+
+**2026-08-14 — 1.1.0-rc.2 candidate comparison.** Seven cases ran five times
+per runtime with OpenAI OAuth, `gpt-5.6-luna`, cloud-only deployment,
+runtime-default sampling, and a bounded filesystem-and-shell tool policy. All
+35 trials executed for each runtime.
+
+| Runtime | Verified | Failed | Verified rate | p50 | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Ódinn Forge `1.1.0-rc.2` | 35/35 | 0 | 100% | 20.27s | 35.42s |
+| OpenClaw `2026.8.1` | 33/35 | 2 | 94.3% | 67.60s | 109.97s |
+| Hermes Agent `0.20.1` | 35/35 | 0 | 100% | 22.92s | 39.13s |
+
+The Odinn row is pinned to `v1.1.0-rc.2` at
+`9256e23c1f78b3ab14b51ee72c0d2a4d0fdd769c` and uses the benchmark adapter's
+local capability-fixture fix. Process-dependent cases used Odinn's explicit
+`--durable-process --confirm-process` authorization. The benchmark checkout was
+locally modified for that fixture, and `main` has since moved beyond RC2; rerun
+the external harness before treating these numbers as current-main performance.
+Without that fixture, the unmodified RC2 binary correctly refuses direct
+`process.exec`: the baseline matrix executes and verifies 20/35 trials, with 15
+cases reported unsupported.
+See the
+[benchmark source revision](https://github.com/BlueDot-IT/agent-benchmarks/commit/e23ad096e0895fb0a6b0ef1f6faaf71d67b2ab35)
+for the harness revision and methodology.
 
 ## For developers and contributors
 

@@ -3,6 +3,7 @@ import { APPLICATION_CONTRACT_VERSION, type OperatorSnapshotReadInputV1 } from "
 export type GatewayReadRequestIdentity = Readonly<{
   applicationRequestId: string;
   hostedUserId?: string;
+  hostedTenantId?: string;
   authentication: string;
 }>;
 
@@ -19,6 +20,7 @@ function executionContext(
   sourceReference: string,
 ) {
   const hostedUserId = identity.hostedUserId ? normalizeHostedUserId(identity.hostedUserId) : undefined;
+  const hostedTenantId = identity.hostedTenantId ? normalizeHostedUserId(identity.hostedTenantId) : hostedUserId;
   return {
     principal: {
       principalId: hostedUserId ? `host-user:${hostedUserId}` : "local-gateway-user",
@@ -28,7 +30,7 @@ function executionContext(
         ? "gateway:auth-disabled"
         : `gateway:${identity.authentication}`,
     },
-    scope: { tenantId: hostedUserId ? `tenant:${hostedUserId}` : "local" },
+    scope: { tenantId: hostedTenantId ? `tenant:${hostedTenantId}` : "local" },
     sourceReference,
     correlationId: identity.applicationRequestId,
     cancellationControlReference: `http:request:${identity.applicationRequestId}`,

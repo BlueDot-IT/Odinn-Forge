@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -283,39 +283,29 @@ export class CronStore {
 
 export class AgentPackageStore {
   path: string;
-  writeChain: Promise<unknown> = Promise.resolve();
-  constructor(path: string) { this.path = path; }
-  async read() {
-    try {
-      const value = JSON.parse(await readFile(this.path, "utf8"));
-      return value?.schemaVersion === 1 && Array.isArray(value.agents) ? value : { schemaVersion: 1, agents: [] };
-    } catch (error: any) {
-      if (error?.code === "ENOENT") return { schemaVersion: 1, agents: [] };
-      throw error;
-    }
+  readonly registry: AgentRegistryStore;
+  constructor(path: string) {
+    this.path = path;
+    this.registry = new AgentRegistryStore(path);
   }
-  async list() { return (await this.read()).agents; }
+  async read() { return this.registry.read(); }
+  async list() { return this.registry.list(); }
   async mutate(operation: (agents: any[]) => any) {
-    const pending = this.writeChain.then(() => withStateMutationLock(dirname(this.path), async () => {
-      const state = await this.read();
-      const result = await operation(state.agents);
-      await mkdir(dirname(this.path), { recursive: true });
-      const temporary = `${this.path}.${process.pid}.${Date.now()}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-      await rename(temporary, this.path);
-      await chmod(this.path, 0o600);
-      return result;
-    }));
-    this.writeChain = pending.catch(() => undefined);
-    return pending;
+    return this.registry.mutate((agents) => operation(agents));
   }
   async install(input: any) {
     if (String(input?.id || "").trim() === "main") throw new GatewayError(409, "the primary main agent cannot be replaced by an SDK package");
     const manifest = validateAgentPackage(input);
-    return this.mutate(async (agents) => {
-      if (manifest.kind === "runtime") await provisionRuntimeAgent(dirname(this.path), manifest);
+    return this.registry.mutate(async (agents) => {
       const current = agents.find((agent) => agent.id === manifest.id);
       const record = { ...manifest, status: "disabled", installedAt: new Date().toISOString(), previousVersion: current?.version };
+      if (manifest.kind === "runtime") {
+        await provisionRuntimeAgent(dirname(this.path), manifest, {
+          assumeLocked: true,
+          previousRecord: current,
+          nextRecord: record
+        });
+      }
       const index = agents.findIndex((agent) => agent.id === manifest.id);
       if (index >= 0) agents[index] = record; else agents.push(record);
       return record;
@@ -737,10 +727,12 @@ export async function createGatewayServer(options: any = {}) {
     quotas = {},
     hosted = false,
     hostedUserId,
+    hostedTenantId,
     channelPluginLoader = loadChannelPlugin
   } = options;
   const testHooks = gatewayTestHooksFor(options);
   const trustedHostedUserId = hosted ? normalizeHostedUserId(hostedUserId) : undefined;
+  const trustedHostedTenantId = hosted ? normalizeHostedUserId(hostedTenantId ?? hostedUserId) : undefined;
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
   const version = await productVersion();
@@ -757,6 +749,14 @@ export async function createGatewayServer(options: any = {}) {
     await reconcileProcessRecovery(state).catch(() => { processRecoveryStartupError = true; });
   }
   await ensureMainAgent(state);
+  const agentRegistryState = await new AgentRegistryStore(join(state, "agents.json")).read();
+  // The registry is the runtime fallback, but do not mutate the persisted
+  // config-shaped object: doing so would make a read-only `/config` request
+  // report a spurious restart requirement when the default only exists in the
+  // registry.
+  const runtimeConfig = !config.defaultAgentId && typeof agentRegistryState.defaultAgentId === "string"
+    ? { ...config, defaultAgentId: agentRegistryState.defaultAgentId }
+    : config;
   const featureFlags = normalizeExperimentalFlags(config.experimental);
   const proofOptions = {
     allowedCommands: config.proof?.allowedCommands ?? [],
@@ -783,8 +783,8 @@ export async function createGatewayServer(options: any = {}) {
     ? createGovernedMcpRuntime({ enabled: true, config: config.mcp, extensionRegistry, extensionExecutor, auditStore, runLedger: runtime.ledger })
     : undefined;
   const writeSelfImprovementConfig = (nextConfig: any, expectedFingerprint: string) => writeEditableConfig(state, { config: nextConfig, fingerprint: expectedFingerprint }, { hosted });
-  const registry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
-  const governedRegistry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: { ...config, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
+  const registry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: runtimeConfig, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
+  const governedRegistry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: { ...runtimeConfig, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const gatewayToken = await loadGatewayToken(state);
   const isolatedTaskExecutor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
@@ -1263,6 +1263,7 @@ export async function createGatewayServer(options: any = {}) {
           applicationRequestId: randomUUID(),
           authentication,
           hostedUserId: trustedHostedUserId,
+          hostedTenantId: trustedHostedTenantId,
           signal: routeAbort.signal,
         }))) return;
       } finally {
@@ -1320,6 +1321,7 @@ export async function createGatewayServer(options: any = {}) {
           const snapshotResult = await operatorSnapshotRead.execute(createGatewayOperatorSnapshotReadRequest({
             applicationRequestId: randomUUID(),
             hostedUserId: trustedHostedUserId,
+            hostedTenantId: trustedHostedTenantId,
             authentication,
             sourcePath: "/operator/actions",
             input: { surface }

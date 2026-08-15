@@ -45,11 +45,11 @@ The packager archives `HEAD`, not uncommitted working-tree changes. Run the
 soak before checksums so its report is included in the final checksum set. If
 an artifact changes afterward, regenerate the checksums and rerun verification.
 
-## RC2 identity and generated metadata
+## Published RC2 identity (historical)
 
-For the `1.1.0-rc.2` candidate, the reviewed merge commit, source metadata,
-tag, generated package metadata, and release evidence must describe one
-identity:
+The `1.1.0-rc.2` candidate is already published and immutable. Its historical
+reviewed merge commit, source metadata, tag, generated package metadata, and
+release evidence describe one identity:
 
 - `package.json` must declare `1.1.0-rc.2` and the annotated tag must be exactly
   `v1.1.0-rc.2` at the same commit.
@@ -67,6 +67,20 @@ identity:
 - Build provenance must cover the final release assets, and the evidence record
   must retain sanitized OS/architecture, toolchain, artifact checksum, SBOM,
   provenance, and downloaded-asset results for each supported platform.
+
+Do not retag RC2 or reuse its release for a later candidate. The next candidate
+must be built from a clean committed head with a new exact tag and a fresh
+downloaded-asset acceptance record.
+
+## Schema rollback boundary
+
+State migrations marked `rollbackCompatible: false` (including runtime SQLite
+schema upgrades through v7/v8) are intentionally fail-closed. The previous
+Odinn binary must not be launched against the newer active state: the updater
+or operator must restore the protected pre-migration backup first, then launch
+the older binary. A green source-level migration test does not prove binary
+rollback; the acceptance record must exercise the actual previous artifact,
+backup restore, and post-restore onboarding/tool smoke.
 
 ## Publication sequence
 

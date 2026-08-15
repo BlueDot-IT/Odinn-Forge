@@ -10,6 +10,7 @@ import {
   type AgentRunGraphResult,
   type ExecutableAgentManifest
 } from "./agent-run-graphs.ts";
+import { DEFAULT_AGENT_ID, type AgentExecutionBinding } from "./agents.ts";
 
 export const AGENT_GRAPH_TOOL = "agent.delegate" as const;
 export const AGENT_GRAPH_REGISTRY_REF = "registry:agent-runner.v1" as const;
@@ -57,7 +58,11 @@ export type AgentGraphExecutorOptions = {
   registry: Map<string, any>;
   policy: RuntimePolicy;
   parentCapabilities: readonly CapabilityId[];
-  runChild: (task: JsonObject & { registry: Map<string, any>; modelRegistry: Map<string, any>; policy: RuntimePolicy; signal: AbortSignal; executionAttemptId: string }) => Promise<any>;
+  runChild: (task: JsonObject & { registry: Map<string, any>; modelRegistry: Map<string, any>; policy: RuntimePolicy; signal: AbortSignal; executionAttemptId: string; agentExecutionBinding?: AgentExecutionBinding }) => Promise<any>;
+  /** Resolve the installed runtime-agent snapshot during graph admission. */
+  resolveAgent?: (agentId: string) => Promise<AgentExecutionBinding>;
+  /** The default agent selected for the generic runner registry reference. */
+  defaultAgentId?: string;
   appendEvent?: (event: { type: string; payload: JsonObject }) => void | Promise<void>;
   appendAuditEvent?: (event: { type: string; payload: JsonObject }) => void | Promise<void>;
   readAuditRun?: (runId: string) => Promise<{ events?: readonly { type?: string }[] } | undefined>;
@@ -74,7 +79,7 @@ export type AgentGraphExecutorOptions = {
       requestDigest: string;
       maxConcurrency: number;
       maxRunMs: number;
-      nodes: readonly { nodeId: string; manifestId: string; manifestDigest: string; inputRef: string; inputDigest: string; resultRef: string; dependsOn: readonly string[] }[];
+      nodes: readonly { nodeId: string; manifestId: string; manifestDigest: string; inputRef: string; inputDigest: string; agentBindingDigest?: string; resultRef: string; dependsOn: readonly string[] }[];
     }): void | Promise<void>;
     startNode(input: { graphRunId: string; nodeId: string; nodeCallId: string; requestDigest: string; executionRunId: string; executionAttemptId: string; resultRef: string; auditRef: string }): void | Promise<void>;
     cancel?(input: { graphRunId: string; errorCode?: string }): void;
@@ -128,7 +133,49 @@ function boundedChildInput(value: unknown, label: string): JsonObject {
   }
   if (input.reasoningBudgetRecovery !== undefined && typeof input.reasoningBudgetRecovery !== "boolean") throw new Error(`${label}.reasoningBudgetRecovery is invalid`);
   if (Buffer.byteLength(JSON.stringify(input), "utf8") > MAX_CHILD_INPUT_BYTES) throw new Error(`${label} exceeds the input limit`);
-  return input as JsonObject;
+  // Never retain caller-owned nested arrays or objects.  The graph digest is
+  // calculated after this function returns and dispatch happens later, so a
+  // shallow return would allow an in-process SDK caller to change the child
+  // request without changing its admitted digest.
+  const snapshot: Record<string, unknown> = {};
+  for (const key of Object.keys(input)) {
+    const current = input[key];
+    if (key === "messages") {
+      snapshot.messages = (current as Array<Record<string, unknown>>).map((message) => ({
+        role: message.role,
+        content: message.content
+      }));
+    } else {
+      snapshot[key] = current;
+    }
+  }
+  return deepFreeze(snapshot as JsonObject);
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function normalizeAgentBinding(value: AgentExecutionBinding, label: string): AgentExecutionBinding {
+  if (!value || typeof value !== "object") throw new Error(`${label} is invalid`);
+  const binding = {
+    agentId: String(value.agentId ?? ""),
+    agentVersion: String(value.agentVersion ?? ""),
+    manifestIntegrity: String(value.manifestIntegrity ?? ""),
+    identityContentDigest: String(value.identityContentDigest ?? ""),
+    resolvedSystemPromptDigest: String(value.resolvedSystemPromptDigest ?? ""),
+    modelConfigurationDigest: String(value.modelConfigurationDigest ?? "")
+  };
+  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/u.test(binding.agentId)) throw new Error(`${label}.agentId is invalid`);
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(binding.agentVersion)) throw new Error(`${label}.agentVersion is invalid`);
+  for (const key of ["manifestIntegrity", "identityContentDigest", "resolvedSystemPromptDigest", "modelConfigurationDigest"] as const) {
+    if (!/^[a-f0-9]{64}$/u.test(binding[key])) throw new Error(`${label}.${key} is invalid`);
+  }
+  return deepFreeze(binding);
 }
 
 function childPolicy(policy: RuntimePolicy, effective: readonly CapabilityId[], parentCapabilities: readonly CapabilityId[]): RuntimePolicy {
@@ -246,8 +293,21 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
     throw new Error(`the active agent graph profile permits maxConcurrency from 1 to ${MAX_LIVE_AGENT_GRAPH_CONCURRENCY}`);
   }
   const inputs = graphInputs(input, graph.nodes);
+  const agentBindingsById = new Map<string, AgentExecutionBinding>();
+  const agentBindingsByManifest = new Map<string, AgentExecutionBinding>();
   for (const manifest of manifests) {
-    runtimeAgentId(manifest.registryRef);
+    const requestedAgentId = runtimeAgentId(manifest.registryRef) ?? options.defaultAgentId ?? DEFAULT_AGENT_ID;
+    if (options.resolveAgent) {
+      let binding = agentBindingsById.get(requestedAgentId);
+      if (!binding) {
+        binding = normalizeAgentBinding(await options.resolveAgent(requestedAgentId), `agent ${requestedAgentId} execution binding`);
+        if (binding.agentId !== requestedAgentId) throw new Error(`agent execution binding identity does not match ${requestedAgentId}`);
+        agentBindingsById.set(requestedAgentId, binding);
+      }
+      agentBindingsByManifest.set(manifest.id, binding);
+    } else if (runtimeAgentId(manifest.registryRef)) {
+      throw new Error(`runtime agent ${requestedAgentId} requires an execution provenance resolver`);
+    }
     if (!manifest.requestedTools.length) throw new Error(`manifest ${manifest.id} must request at least one read-only tool`);
     for (const toolName of manifest.requestedTools) {
       if (!CHILD_TOOL_ALLOWLIST.has(toolName)) throw new Error(`manifest ${manifest.id} requests a non-read-only tool`);
@@ -272,11 +332,13 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
     throw new Error("agent graph parent authority must explicitly include agent.delegate and network.access");
   }
   const graphRunId = `graph:${digestAgentRunValue({ runId: options.runId, graphDigest: graph.graphDigest }).slice(0, 48)}`;
-  const manifestsDigest = digestAgentRunValue(manifests);
+  const admittedAgentBindings = [...agentBindingsByManifest.entries()].sort(([left], [right]) => left.localeCompare(right));
+  const manifestsDigest = digestAgentRunValue({ manifests, agentBindings: admittedAgentBindings });
   const inputDigests = graph.nodes.map((node) => ({ inputRef: node.inputRef, inputDigest: digestAgentRunValue(inputs.get(node.inputRef)) }));
   const graphRequestDigest = digestAgentRunValue({
     graphDigest: graph.graphDigest,
     manifestsDigest,
+    agentBindings: admittedAgentBindings,
     principalNamespace,
     maxConcurrency: input.maxConcurrency ?? Math.min(graph.nodes.length, MAX_LIVE_AGENT_GRAPH_CONCURRENCY),
     maxRunMs: input.maxRunMs ?? 300_000,
@@ -302,6 +364,7 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
           manifestDigest: node.manifestDigest,
           inputRef: node.inputRef,
           inputDigest: digestAgentRunValue(inputs.get(node.inputRef)),
+          ...(agentBindingsByManifest.get(node.manifestId) ? { agentBindingDigest: digestAgentRunValue(agentBindingsByManifest.get(node.manifestId)) } : {}),
           resultRef: node.resultRef,
           dependsOn: node.dependsOn
         }))
@@ -312,7 +375,8 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
       graphId: graph.id,
       graphDigest: graph.graphDigest,
       nodeCount: graph.nodes.length,
-      manifestCount: manifests.length
+      manifestCount: manifests.length,
+      agentBindings: admittedAgentBindings.map(([manifestId, binding]) => ({ manifestId, agentBindingDigest: digestAgentRunValue(binding) }))
     });
   } catch (error) {
     try { options.persistGraph?.cancel?.({ graphRunId, errorCode: "GRAPH_VALIDATION_PUBLICATION_UNCERTAIN" }); } catch { /* preserve the original validation error */ }
@@ -341,6 +405,8 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
     const manifest = request.manifest;
     const resolved = inputs.get(request.inputRef);
     if (!resolved) throw new Error(`graph input is missing: ${request.inputRef}`);
+    const agentBinding = request.agentBinding;
+    const agentBindingDigest = agentBinding ? digestAgentRunValue(agentBinding) : undefined;
     const registries = childRegistry(options.registry, manifest);
     const policy = childPolicy(options.policy, request.effectiveCapabilities, options.parentCapabilities);
     const childId = `child-${digestAgentRunValue({ parentRunId: options.runId, graphRunId: request.graphRunId, nodeId: request.nodeId }).slice(0, 48)}`;
@@ -362,6 +428,8 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
       return {
         graphRunId: request.graphRunId, nodeCallId: request.nodeCallId, principalNamespace: request.principalNamespace,
         graphDigest: request.graphDigest, manifestDigest: request.manifestDigest, requestDigest: request.requestDigest,
+        ...(agentBinding ? { agentBinding } : {}),
+        ...(agentBindingDigest ? { agentBindingDigest } : {}),
         producerNodeId: request.nodeId, resultRef: request.resultRef, resultDigest,
         terminalStatus: "needs-review", auditRef
       } satisfies AgentDispatchReceipt;
@@ -373,6 +441,9 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
         nodeId: request.nodeId,
         requestDigest: request.requestDigest,
         manifestDigest: request.manifestDigest,
+        ...(agentBinding ? { agentBinding } : {}),
+        ...(agentBindingDigest ? { agentBindingDigest } : {}),
+        ...(request.inputDigest ? { inputDigest: request.inputDigest } : {}),
         resultRef: request.resultRef
       });
     } catch {
@@ -400,6 +471,9 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
           graphRunId: request.graphRunId,
           nodeId: request.nodeId,
           requestDigest: request.requestDigest,
+          ...(agentBinding ? { agentBinding } : {}),
+          ...(agentBindingDigest ? { agentBindingDigest } : {}),
+          ...(request.inputDigest ? { inputDigest: request.inputDigest } : {}),
           resultRef: request.resultRef,
           terminalStatus: "needs-review",
           resultDigest,
@@ -412,6 +486,8 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
       return {
         graphRunId: request.graphRunId, nodeCallId: request.nodeCallId, principalNamespace: request.principalNamespace,
         graphDigest: request.graphDigest, manifestDigest: request.manifestDigest, requestDigest: request.requestDigest,
+        ...(agentBinding ? { agentBinding } : {}),
+        ...(agentBindingDigest ? { agentBindingDigest } : {}),
         producerNodeId: request.nodeId, resultRef: request.resultRef, resultDigest,
         terminalStatus: "needs-review", auditRef
       } satisfies AgentDispatchReceipt;
@@ -423,6 +499,7 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
         id: childId,
         tool: "agent.run",
         input: { ...resolved, ...(agentId ? { agentId } : {}) },
+        ...(agentBinding ? { agentExecutionBinding: agentBinding } : {}),
         actor: `child-agent:${request.principalNamespace}`,
         reason: `agent-graph:${request.graphRunId}:${request.nodeId}`,
         registry: registries.execution,
@@ -446,10 +523,12 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
       const terminalStatus = cancelled || !hasTerminalAudit ? "needs-review" : "failed";
       const resultDigest = digestAgentRunValue({ resultRef: request.resultRef, terminalStatus, errorCode: cancelled ? "CHILD_DISPATCH_UNCERTAIN" : "CHILD_DISPATCH_FAILED" });
       await options.persistGraph?.recordNode({ graphRunId: request.graphRunId, nodeId: request.nodeId, status: terminalStatus, nodeCallId: request.nodeCallId, requestDigest: request.requestDigest, executionRunId: childId, executionAttemptId, resultDigest, resultRef: request.resultRef, auditRef, errorCode: cancelled ? "CHILD_DISPATCH_UNCERTAIN" : "CHILD_DISPATCH_FAILED" });
-      await append(options, "agent-graph-node-settled", { graphRunId: request.graphRunId, nodeId: request.nodeId, requestDigest: request.requestDigest, resultRef: request.resultRef, terminalStatus, resultDigest, auditRef });
+      await append(options, "agent-graph-node-settled", { graphRunId: request.graphRunId, nodeId: request.nodeId, requestDigest: request.requestDigest, ...(agentBinding ? { agentBinding } : {}), ...(agentBindingDigest ? { agentBindingDigest } : {}), ...(request.inputDigest ? { inputDigest: request.inputDigest } : {}), resultRef: request.resultRef, terminalStatus, resultDigest, auditRef });
       return {
         graphRunId: request.graphRunId, nodeCallId: request.nodeCallId, principalNamespace: request.principalNamespace,
         graphDigest: request.graphDigest, manifestDigest: request.manifestDigest, requestDigest: request.requestDigest,
+        ...(agentBinding ? { agentBinding } : {}),
+        ...(agentBindingDigest ? { agentBindingDigest } : {}),
         producerNodeId: request.nodeId, resultRef: request.resultRef, resultDigest, terminalStatus, auditRef
       } satisfies AgentDispatchReceipt;
     }
@@ -465,10 +544,12 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
     const terminalStatus = !hasTerminalAudit ? "needs-review" : childResult?.ok === true ? "completed" : "failed";
     const resultDigest = digestAgentRunValue({ resultRef: request.resultRef, terminalStatus, output: childResult?.output });
     await options.persistGraph?.recordNode({ graphRunId: request.graphRunId, nodeId: request.nodeId, status: terminalStatus, nodeCallId: request.nodeCallId, requestDigest: request.requestDigest, executionRunId: childId, executionAttemptId, resultDigest, resultRef: request.resultRef, auditRef, ...(terminalStatus === "completed" ? {} : { errorCode: terminalStatus === "needs-review" ? "CHILD_AUDIT_UNCERTAIN" : "CHILD_DISPATCH_FAILED" }) });
-    await append(options, "agent-graph-node-settled", { graphRunId: request.graphRunId, nodeId: request.nodeId, requestDigest: request.requestDigest, resultRef: request.resultRef, terminalStatus, resultDigest, auditRef });
+    await append(options, "agent-graph-node-settled", { graphRunId: request.graphRunId, nodeId: request.nodeId, requestDigest: request.requestDigest, ...(agentBinding ? { agentBinding } : {}), ...(agentBindingDigest ? { agentBindingDigest } : {}), ...(request.inputDigest ? { inputDigest: request.inputDigest } : {}), resultRef: request.resultRef, terminalStatus, resultDigest, auditRef });
     return {
       graphRunId: request.graphRunId, nodeCallId: request.nodeCallId, principalNamespace: request.principalNamespace,
       graphDigest: request.graphDigest, manifestDigest: request.manifestDigest, requestDigest: request.requestDigest,
+      ...(agentBinding ? { agentBinding } : {}),
+      ...(agentBindingDigest ? { agentBindingDigest } : {}),
       producerNodeId: request.nodeId, resultRef: request.resultRef, resultDigest, terminalStatus, auditRef
     } satisfies AgentDispatchReceipt;
   }});
@@ -479,6 +560,8 @@ export async function executeAgentGraph(input: AgentGraphTaskInput, options: Age
       principalNamespace,
       graph,
       manifests,
+      agentBindings: agentBindingsByManifest,
+      inputDigests: new Map(inputDigests.map((item) => [item.inputRef, item.inputDigest])),
       parentCapabilities: options.parentCapabilities,
       maxConcurrency: input.maxConcurrency ?? Math.min(graph.nodes.length, MAX_LIVE_AGENT_GRAPH_CONCURRENCY),
       maxRunMs: input.maxRunMs,

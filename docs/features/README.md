@@ -41,6 +41,8 @@ are not additional plugin switches:
 - [Sandboxing](../sandboxing.md)
 - [Bounded workspace inspection](../workspace-inspection.md)
 - [Progressive skill disclosure](../progressive-skill-disclosure.md)
+- [Executable agent manifests and bounded child-agent graphs](../agent-run-graphs.md)
+- [Host-capability plugin system](../architecture/plugin-system.md)
 - [Durable session lanes](../durable-session-lanes.md)
 - [Async telemetry](../async-telemetry.md)
 - [Runtime event ledger](../architecture/event-ledger.md)

@@ -35,6 +35,9 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   deliverables, experimental exclusions, and stable-release blockers.
 - [BlueDot agent benchmarks](https://github.com/BlueDot-IT/agent-benchmarks) —
   comparative runtime/model evaluation, performance methodology, and reports.
+  Benchmark harnesses and raw reports remain outside this product repository;
+  the README snapshot is informational and must be read with its provenance
+  and limitations.
 
 ## Runtime and architecture notes
 
@@ -121,6 +124,8 @@ status and date before using it as current product evidence.
 
 - [Stabilization plan](stabilization-plan.md)
 - [1.1 release scope](v1.1-release-scope.md)
+- [Post-1.1 roadmap](post-1.1-roadmap.md) — triage-backed stabilization and
+  future multi-tenant structure.
 - [v0.4.0 user acceptance record](uat/v0.4.0-uat.md)
 - [UAT findings proof log](uat/logs/uat-findings.md)
 
