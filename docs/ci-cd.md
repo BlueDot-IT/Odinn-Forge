@@ -191,10 +191,12 @@ Manual dispatch cannot release an untagged branch. The workflow:
 6. Runs the packaged restart/recovery soak against the compiled archive.
 7. Generates production-package SPDX JSON SBOMs.
 8. Generates SHA-256 checksums and verifies archive identity and contents.
-9. Runs clean install smoke against the exact archives.
+9. Runs clean install, onboarding, diagnostic, and state reopen smoke against
+   exact downloaded draft-release archives across GitHub-hosted Linux, macOS,
+   and Windows runners.
 10. Creates GitHub build provenance attestations.
 11. Publishes the verified assets to the GitHub release through the protected
-    `release` environment.
+    `release` environment after all cross-platform validation passes.
 
 The workflow cannot publish from an untagged branch or a tag that disagrees with the package version.
 

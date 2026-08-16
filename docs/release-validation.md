@@ -9,17 +9,21 @@ being published.
 
 - The package is built from the intended commit and its archive checksums,
   SBOM, and provenance are available.
-- Platform support is covered by the ordinary Linux, macOS, and Windows CI
-  matrix. Downloaded-artifact installation on each operating system is
-  advisory evidence, not a publication gate.
+- Platform support is covered by both ordinary CI and the automated
+  GitHub-hosted Linux, macOS, and Windows release matrix. Validating exact
+  downloaded draft-release assets on all three platforms is a blocking
+  publication dependency. Maintainer-owned physical clean machines and personal
+  live-provider accounts are supplemental testing, not release prerequisites.
 - A configured provider can complete a real model request without exposing
-  credentials in output or diagnostics.
+  credentials in output or diagnostics. Synthetic or local protocol-provider
+  inference is the required automated provider-path regression gate unless a
+  dedicated live-provider canary exists.
 - Gateway restart, queued-job recovery, browser-action recovery, audit
   verification, and installer rollback behave as documented.
 - The single-user gateway remains loopback-only unless the separate TLS host is
   deliberately configured.
 - No unresolved security or release-blocking defect is hidden by a green
-  synthetic check.
+  synthetic check. Reproducible defects within supported scope block promotion.
 
 ## Artifact checks
 
@@ -71,9 +75,12 @@ and a fresh downloaded-asset verification record.
   must agree on version, commit, runtime digest, and archive checksums. The
   workflow's downloaded-asset verification is the authoritative proof that
   published files match the generated set.
-- Build provenance must cover the final release assets. When additional
-  platform-specific validation is performed, retain sanitized OS/architecture,
-  toolchain, artifact checksum, SBOM, provenance, and downloaded-asset results.
+- Build provenance must cover the final release assets. Ephemeral
+  GitHub-hosted runners satisfy the required Linux, macOS, and Windows
+  clean-platform acceptance gate. When supplemental testing (such as physical
+  hardware or live-provider accounts) is performed, retain sanitized
+  OS/architecture, toolchain, artifact checksum, SBOM, provenance, and
+  downloaded-asset results.
 
 ## Schema rollback boundary
 
@@ -83,7 +90,9 @@ Odinn binary must not be launched against the newer active state: the updater
 or operator must restore the protected pre-migration backup first, then launch
 the older binary. A green source-level migration test does not prove binary
 rollback; the acceptance record must exercise the actual previous artifact,
-backup restore, and post-restore onboarding/tool smoke.
+backup restore, and post-restore onboarding/tool smoke. Where full previous-binary
+automation is not yet available, automated lifecycle tests remain blocking while
+the full previous-binary drill is documented as supplemental.
 
 ## Publication sequence
 
@@ -92,10 +101,10 @@ dispatch the protected **Release** workflow with that tag. Draft releases do
 not emit the `release.created` workflow event, so the manual dispatch is
 intentional. The workflow verifies the tag commit, builds and soaks the exact
 candidate, refuses asset replacement, downloads the release assets back, and
-checks their checksums on its staging runner before publishing npm or
-promoting the GitHub release. The separate Linux/macOS/Windows downloaded-
-artifact matrix is not a publication dependency; those platforms remain
-covered by ordinary CI.
+validates exact downloaded artifacts across GitHub-hosted Linux, macOS, and
+Windows runners before publishing npm or promoting the GitHub release. The
+hosted Linux/macOS/Windows downloaded-artifact matrix is a blocking publication
+dependency; physical-machine testing is supplemental.
 The GitHub release `prerelease` flag must match the tag: tags containing `-`
 must be prereleases, and stable tags must not be. Prerelease packages use the
 npm `next` dist-tag. If the npm version already exists, the workflow downloads
@@ -113,9 +122,13 @@ architecture, Node.js and package-manager versions, exact artifact checksum,
 result, and sanitized failure evidence. Do not include credentials, prompts
 containing private data, cookies, gateway tokens, or raw runtime state.
 
-Synthetic providers and hosted CI runners are useful regression coverage, but
-they do not prove the behavior of a live account, external website, or clean
-machine. Keep those distinctions explicit in release notes and issue reports.
+Synthetic providers and GitHub-hosted CI runners provide the required automated
+acceptance gate, but they do not prove every physical device, external browser
+target, live cloud account, or community environment. Supplemental testing
+does not block a release solely because an external environment or credential is
+unavailable, but any reproducible supported-scope defect still blocks promotion.
+Untested external paths must be described accurately rather than falsely marked
+as passed.
 
 ## Boundaries
 
