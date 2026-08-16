@@ -6,6 +6,10 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+* restore automated GitHub-hosted Linux, macOS, and Windows exact downloaded-artifact validation as a blocking publication gate without requiring maintainer-owned physical machines (#140)
+
 ## [1.1.0-rc.3](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.2...v1.1.0-rc.3) (2026-08-15)
 
 ### Added
@@ -33,9 +37,9 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 * serialize agent registry read-modify-write operations and make runtime-agent
   installation crash-consistent through staged directories and reconciliation
-* remove the Linux/macOS/Windows downloaded-artifact matrix from the release
-  publication dependency while retaining ordinary platform CI and single-runner
-  checksum, SBOM, provenance, and downloaded-asset verification
+* automate exact downloaded-artifact acceptance on GitHub-hosted Linux, macOS,
+  and Windows runners while removing the requirement for maintainer-owned
+  physical clean machines
 
 ### Release engineering
 

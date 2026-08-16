@@ -31,9 +31,8 @@ decision:
    adapter.
 7. Freeze feature work, resolve or formally amend the console-extraction
    release criterion, preserve durable review evidence, and perform exact
-   downloaded-artifact verification through the protected release workflow.
-   Linux, macOS, and Windows downloaded-artifact acceptance remains advisory
-   CI evidence rather than a publication gate.
+   downloaded-artifact verification across GitHub-hosted Linux, macOS, and
+   Windows runners through the protected release workflow.
 
 ### Stabilization tranche implemented in the current candidate work
 
@@ -73,8 +72,9 @@ recorded:
 - preserve durable review evidence for the security-sensitive merges;
 - validate rollback with the actual prior binary and restored backup;
 - build a fresh exact candidate from a clean tree and perform protected
-  downloaded-asset verification; platform-specific downloaded acceptance is
-  advisory and is not part of the publication dependency;
+  downloaded-asset verification across GitHub-hosted Linux, macOS, and Windows
+  runners as a publication dependency; maintainer-owned physical machines
+  remain supplemental;
 - require opaque provider identifiers before shipping a concrete email adapter.
 
 ## Multi-tenant structure
