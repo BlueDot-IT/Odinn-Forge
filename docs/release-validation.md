@@ -64,7 +64,7 @@ and a fresh downloaded-asset verification record.
   `9256e23c1f78b3ab14b51ee72c0d2a4d0fdd769c`; it is not evidence that the
   current candidate has an annotated release tag. Future candidates must
   satisfy the annotated-tag policy in [ci-cd](ci-cd.md).
-- RC2 is not evidence that the current `1.1.0-rc.3` line has been published.
+- RC2 is not evidence that the current `1.1.0-rc.4` line has been published.
   The current line still requires a fresh candidate tag, draft release, and
   exact-artifact validation.
 - The source `release-info.json` is an export-substituted template; `pnpm

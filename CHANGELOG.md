@@ -6,9 +6,12 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.1.0-rc.4](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.3...v1.1.0-rc.4) (2026-08-16)
+
 ### Fixed
 
-* restore automated GitHub-hosted Linux, macOS, and Windows exact downloaded-artifact validation as a blocking publication gate without requiring maintainer-owned physical machines (#140)
+* restore automated GitHub-hosted Linux, macOS, and Windows exact downloaded-artifact validation as a blocking publication gate without requiring maintainer-owned physical machines (#140, #164)
+* enforce stale release-version preflight checks during pull request validation and shallow clone detection
 
 ## [1.1.0-rc.3](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.2...v1.1.0-rc.3) (2026-08-15)
 
@@ -37,13 +40,10 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 * serialize agent registry read-modify-write operations and make runtime-agent
   installation crash-consistent through staged directories and reconciliation
-* automate exact downloaded-artifact acceptance on GitHub-hosted Linux, macOS,
-  and Windows runners while removing the requirement for maintainer-owned
-  physical clean machines
 
 ### Release engineering
 
-* publish the exact `v1.1.0-rc.3` candidate from a clean tagged merge commit
+* tag and stage the `v1.1.0-rc.3` candidate with relaxed platform gates
 
 ## [1.1.0-rc.2](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.1...v1.1.0-rc.2) (2026-08-13)
 
