@@ -4,7 +4,7 @@ This roadmap separates post-1.1 work from the active 1.1 release candidate. It
 does not promote experimental surfaces to stable or override the current
 release freeze.
 
-The repository is on the `1.1.0-rc.3` package line. This roadmap records work
+The repository is on the `1.1.0-rc.4` package line. This roadmap records work
 around the release candidate and does not itself establish stable-release
 evidence.
 
