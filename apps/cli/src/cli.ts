@@ -13,6 +13,8 @@ import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessi
 import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteOperatorReadStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
+import { createCliReadCommandContext } from "./application-context.ts";
+import { cliReadCommandRegistry } from "./commands/registry.ts";
 import { checkForUpdate, rollbackApplication, uninstallApplication, updateApplication } from "./lifecycle.ts";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
 import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
@@ -161,6 +163,22 @@ async function main() {
     const report = await ensureStateCompatibility(stateDir(args), identity);
     if (report) console.error(`Odinn migrated persistent state safely. Backup: ${report.backupLocation}`);
   }
+  const registeredReadCommand = cliReadCommandRegistry.resolve(command, args);
+  if (registeredReadCommand) {
+    await registeredReadCommand.execute({
+      name: command ?? registeredReadCommand.name,
+      args,
+      context: createCliReadCommandContext({
+        printJson,
+        status,
+        doctor,
+        operatorSnapshot: operatorCommand,
+        tui,
+        session
+      })
+    });
+    return;
+  }
   switch (command) {
     case "--version":
     case "-V":
@@ -215,18 +233,8 @@ async function main() {
     case "tool":
       await extensionCommand(args);
       break;
-    case "doctor":
-      await printJson(await doctor(args));
-      break;
-    case "status":
-      await printJson(await status(args));
-      break;
     case "operator":
-    case "inspect":
-      await operatorCommand(command === "inspect" ? ["snapshot", ...args] : args);
-      break;
-    case "tui":
-      await tui(args);
+      await operatorCommand(args);
       break;
     case "start":
     case "serve":
