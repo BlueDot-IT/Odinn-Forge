@@ -14,10 +14,12 @@ are composed outside the kernel._
   normalization, routing, and assembly of kernel services. Authentication and
   binding rules live in `security.ts`, process startup and state selection live
   in `bootstrap.ts`, and the large console document lives under `src/public/`.
-- `apps/cli/src/cli.ts` is the command composition root. It owns command
-  parsing, terminal-oriented output, onboarding, and lifecycle commands. The
-  status, doctor, session-list, and operator-snapshot commands now cross
-  `@odinn/application`; other commands still call the kernel directly.
+- `apps/cli/src/cli.ts` remains the process composition root. A typed command
+  registry now owns status, doctor, session, operator, inspect, and TUI command
+  identity, aliases, usage metadata, and argument forwarding through a bounded
+  application context. The migrated status, diagnostics, session-list, and
+  operator-snapshot paths cross `@odinn/application`; legacy commands remain
+  behind the composition-root fallback while migration continues.
 - `packages/kernel/src/index.ts` exports the runtime service surface, including
   policy, approvals, jobs, memory, providers, state, extensions, and task
   execution. It accepts transport-neutral channel-tool definitions and keeps
@@ -135,10 +137,10 @@ a time while preserving the current kernel exports as a compatibility facade.
 
 1. **Complete:** add boundary types and contract tests without moving runtime
    code.
-2. **In progress:** add gateway and CLI mapping modules that use the boundary
-   types; both transports now map `status.read`, `diagnostics.read`,
-   `session.list`, and `operator.snapshot.read` with authenticated server-side
-   principal and scope.
+2. **Complete for the initial read slice:** gateway routes and the typed CLI
+   command registry map `status.read`, `diagnostics.read`, `session.list`, and
+   `operator.snapshot.read` through bounded transport contexts with trusted
+   server-side principal and scope.
 3. **In progress:** move read-only use cases through the boundary. Status,
    diagnostics, session listing, and the bounded operator snapshot now have
    explicit V1 output contracts; the remaining inspection surfaces are
