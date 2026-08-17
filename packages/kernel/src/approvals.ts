@@ -221,6 +221,7 @@ function createApprovalStoreInternal(options: ApprovalStoreOptions, hooks: Appro
         break;
       } catch (error) {
         const failure = error as NodeError;
+        if (failure.code === "ENOENT") throw approvalStoreContentionError();
         if (failure.code !== "EEXIST") throw error;
         if (quarantineStaleApprovalLock(lockPath)) continue;
         __testOnlyOnLockContention?.();
@@ -255,6 +256,7 @@ function createApprovalStoreInternal(options: ApprovalStoreOptions, hooks: Appro
         break;
       } catch (error) {
         const failure = error as NodeError;
+        if (failure.code === "ENOENT") throw approvalStoreContentionError();
         if (failure.code !== "EEXIST") throw error;
         if (quarantineStaleApprovalLock(lockPath)) continue;
         __testOnlyOnLockContention?.();
