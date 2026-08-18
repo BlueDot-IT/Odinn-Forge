@@ -43,6 +43,7 @@ pnpm release:soak
 pnpm release:checksums
 node scripts/release/verify.ts
 pnpm release:install-smoke
+pnpm release:rollback-smoke
 pnpm storage:drill
 ```
 
@@ -82,17 +83,27 @@ and a fresh downloaded-asset verification record.
   OS/architecture, toolchain, artifact checksum, SBOM, provenance, and
   downloaded-asset results.
 
-## Schema rollback boundary
+## Prior binary rollback validation gate
 
 State migrations marked `rollbackCompatible: false` (including runtime SQLite
-schema upgrades through v7/v8) are intentionally fail-closed. The previous
-Odinn binary must not be launched against the newer active state: the updater
-or operator must restore the protected pre-migration backup first, then launch
-the older binary. A green source-level migration test does not prove binary
-rollback; the acceptance record must exercise the actual previous artifact,
-backup restore, and post-restore onboarding/tool smoke. Where full previous-binary
-automation is not yet available, automated lifecycle tests remain blocking while
-the full previous-binary drill is documented as supplemental.
+schema upgrades through v7/v8 and cron schema upgrades to v2) are intentionally
+fail-closed. The previous Odinn binary must not be launched against the newer
+active state: the updater or operator must restore the protected pre-migration
+backup first, then launch the older binary.
+
+The automated rollback gate (`scripts/release/validate-prior-rollback.ts` / `pnpm release:rollback-smoke`)
+exercises the actual published `v1.0.0` distribution across Linux, macOS, and
+Windows runners:
+1. Downloads and verifies the exact pinned `v1.0.0` release assets and checksums.
+2. Installs and initializes the real `v1.0.0` binary into an isolated prefix.
+3. Creates persistent state and sessions, executing tool smoke and audit checks.
+4. Upgrades to the candidate archive via the actual `v1.0.0` update command.
+5. Exercises candidate state migration and creates candidate-only records.
+6. Asserts fail-closed refusal when rollback is attempted before restoring the backup.
+7. Restores the pre-migration backup via `odinn state restore`.
+8. Rolls back the binary via `odinn rollback`.
+9. Verifies that `v1.0.0` is active again, pre-upgrade sessions exist, candidate sessions are absent, and doctor/tool/audit verification all pass.
+10. Emits machine-readable JSON evidence with platform and outcome records.
 
 ## Publication sequence
 

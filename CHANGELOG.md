@@ -8,12 +8,19 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [1.1.0-rc.4](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.3...v1.1.0-rc.4) (2026-08-17)
 
+### Added
+
+* implement repository-native cross-platform v1.0.0 binary rollback validation gate (`validate-prior-rollback.ts` / `pnpm release:rollback-smoke`) integrated into CI package integrity and release workflows (#140)
+
 ### Changed
 
 * route status, diagnostics, session, operator, and TUI read commands through a typed registry and bounded CLI application context (#136)
+* exclude `doctor` from automatic state compatibility migration on startup to maintain read-only diagnostic safety during update verification
 
 ### Fixed
 
+* support restoring pre-v1.1 backups by allowing optional `sandboxRecovery` surface and verifying present state stores against manifest targets (#140)
+* ensure packaged compiled distribution archives preserve root package identity for prior updater compatibility while staging scoped package metadata for npm publication (#140)
 * classify disappearing approval-lock paths through the existing fail-closed contention denial instead of exposing a raw filesystem error (#166)
 * restore automated GitHub-hosted Linux, macOS, and Windows exact downloaded-artifact validation as a blocking publication gate without requiring maintainer-owned physical machines (#140, #164)
 * enforce stale release-version preflight checks during pull request validation and shallow clone detection

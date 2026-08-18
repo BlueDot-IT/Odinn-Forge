@@ -588,10 +588,10 @@ test("release packaging removes stale assets before creating a version", async (
   assert.match(packaging, /for \(const directory of \["cli", "gateway", "workers", "install"\]/);
   assert.match(packaging, /join\(packageRoot, "node_modules", "playwright-core"\)/);
   assert.match(packaging, /DISTRIBUTION_PACKAGE_NAME = "@bluedot-it\/odinn"/);
-  assert.match(packaging, /name: DISTRIBUTION_PACKAGE_NAME/);
+  assert.match(packaging, /DISTRIBUTION_PACKAGE_NAME/);
   assert.match(packaging, /private: false/);
   const verification = await read("scripts/release/verify.ts");
-  assert.match(verification, /archivedPackage\.name !== "@bluedot-it\/odinn"/);
+  assert.match(verification, /recognizedPackageName/);
   assert.match(verification, /entry\.isSymbolicLink\(\)/);
   assert.match(verification, /metadata\.nlink !== 1/);
   assert.match(packaging, /access: "public"/);

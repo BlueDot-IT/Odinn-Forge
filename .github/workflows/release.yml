@@ -215,6 +215,7 @@ jobs:
           cmp release-assets/SHA256SUMS.txt downloaded-release-assets/SHA256SUMS.txt
           node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
           node scripts/release/install-smoke.ts downloaded-release-assets
+          node scripts/release/validate-prior-rollback.ts --candidate-release downloaded-release-assets
 
   validate-downloaded-release:
     name: Validate downloaded release (${{ matrix.os }})
@@ -256,6 +257,8 @@ jobs:
         run: node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
       - name: Run install and recovery smoke against downloaded archives
         run: node scripts/release/install-smoke.ts downloaded-release-assets
+      - name: Run prior baseline rollback validation against downloaded candidate
+        run: node scripts/release/validate-prior-rollback.ts --candidate-release downloaded-release-assets
 
   publish-release:
     name: Publish npm package and verified release
