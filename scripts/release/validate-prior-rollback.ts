@@ -44,10 +44,13 @@ type EvidenceRecord = {
 };
 
 function runCommand(command: string, args: string[], cwd: string, env: Record<string, string> = {}): { status: number; stdout: string; stderr: string } {
+  const baseEnv = { ...process.env };
+  delete baseEnv.ODINN_RELEASE_COMMIT;
+  delete baseEnv.ODINN_ARTIFACT_SHA256;
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf8",
-    env: { ...process.env, ...env },
+    env: { ...baseEnv, ...env },
     stdio: ["ignore", "pipe", "pipe"],
     shell: process.platform === "win32" && (command.endsWith(".cmd") || command.endsWith(".bat"))
   });
@@ -222,9 +225,15 @@ export async function validatePriorRollback(options: {
         join(baselinePackageRoot, "install", "install.ps1"),
         "-Prefix",
         prefix
-      ], workspace);
+      ], workspace, {
+        ODINN_RELEASE_COMMIT: BASELINE_TAG_COMMIT,
+        ODINN_ARTIFACT_SHA256: expectedBaselineDigest
+      });
     } else {
-      run(join(baselinePackageRoot, "install", "install.sh"), ["--prefix", prefix], workspace);
+      run(join(baselinePackageRoot, "install", "install.sh"), ["--prefix", prefix], workspace, {
+        ODINN_RELEASE_COMMIT: BASELINE_TAG_COMMIT,
+        ODINN_ARTIFACT_SHA256: expectedBaselineDigest
+      });
     }
     const cli = join(prefix, "bin", isWindows ? "odinn.cmd" : "odinn");
     recordOutcome(4, "Install baseline binary", true);
@@ -263,7 +272,12 @@ export async function validatePriorRollback(options: {
       "--artifact", candidateArchivePath,
       "--prefix", prefix,
       "--state", stateDir
-    ], workspace, { INIT_CWD: workspace, ODINN_NONINTERACTIVE: "1" });
+    ], workspace, {
+      INIT_CWD: workspace,
+      ODINN_NONINTERACTIVE: "1",
+      ODINN_RELEASE_COMMIT: candidateCommit,
+      ODINN_ARTIFACT_SHA256: candidateArchiveDigest
+    });
 
     if (updateResult.status !== 0) {
       recordOutcome(6, "Execute candidate update from v1.0.0 binary", false, updateResult.stderr || updateResult.stdout);
