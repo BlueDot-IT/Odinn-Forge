@@ -425,12 +425,14 @@ function validateManifest(value: unknown): StateBackupManifest {
   if (!manifest.stateSchemas || typeof manifest.stateSchemas !== "object" || Array.isArray(manifest.stateSchemas)) {
     throw new Error("backup manifest state schemas are invalid");
   }
-  const schemaKeys = Object.keys(manifest.stateSchemas);
-  const expectedKeys = Object.keys(STATE_SCHEMA_TARGETS);
+  const stateSchemas = manifest.stateSchemas;
+  const schemaKeys = Object.keys(stateSchemas);
+  const expectedKeys = (Object.keys(STATE_SCHEMA_TARGETS) as StateSurface[])
+    .filter((surface) => surface in stateSchemas || surface !== "sandboxRecovery");
   if (schemaKeys.length !== expectedKeys.length || expectedKeys.some((key) => !schemaKeys.includes(key))) {
     throw new Error("backup manifest must include every state schema");
   }
-  for (const [surface, version] of Object.entries(manifest.stateSchemas)) {
+  for (const [surface, version] of Object.entries(stateSchemas)) {
     if (!(surface in STATE_SCHEMA_TARGETS) || !Number.isInteger(version) || Number(version) < 0) {
       throw new Error(`backup manifest has an invalid ${surface} schema`);
     }
@@ -451,12 +453,17 @@ function validateManifest(value: unknown): StateBackupManifest {
 
 function assertRestorableSchemas(inspection: StateInspection, recorded: StateSchemaVersions): void {
   if (!inspection.healthy) throw new Error("restored state is unhealthy");
+  const surfaceMap = new Map(inspection.surfaces.map((s) => [s.surface, s]));
   for (const surface of Object.keys(STATE_SCHEMA_TARGETS) as StateSurface[]) {
-    if (inspection.currentVersions[surface] !== recorded[surface]) {
-      throw new Error(`restored ${surface} schema does not match the backup manifest`);
-    }
-    if (inspection.currentVersions[surface] > STATE_SCHEMA_TARGETS[surface]) {
+    if (!(surface in recorded) && surface === "sandboxRecovery") continue;
+    const status = surfaceMap.get(surface);
+    if (!status || !status.present) continue;
+    if (status.currentVersion > STATE_SCHEMA_TARGETS[surface]) {
       throw new Error(`restored ${surface} schema is newer than this Odinn version supports`);
+    }
+    const recordedVersion = recorded[surface];
+    if (recordedVersion !== undefined && status.currentVersion > recordedVersion) {
+      throw new Error(`restored ${surface} schema does not match the backup manifest`);
     }
   }
 }

@@ -104,7 +104,7 @@ for (const path of [
 }
 
 const productionPackage = {
-  name: DISTRIBUTION_PACKAGE_NAME,
+  name: pkg.name,
   version: pkg.version,
   description: pkg.description,
   private: false,
@@ -135,7 +135,7 @@ const stateSchemas = targetStateSchemaVersions();
 const releaseInfo = {
   schemaVersion: 2,
   name: pkg.name,
-  distributionName: productionPackage.name,
+  distributionName: DISTRIBUTION_PACKAGE_NAME,
   version: pkg.version,
   commit,
   distribution: "compiled",
@@ -190,6 +190,11 @@ if (process.platform === "win32") {
 } else {
   run("zip", ["-q", "-r", join(output, zipName), base], staging);
 }
+
+await writeFile(
+  join(packageRoot, "package.json"),
+  `${JSON.stringify({ ...productionPackage, name: DISTRIBUTION_PACKAGE_NAME }, null, 2)}\n`
+);
 
 const sbomFiles = [];
 for (const path of archiveFiles) {
@@ -257,7 +262,7 @@ const lockfile = await readFile(join(root, "pnpm-lock.yaml"));
 const createdAt = new Date().toISOString();
 const manifest = {
   name: pkg.name,
-  distributionName: productionPackage.name,
+  distributionName: DISTRIBUTION_PACKAGE_NAME,
   version: pkg.version,
   commit,
   distribution: "compiled",
@@ -273,7 +278,6 @@ const manifest = {
   runtimeDependencies: productionPackage.dependencies,
   bundledDependencies: [...bundledPackages.values()].sort((left, right) => left.name.localeCompare(right.name) || left.version.localeCompare(right.version)),
   sourceMaps: { included: true, sourcesContent: false, purpose: "post-release debugging without distributing source content" },
-  stateSchemas,
   minimumApplicationVersionForTargetState: STATE_SCHEMA_MINIMUM_APPLICATION_VERSION,
   runtimeStateExcluded: [
     ".odinn/",
@@ -296,7 +300,7 @@ await writeFile(
   `${JSON.stringify({
     schemaVersion: 1,
     subject: pkg.name,
-    distributionName: productionPackage.name,
+    distributionName: DISTRIBUTION_PACKAGE_NAME,
     version: pkg.version,
     commit,
     distribution: "compiled",

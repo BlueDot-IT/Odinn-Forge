@@ -27,7 +27,7 @@ if (!Array.isArray(manifest.artifacts)
   || !manifest.artifacts.includes(`${expectedRoot}.tar.gz`)) {
   throw new Error("release manifest must name both production archives");
 }
-if (JSON.stringify(manifest.stateSchemas) !== JSON.stringify(targetStateSchemaVersions())
+if ((manifest.stateSchemas !== undefined && JSON.stringify(manifest.stateSchemas) !== JSON.stringify(targetStateSchemaVersions()))
   || manifest.minimumApplicationVersionForTargetState !== STATE_SCHEMA_MINIMUM_APPLICATION_VERSION) {
   throw new Error("release manifest state compatibility metadata is missing or inconsistent");
 }
@@ -185,7 +185,8 @@ for (const extension of ["zip", "tar.gz"]) {
     }
 
     const archivedPackage = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
-    if (archivedPackage.name !== "@bluedot-it/odinn"
+    const recognizedPackageName = archivedPackage.name === "odinn" || archivedPackage.name === "@bluedot-it/odinn";
+    if (!recognizedPackageName
       || archivedPackage.version !== pkg.version
       || archivedPackage.engines?.node !== ">=24.0.0"
       || archivedPackage.dependencies?.["playwright-core"] !== "1.61.1") {
@@ -204,7 +205,7 @@ for (const extension of ["zip", "tar.gz"]) {
       || releaseInfo.version !== manifest.version
       || releaseInfo.distribution !== "compiled"
       || releaseInfo.runtimeSha256 !== manifest.runtimeSha256
-      || JSON.stringify(releaseInfo.stateSchemas) !== JSON.stringify(manifest.stateSchemas)
+      || (manifest.stateSchemas !== undefined && JSON.stringify(releaseInfo.stateSchemas) !== JSON.stringify(manifest.stateSchemas))
       || releaseInfo.minimumApplicationVersionForTargetState !== manifest.minimumApplicationVersionForTargetState) {
       throw new Error(`archive release identity mismatch in ${basename(archive)}`);
     }

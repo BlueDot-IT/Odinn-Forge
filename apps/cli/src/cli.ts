@@ -349,7 +349,7 @@ Support: the local single-user workflow is the stable v1 target. Advanced servic
 function requiresStateCompatibilityCheck(currentCommand: string | undefined, currentArgs: string[]): boolean {
   if (!currentCommand || ["--version", "-V", "help", "--help", "-h"].includes(currentCommand)) return false;
   if (currentCommand === "config" && currentArgs[0] === "provider" && currentArgs[1] === "catalog") return false;
-  if (["update", "rollback", "restore", "uninstall"].includes(currentCommand)) return false;
+  if (["update", "rollback", "restore", "uninstall", "doctor"].includes(currentCommand)) return false;
   return !(currentCommand === "state" && ["migrate", "restore", "import", "status"].includes(currentArgs[0]));
 }
 

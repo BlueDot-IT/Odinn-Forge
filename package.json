@@ -56,6 +56,7 @@
     "release:package": "node scripts/release/package.ts",
     "release:checksums": "node scripts/release/checksums.ts",
     "release:install-smoke": "node scripts/release/install-smoke.ts",
+    "release:rollback-smoke": "node scripts/release/validate-prior-rollback.ts",
     "release:soak": "node scripts/release/soak.ts"
   },
   "license": "MIT",
