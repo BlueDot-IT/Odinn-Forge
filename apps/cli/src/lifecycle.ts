@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createWriteStream, existsSync } from "node:fs";
-import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
@@ -808,7 +808,15 @@ async function assertActivePackage(prefix: string, packageRoot: string): Promise
   const installed = await readInstallState(prefix);
   if (!installed.current) return;
   const expected = resolve(prefix, "versions", String(installed.current));
-  if (resolve(packageRoot) !== expected) {
+  let canonicalExpected = expected;
+  let canonicalRoot = resolve(packageRoot);
+  try {
+    canonicalExpected = await realpath(expected);
+    canonicalRoot = await realpath(packageRoot);
+  } catch {
+    // Keep resolved paths if realpath fails
+  }
+  if (canonicalRoot !== canonicalExpected && resolve(packageRoot) !== expected) {
     throw new Error("lifecycle command is not running from the active installed application");
   }
 }

@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,7 +119,12 @@ export async function validatePriorRollback(options: {
   baselineCacheDir?: string;
   evidenceOutput?: string;
 } = {}): Promise<EvidenceRecord> {
-  const candidateDir = resolve(options.candidateDir ?? join(root, "dist", "release"));
+  let candidateDir = resolve(options.candidateDir ?? join(root, "dist", "release"));
+  try {
+    candidateDir = await realpath(candidateDir);
+  } catch {
+    // Keep resolved candidateDir if not yet present
+  }
   const cacheDir = options.baselineCacheDir ? resolve(options.baselineCacheDir) : undefined;
   const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
   const candidateVersion = String(pkg.version);
@@ -177,7 +182,8 @@ export async function validatePriorRollback(options: {
   }
   recordOutcome(2, "Verify baseline archive digest and manifest", true);
 
-  const workDir = await mkdtemp(join(tmpdir(), "odinn-validate-rollback-"));
+  const rawWorkDir = await mkdtemp(join(tmpdir(), "odinn-validate-rollback-"));
+  const workDir = await realpath(rawWorkDir);
   const baselineExtractDir = join(workDir, "baseline-extract");
   const baselineArchiveLocal = join(workDir, baselineArchiveName);
   await writeFile(baselineArchiveLocal, baselineArchiveBuffer);
