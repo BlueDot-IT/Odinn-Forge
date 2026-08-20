@@ -6,6 +6,51 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.1.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.0.0...v1.1.0) (2026-08-20)
+
+### Added
+
+* add versioned application read contracts for status, diagnostics, session
+  listing, and the operator snapshot
+* add the shared operator read plane across CLI, TUI, HTTP JSON, and the local
+  console
+* add durable jobs, workflow/event primitives, bounded child-agent graphs,
+  progressive skills, governed MCP activation, and the OCI process backend
+* add a separately built local console with hashed assets, manifest checks,
+  origin validation, loopback bootstrap, and restrictive CSP
+* add provider-independent runtime agents, first-run identity bootstrap,
+  production channel adapters, and capability metadata
+* add authoritative SQLite storage, FTS5 memory indexing, job recovery,
+  workspace inspection, capability previews, and bounded security fuzzing
+
+### Changed
+
+* route status, diagnostics, session listing, and operator views through the
+  application layer and enforce the production dependency-direction matrix
+* make approval continuations, workflow leases, channel deduplication,
+  runtime-agent installation, and SQLite record writes serialized and
+  crash-consistent
+* bind admitted agent graphs to immutable agent, identity, prompt, model, and
+  manifest digests, with parent capability intersection and digest-only
+  projections
+* carry tenant scope through the hosted gateway while keeping multi-user,
+  multi-tenant, host-capability, graph, and advanced runtime interfaces
+  experimental and opt-in
+* add exact release metadata, SBOM, provenance, checksums, compiled-package
+  verification, and downloaded-artifact validation for Linux, macOS, and
+  Windows
+
+### Fixed
+
+* fail closed on malformed tool arguments, cancelled process admission,
+  unsafe resource reads, unsupported state schemas, missing approval locks,
+  and unsafe rollback paths
+* preserve audit integrity, recovery classification, Windows state/lock
+  behavior, provider failure handling, and authoritative memory retrieval
+  under contention and restart
+* validate rollback with the actual v1.0.0 binary and protected pre-migration
+  backup instead of assuming the current runtime is compatible
+
 ## [1.1.0-rc.4](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0-rc.3...v1.1.0-rc.4) (2026-08-17)
 
 ### Added
