@@ -55,7 +55,7 @@ test("local package operations have conservative resource limits", async () => {
   assert.match(runner, /--workspace-concurrency=\$\{workspaceConcurrency\}/);
 });
 
-test("comparative benchmarking remains outside the product repository", async () => {
+test("comparative harness remains external while Odinn publishes weekly results", async () => {
   const pkg = JSON.parse(await read("package.json"));
   assert.deepEqual(
     Object.keys(pkg.scripts).filter((name) => name.startsWith("benchmark:")),
@@ -63,10 +63,10 @@ test("comparative benchmarking remains outside the product repository", async ()
   );
 
   const ciScripts = await readdir(new URL("../scripts/ci/", import.meta.url));
-  assert.deepEqual(
-    ciScripts.filter((name) => name.includes("benchmark")),
-    [],
-  );
+  assert.deepEqual(ciScripts.filter((name) => name.includes("benchmark")).sort(), [
+    "weekly-benchmark-docs.ts",
+    "weekly-benchmark-state.ts",
+  ]);
 
   const removedBenchmarkControls =
     /benchmark:|dist\/benchmark|benchmark-report|ODINN_(?:ASSURANCE_|WORKSPACE_|AUDIT_)?BENCHMARK|BENCHMARK_(?:SIZES|SAMPLES|CHUNK_SIZE)/u;
@@ -84,11 +84,20 @@ test("comparative benchmarking remains outside the product repository", async ()
 
   const documentation = await read("docs/README.md");
   assert.match(documentation, /BlueDot-IT\/agent-benchmarks/u);
-  assert.doesNotMatch(documentation, /\(benchmarks\.md\)/u);
+  assert.match(documentation, /\(benchmarks\.md\)/u);
+  const weekly = await read(".github/workflows/weekly-benchmarks.yml");
+  assert.match(weekly, /schedule:/u);
+  assert.match(weekly, /workflow_dispatch:/u);
+  assert.match(weekly, /runs-on: ubuntu-latest/u);
+  assert.match(weekly, /BlueDot-IT\/agent-benchmarks/u);
+  assert.match(weekly, /BENCHMARK_COMMIT: [0-9a-f]{40}/u);
+  assert.match(weekly, /ODINN_OPENAI_OAUTH_JSON/u);
+  assert.match(weekly, /docs\/benchmarks\.md/u);
+  assert.doesNotMatch(weekly, /openrouter|api[-_]?key|auth\.openai\.com/iu);
 });
 
 test("required CI/CD workflows exist", async () => {
-  for (const workflow of ["ci.yml", "security.yml", "release.yml", "nightly.yml"]) {
+  for (const workflow of ["ci.yml", "security.yml", "release.yml", "nightly.yml", "weekly-benchmarks.yml"]) {
     const content = await read(`.github/workflows/${workflow}`);
     assert.match(content, /^name:/m);
     assert.match(content, /^permissions:/m);

@@ -1,0 +1,226 @@
+name: Weekly comparative benchmarks
+
+on:
+  schedule:
+    - cron: "17 8 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: odinn-maintainer-oauth-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "24.15.0"
+  PNPM_VERSION: "10.14.0"
+  BENCHMARK_COMMIT: b1213d03dcf17b6e6e0e02410f606a6dce73a815
+  ODINN_VERSION: "1.1.0"
+  OPENCLAW_VERSION: "2026.7.1-2"
+  HERMES_VERSION: "0.19.0"
+
+jobs:
+  benchmark:
+    name: Run three-runtime matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    permissions:
+      contents: read
+    steps:
+      - name: Check out Odinn Forge without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check out the pinned external harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: BlueDot-IT/agent-benchmarks
+          ref: ${{ env.BENCHMARK_COMMIT }}
+          path: harness-base
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned harness and runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --dir harness-base install --frozen-lockfile --ignore-scripts
+          npm install --global "openclaw@${OPENCLAW_VERSION}"
+          python -m pip install --disable-pip-version-check "hermes-agent==${HERMES_VERSION}"
+          curl --fail --silent --show-error --location \
+            "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/v${ODINN_VERSION}/odinn-v${ODINN_VERSION}.tar.gz" \
+            --output "${RUNNER_TEMP}/odinn.tar.gz"
+          echo "340ccab7bbc1ba4afb9568db3111bf940dcd288f8b2a49e76a82aa6a404aa84e  ${RUNNER_TEMP}/odinn.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file "${RUNNER_TEMP}/odinn.tar.gz" --directory "${RUNNER_TEMP}"
+          docker pull "docker.io/library/node@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03"
+          cp -a harness-base "${RUNNER_TEMP}/harness-odinn"
+          cp -a harness-base "${RUNNER_TEMP}/harness-openclaw"
+          cp -a harness-base "${RUNNER_TEMP}/harness-hermes"
+
+      - name: Prepare isolated runtime state from the synchronized repository secret
+        shell: bash
+        env:
+          ODINN_OPENAI_OAUTH_JSON: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/weekly-benchmark-state.ts prepare \
+            --state-root "${RUNNER_TEMP}/benchmark-state" \
+            --harness "${GITHUB_WORKSPACE}/harness-base" \
+            --odinn "${RUNNER_TEMP}/odinn-v${ODINN_VERSION}/bin/odinn" \
+            --openclaw "$(command -v openclaw)" \
+            --hermes "$(command -v hermes)" \
+            --config-output "${RUNNER_TEMP}/adapters.json"
+
+      - name: Run the complete matrix in parallel
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_adapter() {
+            local adapter="$1"
+            local harness="$2"
+            pnpm --dir "${harness}" benchmark -- \
+              --config "${RUNNER_TEMP}/adapters.json" \
+              --suite benchmarks/suites/comprehensive.json \
+              --adapter "${adapter}" \
+              --trials 5 \
+              --strict-comparison \
+              --output "${harness}/dist/benchmarks/${adapter}" \
+              --lock-file "${RUNNER_TEMP}/${adapter}.lock" \
+              > "${RUNNER_TEMP}/${adapter}.log" 2>&1
+          }
+          run_adapter odinn-forge "${RUNNER_TEMP}/harness-odinn" & odinn_pid=$!
+          run_adapter openclaw "${RUNNER_TEMP}/harness-openclaw" & openclaw_pid=$!
+          run_adapter hermes-agent "${RUNNER_TEMP}/harness-hermes" & hermes_pid=$!
+          status=0
+          wait "${odinn_pid}" || status=1
+          wait "${openclaw_pid}" || status=1
+          wait "${hermes_pid}" || status=1
+          for adapter in odinn-forge openclaw hermes-agent; do
+            echo "## ${adapter}" >> "${GITHUB_STEP_SUMMARY}"
+            tail -n 25 "${RUNNER_TEMP}/${adapter}.log" >> "${GITHUB_STEP_SUMMARY}" || true
+          done
+          exit "${status}"
+
+      - name: Collect complete reports
+        if: steps.matrix.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/weekly-benchmark-reports"
+          for adapter in odinn-forge openclaw hermes-agent; do
+            harness="${RUNNER_TEMP}/harness-${adapter%%-*}"
+            if [[ "${adapter}" == "hermes-agent" ]]; then harness="${RUNNER_TEMP}/harness-hermes"; fi
+            mapfile -t reports < <(find "${harness}/dist/benchmarks/${adapter}" -maxdepth 1 -type f -name '*.json' ! -name '*.progress.json' -print | sort)
+            if [[ "${#reports[@]}" -ne 1 ]]; then
+              echo "::error::Expected exactly one final JSON report for ${adapter}, found ${#reports[@]}."
+              exit 1
+            fi
+            cp "${reports[0]}" "${RUNNER_TEMP}/weekly-benchmark-reports/${adapter}.json"
+          done
+
+      - name: Remove plaintext credentials and runtime state
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "${RUNNER_TEMP}/benchmark-state" "${RUNNER_TEMP}/adapters.json"
+
+      - name: Upload complete reports for documentation
+        if: steps.matrix.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: weekly-benchmark-reports-${{ github.run_id }}
+          path: ${{ runner.temp }}/weekly-benchmark-reports/
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 90
+
+      - name: Upload raw benchmark evidence
+        if: steps.matrix.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: weekly-benchmark-raw-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/harness-odinn/dist/benchmarks/
+            ${{ runner.temp }}/harness-openclaw/dist/benchmarks/
+            ${{ runner.temp }}/harness-hermes/dist/benchmarks/
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 90
+
+      - name: Upload bounded failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: weekly-benchmark-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/*.log
+          if-no-files-found: ignore
+          include-hidden-files: false
+          retention-days: 14
+
+  publish:
+    name: Publish current Odinn Forge benchmark docs
+    needs: benchmark
+    if: needs.benchmark.result == 'success' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download complete reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: weekly-benchmark-reports-${{ github.run_id }}
+          path: ${{ runner.temp }}/weekly-benchmark-reports
+
+      - name: Generate current benchmark documentation
+        shell: bash
+        run: |
+          node scripts/ci/weekly-benchmark-docs.ts \
+            --reports "${RUNNER_TEMP}/weekly-benchmark-reports" \
+            --readme README.md \
+            --docs docs/benchmarks.md \
+            --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --expected-commit "${BENCHMARK_COMMIT}"
+          git diff --check
+
+      - name: Commit updated benchmark snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add README.md docs/benchmarks.md
+          if git diff --cached --quiet; then
+            echo "Benchmark documentation is already current." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "docs(bench): update weekly comparison"
+          git pull --rebase origin main
+          git push origin HEAD:main
