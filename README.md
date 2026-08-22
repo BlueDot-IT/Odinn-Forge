@@ -331,6 +331,7 @@ checks artifacts and deterministic assertions rather than treating a plausible
 final message as proof. The dated snapshot below is informational: it is not a
 CI gate, a release guarantee, or a model-only score.
 
+<!-- weekly-benchmark:start -->
 **2026-08-14 — 1.1.0-rc.2 candidate comparison.** Seven cases ran five times
 per runtime with OpenAI OAuth, `gpt-5.6-luna`, cloud-only deployment,
 runtime-default sampling, and a bounded filesystem-and-shell tool policy. All
@@ -354,6 +355,11 @@ cases reported unsupported.
 See the
 [benchmark source revision](https://github.com/BlueDot-IT/agent-benchmarks/commit/e23ad096e0895fb0a6b0ef1f6faaf71d67b2ab35)
 for the harness revision and methodology.
+<!-- weekly-benchmark:end -->
+
+The [current benchmark page](docs/benchmarks.md) contains the complete generated
+matrix and provenance. A scheduled run replaces the marked snapshot only after
+all three runtime reports pass the publication validator.
 
 ## For developers and contributors
 

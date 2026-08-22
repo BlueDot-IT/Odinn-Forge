@@ -241,8 +241,20 @@ scope correctness over 10,000 authoritative records. Compiled inference smoke
 separately exercises the staged production gateway. These are correctness and
 resource-bound checks; they do not publish latency or throughput claims.
 
-Comparative runtime, model, and performance evaluation belongs in
-[BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).
+The weekly `Weekly comparative benchmarks` workflow checks out a pinned
+[BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks)
+revision and runs the complete Odinn Forge, OpenClaw, and Hermes matrix on a
+GitHub-hosted Ubuntu runner. The harness continues to own cases, deterministic
+grading, and raw reports. Odinn Forge owns the generated
+[current benchmark page](benchmarks.md) and README snapshot.
+
+The local `odinn-maintainer-oauth-sync` command job keeps the existing masked
+`ODINN_OPENAI_OAUTH_JSON` Actions secret synchronized. The benchmark workflow
+only reads that secret into ephemeral isolated runtime state; it does not
+refresh, replace, or publish credentials and does not select another provider
+or model. Plaintext runtime state is removed before artifacts or repository
+writes. Publication occurs in a separate write-capable job only after the three
+reports pass strict metadata, provenance, and completeness validation.
 
 To inspect release output without publishing:
 

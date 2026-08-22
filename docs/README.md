@@ -33,11 +33,12 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   release candidate.
 - [1.1 release scope](v1.1-release-scope.md) — active feature freeze,
   deliverables, experimental exclusions, and stable-release blockers.
-- [BlueDot agent benchmarks](https://github.com/BlueDot-IT/agent-benchmarks) —
-  comparative runtime/model evaluation, performance methodology, and reports.
-  Benchmark harnesses and raw reports remain outside this product repository;
-  the README snapshot is informational and must be read with its provenance
-  and limitations.
+- [Current comparative benchmarks](benchmarks.md) — the latest complete
+  GitHub-hosted three-runtime matrix published by the weekly workflow.
+- [BlueDot agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks) —
+  the pinned external harness, deterministic cases, grading methodology, and
+  raw report contract. Raw reports remain Actions artifacts rather than product
+  source files.
 
 ## Runtime and architecture notes
 
