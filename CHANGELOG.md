@@ -6,6 +6,11 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+* advance the post-1.1.0 development version to `1.1.1-dev.0` while adding the
+  weekly GitHub-hosted comparative benchmark and generated documentation flow
+
 ## [1.1.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.0.0...v1.1.0) (2026-08-20)
 
 ### Added
