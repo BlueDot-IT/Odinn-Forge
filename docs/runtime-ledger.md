@@ -39,6 +39,13 @@ The three hard limits are:
 - [x] Extension/MCP execution adapters. Container extensions require a whole-bundle digest and execute with read-only mounts, no network, dropped capabilities, no-new-privileges, CPU/memory/PID/tmpfs limits, and bounded output. Trusted `unconfined-process` extensions still require an entrypoint digest and explicit unsafe acknowledgement. Both cross the audited Gatewatch/Rune Key boundary. Stage 9 MCP manifests use a response-gated JSON-RPC `initialize`/`tools/list`/`tools/call` JSONL subset; approved invocation continuation resumes the original awaiting-approval run with sealed exact input, while remote URLs and unconfined MCP remain unavailable.
 - [x] Provider retries for transient failures, rate-limit backoff, generic chat SSE normalization, OAuth refresh path, and provider transport tests.
 - [x] Provider catalog conformance contract across every preset, generic chat/Responses/SSE/tool-call fixtures, retry behavior, and canonical token accounting. Live provider-account and provider-specific service behavior remains an external release test, not a fake local green check.
+- [x] Agent turns use a bounded adaptive output budget. Earlier tool-selection
+  turns receive only a proportional share of discretionary output while every
+  request retains an explicit visible-answer reserve; later turns ramp toward
+  the configured ceiling. A bounded context estimate fails closed before a
+  provider call when preserving that reserve is impossible. The terminal
+  result reports the ceiling, reserve, last allocation, context window, and
+  observed completion-token usage without changing tool or capability grants.
 - [x] Loopback-only gateway default, strict localhost/127.0.0.1/[::1] Host validation, per-state bearer token, browser bootstrap cookie, exact scheme/host/port checks for cookie-authenticated mutations, missing-Origin rejection for cookie mutations, request limits, content-bound idempotency keys, graceful shutdown, and reconnectable audit SSE.
 - [x] Opt-in remote multi-user host with mandatory TLS/public-origin configuration for non-loopback binds, scrypt password verification, login throttling, signed revocable sessions, logout, and separate state/workspace/gateway/browser boundaries per tenant.
 - [x] Browser approval gate, DNS-pinned local egress proxy, request/WebSocket interception, blocked service workers, domain/private-network policy, input redaction, and stale snapshot checks when an action is based on a snapshot.

@@ -1036,16 +1036,18 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   let toolRepairUsed = false;
   let budgetRecoveryUsed = false;
   let budgetRecovery;
+  const tokenBudget = createAgentTokenBudget(input, maxTurns);
   for (let turn = 0; turn < maxTurns; turn += 1) {
     throwIfAborted(signal);
     await onAgentProgress?.({ stage: "drafting-answer", message: "Drafting the answer.", turn: turn + 1 });
     const selectedModel = input.model || agent.manifest.model.default || undefined;
+    const turnBudget = tokenBudget.allocate(messages, availableTools, turn);
     const modelRequest = {
       model: selectedModel,
       messages,
       tools: availableTools,
       stream: true,
-      ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens })
+      maxTokens: turnBudget.maxTokens
     };
     let result: any;
     try {
@@ -1071,11 +1073,13 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
       }, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
     }
     aggregateUsage = mergeUsage(aggregateUsage, result.usage);
+    tokenBudget.record(result.usage);
     if (!result.toolCalls?.length) {
       return {
         ...result,
         ...(aggregateUsage ? { usage: aggregateUsage } : {}),
         ...(budgetRecovery ? { modelRecovery: budgetRecovery } : {}),
+        tokenBudget: tokenBudget.summary(),
         ...answerShapeMetadata(latestUserMessage?.content, result.content),
         memory: { recalled: recalled.memories.length, suggested: learned.suggested.length, learned: 0, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 }
       };
@@ -1141,6 +1145,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
           content: `I need your approval before I ${nested.output.summary.toLowerCase()}.`,
           pendingApproval: nested.output,
           ...(budgetRecovery ? { modelRecovery: budgetRecovery } : {}),
+          tokenBudget: tokenBudget.summary(),
           memory: { recalled: recalled.memories.length, suggested: learned.suggested.length, learned: 0, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 }
         };
       }
@@ -1352,6 +1357,73 @@ function agentBudgetRecovery(error: any, selectedModel: any, input: any, already
     fromMaxTokens,
     toMaxTokens
   };
+}
+
+const DEFAULT_AGENT_OUTPUT_BUDGET = 4_096;
+const DEFAULT_VISIBLE_ANSWER_RESERVE = 768;
+const DEFAULT_AGENT_CONTEXT_WINDOW = 32_768;
+const AGENT_CONTEXT_SAFETY_MARGIN = 1_024;
+
+function createAgentTokenBudget(input: any, maxTurns: number) {
+  const outputCeiling = boundedAgentTokenOption(input.maxTokens, DEFAULT_AGENT_OUTPUT_BUDGET, 128, 32_768, "maxTokens");
+  const visibleAnswerReserve = boundedAgentTokenOption(
+    input.visibleAnswerReserveTokens,
+    Math.min(DEFAULT_VISIBLE_ANSWER_RESERVE, outputCeiling),
+    64,
+    outputCeiling,
+    "visibleAnswerReserveTokens"
+  );
+  const contextWindow = boundedAgentTokenOption(input.contextWindowTokens, DEFAULT_AGENT_CONTEXT_WINDOW, 2_048, 2_000_000, "contextWindowTokens");
+  let completionTokensUsed = 0;
+  let lastAllocation = visibleAnswerReserve;
+  return {
+    allocate(messages: any[], tools: any[], turn: number) {
+      const estimatedContextTokens = estimateAgentContextTokens(messages, tools);
+      const contextAvailable = contextWindow - estimatedContextTokens - AGENT_CONTEXT_SAFETY_MARGIN;
+      if (contextAvailable < visibleAnswerReserve) {
+        const error = new Error("agent context cannot preserve the reserved visible-answer budget; compact or shorten the conversation") as NodeError;
+        error.code = "AGENT_VISIBLE_ANSWER_BUDGET_EXHAUSTED";
+        throw error;
+      }
+      // Ramp the discretionary portion as terminal pressure rises. Every turn
+      // retains the complete visible-answer reserve; earlier tool-selection
+      // turns receive less speculative output than the final allowed turn.
+      const turnsRemaining = Math.max(1, maxTurns - turn);
+      const discretionary = Math.max(0, outputCeiling - visibleAnswerReserve);
+      const adaptiveDiscretionary = Math.ceil(discretionary / turnsRemaining);
+      lastAllocation = Math.min(outputCeiling, contextAvailable, visibleAnswerReserve + adaptiveDiscretionary);
+      return { maxTokens: lastAllocation, estimatedContextTokens };
+    },
+    record(usage: any) {
+      const completion = Number(usage?.completion_tokens ?? usage?.completionTokens ?? 0);
+      if (Number.isFinite(completion) && completion > 0) completionTokensUsed += Math.floor(completion);
+    },
+    summary() {
+      return {
+        outputCeiling,
+        visibleAnswerReserve,
+        contextWindow,
+        lastTurnAllocation: lastAllocation,
+        completionTokensUsed
+      };
+    }
+  };
+}
+
+function boundedAgentTokenOption(value: any, fallback: number, minimum: number, maximum: number, label: string): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${label} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return parsed;
+}
+
+function estimateAgentContextTokens(messages: any[], tools: any[]): number {
+  let bytes = 0;
+  for (const message of messages) bytes += Buffer.byteLength(JSON.stringify(message), "utf8") + 16;
+  for (const tool of tools) bytes += Buffer.byteLength(JSON.stringify(tool), "utf8") + 16;
+  return Math.max(1, Math.ceil(bytes / 4));
 }
 
 function answerShapeMetadata(request: any, content: any) {
