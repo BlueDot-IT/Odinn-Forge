@@ -1099,7 +1099,13 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
         throwIfAborted(signal);
         const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError;
         const argumentCorrection = failure.code === "TOOL_ARGUMENTS_MALFORMED" || failure.code === "TOOL_ARGUMENTS_SCHEMA_INVALID";
-        if (argumentCorrection) await recordAgentToolRejection(auditStore, runId ?? input?.sessionId, call, failure);
+        if (argumentCorrection) {
+          await recordAgentToolRejection(auditStore, runId ?? input?.sessionId, call, failure);
+          // The rejected payload is neither executable nor useful context. Do
+          // not echo attacker-sized or malformed arguments into the correction
+          // request; preserve only the call identity and the bounded tool error.
+          call.arguments = "{}";
+        }
         const safety = toolSafetyDescriptor(call.name, registry?.get?.(call.name));
         if ((!argumentCorrection && !safety.retrySafe) || toolRepairUsed) throw error;
         toolRepairUsed = true;
