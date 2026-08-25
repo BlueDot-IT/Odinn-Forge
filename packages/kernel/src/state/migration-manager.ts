@@ -8,6 +8,7 @@ import { STATE_MIGRATIONS, type StateMigrationDefinition, type StateMigrationRes
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
 import { withStateMutationLock } from "../state-mutation.ts";
 import { auditFilenameFromConfig } from "./audit-path.ts";
+import { relocateLegacyBrowserProfiles } from "../browser-profile-state.ts";
 
 const MARKER_SCHEMA_VERSION = 1;
 const MANIFEST_FILENAME = "state-schema.json";
@@ -314,6 +315,7 @@ async function applyStateMigrationPlanUnlocked(
   const results: Array<PlannedMigrationStep & StateMigrationResult> = [];
 
   await validatePhysicalTree(plan.stateRoot);
+  await relocateLegacyBrowserProfiles(plan.stateRoot);
   await mkdir(dirname(plan.backupLocation!), { recursive: true, mode: 0o700 });
   await cp(plan.stateRoot, plan.backupLocation!, { recursive: true, force: false, errorOnExist: true });
   await secureTree(dirname(plan.backupLocation!));
@@ -762,14 +764,19 @@ async function validatePhysicalTree(root: string): Promise<void> {
   const walk = async (directory: string): Promise<void> => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
+      const name = relative(root, path).replaceAll("\\", "/");
       const metadata = await lstat(path);
-      if (metadata.isSymbolicLink()) throw new Error(`state contains a symbolic link: ${relative(root, path)}`);
+      if (name === "browser-profile" || name === "browser-profiles") {
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`state contains an invalid legacy browser profile root: ${name}`);
+        continue;
+      }
+      if (metadata.isSymbolicLink()) throw new Error(`state contains a symbolic link: ${name}`);
       if (metadata.isDirectory()) {
         await walk(path);
       } else if (!metadata.isFile()) {
-        throw new Error(`state contains an unsupported file type: ${relative(root, path)}`);
+        throw new Error(`state contains an unsupported file type: ${name}`);
       } else if (metadata.nlink !== 1) {
-        throw new Error(`state contains a hard-linked file: ${relative(root, path)}`);
+        throw new Error(`state contains a hard-linked file: ${name}`);
       }
     }
   };

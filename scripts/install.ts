@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
+import { spawnPnpmSync } from "./lib/package-manager.ts";
 
 const [command = "status", ...args] = process.argv.slice(2);
 const prefix = resolve(option("--prefix", process.env.ODINN_INSTALL_PREFIX || join(homedir(), ".local", "share", "odinn")));
@@ -47,7 +47,7 @@ async function install(operation: any) {
   await ensurePhysicalDirectory(versions, "version root");
   const staging = await mkdtemp(join(versions, ".staging-"));
   await cp(source, staging, { recursive: true, filter: (path: any) => !excluded(path, source, compiled) });
-  if (!compiled && !has("--skip-deps")) run(process.platform === "win32" ? "corepack.cmd" : "corepack", ["pnpm", "install", "--frozen-lockfile"], staging);
+  if (!compiled && !has("--skip-deps")) runPnpm(["install", "--frozen-lockfile"], staging);
   const metadata = { schemaVersion: 2, version, commit, runtimeSha256, lockfileSha256: lockfileSha256 || undefined, artifactSha256, toolchain, installedAt: new Date().toISOString() };
   await writeFile(join(staging, "install-metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
   const destinationExists = await access(destination).then(() => true).catch(() => false);
@@ -222,7 +222,12 @@ function excluded(path: any, source: any, compiled: boolean) {
   if (!compiled && /(^|\/)(node_modules|dist)(\/|$)/.test(relative)) return true;
   return false;
 }
-function run(commandName: any, commandArgs: any, cwd: any) { const result = spawnSync(commandName, commandArgs, { cwd, stdio: "inherit", shell: false }); if (result.status !== 0) throw new Error(`${commandName} failed with exit code ${result.status}`); }
+function runPnpm(commandArgs: string[], cwd: string) {
+  const result = spawnPnpmSync(commandArgs, { cwd, encoding: "utf8", env: process.env });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.error || result.status !== 0) throw new Error(`pnpm failed: ${result.error?.message ?? `exit ${result.status ?? "unknown"}`}`);
+}
 function option(name: any, fallback: any = "") { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : fallback; }
 function has(name: any) { return args.includes(name); }
 function shellQuote(value: any) { return `'${String(value).replaceAll("'", `'\\''`)}'`; }

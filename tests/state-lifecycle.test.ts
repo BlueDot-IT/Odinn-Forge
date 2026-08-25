@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -75,6 +75,9 @@ test("normal backup is checksummed and excludes credentials while preserving sta
       assert.equal(created.manifest.files.some((file) => file.path === forbidden), false);
     }
     assert.equal(created.manifest.files.some((file) => /^db\/custom-audit\.sqlite(?:-(?:wal|shm)|\.notify)$/u.test(file.path)), false);
+    for (const sidecar of ["custom-audit.sqlite-wal", "custom-audit.sqlite-shm", "custom-audit.sqlite.notify", "audit.sqlite.notify"]) {
+      await assert.rejects(access(join(backup, "db", sidecar)), { code: "ENOENT" });
+    }
     assert.ok(created.manifest.excluded.includes("credentials/custom-oauth.json"));
     assert.ok(created.manifest.excluded.includes("approvals.json"));
     assert.ok(created.manifest.excluded.includes("approvals.json.key"));
@@ -83,6 +86,53 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     const inspected = await inspectStateBackup(backup);
     assert.equal(inspected.valid, true);
     assert.equal(inspected.manifest.sourceApplication.version, "1.0.0");
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("backup inspection rejects an unmanifested excluded sidecar", async () => {
+  const fixture = await preparedState();
+  const backup = join(fixture.temporary, "unmanifested-sidecar-backup");
+  try {
+    await createStateBackup(fixture.state, backup);
+    await mkdir(join(backup, "db"), { recursive: true });
+    await writeFile(join(backup, "db", "audit.sqlite.notify"), "unexpected\n");
+    await assert.rejects(() => inspectStateBackup(backup), /backup contents do not match the manifest/u);
+    await rm(join(backup, "db", "audit.sqlite.notify"));
+    await mkdir(join(backup, "unexpected-empty-directory"));
+    await assert.rejects(() => inspectStateBackup(backup), /backup contents do not match the manifest/u);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("legacy Chromium profile links are excluded while arbitrary state links remain forbidden", { skip: process.platform === "win32" }, async () => {
+  const fixture = await preparedState();
+  const outside = join(fixture.temporary, "chromium-runtime");
+  try {
+    await mkdir(outside);
+    const legacyProfile = join(fixture.state, "browser-profile");
+    await mkdir(legacyProfile);
+    for (const link of ["RunningChromeVersion", "SingletonSocket", "SingletonCookie", "SingletonLock"]) {
+      await symlink(outside, join(legacyProfile, link));
+    }
+    const backup = join(fixture.temporary, "legacy-browser-backup");
+    const created = await createStateBackup(fixture.state, backup);
+    assert.equal(created.manifest.files.some((file) => file.path.startsWith("browser-profile/")), false);
+
+    await rm(legacyProfile, { recursive: true, force: true });
+    await symlink(outside, legacyProfile);
+    await assert.rejects(
+      () => createStateBackup(fixture.state, join(fixture.temporary, "rejected-profile-root-backup")),
+      /invalid legacy browser profile root/u
+    );
+    await rm(legacyProfile);
+    await symlink(outside, join(fixture.state, "unexpected-link"));
+    await assert.rejects(
+      () => createStateBackup(fixture.state, join(fixture.temporary, "rejected-link-backup")),
+      /state contains a symbolic link: unexpected-link/u
+    );
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
   }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { chmod, cp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { spawnPnpmSync } from "../lib/package-manager.ts";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
@@ -270,7 +271,11 @@ const manifest = {
   lockfileSha256: createHash("sha256").update(lockfile).digest("hex"),
   toolchain: {
     node: process.version,
-    pnpm: commandOutput(process.platform === "win32" ? "corepack.cmd" : "corepack", ["pnpm", "--version"])
+    pnpm: (() => {
+      const result = spawnPnpmSync(["--version"], { cwd: root, encoding: "utf8" });
+      if (result.error || result.status !== 0) throw new Error(`pnpm --version failed: ${result.error?.message ?? `exit ${result.status ?? "unknown"}`}`);
+      return result.stdout.trim();
+    })()
   },
   artifacts: [zipName, tarName],
   sbom: "odinn.spdx.json",

@@ -5,7 +5,7 @@ process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -19,6 +19,22 @@ import { createApprovalStore, createRunLedger, loadAgent } from "../packages/ker
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
+
+test("gateway rejects a symbolic-link state root", { skip: process.platform === "win32" }, async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-state-root-"));
+  const physicalState = join(fixtureRoot, "physical");
+  const linkedState = join(fixtureRoot, "linked");
+  try {
+    await mkdir(physicalState);
+    await symlink(physicalState, linkedState, "dir");
+    await assert.rejects(
+      () => createGatewayServer({ stateDir: linkedState, workspaceRoot: root }),
+      /physical directory/u
+    );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
 
 async function readSseIds(response: Response, count: number) {
   const reader = response.body!.getReader(); const decoder = new TextDecoder(); const ids: number[] = []; let buffer = "";

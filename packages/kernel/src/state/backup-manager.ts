@@ -10,6 +10,7 @@ import { STATE_SCHEMA_TARGETS, type StateSchemaVersions, type StateSurface } fro
 
 const BACKUP_MANIFEST = "backup-manifest.json";
 const BACKUP_SCHEMA_VERSION = 1;
+const LEGACY_BROWSER_PROFILE_DIRECTORIES = new Set(["browser-profile", "browser-profiles"]);
 const DEFAULT_EXCLUSIONS = Object.freeze([
   "oauth/",
   "browser-profile/",
@@ -134,6 +135,7 @@ async function createStateBackupUnlocked(
     }
     const stagedAudit = await verifyAudit(staging);
     if (!stagedAudit.valid) throw new Error("state backup refused because the staged audit snapshot is inconsistent");
+    await removeEphemeralStateFiles(staging);
     const manifest: StateBackupManifest = {
       schemaVersion: BACKUP_SCHEMA_VERSION,
       kind: "odinn-state-backup",
@@ -168,10 +170,19 @@ export async function inspectStateBackup(inputDir: string): Promise<InspectedSta
   await validatePhysicalTree(root, "state backup");
   const raw = JSON.parse(await readFile(join(root, BACKUP_MANIFEST), "utf8"));
   const manifest = validateManifest(raw);
-  const actualFiles = (await payloadFiles(root, true, [], { excludeProtected: false })).filter((path) => path !== BACKUP_MANIFEST);
+  const actualFiles = (await payloadFiles(root, true, [], { excludeProtected: false, includeEphemeral: true })).filter((path) => path !== BACKUP_MANIFEST);
   const expected = new Map(manifest.files.map((file) => [file.path, file]));
   if (expected.size !== manifest.files.length) throw new Error("backup manifest contains duplicate file paths");
   if (actualFiles.length !== expected.size || actualFiles.some((path) => !expected.has(path))) {
+    throw new Error("backup contents do not match the manifest");
+  }
+  const expectedDirectories = new Set<string>();
+  for (const path of expected.keys()) {
+    const parts = path.split("/");
+    for (let index = 1; index < parts.length; index += 1) expectedDirectories.add(parts.slice(0, index).join("/"));
+  }
+  const actualDirectories = await payloadDirectories(root);
+  if (actualDirectories.length !== expectedDirectories.size || actualDirectories.some((path) => !expectedDirectories.has(path))) {
     throw new Error("backup contents do not match the manifest");
   }
   for (const file of actualFiles) {
@@ -505,13 +516,27 @@ async function appendLifecycleAudit(stateRoot: string, type: string, message: st
   if ("close" in store) store.close();
 }
 
-async function payloadFiles(root: string, includeSensitiveState: boolean, sensitiveExclusions: string[] = [], { excludeProtected = false }: { excludeProtected?: boolean } = {}): Promise<string[]> {
+async function payloadFiles(
+  root: string,
+  includeSensitiveState: boolean,
+  sensitiveExclusions: string[] = [],
+  {
+    excludeProtected = false,
+    includeEphemeral = false,
+    ignoreLegacyBrowserProfiles = false
+  }: { excludeProtected?: boolean; includeEphemeral?: boolean; ignoreLegacyBrowserProfiles?: boolean } = {}
+): Promise<string[]> {
   const files: string[] = [];
   const walk = async (directory: string): Promise<void> => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       const name = relative(root, path).replaceAll("\\", "/");
-      if (isEphemeralStateFile(name)) continue;
+      if (ignoreLegacyBrowserProfiles && LEGACY_BROWSER_PROFILE_DIRECTORIES.has(name)) {
+        const metadata = await lstat(path);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`state contains an invalid legacy browser profile root: ${name}`);
+        continue;
+      }
+      if (!includeEphemeral && isEphemeralStateFile(name)) continue;
       if (excludeProtected && excludedFromBackup(name, entry.isDirectory(), includeSensitiveState, sensitiveExclusions)) continue;
       const metadata = await lstat(path);
       if (metadata.isSymbolicLink()) throw new Error(`state contains a symbolic link: ${name}`);
@@ -527,6 +552,27 @@ async function payloadFiles(root: string, includeSensitiveState: boolean, sensit
   return files.sort();
 }
 
+async function payloadDirectories(root: string): Promise<string[]> {
+  const directories: string[] = [];
+  const walk = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const path = join(directory, entry.name);
+      directories.push(relative(root, path).replaceAll("\\", "/"));
+      await walk(path);
+    }
+  };
+  await walk(root);
+  return directories.sort();
+}
+
+async function removeEphemeralStateFiles(root: string): Promise<void> {
+  const files = await payloadFiles(root, true, [], { excludeProtected: false, includeEphemeral: true });
+  for (const file of files) {
+    if (isEphemeralStateFile(file)) await rm(join(root, file), { force: true });
+  }
+}
+
 function excludedFromBackup(path: string, directory: boolean, includeSensitiveState: boolean, sensitiveExclusions: string[]): boolean {
   const normalized = directory ? `${path}/` : path;
   const exclusions = [
@@ -535,7 +581,9 @@ function excludedFromBackup(path: string, directory: boolean, includeSensitiveSt
     ...sensitiveExclusions
   ];
   return exclusions.some((excluded) =>
-    excluded.endsWith("/") ? normalized === excluded || normalized.startsWith(excluded) : normalized === excluded
+    excluded.endsWith("/")
+      ? path === excluded.slice(0, -1) || normalized === excluded || normalized.startsWith(excluded)
+      : normalized === excluded
   );
 }
 
@@ -582,7 +630,7 @@ async function copySqliteSnapshot(source: string, destination: string): Promise<
 async function validatePhysicalTree(root: string, label: string): Promise<void> {
   const metadata = await lstat(root);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`${label} root must be a physical directory`);
-  await payloadFiles(root, true, [], { excludeProtected: false });
+  await payloadFiles(root, true, [], { excludeProtected: false, ignoreLegacyBrowserProfiles: true });
 }
 
 async function secureTree(root: string): Promise<void> {

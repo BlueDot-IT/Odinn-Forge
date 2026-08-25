@@ -200,6 +200,8 @@ async function removeOwnedLock(lockPath: string, token: string, afterOwnerRead?:
 
 export async function ensureSecureStateDirectory(path: string) {
   await mkdir(path, { recursive: true, mode: 0o700 });
+  const metadata = await lstat(path);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`state path must be a physical directory: ${path}`);
   if (process.platform === "win32") await secureWindowsPath(path, true);
   else await chmod(path, 0o700);
   return path;

@@ -9,6 +9,9 @@ import { chromium } from "playwright-core";
 import type { ApprovalStore } from "./approvals.ts";
 import { assertPublicWebUrl, browserSecurityFingerprint, dnsLookupAll, pinnedAddressLookup, validateBrowserNetworkUrl, WEB_TIMEOUT_MS } from "./web.ts";
 import { readRecoveryJournalJson } from "./recovery-journal-file.ts";
+import { prepareBrowserProfileDirectory } from "./browser-profile-state.ts";
+
+export { prepareBrowserProfileDirectory } from "./browser-profile-state.ts";
 
 type NodeError = Error & { code?: string };
 
@@ -176,8 +179,7 @@ class BrowserManager {
       } catch (error) { if ((error as NodeError | undefined)?.code !== "ENOENT") this.handles.clear(); }
       this.handlesLoaded = true;
     }
-    const userDataDir = join(this.stateDir, "browser-profile");
-    await mkdir(userDataDir, { recursive: true });
+    const userDataDir = await prepareBrowserProfileDirectory(this.stateDir);
     const executablePath = await resolveChromiumExecutable();
     const headedRequested = process.env.ODINN_BROWSER_HEADLESS !== "1";
     const displayAvailable = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
