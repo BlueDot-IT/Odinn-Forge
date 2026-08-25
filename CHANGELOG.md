@@ -6,6 +6,13 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+Development version: `1.1.1-dev.1`.
+
+### Changed
+
+* pin the comparative benchmark to the published `v1.1.1-rc.0` candidate and
+  its verified archive checksum
+
 ## [1.1.1-rc.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0...v1.1.1-rc.0) (2026-08-25)
 
 ### Added
