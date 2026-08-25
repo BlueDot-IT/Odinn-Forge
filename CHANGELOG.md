@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.1.2](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.1...v1.1.2) (2026-08-25)
+
+### Fixed
+
+- Added authenticated, idempotent recovery for publishing an already verified staged release after a workflow interruption.
+
 ## [1.1.1](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.1-rc.0...v1.1.1) (2026-08-25)
 
 ### Changed
