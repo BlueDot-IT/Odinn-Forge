@@ -14,7 +14,7 @@ export function spawnPnpmSync(
     return spawnSync(activePackageManager, [...args], { ...options, shell: false });
   }
   if (process.platform === "win32") {
-    return spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "pnpm.cmd", ...args], { ...options, shell: false });
+    return spawnSync("pnpm.cmd", [...args], { ...options, shell: true });
   }
   return spawnSync("pnpm", [...args], { ...options, shell: false });
 }
