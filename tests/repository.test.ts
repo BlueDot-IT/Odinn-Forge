@@ -633,7 +633,7 @@ test("maintainer reconciliation serializes the exact target across every trigger
 test("daily Codex remediation is isolated, pinned, and draft-only", async () => {
   const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
   const ciDocs = await read("docs/ci-cd.md");
-  const remediationSha = "0c5f7b0dea200979ea96107b6856ed3dc5e7bcc0";
+  const remediationSha = "b16502b1bb0e897fd7664c240489fe5811418b46";
 
   assert.deepEqual(
     [...dispatcher.matchAll(/^\s+- cron: "([^"]+)"$/gmu)].map((match) => match[1]),
