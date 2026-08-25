@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { spawnPnpmSync } from "../scripts/lib/package-manager.ts";
 import * as applicationRoot from "../packages/application/src/index.ts";
 import {
   MAX_APPLICATION_CONTRACT_BYTES,
@@ -1193,7 +1194,7 @@ test("session page contract rejects projection drift, content leakage, and incon
 test("CLI and gateway producers compile against the explicit read contracts", () => {
   const repositoryRoot = join(import.meta.dirname, "..");
   for (const workspace of ["@odinn/gateway", "@odinn/cli"]) {
-    const result = spawnSync("corepack", ["pnpm", "--filter", workspace, "typecheck"], {
+    const result = spawnPnpmSync(["--filter", workspace, "typecheck"], {
       cwd: repositoryRoot,
       encoding: "utf8"
     });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import test from "node:test";
 
 import {
@@ -12,11 +12,31 @@ import {
   materializeHostCapabilityPlugin,
   toolSafetyDescriptor
 } from "../packages/kernel/src/index.ts";
+import { prepareBrowserProfileDirectory } from "../packages/kernel/src/browser.ts";
 import { capabilitiesForTool } from "../packages/policy/src/index.ts";
 
 const browserContext = (stateDir: string) => ({
   stateDir,
   approvalStore: createApprovalStore()
+});
+
+test("browser profiles remain owner-private and outside governed Odinn state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-browser-profile-contract-"));
+  try {
+    const stateDir = join(root, "state");
+    await mkdir(stateDir);
+    const profileDir = await prepareBrowserProfileDirectory(stateDir);
+    const profileRelativeToState = relative(stateDir, profileDir);
+    assert.ok(profileRelativeToState === ".." || profileRelativeToState.startsWith(`..${sep}`));
+    assert.equal(dirname(dirname(profileDir)), await realpath(root));
+    assert.match(basename(dirname(profileDir)), /^\.odinn-browser-profiles-/u);
+    assert.equal((await lstat(profileDir)).mode & 0o077, 0);
+    await rm(profileDir, { recursive: true });
+    await symlink(root, profileDir);
+    await assert.rejects(() => prepareBrowserProfileDirectory(stateDir), /physical directory/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("browser host capability materializes exactly its declared tools", () => {

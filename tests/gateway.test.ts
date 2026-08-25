@@ -5,7 +5,7 @@ process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -14,11 +14,28 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
+import { withGatewayTestHooks } from "../apps/gateway/src/testing.ts";
 import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/teams/src/index.ts";
 import { createApprovalStore, createRunLedger, loadAgent } from "../packages/kernel/src/index.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
+
+test("gateway rejects a symbolic-link state root", { skip: process.platform === "win32" }, async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-state-root-"));
+  const physicalState = join(fixtureRoot, "physical");
+  const linkedState = join(fixtureRoot, "linked");
+  try {
+    await mkdir(physicalState);
+    await symlink(physicalState, linkedState, "dir");
+    await assert.rejects(
+      () => createGatewayServer({ stateDir: linkedState, workspaceRoot: root }),
+      /physical directory/u
+    );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
 
 async function readSseIds(response: Response, count: number) {
   const reader = response.body!.getReader(); const decoder = new TextDecoder(); const ids: number[] = []; let buffer = "";
@@ -765,7 +782,11 @@ test("gateway governed workspace routes support preview/apply and stale/conflict
     }
   }, null, 2));
   await writeFile(join(workspaceRoot, "seed.txt"), "baseline");
-  const server = await createGatewayServer({ stateDir, workspaceRoot });
+  let requestError: unknown;
+  const server = await createGatewayServer(withGatewayTestHooks(
+    { stateDir, workspaceRoot },
+    { onRequestError: ({ error }) => { requestError = error; } }
+  ));
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
@@ -820,14 +841,19 @@ test("gateway governed workspace routes support preview/apply and stale/conflict
     assert.equal(mutatePreview.output?.status, "ready");
     assert.notEqual(mutatePreview.output?.applied, true);
 
-    const mutateApply = await postJson(`${base}/governed/workspace/mutate`, {
-      runId: "governed-mutate-apply",
-      capabilityToken: mutateApplyToken,
-      operation: "write",
-      path: "seed.txt",
-      content: "candidate-applied",
-      apply: true
-    });
+    let mutateApply;
+    try {
+      mutateApply = await postJson(`${base}/governed/workspace/mutate`, {
+        runId: "governed-mutate-apply",
+        capabilityToken: mutateApplyToken,
+        operation: "write",
+        path: "seed.txt",
+        content: "candidate-applied",
+        apply: true
+      });
+    } catch (error) {
+      assert.fail(`${error instanceof Error ? error.message : String(error)}; internal request error: ${requestError instanceof Error ? requestError.stack : String(requestError)}`);
+    }
     assert.equal(mutateApply.output?.applied, true);
     assert.equal(mutateApply.output?.preview, false);
     const checkpointId = mutateApply.output?.checkpointId;
@@ -1932,8 +1958,13 @@ async function postJson(url: any, body: any, expectedStatus = 200) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   });
-  assert.equal(response.status, expectedStatus);
-  return response.json();
+  const responseBody = await response.text();
+  assert.equal(
+    response.status,
+    expectedStatus,
+    `unexpected POST ${url} response: ${responseBody}`
+  );
+  return JSON.parse(responseBody);
 }
 
 async function waitForStatus(url: any) {

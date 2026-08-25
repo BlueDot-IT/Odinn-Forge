@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, link, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -593,7 +593,6 @@ test("rejects symlinked parents and database files", { skip: process.platform ==
   const root = await temporaryRoot();
   const real = join(root, "real");
   const linked = join(root, "linked");
-  const { mkdir } = await import("node:fs/promises");
   await mkdir(real);
   await symlink(real, linked, "dir");
   assert.throws(() => open(join(linked, "memory.sqlite")), /symbolic link/u);
@@ -615,6 +614,30 @@ test("rejects symlinked parents and database files", { skip: process.platform ==
   await writeFile(journalPath, "");
   await symlink(target, `${journalPath}-journal`, "file");
   assert.throws(() => open(journalPath), /sidecar/u);
+});
+
+test("accepts only the standard macOS temporary aliases", { skip: process.platform !== "darwin" }, async () => {
+  const root = await mkdtemp("/tmp/odinn-memory-index-macos-");
+  const platformTemporaryRoot = await mkdtemp(join(tmpdir(), "odinn-memory-index-platform-macos-"));
+  try {
+    await chmod(root, 0o700);
+    const index = open(join(root, "memory.sqlite"));
+    index.close();
+    await chmod(platformTemporaryRoot, 0o700);
+    const platformIndex = open(join(platformTemporaryRoot, "memory.sqlite"));
+    platformIndex.close();
+
+    const target = join(root, "target");
+    const linked = join(root, "attacker-link");
+    await mkdir(target, { mode: 0o700 });
+    await symlink(target, linked, "dir");
+    assert.throws(() => open(join(linked, "memory.sqlite")), /symbolic link/u);
+  } finally {
+    await Promise.all([
+      rm(root, { recursive: true, force: true }),
+      rm(platformTemporaryRoot, { recursive: true, force: true })
+    ]);
+  }
 });
 
 test("requires an owner-only immediate parent on POSIX", { skip: process.platform === "win32" }, async () => {

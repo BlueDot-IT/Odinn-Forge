@@ -347,7 +347,11 @@ function expectedFromNode(node: MutationNodeState): ExpectedState {
     type: node.kind === "missing" ? undefined : node.kind
   };
   if (node.bytes !== undefined) expected.bytes = node.bytes;
-  if (node.mode !== undefined) expected.mode = node.mode;
+  // Windows exposes synthetic stat mode bits and does not honor POSIX create
+  // modes. Verify the portable content and identity contract there without
+  // falsely rolling back a successful write because 0755 was reported as
+  // the platform's synthetic file mode.
+  if (process.platform !== "win32" && node.mode !== undefined) expected.mode = node.mode;
   if (node.digest !== undefined) expected.digest = node.digest;
   return expected;
 }

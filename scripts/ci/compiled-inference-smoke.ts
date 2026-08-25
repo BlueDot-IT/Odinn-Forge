@@ -1,30 +1,20 @@
-import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { runInferenceProtocolSmoke } from "./inference-smoke.ts";
+import { spawnPnpmSync } from "../lib/package-manager.ts";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
-function run(command: string, args: string[]): void {
-  const result = spawnSync(command, args, {
-    cwd: root,
-    encoding: "utf8",
-    env: process.env,
-    shell: process.platform === "win32"
-  });
-  if (result.stdout) process.stdout.write(result.stdout);
-  if (result.stderr) process.stderr.write(result.stderr);
-  if (result.error || result.status !== 0) {
-    throw new Error(
-      `${command} ${args.join(" ")} failed: ${result.error?.message ?? `exit ${result.status ?? "unknown"}`}`
-    );
-  }
-}
-
 export async function runCompiledInferenceSmoke(): Promise<void> {
-  run("corepack", ["pnpm", "build"]);
-  run("corepack", ["pnpm", "release:package"]);
+  const build = spawnPnpmSync(["build"], { cwd: root, encoding: "utf8", env: process.env });
+  if (build.stdout) process.stdout.write(build.stdout);
+  if (build.stderr) process.stderr.write(build.stderr);
+  if (build.error || build.status !== 0) throw new Error(`pnpm build failed: ${build.error?.message ?? `exit ${build.status ?? "unknown"}`}`);
+  const packaged = spawnPnpmSync(["release:package"], { cwd: root, encoding: "utf8", env: process.env });
+  if (packaged.stdout) process.stdout.write(packaged.stdout);
+  if (packaged.stderr) process.stderr.write(packaged.stderr);
+  if (packaged.error || packaged.status !== 0) throw new Error(`pnpm release:package failed: ${packaged.error?.message ?? `exit ${packaged.status ?? "unknown"}`}`);
 
   const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
   const packageRoot = join(root, "dist", "package-stage", `odinn-v${pkg.version}`);

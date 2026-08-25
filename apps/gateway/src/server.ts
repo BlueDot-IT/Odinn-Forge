@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, open, readFile, readdir, realpath, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
@@ -735,11 +735,16 @@ export async function createGatewayServer(options: any = {}) {
   const trustedHostedUserId = hosted ? normalizeHostedUserId(hostedUserId) : undefined;
   const trustedHostedTenantId = hosted ? normalizeHostedUserId(hostedTenantId ?? hostedUserId) : undefined;
   const tenantScope = createGatewayTenantScope({ hosted, userId: trustedHostedUserId, tenantId: trustedHostedTenantId });
-  const state = resolve(stateDir);
+  const requestedState = resolve(stateDir);
   const root = resolve(workspaceRoot);
   const version = await productVersion();
-  await ensureStateCompatibility(state, { applicationVersion: version, applicationCommit: await productCommit() });
-  await ensureSecureStateDirectory(state);
+  await ensureSecureStateDirectory(requestedState);
+  await ensureStateCompatibility(requestedState, { applicationVersion: version, applicationCommit: await productCommit() });
+  // macOS exposes standard temporary paths through system-owned aliases such
+  // as /var -> /private/var. Keep the public path for the security checks
+  // above, then hand stores the physical root so later containment checks do
+  // not mistake that platform layout for an escaped managed package.
+  const state = await realpath(requestedState);
   const config = await readConfig(state, { hosted });
   const startupSandboxConfig = normalizeSandboxConfig(config);
   let processRecoveryStartupError = false;
@@ -2258,6 +2263,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       return json(response, 404, { ok: false, error: "not found" });
     } catch (error: any) {
+      await testHooks?.onRequestError?.({ pathname: String(request.url ?? "/").split("?", 1)[0], error });
       return json(response, error.status ?? 400, publicError(error, requestId));
     }
   });

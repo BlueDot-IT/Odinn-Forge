@@ -5,6 +5,7 @@ import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { exit as exitProcess } from "node:process";
+import { spawnPnpmSync } from "../lib/package-manager.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const mode = process.argv[2];
@@ -35,11 +36,10 @@ function boundedEnvironment() {
 }
 
 function runPnpm(args: string[]) {
-  return spawnSync("corepack", ["pnpm", ...args], {
+  return spawnPnpmSync(args, {
     cwd: root,
     encoding: "utf8",
     env: boundedEnvironment(),
-    shell: process.platform === "win32"
   });
 }
 

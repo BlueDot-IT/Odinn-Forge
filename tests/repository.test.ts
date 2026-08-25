@@ -55,6 +55,17 @@ test("local package operations have conservative resource limits", async () => {
   assert.match(runner, /--workspace-concurrency=\$\{workspaceConcurrency\}/);
 });
 
+test("portable test entry point covers supported-platform release gates", async () => {
+  const pkg = JSON.parse(await read("package.json"));
+  const portable = String(pkg.scripts?.["test:portable"] ?? "");
+  assert.equal(portable, "node scripts/ci/portable.ts");
+  const orchestrator = await read("scripts/ci/portable.ts");
+  for (const gate of ["test:platform", "test:gateway", "test:invariants", "test:migrations", "test:lifecycle", "test:browser-lifecycle"]) {
+    assert.match(orchestrator, new RegExp(`"${gate}"`), gate);
+  }
+  assert.match(await read(".github/workflows/ci.yml"), /pnpm test:portable/u);
+});
+
 test("comparative harness remains external while Odinn publishes weekly results", async () => {
   const pkg = JSON.parse(await read("package.json"));
   assert.deepEqual(

@@ -208,8 +208,23 @@ function corpusFingerprint(entries: FingerprintEntry[]): string {
 
 function ensureSecureDatabasePath(input: string): string {
   if (typeof input !== "string" || input.length === 0 || input.includes("\0")) throw new TypeError("memory index path must be a non-empty path");
-  const path = resolve(input);
+  let path = resolve(input);
   if (!isAbsolute(path)) throw new TypeError("memory index path must resolve to an absolute path");
+  // macOS exposes /tmp and /var as fixed operating-system aliases beneath
+  // /private. Treat only those exact platform roots as lexical sugar, then
+  // apply the normal non-symlink walk to the canonical tree. Symlinks below
+  // either root remain forbidden.
+  if (process.platform === "darwin") {
+    for (const alias of ["/tmp", "/var"]) {
+      if (path !== alias && !path.startsWith(`${alias}/`)) continue;
+      const metadata = lstatSync(alias);
+      if (!metadata.isSymbolicLink() || resolve(realpathSync(alias)) !== `/private${alias}`) {
+        throw new Error(`memory index macOS ${alias} alias is not canonical`);
+      }
+      path = resolve(`/private${path}`);
+      break;
+    }
+  }
   const root = parse(path).root;
   let cursor = root;
   for (const part of path.slice(root.length).split(sep).filter(Boolean).slice(0, -1)) {

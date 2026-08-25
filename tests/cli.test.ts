@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { SqliteAuditStore } from "../packages/store-sqlite/src/audit.ts";
+import { prepareBrowserProfileDirectory } from "../packages/kernel/src/browser.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -513,6 +514,56 @@ test("CLI state restore rejects symbolic links before copying the backup", async
   assert.match(restore.stderr, /symbolic link/);
   assert.equal(await readFile(join(state, "config.json"), "utf8"), "{}\n");
 });
+
+test("CLI audit and backup accept legacy Chromium links without copying them", { skip: process.platform === "win32" }, async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "odinn-cli-browser-lifecycle-"));
+  try {
+    const state = join(fixtureRoot, "state");
+    const backup = join(fixtureRoot, "backup");
+    const outside = join(fixtureRoot, "chromium-runtime");
+    const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], { cwd: root, encoding: "utf8" });
+    assert.equal(init.status, 0, init.stderr || init.stdout);
+    await mkdir(outside);
+    const legacyProfile = join(state, "browser-profile");
+    await mkdir(legacyProfile);
+    for (const link of ["RunningChromeVersion", "SingletonSocket", "SingletonCookie", "SingletonLock"]) {
+      await symlink(outside, join(legacyProfile, link));
+    }
+
+    const verify = spawnSync("node", ["apps/cli/src/cli.ts", "audit", "verify", "--allow-unsigned", "--state", state], {
+      cwd: root,
+      encoding: "utf8"
+    });
+    assert.equal(verify.status, 0, verify.stderr || verify.stdout);
+    assert.equal(JSON.parse(verify.stdout).valid, true);
+
+    const created = spawnSync("node", ["apps/cli/src/cli.ts", "state", "backup", "--output", backup, "--state", state], {
+      cwd: root,
+      encoding: "utf8"
+    });
+    assert.equal(created.status, 0, created.stderr || created.stdout);
+    const relocatedProfile = await prepareBrowserProfileDirectory(state);
+    for (const link of ["RunningChromeVersion", "SingletonSocket", "SingletonCookie", "SingletonLock"]) {
+      await access(join(relocatedProfile, link));
+    }
+    const manifest = JSON.parse(await readFile(join(backup, "backup-manifest.json"), "utf8"));
+    const physicalFiles = await recursiveFiles(backup);
+    assert.deepEqual(physicalFiles, [...manifest.files.map((file: { path: string }) => file.path), "backup-manifest.json"].sort());
+    assert.equal(physicalFiles.some((file) => file.startsWith("browser-profile/")), false);
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+async function recursiveFiles(directory: string, rootDirectory = directory): Promise<string[]> {
+  const files: string[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) files.push(...await recursiveFiles(path, rootDirectory));
+    else files.push(path.slice(rootDirectory.length + 1).replaceAll("\\", "/"));
+  }
+  return files.sort();
+}
 
 test("CLI onboarding configures a provider without storing a secret", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-provider-"));
