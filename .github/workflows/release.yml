@@ -11,6 +11,11 @@ on:
         description: Numeric GitHub draft release ID to verify and publish
         required: true
         type: string
+      resume_staged_assets:
+        description: Resume publication from assets already staged on the verified draft release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -29,6 +34,7 @@ jobs:
   verify:
     name: Verify release candidate
     needs: release-policy
+    if: ${{ !inputs.resume_staged_assets }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -97,6 +103,7 @@ jobs:
     needs:
       - release-policy
       - verify
+    if: ${{ !inputs.resume_staged_assets }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -150,6 +157,7 @@ jobs:
     needs:
       - release-policy
       - source-package
+    if: ${{ !inputs.resume_staged_assets }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -222,6 +230,7 @@ jobs:
     needs:
       - release-policy
       - stage-release-assets
+    if: ${{ always() && needs.release-policy.result == 'success' && (inputs.resume_staged_assets || needs.stage-release-assets.result == 'success') }}
     strategy:
       fail-fast: false
       matrix:
@@ -267,6 +276,7 @@ jobs:
       - source-package
       - stage-release-assets
       - validate-downloaded-release
+    if: ${{ always() && needs.release-policy.result == 'success' && needs.validate-downloaded-release.result == 'success' && (inputs.resume_staged_assets || (needs.source-package.result == 'success' && needs.stage-release-assets.result == 'success')) }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -283,9 +293,22 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: ${{ !inputs.resume_staged_assets }}
         with:
           name: odinn-npm-package
           path: dist/npm-package
+      - name: Recover npm package from verified staged release archive
+        if: ${{ inputs.resume_staged_assets }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          test "$TAG" = "v$version"
+          mkdir -p dist/resume-package dist/npm-package
+          gh release download "$TAG" --pattern "odinn-v$version.tar.gz" --dir dist/resume-package
+          tar -xzf "dist/resume-package/odinn-v$version.tar.gz" -C dist/npm-package
       - name: Revalidate draft release and exact tag commit
         id: tag
         shell: bash
