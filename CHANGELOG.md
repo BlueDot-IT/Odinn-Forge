@@ -6,10 +6,35 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.1.1-rc.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.0...v1.1.1-rc.0) (2026-08-25)
+
+### Added
+
+* add the pinned weekly GitHub-hosted comparative benchmark and generated
+  documentation publication flow
+* add the supported-platform `test:portable` gate across platform, Gateway,
+  invariant, migration, lifecycle, and real macOS browser-state validation
+
 ### Changed
 
-* advance the post-1.1.0 development version to `1.1.1-dev.0` while adding the
-  weekly GitHub-hosted comparative benchmark and generated documentation flow
+* place persistent Chromium profiles in a physically validated owner-private
+  directory outside governed state while preserving and relocating legacy
+  browser data
+* invoke pnpm without assuming Corepack is installed, including Windows command
+  shim behavior
+
+### Fixed
+
+* keep Chromium-managed symlinks from invalidating normal audit verification
+  and state backup operations
+* make backup contents exactly match their manifest, including rejection of
+  unexpected SQLite sidecars and empty directories
+* accept only the standard macOS `/tmp` and `/var` physical aliases while
+  retaining rejection of attacker-controlled symlink traversal
+* normalize validated Gateway state paths for macOS and reject terminal state
+  symlinks before canonicalization
+* avoid rolling back successful governed Windows writes because Windows reports
+  synthetic non-POSIX file modes
 
 ## [1.1.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.0.0...v1.1.0) (2026-08-20)
 
