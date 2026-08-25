@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
 import { assertReleaseCommit } from "./commit.ts";
 
+const PLAYWRIGHT_VERSION = "1.62.1";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const dist = join(root, "dist");
 const output = join(dist, "release");
@@ -115,7 +117,7 @@ const productionPackage = {
     "odinn-gateway": "bin/odinn-gateway.js"
   },
   engines: { node: ">=24.0.0" },
-  dependencies: { "playwright-core": "1.61.1" },
+  dependencies: { "playwright-core": PLAYWRIGHT_VERSION },
   license: pkg.license,
   repository: {
     type: "git",
@@ -235,7 +237,7 @@ for (const input of Object.keys(productionMeta.inputs ?? {})) {
 }
 const sbomPackages = [
   { name: pkg.name, version: pkg.version },
-  { name: "playwright-core", version: "1.61.1" },
+  { name: "playwright-core", version: PLAYWRIGHT_VERSION },
   ...bundledPackages.values()
 ].filter((entry, index, entries) => entries.findIndex((candidate) => candidate.name === entry.name && candidate.version === entry.version) === index);
 const sbom = {

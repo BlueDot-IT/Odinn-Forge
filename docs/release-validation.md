@@ -51,6 +51,14 @@ The packager archives `HEAD`, not uncommitted working-tree changes. Run the
 soak before checksums so its report is included in the final checksum set. If
 an artifact changes afterward, regenerate the checksums and rerun verification.
 
+The archive verifier rejects JavaScript that imports or resolves TypeScript
+runtime sources. Playwright 1.62 retains one Vite-generated
+`importAnalysisBuild.ts` source label as the inert nested base of compiled
+module-preload URLs in its recorder and trace-viewer assets. The verifier
+allows only that exact path-and-AST shape under the pinned Playwright package;
+direct TypeScript imports, URLs, workers, and all physical TypeScript files
+remain forbidden.
+
 ## Published RC2 identity (historical)
 
 The published `1.1.0-rc.2` candidate is immutable historical evidence. Its
