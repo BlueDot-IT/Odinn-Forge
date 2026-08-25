@@ -46,6 +46,12 @@ The three hard limits are:
   provider call when preserving that reserve is impossible. The terminal
   result reports the ceiling, reserve, last allocation, context window, and
   observed completion-token usage without changing tool or capability grants.
+- [x] Agent callers may declare a bounded JSON Schema subset for the final
+  assistant answer. Final content is duplicate-key checked, parsed, and schema
+  validated; one invalid answer receives exactly one bounded repair request,
+  and a second invalid answer fails closed without another provider call.
+  Parent results also project bounded nested-tool and child-run summaries with
+  call/run identity and terminal status, never raw tool input or output.
 - [x] Loopback-only gateway default, strict localhost/127.0.0.1/[::1] Host validation, per-state bearer token, browser bootstrap cookie, exact scheme/host/port checks for cookie-authenticated mutations, missing-Origin rejection for cookie mutations, request limits, content-bound idempotency keys, graceful shutdown, and reconnectable audit SSE.
 - [x] Opt-in remote multi-user host with mandatory TLS/public-origin configuration for non-loopback binds, scrypt password verification, login throttling, signed revocable sessions, logout, and separate state/workspace/gateway/browser boundaries per tenant.
 - [x] Browser approval gate, DNS-pinned local egress proxy, request/WebSocket interception, blocked service workers, domain/private-network policy, input redaction, and stale snapshot checks when an action is based on a snapshot.
