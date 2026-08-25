@@ -1948,8 +1948,13 @@ async function postJson(url: any, body: any, expectedStatus = 200) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   });
-  assert.equal(response.status, expectedStatus);
-  return response.json();
+  const responseBody = await response.text();
+  assert.equal(
+    response.status,
+    expectedStatus,
+    `unexpected POST ${url} response: ${responseBody}`
+  );
+  return JSON.parse(responseBody);
 }
 
 async function waitForStatus(url: any) {
