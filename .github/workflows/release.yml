@@ -280,6 +280,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     permissions:
+      attestations: read
       contents: write
       id-token: write
     steps:
@@ -301,14 +302,40 @@ jobs:
         if: ${{ inputs.resume_staged_assets }}
         shell: bash
         env:
+          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           version="$(node -p "require('./package.json').version")"
           test "$TAG" = "v$version"
-          mkdir -p dist/resume-package dist/npm-package
-          gh release download "$TAG" --pattern "odinn-v$version.tar.gz" --dir dist/resume-package
-          tar -xzf "dist/resume-package/odinn-v$version.tar.gz" -C dist/npm-package
+          mkdir -p dist/resume-assets dist/npm-package
+          gh release download "$TAG" --dir dist/resume-assets
+          while IFS= read -r asset; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"
+          done < <(find dist/resume-assets -maxdepth 1 -type f -print | sort)
+          ODINN_RELEASE_COMMIT="$EXPECTED_COMMIT" node scripts/release/verify-downloaded-assets.ts dist/resume-assets
+          tar -xzf "dist/resume-assets/odinn-v$version.tar.gz" -C dist/npm-package
+          package_manifest="dist/npm-package/odinn-v$version/package.json"
+          release_info="dist/npm-package/odinn-v$version/release-info.json"
+          PACKAGE_MANIFEST="$package_manifest" RELEASE_INFO="$release_info" EXPECTED_VERSION="$version" \
+            EXPECTED_COMMIT="$EXPECTED_COMMIT" node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+
+          const manifestPath = process.env.PACKAGE_MANIFEST;
+          const releaseInfoPath = process.env.RELEASE_INFO;
+          const expectedVersion = process.env.EXPECTED_VERSION;
+          const expectedCommit = process.env.EXPECTED_COMMIT;
+          const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+          const releaseInfo = JSON.parse(await readFile(releaseInfoPath, "utf8"));
+          if (manifest.name !== "odinn" || manifest.version !== expectedVersion || manifest.private !== false) {
+            throw new Error("staged archive package metadata is not the expected public Odinn package");
+          }
+          if (releaseInfo.version !== expectedVersion || releaseInfo.commit !== expectedCommit ||
+              releaseInfo.distributionName !== "@bluedot-it/odinn") {
+            throw new Error("staged archive release identity does not authorize the npm distribution transform");
+          }
+          await writeFile(manifestPath, `${JSON.stringify({ ...manifest, name: "@bluedot-it/odinn" }, null, 2)}\n`);
+          NODE
       - name: Revalidate draft release and exact tag commit
         id: tag
         shell: bash
