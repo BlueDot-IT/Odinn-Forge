@@ -1009,7 +1009,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
     ? await learnFromConversation(memoryStore, messages, memoryScope, (toolInput: any) => runMemoryTool("memory.suggest", toolInput, "automatic memory suggestion"))
     : { suggested: [], skipped: [] };
   const compacted = memoryStore && canCompactMemory && input.sessionId && memoryOptions.autoCompact && messages.length >= memoryOptions.compactAfter
-    ? await runMemoryTool("memory.compact", { sessionId: input.sessionId, messages }, "automatic session memory compaction")
+    ? await runMemoryTool("memory.compact", { sessionId: input.sessionId, messages, ...(input.taskState === undefined ? {} : { taskState: input.taskState }) }, "automatic session memory compaction")
     : undefined;
   const latestUserMessage = [...messages].reverse().find((message: any) => message.role === "user");
   const recallStartedAt = Date.now();

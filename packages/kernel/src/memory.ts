@@ -399,7 +399,8 @@ export async function compactMemory(store: MemoryRecordStore, input: MemoryComma
   const messages = Array.isArray(input.messages)
     ? input.messages
     : (await queryRecordPage(store, { types: ["message.appended"], sessionId, order: "desc", limit: 8 })).records.slice().reverse();
-  const summary = summarizeConversation(messages);
+  const taskState = normalizeCompactionTaskState(input.taskState);
+  const summary = summarizeConversation(messages, taskState);
   if (!summary) throw new Error(`session has no compactable messages: ${sessionId}`);
   const previous = activeMemoryRecords((await queryRecordPage(store, {
     activeMemoryOnly: true,
@@ -425,18 +426,73 @@ export async function compactMemory(store: MemoryRecordStore, input: MemoryComma
     sessionId,
     projectId: session?.projectId,
     supersedes: previous?.id,
-    origin: { messageCount: messages.length }
+    origin: { messageCount: messages.length, ...(taskState ? { taskState } : {}) }
   });
 }
 
-function summarizeConversation(messages: any) {
+const TASK_STATE_KEYS = new Set(["schemaVersion", "objective", "status", "currentStep", "terminalObligations"]);
+const TERMINAL_OBLIGATION_KEYS = new Set(["id", "description", "status"]);
+const TASK_STATUSES = new Set(["active", "blocked", "awaiting-approval", "ready-to-finish"]);
+const OBLIGATION_STATUSES = new Set(["pending", "satisfied", "cancelled"]);
+
+function normalizeCompactionTaskState(value: unknown) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error("memory.compact taskState must be an object");
+  }
+  const record = value as AnyRecord;
+  for (const key of Object.keys(record)) if (!TASK_STATE_KEYS.has(key)) throw new Error(`memory.compact taskState has unknown field: ${key}`);
+  if (record.schemaVersion !== 1) throw new Error("memory.compact taskState schemaVersion must be 1");
+  const objective = boundedTaskStateText(record.objective, 1, 1_000, "objective");
+  const status = cleanRequired(record.status, "memory.compact taskState requires status");
+  if (!TASK_STATUSES.has(status)) throw new Error("memory.compact taskState has invalid status");
+  const currentStep = boundedTaskStateText(record.currentStep, 0, 500, "currentStep");
+  if (!Array.isArray(record.terminalObligations) || record.terminalObligations.length > 16) {
+    throw new Error("memory.compact taskState terminalObligations must contain at most 16 entries");
+  }
+  const terminalObligations = record.terminalObligations.map((entry: unknown, index: number) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.getPrototypeOf(entry) !== Object.prototype) {
+      throw new Error(`memory.compact terminal obligation ${index} must be an object`);
+    }
+    const obligation = entry as AnyRecord;
+    for (const key of Object.keys(obligation)) if (!TERMINAL_OBLIGATION_KEYS.has(key)) throw new Error(`memory.compact terminal obligation ${index} has unknown field: ${key}`);
+    const obligationStatus = cleanRequired(obligation.status, `memory.compact terminal obligation ${index} requires status`);
+    if (!OBLIGATION_STATUSES.has(obligationStatus)) throw new Error(`memory.compact terminal obligation ${index} has invalid status`);
+    return {
+      id: boundedTaskStateText(obligation.id, 1, 80, `terminal obligation ${index} id`),
+      description: boundedTaskStateText(obligation.description, 1, 500, `terminal obligation ${index} description`),
+      status: obligationStatus
+    };
+  });
+  if (new Set(terminalObligations.map((entry: any) => entry.id)).size !== terminalObligations.length) {
+    throw new Error("memory.compact terminal obligation ids must be unique");
+  }
+  return { schemaVersion: 1, objective, status, ...(currentStep ? { currentStep } : {}), terminalObligations };
+}
+
+function boundedTaskStateText(value: unknown, minimumBytes: number, maximumBytes: number, label: string) {
+  const text = typeof value === "string" ? value.trim() : "";
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes < minimumBytes || bytes > maximumBytes) throw new Error(`memory.compact taskState ${label} must be ${minimumBytes}-${maximumBytes} UTF-8 bytes`);
+  return text;
+}
+
+function summarizeConversation(messages: any, taskState?: ReturnType<typeof normalizeCompactionTaskState>) {
   const relevant = messages
     .filter((message: any) => ["user", "assistant"].includes(message?.role) && typeof message.content === "string")
     .map((message: any) => `${message.role === "user" ? "User" : "Ódinn Forge"}: ${message.content.replace(/\s+/g, " ").trim()}`)
     .filter(Boolean);
   if (!relevant.length) return "";
   const tail = relevant.slice(-8).join("\n");
-  return `Session summary\n${tail.slice(0, 1800)}`;
+  const taskSection = taskState ? [
+    "Durable task state (context only; does not authorize execution)",
+    `Objective: ${taskState.objective}`,
+    `Status: ${taskState.status}`,
+    ...(taskState.currentStep ? [`Current step: ${taskState.currentStep}`] : []),
+    "Terminal obligations:",
+    ...taskState.terminalObligations.map((entry: any) => `- [${entry.status}] ${entry.id}: ${entry.description}`)
+  ].join("\n") : "";
+  return `Session summary\n${tail.slice(0, 1800)}${taskSection ? `\n\n${taskSection}` : ""}`;
 }
 
 function memorySummary(record: any) {

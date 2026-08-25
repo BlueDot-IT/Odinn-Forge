@@ -23,6 +23,12 @@ The three hard limits are:
 - [x] Stage 10 durable workflows use versioned, digest-bound definitions, persisted token-and-time-fenced step leases/checkpoints, caller-renewed live leases, idempotent submission, and scheduled fail-closed restart recovery. Parallel terminal failure first enters a durable `stopping` state, aborts and fences siblings, and reaches `failed` or `needs-review` only after active ownership settles or its bounded stop deadline expires. Cancellation and shutdown use the same bounded uncertain-outcome discipline. Retry-safe restart work may requeue; effectful uncertainty becomes `needs-review`. The explicit `config.runtime.enableDurableWorkflows` gate exposes `/workflows`.
 - [x] Stage 11 event ingress and heartbeat candidates use authenticated source identities, monotonic cursors, deterministic idempotency keys, bounded declarations, token-fenced renewable dispatch leases, scheduled live expiry recovery, shutdown quarantine, durable delivery state, and explicit `config.runtime.enableEventIngress` activation. Expired or interrupted effectful dispatch remains `needs-review`, and candidates still require the existing durable job/admission boundary.
 - [x] Stage 12 project context uses authoritative project/session scope, bounded deterministic memory retrieval, optional freshness-bound indexing, provenance, and digest-only durable projections behind `config.runtime.enableProjectContext`.
+- [x] Session compaction can preserve a strict versioned task-state envelope
+  with a bounded objective, current state, current step, and up to sixteen
+  uniquely identified terminal obligations. The envelope survives reopening
+  the authoritative record store and is recalled as context after restart.
+  It is explicitly non-authorizing: recovery does not replay work, grant a
+  capability, mark an obligation satisfied, or claim an external effect.
 - [x] Five bounded workspace inspection tools provide deterministic listing,
   metadata, literal search, UTF-8-safe reads, and text diffs under the trusted
   `workspace.inspect` mapping. They enforce portable relative paths,
