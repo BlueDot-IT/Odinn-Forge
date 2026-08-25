@@ -31,7 +31,7 @@ test("package-manager subprocesses fall back to pnpm on PATH", async () => {
   const bin = join(root, "bin");
   await mkdir(bin);
   const launcher = join(bin, process.platform === "win32" ? "pnpm.cmd" : "pnpm");
-  await writeFile(launcher, process.platform === "win32" ? "@echo off\r\n<nul set /p =%*\r\n" : "#!/bin/sh\nprintf '%s' \"$*\"\n");
+  await writeFile(launcher, process.platform === "win32" ? "@echo off\r\n<nul set /p =%*\r\nexit /b 0\r\n" : "#!/bin/sh\nprintf '%s' \"$*\"\n");
   if (process.platform !== "win32") await chmod(launcher, 0o700);
   const previous = process.env.npm_execpath;
   delete process.env.npm_execpath;
