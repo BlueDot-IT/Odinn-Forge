@@ -14,6 +14,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
+import { withGatewayTestHooks } from "../apps/gateway/src/testing.ts";
 import { TeamsChannelAdapter, teamsChannelPlugin } from "../adapters/channels/teams/src/index.ts";
 import { createApprovalStore, createRunLedger, loadAgent } from "../packages/kernel/src/index.ts";
 
@@ -781,7 +782,11 @@ test("gateway governed workspace routes support preview/apply and stale/conflict
     }
   }, null, 2));
   await writeFile(join(workspaceRoot, "seed.txt"), "baseline");
-  const server = await createGatewayServer({ stateDir, workspaceRoot });
+  let requestError: unknown;
+  const server = await createGatewayServer(withGatewayTestHooks(
+    { stateDir, workspaceRoot },
+    { onRequestError: ({ error }) => { requestError = error; } }
+  ));
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
@@ -836,14 +841,19 @@ test("gateway governed workspace routes support preview/apply and stale/conflict
     assert.equal(mutatePreview.output?.status, "ready");
     assert.notEqual(mutatePreview.output?.applied, true);
 
-    const mutateApply = await postJson(`${base}/governed/workspace/mutate`, {
-      runId: "governed-mutate-apply",
-      capabilityToken: mutateApplyToken,
-      operation: "write",
-      path: "seed.txt",
-      content: "candidate-applied",
-      apply: true
-    });
+    let mutateApply;
+    try {
+      mutateApply = await postJson(`${base}/governed/workspace/mutate`, {
+        runId: "governed-mutate-apply",
+        capabilityToken: mutateApplyToken,
+        operation: "write",
+        path: "seed.txt",
+        content: "candidate-applied",
+        apply: true
+      });
+    } catch (error) {
+      assert.fail(`${error instanceof Error ? error.message : String(error)}; internal request error: ${requestError instanceof Error ? requestError.stack : String(requestError)}`);
+    }
     assert.equal(mutateApply.output?.applied, true);
     assert.equal(mutateApply.output?.preview, false);
     const checkpointId = mutateApply.output?.checkpointId;

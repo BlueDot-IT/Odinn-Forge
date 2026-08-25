@@ -2263,6 +2263,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       return json(response, 404, { ok: false, error: "not found" });
     } catch (error: any) {
+      await testHooks?.onRequestError?.({ pathname: String(request.url ?? "/").split("?", 1)[0], error });
       return json(response, error.status ?? 400, publicError(error, requestId));
     }
   });

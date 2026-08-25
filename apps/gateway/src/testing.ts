@@ -5,6 +5,7 @@ type ApprovalJobClaimedTestEvent = {
 
 export type GatewayTestHooks = {
   afterApprovalJobClaimed?: (event: ApprovalJobClaimedTestEvent) => void | Promise<void>;
+  onRequestError?: (event: { pathname: string; error: unknown }) => void | Promise<void>;
 };
 
 const hooksByOptions = new WeakMap<object, Readonly<GatewayTestHooks>>();
