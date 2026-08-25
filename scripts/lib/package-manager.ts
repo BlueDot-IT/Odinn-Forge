@@ -13,6 +13,8 @@ export function spawnPnpmSync(
     }
     return spawnSync(activePackageManager, [...args], { ...options, shell: false });
   }
-  const command = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
-  return spawnSync(command, [...args], { ...options, shell: process.platform === "win32" });
+  if (process.platform === "win32") {
+    return spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "pnpm.cmd", ...args], { ...options, shell: false });
+  }
+  return spawnSync("pnpm", [...args], { ...options, shell: false });
 }

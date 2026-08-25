@@ -65,7 +65,9 @@ async function ensureOwnerPrivateDirectory(path: string, ownerUid: number): Prom
   }
   const metadata = await lstat(path);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("browser profile path must be a physical directory");
-  if (metadata.uid !== ownerUid) throw new Error("browser profile path must be owned by the current user");
+  if (process.platform !== "win32" && metadata.uid !== ownerUid) {
+    throw new Error("browser profile path must be owned by the current user");
+  }
   await chmod(path, 0o700);
   await readdir(path);
 }
