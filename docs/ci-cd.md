@@ -255,6 +255,9 @@ refresh, replace, or publish credentials and does not select another provider
 or model. Plaintext runtime state is removed before artifacts or repository
 writes. Publication occurs in a separate write-capable job only after the three
 reports pass strict metadata, provenance, and completeness validation.
+Failed matrices retain bounded adapter logs and per-trial progress journals for
+14 days. These diagnostics contain only disposable public benchmark fixtures
+and model results; runtime state and plaintext credentials are removed first.
 
 To inspect release output without publishing:
 

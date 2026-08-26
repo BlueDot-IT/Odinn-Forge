@@ -168,7 +168,11 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: weekly-benchmark-diagnostics-${{ github.run_id }}
-          path: ${{ runner.temp }}/*.log
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/harness-odinn/dist/benchmarks/**/*.progress.ndjson
+            ${{ runner.temp }}/harness-openclaw/dist/benchmarks/**/*.progress.ndjson
+            ${{ runner.temp }}/harness-hermes/dist/benchmarks/**/*.progress.ndjson
           if-no-files-found: ignore
           include-hidden-files: false
           retention-days: 14
