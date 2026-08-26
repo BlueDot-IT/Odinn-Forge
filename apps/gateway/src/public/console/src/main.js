@@ -10,6 +10,7 @@ import { relativeTime as sessionRelativeTime } from "./views/sessions.ts";
 import { cloneConfig as cloneStructuredConfig, configLines as structuredConfigLines, configNumber as structuredConfigNumber } from "./views/settings.ts";
 import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
 import { composeMessageWithLocalAttachments, readLocalTextAttachmentBatch, renderLocalAttachmentList } from "./components/local-attachments.ts";
+import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, isAgentGraphActive, renderAgentGraphDetail, renderAgentGraphRow } from "./views/agent-graphs.ts";
 
     let chatAttachments = [];
 
@@ -290,6 +291,7 @@ import { composeMessageWithLocalAttachments, readLocalTextAttachmentBatch, rende
         else $("session-list").innerHTML = '<div class="empty-state"><strong>Sessions are disabled by policy</strong><span>Grant the required workspace capabilities to manage conversations.</span></div>';
       }
       if (name === "tasks") refreshTasks().catch((error) => showOutput(error.message));
+      if (name === "delegation") refreshAgentGraphs().catch((error) => showOutput(error.message));
       if (name === "usage") {
         setActivityTab(options.activityTab || "overview");
         refreshUsage().catch((error) => showOutput(error.message));
@@ -2130,6 +2132,96 @@ import { composeMessageWithLocalAttachments, readLocalTextAttachmentBatch, rende
       $("session-list").innerHTML = Array.from(groups.entries()).map(([label, entries]) => '<div class="data-row data-group"><span class="data-group-label"><strong>' + escapeHtml(label) + '</strong> <span class="muted">' + escapeHtml(entries.length + " sessions") + '</span></span></div>' + entries.map(renderSessionRecord).join("")).join("") || '<div class="empty-state"><strong>No matching sessions</strong><span>Change the filters or create a new session.</span></div>';
     }
 
+    function selectedAgentGraph() {
+      return state.agentGraphs.find((graph) => graph.graphRunId === state.selectedAgentGraphId);
+    }
+
+    function renderSelectedAgentGraph(graph) {
+      const status = $("agent-graph-detail-status");
+      const cancel = $("agent-graph-cancel");
+      const reassign = $("agent-graph-reassign");
+      const checkpoint = $("agent-graph-checkpoint");
+      if (!graph) {
+        status.textContent = "No selection";
+        status.className = "chip";
+        cancel.disabled = true;
+        reassign.disabled = true;
+        checkpoint.disabled = true;
+        $("agent-graph-detail").innerHTML = '<div class="empty-state"><strong>Select delegated work</strong><span>Its child progress, budgets, result references, and terminal reason will appear here.</span></div>';
+        return;
+      }
+      status.textContent = agentGraphStatusLabel(graph.status);
+      status.className = "chip " + agentGraphStatusClass(graph.status);
+      cancel.disabled = !isAgentGraphActive(graph.status);
+      reassign.disabled = !canReassignAgentGraph(graph.status);
+      checkpoint.disabled = graph.status !== "completed" || !graph.nodes.some((node) => node.status === "completed" && node.resultDigest);
+      $("agent-graph-detail").innerHTML = renderAgentGraphDetail(graph);
+    }
+
+    function renderAgentGraphList() {
+      const status = $("agent-graph-status-filter").value;
+      const graphs = state.agentGraphs.filter((graph) => !status || graph.status === status);
+      const active = state.agentGraphs.filter((graph) => isAgentGraphActive(graph.status)).length;
+      const completed = state.agentGraphs.filter((graph) => graph.status === "completed").length;
+      const attention = state.agentGraphs.filter((graph) => ["failed", "cancelled", "needs-review"].includes(graph.status)).length;
+      $("agent-graph-total").textContent = String(state.agentGraphs.length);
+      $("agent-graph-active").textContent = String(active);
+      $("agent-graph-completed").textContent = String(completed);
+      $("agent-graph-review").textContent = String(attention);
+      $("nav-delegation-attention").textContent = String(attention);
+      $("nav-delegation-attention").className = "badge" + (attention ? " danger" : "");
+      $("agent-graph-count").textContent = graphs.length + (graphs.length === 1 ? " graph" : " graphs");
+      $("agent-graph-list").innerHTML = graphs.map((graph) => renderAgentGraphRow(graph, graph.graphRunId === state.selectedAgentGraphId)).join("") || '<div class="empty-state"><strong>No matching delegated work</strong><span>Change the status filter or start a child graph.</span></div>';
+      renderSelectedAgentGraph(selectedAgentGraph());
+    }
+
+    async function selectAgentGraph(graphRunId) {
+      const data = await api("/agent-graphs/" + encodeURIComponent(graphRunId));
+      const graph = data.graph;
+      const index = state.agentGraphs.findIndex((item) => item.graphRunId === graphRunId);
+      if (index >= 0) state.agentGraphs[index] = graph;
+      else state.agentGraphs.unshift(graph);
+      state.selectedAgentGraphId = graphRunId;
+      renderAgentGraphList();
+    }
+
+    async function refreshAgentGraphs() {
+      const data = await api("/agent-graphs?limit=200");
+      state.agentGraphs = data.graphs || [];
+      if (state.selectedAgentGraphId && !state.agentGraphs.some((graph) => graph.graphRunId === state.selectedAgentGraphId)) state.selectedAgentGraphId = "";
+      renderAgentGraphList();
+      if (!state.selectedAgentGraphId && state.agentGraphs.length) await selectAgentGraph(state.agentGraphs[0].graphRunId);
+    }
+
+    async function cancelSelectedAgentGraph() {
+      const graph = selectedAgentGraph();
+      if (!graph || !isAgentGraphActive(graph.status)) return;
+      if (!window.confirm("Stop this child graph? Any uncertain in-flight child work will be quarantined for review.")) return;
+      const result = await api("/agent-graphs/" + encodeURIComponent(graph.graphRunId) + "/cancel", { method: "POST" });
+      showOutput(result);
+      await refreshAgentGraphs();
+      await selectAgentGraph(graph.graphRunId);
+    }
+
+    function openAgentGraphReassignment() {
+      const graph = selectedAgentGraph();
+      if (!graph || !canReassignAgentGraph(graph.status)) return;
+      $("agent-graph-reassign-form").reset();
+      $("agent-graph-replacement-id").value = "agent-graph-reassignment-" + Date.now();
+      openDialog($("agent-graph-reassign-dialog"));
+    }
+
+    function openAgentGraphCheckpoint() {
+      const graph = selectedAgentGraph();
+      if (!graph || graph.status !== "completed") return;
+      const completed = graph.nodes.filter((node) => node.status === "completed" && node.resultDigest);
+      if (!completed.length) return;
+      $("agent-graph-checkpoint-form").reset();
+      $("agent-graph-checkpoint-node").innerHTML = completed.map((node) => '<option value="' + escapeHtml(node.nodeId) + '">' + escapeHtml(node.nodeId) + '</option>').join("");
+      $("agent-graph-checkpoint-run").value = "agent-graph-checkpoint-" + Date.now();
+      openDialog($("agent-graph-checkpoint-dialog"));
+    }
+
     async function refreshGoals() {
       const data = await api("/goals?limit=100");
       state.goals = data.goals || [];
@@ -2667,6 +2759,53 @@ import { composeMessageWithLocalAttachments, readLocalTextAttachmentBatch, rende
     $("session-status-filter").addEventListener("change", renderSessionTable);
     $("session-project-filter").addEventListener("change", renderSessionTable);
     $("session-group").addEventListener("change", renderSessionTable);
+    $("refresh-agent-graphs").addEventListener("click", () => refreshAgentGraphs().catch((error) => showOutput(error.message)));
+    $("agent-graph-status-filter").addEventListener("change", renderAgentGraphList);
+    $("agent-graph-list").addEventListener("click", (event) => {
+      const item = event.target.closest("[data-agent-graph-id]");
+      if (item) selectAgentGraph(item.dataset.agentGraphId).catch((error) => showOutput(error.message));
+    });
+    $("agent-graph-cancel").addEventListener("click", () => cancelSelectedAgentGraph().catch((error) => showOutput(error.message)));
+    $("agent-graph-reassign").addEventListener("click", openAgentGraphReassignment);
+    $("agent-graph-checkpoint").addEventListener("click", openAgentGraphCheckpoint);
+    $("agent-graph-reassign-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      const graph = selectedAgentGraph();
+      if (!graph) return;
+      try {
+        const replacement = JSON.parse($("agent-graph-replacement-json").value);
+        const replacementId = $("agent-graph-replacement-id").value.trim();
+        replacement.id = replacementId;
+        const result = await api("/agent-graphs/" + encodeURIComponent(graph.graphRunId) + "/reassign", {
+          method: "POST",
+          headers: { "content-type": "application/json", "idempotency-key": replacementId },
+          body: JSON.stringify({ expectedRequestDigest: graph.requestDigest, replacement })
+        });
+        closeDialog($("agent-graph-reassign-dialog"));
+        showOutput(result);
+        await refreshAgentGraphs();
+      } catch (error) { showOutput(error.message); }
+    });
+    $("agent-graph-checkpoint-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      const graph = selectedAgentGraph();
+      const node = graph?.nodes.find((item) => item.nodeId === $("agent-graph-checkpoint-node").value);
+      if (!graph || !node?.resultDigest) return;
+      try {
+        const payload = JSON.parse($("agent-graph-checkpoint-json").value);
+        const runId = $("agent-graph-checkpoint-run").value.trim();
+        const result = await api("/agent-graphs/" + encodeURIComponent(graph.graphRunId) + "/checkpoint", {
+          method: "POST",
+          headers: { "content-type": "application/json", "idempotency-key": runId },
+          body: JSON.stringify({ ...payload, runId, nodeId: node.nodeId, expectedResultDigest: node.resultDigest })
+        });
+        closeDialog($("agent-graph-checkpoint-dialog"));
+        showOutput(result);
+        await selectAgentGraph(graph.graphRunId);
+      } catch (error) { showOutput(error.message); }
+    });
     $("refresh-goals").addEventListener("click", () => refreshGoals().catch((error) => showOutput(error.message)));
     $("goal-query").addEventListener("input", () => refreshGoals().catch((error) => showOutput(error.message)));
     $("goal-status-filter").addEventListener("change", () => refreshGoals().catch((error) => showOutput(error.message)));

@@ -20,6 +20,8 @@ export const state: ConsoleState = {
       taskSelection: new Map(),
       selectedAgentId: "",
       agents: [],
+      agentGraphs: [],
+      selectedAgentGraphId: "",
       skills: [],
       selectedSkillId: "",
       projects: [],

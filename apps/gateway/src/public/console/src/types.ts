@@ -16,6 +16,31 @@ export type ConsoleSession = {
   [key: string]: unknown;
 };
 
+export type AgentGraphNode = {
+  nodeId: string;
+  manifestId: string;
+  status: string;
+  resultRef?: string;
+  resultDigest?: string;
+  errorCode?: string;
+  startedAt?: string;
+  settledAt?: string;
+};
+
+export type AgentGraphRun = {
+  graphRunId: string;
+  parentRunId: string;
+  requestDigest: string;
+  status: string;
+  maxConcurrency: number;
+  maxRunMs: number;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  errorCode?: string;
+  nodes: AgentGraphNode[];
+};
+
 export type ConsoleState = {
   status: Record<string, any> | null;
   runs: any[];
@@ -36,6 +61,8 @@ export type ConsoleState = {
   taskSelection: Map<string, boolean>;
   selectedAgentId: string;
   agents: any[];
+  agentGraphs: AgentGraphRun[];
+  selectedAgentGraphId: string;
   skills: any[];
   selectedSkillId: string;
   projects: any[];

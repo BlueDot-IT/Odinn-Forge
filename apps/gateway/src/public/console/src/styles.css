@@ -1343,7 +1343,7 @@
       .menu-chat {
         width: 100%;
       }
-      .overview-grid, .layout-grid, .split, .grid-2, .chat-shell, .capability-grid, .stat-strip, .record-grid {
+      .overview-grid, .layout-grid, .split, .grid-2, .chat-shell, .capability-grid, .stat-strip, .record-grid, .agent-graph-layout {
         grid-template-columns: 1fr;
       }
       .config-check-grid { grid-template-columns: 1fr; }
@@ -1485,6 +1485,15 @@
     .count-badge { display: inline-grid; place-items: center; min-width: 24px; height: 24px; border-radius: 999px; background: #222936; color: var(--muted); font-size: 12px; }
     .session-filters { display: grid; grid-template-columns: minmax(240px, 1fr) 190px 150px 150px; gap: 10px; padding: 12px 0; }
     .session-detail { margin-top: 14px; }
+    .agent-graph-layout { display: grid; grid-template-columns: minmax(420px, .9fr) minmax(0, 1.1fr); gap: 14px; align-items: start; }
+    .agent-graph-head, .agent-graph-row { display: grid; grid-template-columns: minmax(220px, 1.5fr) 130px 80px 110px; align-items: center; gap: 10px; width: 100%; }
+    .agent-graph-head { min-height: 36px; padding: 6px 10px; color: var(--muted); background: #171c24; font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+    .agent-graph-row { min-height: 64px; padding: 9px 10px; border: 0; border-bottom: 1px solid #242b35; border-radius: 0; background: transparent; color: var(--text); text-align: left; }
+    .agent-graph-row:hover, .agent-graph-row.selected { background: #17231f; }
+    .agent-graph-summary .item { display: grid; gap: 7px; min-height: 78px; }
+    .agent-graph-summary .item span { overflow-wrap: anywhere; }
+    .agent-graph-nodes { margin-top: 4px; }
+    .code-inline { font-family: var(--mono); font-size: 11px; }
     .usage-grid, .agent-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, .8fr); gap: 14px; }
     .projects-page { gap: 10px; }
     .project-layout { display: grid; grid-template-columns: minmax(280px, .8fr) minmax(0, 1.2fr); gap: 10px; align-items: start; }
