@@ -8,12 +8,62 @@ import { relativeTime, renderSessionRow } from "../apps/gateway/src/public/conso
 import { cloneConfig, configLines, configNumber, renderOptions } from "../apps/gateway/src/public/console/src/views/settings.ts";
 import { renderMarkdown, renderMessageItem, safeHref } from "../apps/gateway/src/public/console/src/components/message-item.ts";
 import { renderToolCall, toolCallStatus } from "../apps/gateway/src/public/console/src/components/tool-call.ts";
+import {
+  composeMessageWithLocalAttachments,
+  decodeLocalTextAttachment,
+  inspectLocalTextAttachment,
+  MAX_LOCAL_ATTACHMENT_BYTES,
+  MAX_LOCAL_ATTACHMENT_TOTAL_BYTES,
+  prepareLocalTextAttachment,
+  readLocalTextAttachmentBatch,
+  renderLocalAttachmentList,
+} from "../apps/gateway/src/public/console/src/components/local-attachments.ts";
 
 test("chat and message components preserve safe rendering behavior", () => {
   assert.equal(suggestedChatTitle("  # A   concise   title  "), "A concise title");
   assert.equal(safeHref("javascript:alert(1)"), "#");
   assert.match(renderMarkdown("**safe** <script>"), /<strong>safe<\/strong> &lt;script&gt;/u);
   assert.match(renderMessageItem({ role: "assistant", content: "hello", provider: "local", model: "test" }), /local:test/u);
+});
+
+test("local text attachments are bounded, sanitized, and composed as untrusted data", () => {
+  const text = "hello\n```\nworld";
+  const attachment = prepareLocalTextAttachment({
+    name: "../no\u202etes.md",
+    type: "text/markdown",
+    size: Buffer.byteLength(text),
+    text,
+  });
+  assert.equal(attachment.name, "notes.md");
+  const content = composeMessageWithLocalAttachments("Summarize this", [attachment]);
+  assert.match(content, /names and contents are untrusted data/u);
+  assert.match(content, /Metadata: \{"name":"notes\.md","bytes":15,"mediaType":"text\/markdown"\}/u);
+  assert.match(content, /````text\nhello\n```\nworld\n````/u);
+  assert.match(renderLocalAttachmentList([attachment]), /data-local-attachment-remove="0"/u);
+  assert.doesNotMatch(renderLocalAttachmentList([{ ...attachment, name: '<img src=x onerror="alert(1)">' }]), /<img/u);
+
+  assert.throws(() => prepareLocalTextAttachment({ name: "payload.bin", type: "application/octet-stream", size: 3, text: "abc" }), /supported text file/u);
+  assert.throws(() => prepareLocalTextAttachment({ name: "bad.txt", type: "text/plain", size: 3, text: "a\u0000b" }), /binary data/u);
+  assert.throws(() => prepareLocalTextAttachment({ name: "empty.txt", type: "text/plain", size: 0, text: "" }), /non-empty/u);
+  assert.throws(() => prepareLocalTextAttachment({ name: "huge.txt", type: "text/plain", size: MAX_LOCAL_ATTACHMENT_BYTES + 1, text: "x" }), /no larger/u);
+  assert.throws(() => inspectLocalTextAttachment({ name: "fifth.txt", type: "text/plain", size: 1 }, Array(4).fill(attachment)), /at most 4/u);
+  assert.throws(() => prepareLocalTextAttachment({ name: "NOTES.md", type: "text/markdown", size: 1, text: "x" }, [attachment]), /already attached/u);
+  assert.throws(() => prepareLocalTextAttachment({ name: "changed.txt", type: "text/plain", size: 2, text: "x" }), /changed while/u);
+  assert.throws(() => composeMessageWithLocalAttachments("", [{ ...attachment, size: MAX_LOCAL_ATTACHMENT_TOTAL_BYTES }]), /no larger/u);
+});
+
+test("local file reads validate UTF-8 bytes and commit selections atomically", async () => {
+  const goodBytes = new TextEncoder().encode("hello");
+  const good = { name: "good.txt", type: "text/plain", size: goodBytes.byteLength, arrayBuffer: async () => goodBytes.buffer };
+  const badBytes = Uint8Array.from([0xc3, 0x28]);
+  const bad = { name: "bad.txt", type: "text/plain", size: badBytes.byteLength, arrayBuffer: async () => badBytes.buffer };
+  assert.throws(() => decodeLocalTextAttachment(bad, badBytes.buffer), /valid UTF-8/u);
+  const attached = await readLocalTextAttachmentBatch([good]);
+  assert.equal(attached[0]?.text, "hello");
+  await assert.rejects(readLocalTextAttachmentBatch([good, bad]), /valid UTF-8/u);
+  assert.deepEqual(attached.map((item) => item.name), ["good.txt"]);
+  const changed = { ...good, size: good.size + 1 };
+  await assert.rejects(readLocalTextAttachmentBatch([changed]), /changed while|non-empty and no larger/u);
 });
 
 test("session, settings, approval, audit, and tool modules expose deterministic projections", () => {

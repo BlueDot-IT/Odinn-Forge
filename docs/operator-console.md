@@ -23,6 +23,25 @@ shared state and response shapes belong in `types.ts`, `state.ts`, or `api.ts`.
 Do not place credentials, raw secrets, or unredacted tool payloads in frontend
 state or rendered progress projections.
 
+## Chat and local text files
+
+The Chat composer can attach up to four local text files to one message. Each
+file is limited to 128 KiB and the combined attachment budget is 256 KiB. The
+browser accepts a bounded set of text and source-code formats, removes local
+path components and invisible formatting controls from displayed names, rejects
+empty, duplicate, binary, and invalid UTF-8 content, and verifies actual bytes
+against metadata after each read. Multi-file selections are atomic: one failure
+leaves the existing attachment list unchanged. Files are not
+uploaded to a separate storage service: their bounded text is composed into
+the authenticated session message, labeled as untrusted data, and cleared from
+the composer only after a successful send. A failed send retains the files for
+retry; changing chats clears them to prevent accidental cross-session delivery.
+
+Review files before attaching them. Their contents become part of the model
+context and the durable conversation record. Do not attach credentials,
+private keys, or other secrets. Unsupported binary, archive, image, audio, and
+video inputs are rejected by this local-text path.
+
 ## Projects, sessions, goals, and activity
 
 Projects group related sessions and goals through `/projects`. Sessions default to the built-in Workspace project and can be reassigned. Goals must belong to a project or a specific session; session-scoped goals also inherit that session's project. Sessions remain durable conversation records exposed through `/sessions` and `/sessions/<id>`.
