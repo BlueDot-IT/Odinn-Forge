@@ -8,6 +8,21 @@ The three hard limits are:
 - Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
 - External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
+## Frontend source boundaries
+
+The Vite-built console keeps its browser entrypoint as a composition layer over
+typed API and state bindings. User-facing behavior is grouped under
+`src/views/` for chat, sessions, settings, approvals, and audit. Reusable dialog,
+message, and tool-activity renderers live under `src/components/`. These are
+source-maintenance boundaries only: the Gateway still serves one deterministic,
+content-hashed production bundle with the same restrictive content security
+policy and authenticated API boundary.
+
+New console behavior belongs in the corresponding view or component module;
+shared state and response shapes belong in `types.ts`, `state.ts`, or `api.ts`.
+Do not place credentials, raw secrets, or unredacted tool payloads in frontend
+state or rendered progress projections.
+
 ## Projects, sessions, goals, and activity
 
 Projects group related sessions and goals through `/projects`. Sessions default to the built-in Workspace project and can be reassigned. Goals must belong to a project or a specific session; session-scoped goals also inherit that session's project. Sessions remain durable conversation records exposed through `/sessions` and `/sessions/<id>`.

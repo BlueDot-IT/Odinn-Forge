@@ -1,4 +1,6 @@
-export const state = {
+import type { ConsoleState } from "./types.ts";
+
+export const state: ConsoleState = {
       status: null,
       runs: [],
       selectedGoalId: "",

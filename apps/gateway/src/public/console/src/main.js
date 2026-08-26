@@ -1,6 +1,14 @@
-import { $ } from "./dom.js";
-import { api, streamApi } from "./api.js";
-import { state } from "./state.js";
+import { $ } from "./dom.ts";
+import { api, streamApi } from "./api.ts";
+import { state } from "./state.ts";
+import { renderChatMessages as renderChatMessagesView, suggestedChatTitle as suggestedChatTitleView } from "./views/chat.ts";
+import { renderApproval as renderApprovalView } from "./views/approvals.ts";
+import { toolCallStatus } from "./components/tool-call.ts";
+import { closeDialog, openDialog } from "./components/dialog.ts";
+import { escapeHtml, renderMarkdown, safeHref } from "./components/message-item.ts";
+import { relativeTime as sessionRelativeTime } from "./views/sessions.ts";
+import { cloneConfig as cloneStructuredConfig, configLines as structuredConfigLines, configNumber as structuredConfigNumber } from "./views/settings.ts";
+import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
 
     const advancedFeatureBrands = {"proof":{"name":"Runemark","descriptor":"Run verification","legacyName":"Proof"},"sentinel":{"name":"Gatewatch","descriptor":"Policy safety","legacyName":"Sentinel"},"rewind":{"name":"Norn Restore","descriptor":"Restore points","legacyName":"Rewind"},"darwin":{"name":"Raven Route","descriptor":"Model routing","legacyName":"Darwin"},"capabilities":{"name":"Rune Key","descriptor":"Scoped temporary access","legacyName":"Capability Tokens"},"capsules":{"name":"Saga Archive","descriptor":"Portable run bundles","legacyName":"Capsules"},"counterfactual":{"name":"Worldtree Paths","descriptor":"Scenario comparison","legacyName":"Counterfactual"}};
     const experimentalFeatures = {
@@ -126,104 +134,6 @@ import { state } from "./state.js";
         ? value
         : value?.error || value?.message || (value?.ok === false ? "Action failed." : "Action completed.");
       showToast(message, /error|fail|denied|unavailable|offline|invalid/i.test(String(message)) ? "error" : "status");
-    }
-
-    function escapeHtml(value) {
-      return String(value ?? "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#39;");
-    }
-
-    function safeHref(value) {
-      const raw = String(value || "").trim();
-      if (/^(https?:|mailto:)/i.test(raw)) return raw;
-      if (raw.startsWith("/")) return raw;
-      return "#";
-    }
-
-    function markdownInline(value) {
-      let text = escapeHtml(value);
-      const code = [];
-      const codeSpan = new RegExp(String.fromCharCode(96) + "([^" + String.fromCharCode(96) + "\n]+)" + String.fromCharCode(96), "g");
-      text = text.replace(codeSpan, (_, content) => {
-        const key = "ODINNCODE" + code.length + "";
-        code.push("<code>" + content + "</code>");
-        return key;
-      });
-      text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_, alt, href, title) => {
-        const label = alt || "Image";
-        return '<span class="markdown-image-alt" role="img" aria-label="' + label + '"' + (title ? ' title="' + title + '"' : "") + ">[Image: " + label + "]</span>";
-      });
-      text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_, label, href, title) => {
-        const safe = safeHref(href);
-        return '<a href="' + escapeHtml(safe) + '" target="_blank" rel="noreferrer noopener"' + (title ? ' title="' + title + '"' : "") + ">" + label + "</a>";
-      });
-      text = text.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-      text = text.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
-      text = text.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
-      text = text.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
-      text = text.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1<em>$2</em>");
-      return text.replace(/ODINNCODE(\d+)/g, (_, index) => code[Number(index)] || "");
-    }
-
-    function renderMarkdown(source) {
-      const lines = String(source ?? "").replaceAll("\r", "").split("\n");
-      const out = [];
-      let paragraph = [];
-      let list = null;
-      let code = null;
-      const flushParagraph = () => {
-        if (paragraph.length) {
-          out.push("<p>" + markdownInline(paragraph.join(" ")) + "</p>");
-          paragraph = [];
-        }
-      };
-      const closeList = () => {
-        if (!list) return;
-        out.push("</" + list.type + ">");
-        list = null;
-      };
-      for (const line of lines) {
-        const fence = line.match(new RegExp("^\s*" + String.fromCharCode(96).repeat(3) + "(.*)$"));
-        if (fence) {
-          flushParagraph();
-          closeList();
-          if (!code) code = { lang: fence[1].trim(), lines: [] };
-          else {
-            out.push('<pre><code class="language-' + escapeHtml(code.lang || "text") + '">' + escapeHtml(code.lines.join("\n")) + "</code></pre>");
-            code = null;
-          }
-          continue;
-        }
-        if (code) { code.lines.push(line); continue; }
-        if (!line.trim()) { flushParagraph(); closeList(); continue; }
-        const heading = line.match(/^\s*(#{1,6})\s+(.+?)\s*#*\s*$/);
-        if (heading) { flushParagraph(); closeList(); const level = heading[1].length; out.push("<h" + level + ">" + markdownInline(heading[2]) + "</h" + level + ">"); continue; }
-        if (/^\s*(---+|\*\*\*+)\s*$/.test(line)) { flushParagraph(); closeList(); out.push("<hr>"); continue; }
-        const quote = line.match(/^\s*>\s?(.*)$/);
-        if (quote) { flushParagraph(); closeList(); out.push("<blockquote>" + markdownInline(quote[1]) + "</blockquote>"); continue; }
-        const item = line.match(/^\s*([-+*]|\d+\.)\s+(.*)$/);
-        if (item) {
-          flushParagraph();
-          const type = /\d+\./.test(item[1]) ? "ol" : "ul";
-          if (!list || list.type !== type) { closeList(); list = { type }; out.push("<" + type + ">"); }
-          let content = item[2];
-          const task = content.match(/^\[([ xX])\]\s+(.*)$/);
-          if (task) content = '<span class="task-list-item"><input type="checkbox" disabled' + (task[1].toLowerCase() === "x" ? " checked" : "") + ">" + markdownInline(task[2]) + "</span>";
-          else content = markdownInline(content);
-          out.push("<li>" + content + "</li>");
-          continue;
-        }
-        closeList();
-        paragraph.push(line.trim());
-      }
-      flushParagraph();
-      closeList();
-      if (code) out.push('<pre><code class="language-' + escapeHtml(code.lang || "text") + '">' + escapeHtml(code.lines.join("\n")) + "</code></pre>");
-      return out.join("") || '<p class="muted">No content.</p>';
     }
 
     function compactPath(value) {
@@ -932,13 +842,7 @@ import { state } from "./state.js";
     }
 
     function relativeTime(value) {
-      const at = Date.parse(value || "");
-      if (!Number.isFinite(at)) return "—";
-      const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
-      if (seconds < 60) return seconds + "s ago";
-      if (seconds < 3600) return Math.floor(seconds / 60) + "m ago";
-      if (seconds < 86400) return Math.floor(seconds / 3600) + "h ago";
-      return Math.floor(seconds / 86400) + "d ago";
+      return sessionRelativeTime(value);
     }
 
     function sessionDisplayTitle(sessionId) {
@@ -979,36 +883,7 @@ import { state } from "./state.js";
     }
 
     function renderChatMessages(messages) {
-      if (!messages.length) {
-        const configured = providerReady(state.status);
-        $("chat-thread").innerHTML = '<div class="chat-empty">' +
-          '<div class="chat-avatar"><img src="/odinn-logo.png" alt=""></div>' +
-          '<h1>Ódinn Forge</h1>' +
-          '<span class="pill ' + (configured ? "" : "warn") + '">' + (configured ? "Provider connected" : "Connect a model provider") + '</span>' +
-          '<p>' + (configured
-            ? 'Choose a model and send a message. Use Web tools when you need current information or work on a website.'
-            : 'Run odinn onboard in a terminal, then refresh this page.') + '</p>' +
-          (configured
-            ? '<div class="chat-prompts">' +
-              '<button class="chat-prompt" data-chat-prompt="What can you do?">What can you do?</button>' +
-              '<button class="chat-prompt" data-chat-prompt="Search the web for current information about Ódinn Forge.">Search the web</button>' +
-              '<button class="chat-prompt" data-chat-prompt="Open the browser workspace and show me the current page.">Open browser workspace</button>' +
-              '<button class="chat-prompt" data-chat-prompt="Summarize my recent activity and tasks.">Review recent activity</button>' +
-            '</div>'
-            : "") +
-          '</div>';
-        return;
-      }
-      $("chat-thread").innerHTML = messages.map((message) => {
-        const route = message.provider && message.model
-          ? '<span class="chip ok">' + escapeHtml(message.provider + ":" + message.model) + '</span>'
-          : "";
-        return '<div class="message ' + escapeHtml(message.role) + '">' +
-          '<div class="message-role">' + (message.role === "assistant" ? '<span class="message-assistant-head"><span class="message-avatar"><img src="/odinn-logo.png" alt=""></span><span>Ódinn Forge</span></span>' : escapeHtml(message.role)) + route + '</div>' +
-          '<div class="markdown-body">' + renderMarkdown(message.content) + '</div>' +
-        '</div>';
-      }).join("");
-      $("chat-thread").scrollTop = $("chat-thread").scrollHeight;
+      return renderChatMessagesView($, messages, providerReady(state.status));
     }
 
     async function createChat(title = "New chat") {
@@ -1045,11 +920,7 @@ import { state } from "./state.js";
     }
 
     function suggestedChatTitle(content) {
-      const title = String(content || "")
-        .replace(/^s*[-*#>]+s*/, "")
-        .replace(/s+/g, " ")
-        .trim();
-      return title.length > 38 ? title.slice(0, 35).trimEnd() + "..." : title;
+      return suggestedChatTitleView(content);
     }
 
     async function sendChatMessage(text, options = {}) {
@@ -1105,7 +976,7 @@ import { state } from "./state.js";
               renderChatMessages(state.messages);
             },
             (progress) => {
-              $("chat-status").textContent = progress.message || "Working…";
+              $("chat-status").textContent = toolCallStatus(progress);
             }
           );
       const reply = options.tool === "job.healthcheck"
@@ -1151,8 +1022,7 @@ import { state } from "./state.js";
     }
 
     function renderApproval(approval) {
-      const effectSummary = approval.effect?.summary || "Review the bounded effect details before deciding.";
-      return '<div class="item approval-card"><div class="item-line"><strong>' + escapeHtml(friendlyArea(approval.tool || "browser action")) + '</strong><span class="chip warn">waiting for you</span></div><div class="approval-summary">' + escapeHtml(effectSummary) + '</div><div class="row"><span class="muted">This permission will be used once.</span><button data-approve-id="' + escapeHtml(approval.id) + '" data-approval-action="approve" type="button">Allow once</button><button class="secondary" data-approve-id="' + escapeHtml(approval.id) + '" data-approval-action="deny" type="button">Deny</button></div></div>';
+      return renderApprovalView(approval, friendlyArea);
     }
 
     async function refreshApprovals() {
@@ -1258,16 +1128,15 @@ import { state } from "./state.js";
     }
 
     function cloneConfig(value) {
-      return JSON.parse(JSON.stringify(value && typeof value === "object" ? value : {}));
+      return cloneStructuredConfig(value && typeof value === "object" ? value : {});
     }
 
     function configLines(value) {
-      return String(value || "").split(/\r?\n/u).map((item) => item.trim()).filter(Boolean);
+      return structuredConfigLines(value);
     }
 
     function configNumber(value, fallback) {
-      const number = Number(value);
-      return Number.isFinite(number) ? number : fallback;
+      return structuredConfigNumber(value, fallback);
     }
 
     function configField(container, name) {
@@ -2265,7 +2134,7 @@ import { state } from "./state.js";
       $("goal-status-field").hidden = !goal;
       $("create-goal").hidden = Boolean(goal);
       $("update-goal").hidden = !goal;
-      $("goal-dialog").showModal();
+      openDialog($("goal-dialog"));
     }
 
     async function quickUpdateGoal(goal, status) {
@@ -2312,7 +2181,7 @@ import { state } from "./state.js";
       if (facet === "types") return friendlyEventTitle({ type: value });
       if (facet === "tools") return friendlyArea(value);
       if (facet === "actors") return friendlyActor(value);
-      return friendlyStatus(value);
+      return typedAuditFacetLabel(facet, value);
     }
 
     async function showRunDetail(runId) {
@@ -2728,7 +2597,7 @@ import { state } from "./state.js";
           });
           state.selectedGoalId = result.id;
         }
-        $("goal-dialog").close();
+        closeDialog($("goal-dialog"));
         showOutput(result);
         await refreshGoals();
         await refreshRuns();
@@ -2809,7 +2678,7 @@ import { state } from "./state.js";
       await refreshTasks();
     });
 
-    $("new-cron").addEventListener("click", () => { updateSchedulePattern(); $("cron-dialog").showModal(); });
+    $("new-cron").addEventListener("click", () => { updateSchedulePattern(); openDialog($("cron-dialog")); });
     $("refresh-cron").addEventListener("click", () => refreshCron().catch((error) => showOutput(error.message)));
     $("cron-query").addEventListener("input", () => refreshCron().catch((error) => showOutput(error.message)));
     ["cron-frequency", "cron-time", "cron-weekday"].forEach((id) => $(id).addEventListener("change", updateSchedulePattern));
@@ -2819,7 +2688,7 @@ import { state } from "./state.js";
       try {
         updateSchedulePattern();
         await api("/cron", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("cron-name").value, schedule: $("cron-schedule").value, timezone: $("cron-timezone").value, tool: $("cron-tool").value, input: JSON.parse($("cron-input").value || "{}") }) });
-        $("cron-dialog").close();
+        closeDialog($("cron-dialog"));
         await refreshCron();
       } catch (error) { showOutput(/JSON/i.test(error.message) ? "The advanced action input needs valid structured data." : error.message); }
     });
@@ -2903,7 +2772,7 @@ import { state } from "./state.js";
       $("manifest-fields").hidden = false;
       $("agent-manifest-error").textContent = "";
       $("agent-manifest").value = JSON.stringify(readAgentManifestFields(), null, 2);
-      $("agent-dialog").showModal();
+      openDialog($("agent-dialog"));
     });
     $("agent-advanced-toggle").addEventListener("change", (event) => {
       try { setAgentAdvanced(event.target.checked); }
@@ -2924,7 +2793,7 @@ import { state } from "./state.js";
         await api("/agents/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
         const result = await api("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
         state.selectedAgentId = result.agent.id;
-        $("agent-dialog").close();
+        closeDialog($("agent-dialog"));
         await refreshAgents();
         renderAgentDetail(result.agent);
       } catch (error) {
@@ -2960,7 +2829,7 @@ import { state } from "./state.js";
     });
     $("new-skill").addEventListener("click", () => {
       $("skill-form").reset();
-      $("skill-dialog").showModal();
+      openDialog($("skill-dialog"));
     });
     $("skill-form").addEventListener("submit", async (event) => {
       if (event.submitter?.value === "cancel") return;
@@ -2976,7 +2845,7 @@ import { state } from "./state.js";
         await api("/skills/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
         const result = await api("/skills", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
         state.selectedSkillId = result.skill.id;
-        $("skill-dialog").close();
+        closeDialog($("skill-dialog"));
         await refreshSkills();
         renderSkillDetail(state.skills.find((skill) => skill.id === state.selectedSkillId));
         showOutput(result);
@@ -3007,7 +2876,7 @@ import { state } from "./state.js";
 
     $("new-project").addEventListener("click", () => {
       $("project-form").reset();
-      $("project-dialog").showModal();
+      openDialog($("project-dialog"));
     });
     $("refresh-projects").addEventListener("click", () => refreshProjects().catch((error) => showOutput(error.message)));
     $("project-query").addEventListener("input", () => refreshProjects().catch((error) => showOutput(error.message)));
@@ -3021,7 +2890,7 @@ import { state } from "./state.js";
       try {
         const result = await api("/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("project-name").value.trim(), description: $("project-description").value.trim(), source: "console" }) });
         state.selectedProjectId = result.id;
-        $("project-dialog").close();
+        closeDialog($("project-dialog"));
         await refreshProjects();
         showOutput(result);
       } catch (error) { showOutput(error.message); }
@@ -3091,10 +2960,10 @@ import { state } from "./state.js";
     $("memory-new-toggle").addEventListener("click", () => {
       $("memory-form").reset();
       updateMemoryScopeOptions();
-      $("memory-dialog").showModal();
+      openDialog($("memory-dialog"));
     });
-    $("memory-dialog-close").addEventListener("click", () => $("memory-dialog").close());
-    $("memory-correction-dialog-close").addEventListener("click", () => $("memory-correction-dialog").close());
+    $("memory-dialog-close").addEventListener("click", () => closeDialog($("memory-dialog")));
+    $("memory-correction-dialog-close").addEventListener("click", () => closeDialog($("memory-correction-dialog")));
     $("memory-scope-type").addEventListener("change", updateMemoryScopeOptions);
     $("memory-list").addEventListener("click", (event) => {
       const item = event.target.closest("[data-memory-id]");
@@ -3116,7 +2985,7 @@ import { state } from "./state.js";
         }) });
         state.selectedMemoryId = result.id;
         setMemoryTab("saved", true);
-        $("memory-dialog").close();
+        closeDialog($("memory-dialog"));
         await refreshMemory();
         showOutput(result);
       } catch (error) { showOutput(error.message); }
@@ -3126,7 +2995,7 @@ import { state } from "./state.js";
       if (!memory) return;
       $("memory-correction-form").reset();
       $("memory-correction-text").value = memory.text || "";
-      $("memory-correction-dialog").showModal();
+      openDialog($("memory-correction-dialog"));
     });
     $("memory-correction-form").addEventListener("submit", async (event) => {
       if (event.submitter?.value === "cancel") return;
@@ -3135,7 +3004,7 @@ import { state } from "./state.js";
         const result = await api("/memory/corrections", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ targetId: state.selectedMemoryId, text: $("memory-correction-text").value.trim(), reason: $("memory-correction-reason").value.trim(), source: "console", authority: "user-correction" }) });
         state.selectedMemoryId = result.id;
         setMemoryTab("saved");
-        $("memory-correction-dialog").close();
+        closeDialog($("memory-correction-dialog"));
         await refreshMemory();
         showOutput(result);
       } catch (error) { showOutput(error.message); }

@@ -32,6 +32,24 @@ test("package metadata names Odinn Forge and pins the toolchain", async () => {
   );
 });
 
+test("operator console keeps typed view and component boundaries", async () => {
+  const root = "apps/gateway/src/public/console/src";
+  const required = [
+    "views/chat.ts", "views/sessions.ts", "views/settings.ts", "views/approvals.ts", "views/audit.ts",
+    "components/dialog.ts", "components/message-item.ts", "components/tool-call.ts",
+    "types.ts", "state.ts", "api.ts", "dom.ts"
+  ];
+  const sources = new Map(await Promise.all(required.map(async (path) => [path, await read(`${root}/${path}`)] as const)));
+  const entry = await read(`${root}/main.js`);
+  for (const path of required) assert.ok(sources.get(path)?.trim(), `${path} must remain a non-empty source boundary`);
+  for (const path of ["chat", "sessions", "settings", "approvals", "audit"]) assert.match(entry, new RegExp(`from ["']\\./views/${path}\\.ts["']`));
+  for (const path of ["dialog", "tool-call"]) assert.match(entry, new RegExp(`from ["']\\./components/${path}\\.ts["']`));
+  assert.match(await read(`${root}/state.ts`), /ConsoleState/u);
+  assert.match(await read(`${root}/api.ts`), /Promise<T>/u);
+  assert.match(sources.get("components/message-item.ts") ?? "", /renderMessageItem/u);
+  assert.match(sources.get("components/tool-call.ts") ?? "", /terminalReason/u);
+});
+
 test("routine dependency groups exclude runtime and Node typing migrations", async () => {
   const dependabot = await read(".github/dependabot.yml");
   assert.match(dependabot, /npm-minor-and-patch:[\s\S]*exclude-patterns: \["@types\/node", "playwright-core"\]/u);

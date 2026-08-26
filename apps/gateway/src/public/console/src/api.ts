@@ -1,25 +1,25 @@
-import { $ } from "./dom.js";
-import { state } from "./state.js";
+import { $ } from "./dom.ts";
+import { state } from "./state.ts";
 
-export async function api(path, options) {
+export async function api<T = any>(path: string, options?: RequestInit): Promise<T> {
       const response = await fetch(path, options);
       if (response.headers.get("x-odinn-hosted") === "true") {
         state.hosted = true;
         state.hostUser = response.headers.get("x-odinn-host-user") || "";
-        $("remote-signout").hidden = false;
-        $("gateway-context").textContent = state.hostUser ? "Remote tenant · " + state.hostUser : "Remote tenant gateway";
+        $("remote-signout")!.hidden = false;
+        $("gateway-context")!.textContent = state.hostUser ? "Remote tenant · " + state.hostUser : "Remote tenant gateway";
       }
       const data = await response.json();
       if (!response.ok || data.ok === false) throw new Error(data.error || response.statusText);
-      return data;
+      return data as T;
     }
-export async function streamApi(path, options, onDelta, onProgress = () => {}) {
+export async function streamApi<T = any>(path: string, options: RequestInit, onDelta: (delta: string) => void, onProgress: (progress: Record<string, any>) => void = () => {}): Promise<T> {
       const response = await fetch(path, options);
       if (!response.ok || !response.body) throw new Error(response.statusText || "stream request failed");
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let result;
+      let result: T | undefined;
       while (true) {
         const chunk = await reader.read();
         if (chunk.done) break;
@@ -33,7 +33,7 @@ export async function streamApi(path, options, onDelta, onProgress = () => {}) {
           const value = JSON.parse(raw);
           if (event === "delta") onDelta(value.delta || "");
           if (event === "progress") onProgress(value);
-          if (event === "result") result = value;
+          if (event === "result") result = value as T;
           if (event === "error") throw new Error(value.error || "stream failed");
         }
       }
