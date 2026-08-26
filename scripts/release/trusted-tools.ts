@@ -29,9 +29,14 @@ const PROCESS_LOADER_ENVIRONMENT = [
   "LD_PRELOAD", "LOCPATH", "NLSPATH"
 ];
 
-function samePhysicalPath(left: string, right: string): boolean {
-  const normalize = (value: string) => process.platform === "win32" ? resolve(value).toLowerCase() : resolve(value);
-  return normalize(left) === normalize(right);
+function isReviewedSystemToolPath(path: string): boolean {
+  const normalized = resolve(path).replaceAll("\\", "/");
+  if (process.platform === "darwin") {
+    return normalized.startsWith("/usr/bin/")
+      || normalized.startsWith("/System/Volumes/Data/usr/bin/")
+      || normalized.startsWith("/System/Volumes/Preboot/Cryptexes/OS/usr/bin/");
+  }
+  return normalized.startsWith("/usr/bin/");
 }
 
 export function trustedTool(name: TrustedToolName): string {
@@ -42,9 +47,9 @@ export function trustedTool(name: TrustedToolName): string {
       const metadata = lstatSync(candidate);
       if (!metadata.isFile() || metadata.isSymbolicLink()) continue;
       accessSync(candidate, constants.X_OK);
-      if (!samePhysicalPath(realpathSync(candidate), candidate)) continue;
+      if (!isReviewedSystemToolPath(realpathSync(candidate))) continue;
       const parent = dirname(candidate);
-      if (!samePhysicalPath(realpathSync(parent), parent)) continue;
+      if (!isReviewedSystemToolPath(`${realpathSync(parent)}/tool`)) continue;
       return candidate;
     } catch {
       // Try the next reviewed, absolute system location.

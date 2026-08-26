@@ -34,12 +34,25 @@ if (!Array.isArray(manifest.artifacts)
   throw new Error("release manifest must name both production archives");
 }
 const standaloneArtifacts = Array.isArray(manifest.standaloneArtifacts) ? manifest.standaloneArtifacts : [];
+const hasStandaloneArtifacts = standaloneArtifacts.length > 0;
 const expectedStandaloneNames = Object.keys(runtimePolicy.targets).sort().map((target) => `odinn-v${pkg.version}-standalone-${target}.${target === "win32-x64" ? "zip" : "tar.gz"}`);
-if (standaloneArtifacts.length !== expectedStandaloneNames.length
+if (!hasStandaloneArtifacts && (manifest.standaloneArtifacts !== undefined
+  || manifest.nodeRuntimePolicySha256 !== undefined
+  || manifest.standaloneSbom !== undefined
+  || provenanceHasStandaloneFields(manifest))) {
+  throw new Error("release manifest contains an incomplete controlled standalone runtime matrix");
+}
+if (hasStandaloneArtifacts && (standaloneArtifacts.length !== expectedStandaloneNames.length
   || manifest.nodeRuntimePolicySha256 !== policySha256
   || manifest.standaloneSbom !== "odinn-standalone.spdx.json"
-  || expectedStandaloneNames.some((name) => !standaloneArtifacts.some((entry: any) => entry.name === name))) {
+  || expectedStandaloneNames.some((name) => !standaloneArtifacts.some((entry: any) => entry.name === name)))) {
   throw new Error("release manifest must name the controlled standalone runtime matrix");
+}
+
+function provenanceHasStandaloneFields(value: any): boolean {
+  return value?.standaloneArtifacts !== undefined
+    || value?.nodeRuntimePolicySha256 !== undefined
+    || value?.standaloneSbom !== undefined;
 }
 for (const entry of standaloneArtifacts) {
   const policy = runtimePolicy.targets[entry.target as RuntimeTarget];
@@ -106,10 +119,10 @@ if (provenance.commit !== manifest.commit
   || provenance.runtimeSha256 !== manifest.runtimeSha256) {
   throw new Error("release provenance does not match the compiled package manifest");
 }
-if (provenance.nodeRuntimePolicySha256 !== policySha256
+if (hasStandaloneArtifacts && (provenance.nodeRuntimePolicySha256 !== policySha256
   || provenance.standaloneSbom !== manifest.standaloneSbom
   || JSON.stringify(provenance.standaloneArtifacts) !== JSON.stringify(standaloneArtifacts)
-  || JSON.stringify(provenance.archiveSha256) !== JSON.stringify(manifest.archiveSha256)) {
+  || JSON.stringify(provenance.archiveSha256) !== JSON.stringify(manifest.archiveSha256))) {
   throw new Error("release provenance does not bind the standalone runtime artifacts");
 }
 
@@ -233,6 +246,7 @@ if (sbomFiles.size !== zipContents.size || [...zipContents.keys()].some((path) =
   throw new Error("release SBOM does not cover the complete production package");
 }
 
+if (hasStandaloneArtifacts) {
 const standaloneSbom = JSON.parse(await readFile(join(releaseDir, manifest.standaloneSbom), "utf8"));
 if (standaloneSbom.spdxVersion !== "SPDX-2.3"
   || !Array.isArray(standaloneSbom.files)
@@ -318,6 +332,7 @@ for (const artifact of standaloneArtifacts) {
   } finally {
     await rm(destination, { recursive: true, force: true });
   }
+}
 }
 
 console.log(`verified ${sums.length} checksums, ${zipContents.size} equivalent compiled runtime files, and ${standaloneArtifacts.length} controlled standalone archives for Odinn Forge ${pkg.version}`);
