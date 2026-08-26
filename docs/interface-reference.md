@@ -110,6 +110,17 @@ the assigned local worktree under the separate `git.read` capability. See
 [Local Git inspection](git-inspection.md) for ref/path admission, durable
 redaction, diagnostics, and recovery behavior.
 
+### GitHub read contract
+
+`github.repository`, `github.issue`, `github.pull-request`, and
+`github.checks` provide bounded live reads from explicitly allowed repositories
+under the separate `github.read`, `network.access`, and
+`secret.reference.use` capabilities. The integration is disabled by default,
+uses only the fixed GitHub REST origin, refuses redirects and private network
+resolution, and persists digests rather than remote content. See
+[Bounded GitHub reads](github-read.md) for configuration, credentials,
+diagnostics, replay, and recovery behavior.
+
 ### `workspace.readText` compatibility contract
 
 `workspace.readText` reads one UTF-8 text file beneath the assigned workspace

@@ -2,6 +2,7 @@ export { capabilityTokensPlugin } from "./capability-tokens.ts";
 export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin } from "./browser.ts";
 export { COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin } from "./computer.ts";
 export { EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin } from "./email.ts";
+export { GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin } from "./github.ts";
 export { capsulesPlugin } from "./capsules.ts";
 export { counterfactualPlugin } from "./counterfactual.ts";
 export { materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./host-capability.ts";

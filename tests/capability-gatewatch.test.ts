@@ -28,7 +28,7 @@ test("capability registry is versioned, immutable, and separates process authori
   assert.equal(CAPABILITY_REGISTRY.every(Object.isFrozen), true);
   assert.equal(TOOL_CAPABILITY_REGISTRY.every((entry) => Object.isFrozen(entry) && Object.isFrozen(entry.capabilities)), true);
   assert.deepEqual(CAPABILITY_IDS, [
-    "workspace.inspect", "workspace.mutate", "workspace.patch", "git.read", "process.execute",
+    "workspace.inspect", "workspace.mutate", "workspace.patch", "git.read", "github.read", "process.execute",
     "process.interactive", "process.shell", "network.access", "browser.read",
     "browser.mutate", "computer.read", "email.read", "agent.delegate", "mcp.discover", "mcp.invoke",
     "skill.catalog", "skill.hydrate", "skill.manage", "event.register", "secret.reference.use", "restore.create", "restore.apply"
