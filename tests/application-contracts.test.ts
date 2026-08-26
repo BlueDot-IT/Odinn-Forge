@@ -1086,10 +1086,23 @@ test("status output contract rejects missing, extra, mistyped, accessor, and lea
 
 test("diagnostics output contract rejects unstable fields and unredacted material", () => {
   const fixture: any = structuredClone(readContractFixtures.diagnostics);
+  const legacy = structuredClone(fixture);
+  delete legacy.browserEngine;
+  assert.doesNotThrow(() => validateDiagnosticsReportV1(legacy));
   const { state: _missing, ...missing } = fixture;
   assert.throws(() => validateDiagnosticsReportV1(missing), /missing required field: state/u);
   assert.throws(() => validateDiagnosticsReportV1({ ...fixture, stateDirectory: "/private/state" }), /unknown field: stateDirectory/u);
   assert.throws(() => validateDiagnosticsReportV1({ ...fixture, jobs: { ...fixture.jobs, failed: "0" } }), /jobs\.failed must be a non-negative safe integer/u);
+  for (const browserEngine of [
+    { available: false, configured: false, source: "platform" },
+    { available: true, configured: true, source: "configured-unverified" },
+    { available: true, configured: false, source: "unavailable" }
+  ]) {
+    assert.throws(
+      () => validateDiagnosticsReportV1({ ...fixture, browserEngine }),
+      /browserEngine fields are inconsistent/u
+    );
+  }
   assert.throws(
     () => validateDiagnosticsReportV1({ ...fixture, privateKey: "-----BEGIN PRIVATE KEY-----" }),
     (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"

@@ -222,6 +222,11 @@
       "pending": 0,
       "ids": []
     },
+    "browserEngine": {
+      "available": true,
+      "configured": false,
+      "source": "platform"
+    },
     "browserRecovery": {
       "status": "clear",
       "pending": false

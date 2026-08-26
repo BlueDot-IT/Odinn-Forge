@@ -102,7 +102,7 @@ export type { GovernedMcpRuntimeOptions, McpRuntimeContext, McpRuntimeStatus, Mc
 export { ensureSecureStateDirectory, ensureSecureStateTree, isOwnerOnlyPath } from "@odinn/store-file";
 export { SqliteRecordStore } from "@odinn/store-sqlite";
 export { SqliteOperatorReadStore, SqliteWorkflowStore } from "@odinn/store-sqlite";
-export { closeBrowserManagers } from "./browser.ts";
+export { closeBrowserManagers, probeChromiumEngine } from "./browser.ts";
 export { normalizeSelfImprovementConfig } from "./improvements.ts";
 export { AGENT_BOOTSTRAP_FILE, AGENT_IDENTITY_FILES, AGENT_SDK_VERSION, DEFAULT_AGENT_ID, AgentRegistryStore, defaultMainAgentManifest, ensureMainAgent, loadAgent, provisionRuntimeAgent, validateAgentManifest } from "./agents.ts";
 export type { AgentExecutionBinding, AgentManifest, AgentRegistry, AgentRegistryMutationOptions, EnsureMainAgentOptions, RuntimeAgentProvisionOptions } from "./agents.ts";
