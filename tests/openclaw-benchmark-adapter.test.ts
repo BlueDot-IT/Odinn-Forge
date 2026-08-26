@@ -26,6 +26,7 @@ export function clearRuntimeAuthProfileStoreSnapshots() { snapshots = []; }
 export async function agentCommand(input) {
   const credential = snapshots[0]?.store?.profiles?.["openai:benchmark"];
   if (credential?.type !== "oauth" || credential?.provider !== "openai") throw new Error("missing benchmark OAuth snapshot");
+  console.log("[agents/tools] synthetic runtime diagnostic");
   return { payloads: [{ text: input.message.trim() }], meta: { agentMeta: { provider: "openai", model: input.model } } };
 }\n`);
   await writeFile(join(agentDir, "auth-profiles.json"), `${JSON.stringify({
@@ -52,6 +53,7 @@ export async function agentCommand(input) {
   const output = JSON.parse(result.stdout);
   assert.equal(output.payloads[0].text, "AGENT_BENCH_PREFLIGHT_OK");
   assert.equal(output.meta.agentMeta.model, "openai/gpt-5.6-luna");
+  assert.match(result.stderr, /\[agents\/tools\] synthetic runtime diagnostic/u);
   assert.equal((await readFile(prompt, "utf8")).trim(), output.payloads[0].text);
 });
 
