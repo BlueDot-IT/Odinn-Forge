@@ -1266,7 +1266,8 @@ export async function createGatewayServer(options: any = {}) {
     operationId,
     type,
     tool,
-    data
+    data,
+    controlDigest
   }: {
     action: "cancel" | "reassign" | "checkpoint";
     graphRunId: string;
@@ -1275,12 +1276,23 @@ export async function createGatewayServer(options: any = {}) {
     type: string;
     tool: string;
     data: Record<string, unknown>;
+    controlDigest?: string;
   }) => {
     const auditRun = await auditStore.readRun(parentRunId);
-    const exists = auditRun?.events?.some((event: any) => event.type === type
+    const existing = auditRun?.events?.find((event: any) => event.type === type
       && event.data?.graphRunId === graphRunId
       && event.data?.operationId === operationId);
-    if (exists) return false;
+    if (existing) {
+      if (controlDigest) {
+        const exactData = { ...data, graphRunId, operationId, controlDigest };
+        const exactMatch = existing.actor === tenantScope.principalId
+          && Object.entries(exactData).every(([key, value]) => stableJson(existing.data?.[key]) === stableJson(value));
+        if (!exactMatch) {
+          throw new GatewayError(409, "agent graph control intent conflicts with the signed immutable request");
+        }
+      }
+      return false;
+    }
     await testHooks?.beforeAgentGraphControlAudit?.({ action, graphRunId, operationId });
     await auditStore.append({
       at: new Date().toISOString(),
@@ -1290,7 +1302,7 @@ export async function createGatewayServer(options: any = {}) {
       tool,
       capability: action === "checkpoint" ? tool : "agent.delegate",
       decision: "allow",
-      data: { ...data, graphRunId, operationId }
+      data: { ...data, graphRunId, operationId, ...(controlDigest ? { controlDigest } : {}) }
     });
     return true;
   };
@@ -1340,11 +1352,30 @@ export async function createGatewayServer(options: any = {}) {
     return true;
   };
 
-  const submitDurableJob = async (
+  type PreparedDurableJobSubmission = {
+    id?: string;
+    requestHash: string;
+    scopedPayload: any;
+    effectiveTimeout?: number;
+    retrySafe: boolean;
+    existingSubmission?: { status: number; payload: any };
+  };
+
+  type AgentGraphReassignmentCreationControl = {
+    agentGraphReassignment: {
+      graphRunId: string;
+      replacementJobId: string;
+      replacementRequestHash: string;
+      replacementIdentityDigest: string;
+      trustedPrincipalId: string;
+    };
+  };
+
+  const prepareDurableJobSubmission = async (
     body: any,
     idempotencyKey?: string,
     delegation?: { reassignedFromGraphRunId: string; reassignedFromRequestDigest: string }
-  ): Promise<{ status: number; payload: any }> => {
+  ): Promise<PreparedDurableJobSubmission> => {
     const task = body.task && typeof body.task === "object" && !Array.isArray(body.task) ? body.task : body;
     if (task.tool === "agent.delegate" && body.kind !== "agent-graph") {
       throw new GatewayError(400, "agent.delegate jobs require kind=agent-graph");
@@ -1385,9 +1416,21 @@ export async function createGatewayServer(options: any = {}) {
       const existing = await supervisor.get(String(id));
       if (existing) {
         if (!durableJobReplayIdentityMatches({ existing, requestHash, scopedPayload })) {
-          return { status: 409, payload: { ok: false, error: "idempotency key was already used for a different request" } };
+          return {
+            id: String(id),
+            requestHash,
+            scopedPayload,
+            retrySafe: false,
+            existingSubmission: { status: 409, payload: { ok: false, error: "idempotency key was already used for a different request" } }
+          };
         }
-        return { status: 200, payload: { ok: true, replayed: true, job: existing } };
+        return {
+          id: String(id),
+          requestHash,
+          scopedPayload,
+          retrySafe: false,
+          existingSubmission: { status: 200, payload: { ok: true, replayed: true, job: existing } }
+        };
       }
     }
     const safety = toolSafetyDescriptor(task.tool, registry.get(task.tool));
@@ -1399,12 +1442,49 @@ export async function createGatewayServer(options: any = {}) {
       : task.tool === "agent.delegate"
         ? Math.min(Math.max(requestedGraphTimeout, 1), 300_000) + 30_000
         : body.timeoutMs;
-    const job = await supervisor.submit(
+    return {
+      ...(id ? { id: String(id) } : {}),
+      requestHash,
       scopedPayload,
-      { id: id ? String(id) : undefined, requestHash, timeoutMs: effectiveTimeout, retrySafe: safety.retrySafe === true }
-    );
+      effectiveTimeout,
+      retrySafe: safety.retrySafe === true
+    };
+  };
+
+  const commitDurableJobSubmission = async (
+    prepared: PreparedDurableJobSubmission,
+    creationControl?: AgentGraphReassignmentCreationControl
+  ): Promise<{ status: number; payload: any }> => {
+    if (prepared.existingSubmission) return prepared.existingSubmission;
+    let job;
+    try {
+      job = await supervisor.submit(
+        prepared.scopedPayload,
+        {
+          id: prepared.id,
+          requestHash: prepared.requestHash,
+          timeoutMs: prepared.effectiveTimeout,
+          retrySafe: prepared.retrySafe,
+          ...(creationControl ? { creationControl } : {})
+        }
+      );
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+      if (["AGENT_GRAPH_REASSIGNMENT_TARGET_RESERVED", "AGENT_GRAPH_REASSIGNMENT_RESERVATION_LOST"].includes(code)) {
+        throw new GatewayError(409, error instanceof Error ? error.message : "job id is reserved for agent graph reassignment");
+      }
+      throw error;
+    }
     return { status: 202, payload: { ok: true, job } };
   };
+
+  const submitDurableJob = async (
+    body: any,
+    idempotencyKey?: string,
+    delegation?: { reassignedFromGraphRunId: string; reassignedFromRequestDigest: string }
+  ): Promise<{ status: number; payload: any }> => commitDurableJobSubmission(
+    await prepareDurableJobSubmission(body, idempotencyKey, delegation)
+  );
 
   const server: any = createServer(async (request: any, response: any) => {
     const requestId = String(request.headers["x-odinn-request-id"] || randomUUID());
@@ -1986,13 +2066,29 @@ export async function createGatewayServer(options: any = {}) {
             reassignedFromGraphRunId: graphRunId,
             reassignedFromRequestDigest: graph.requestDigest
           };
-          const replacementRequestHash = hashRequest({ ...replacement, delegation });
+          const preparedSubmission = await prepareDurableJobSubmission(replacement, replacementId, delegation);
+          const replacementRequestHash = preparedSubmission.requestHash;
           const replacementIdentityDigest = hashRequest({
             tool: replacementTask.tool,
             delegation,
             scope: trustedParentScopeRecord,
             principalNamespace: replacementPrincipal,
             parentCapabilities: replacementCapabilities
+          });
+          const operationId = `reassign:${replacementId}`;
+          const scopeDigest = hashRequest(trustedParentScopeRecord);
+          const controlDigest = hashRequest({
+            action: "reassign",
+            graphRunId,
+            parentRunId: graph.parentRunId,
+            operationId,
+            sourceRequestDigest: graph.requestDigest,
+            replacementJobId: replacementId,
+            replacementRequestHash,
+            replacementIdentityDigest,
+            tenantId: tenantScope.tenantId,
+            principalId: tenantScope.principalId,
+            scopeDigest
           });
           try {
             runtime.ledger.reserveAgentGraphReassignment({
@@ -2010,7 +2106,6 @@ export async function createGatewayServer(options: any = {}) {
                 : 409;
             throw new GatewayError(status, error instanceof Error ? error.message : "agent graph reassignment reservation failed");
           }
-          const operationId = `reassign:${replacementId}`;
           try {
             await ensureGraphControlAuditIntent({
               action: "reassign",
@@ -2022,8 +2117,13 @@ export async function createGatewayServer(options: any = {}) {
               data: {
                 requestDigest: graph.requestDigest,
                 replacementJobId: replacementId,
-                replacementRequestHash
-              }
+                replacementRequestHash,
+                replacementIdentityDigest,
+                tenantId: tenantScope.tenantId,
+                trustedPrincipalId: tenantScope.principalId,
+                scopeDigest
+              },
+              controlDigest
             });
           } catch (error) {
             runtime.ledger.releaseAgentGraphReassignment({ graphRunId, replacementJobId: replacementId });
@@ -2031,7 +2131,15 @@ export async function createGatewayServer(options: any = {}) {
           }
           let submission;
           try {
-            submission = await submitDurableJob(replacement, replacementId, delegation);
+            submission = await commitDurableJobSubmission(preparedSubmission, {
+              agentGraphReassignment: {
+                graphRunId,
+                replacementJobId: replacementId,
+                replacementRequestHash,
+                replacementIdentityDigest,
+                trustedPrincipalId: tenantScope.principalId
+              }
+            });
           } catch (error) {
             runtime.ledger.releaseAgentGraphReassignment({ graphRunId, replacementJobId: replacementId });
             throw error;

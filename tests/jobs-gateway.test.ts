@@ -153,6 +153,10 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-agent-graph-"));
   let failGraphControlAudit: "cancel" | "reassign" | "checkpoint" | undefined;
   let lastGraphControlError: unknown;
+  let signalReassignmentAuditEntered!: () => void;
+  let releaseReassignmentAudit!: () => void;
+  const reassignmentAuditEntered = new Promise<void>((resolve) => { signalReassignmentAuditEntered = resolve; });
+  const reassignmentAuditRelease = new Promise<void>((resolve) => { releaseReassignmentAudit = resolve; });
   const provider = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
       response.writeHead(404).end();
@@ -201,7 +205,11 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
   const server = await createGatewayServer(withGatewayTestHooks(
     { stateDir, workspaceRoot: stateDir },
     {
-      beforeAgentGraphControlAudit: ({ action }) => {
+      beforeAgentGraphControlAudit: async ({ action, operationId }) => {
+        if (action === "reassign" && operationId === "reassign:stage7_race_replacement") {
+          signalReassignmentAuditEntered();
+          await reassignmentAuditRelease;
+        }
         if (action === failGraphControlAudit) throw new Error(`injected ${action} audit failure`);
       },
       onRequestError: ({ error }) => { lastGraphControlError = error; }
@@ -356,6 +364,15 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
     const foreignParentRunId = "stage7_graph_foreign_parent";
     const foreignParentGraphRunId = "graph:stage7-foreign-parent-fixture";
     const foreignParentRequestDigest = "7".repeat(64);
+    const raceParentRunId = "stage7_graph_race_parent";
+    const raceGraphRunId = "graph:stage7-race-fixture";
+    const raceRequestDigest = "8".repeat(64);
+    const staleIntentParentRunId = "stage7_graph_stale_intent_parent";
+    const staleIntentGraphRunId = "graph:stage7-stale-intent-fixture";
+    const staleIntentRequestDigest = "9".repeat(64);
+    const conflictingIntentParentRunId = "stage7_graph_conflicting_intent_parent";
+    const conflictingIntentGraphRunId = "graph:stage7-conflicting-intent-fixture";
+    const conflictingIntentRequestDigest = "a".repeat(64);
     const fixtureLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
     try {
       fixtureLedger.ensureRun({ runId: failedParentRunId, objective: "failed graph fixture" });
@@ -492,6 +509,24 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
         requestDigest: foreignParentRequestDigest,
         parentStatus: "failed"
       });
+      await createFailedFixture({
+        parentRunId: raceParentRunId,
+        graphRunId: raceGraphRunId,
+        requestDigest: raceRequestDigest,
+        parentStatus: "failed"
+      });
+      await createFailedFixture({
+        parentRunId: staleIntentParentRunId,
+        graphRunId: staleIntentGraphRunId,
+        requestDigest: staleIntentRequestDigest,
+        parentStatus: "failed"
+      });
+      await createFailedFixture({
+        parentRunId: conflictingIntentParentRunId,
+        graphRunId: conflictingIntentGraphRunId,
+        requestDigest: conflictingIntentRequestDigest,
+        parentStatus: "failed"
+      });
       const foreignParent = await jobs.get(foreignParentRunId);
       assert.ok(foreignParent);
       fixtureLedger.database.db.prepare("UPDATE runtime_jobs SET payload_json=? WHERE id=?")
@@ -623,6 +658,147 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
       body: JSON.stringify({ expectedRequestDigest: failedRequestDigest, replacement: { ...replacement, task: { ...replacement.task, input: { ...replacement.task.input, principalNamespace: "other-principal" } } } })
     });
     assert.equal(substituted.status, 403);
+
+    const raceCapability = await (await fetch(`${base}/capabilities/issue`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runId: "stage7_race_replacement", stepId: "stage7-race-replacement", toolName: "agent.delegate" })
+    })).json();
+    const raceReplacement = {
+      ...replacement,
+      id: "stage7_race_replacement",
+      task: {
+        ...replacement.task,
+        input: { ...replacement.task.input, capabilityToken: raceCapability.token }
+      }
+    };
+    const racingReassignment = fetch(`${base}/agent-graphs/${encodeURIComponent(raceGraphRunId)}/reassign`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": raceReplacement.id },
+      body: JSON.stringify({ expectedRequestDigest: raceRequestDigest, replacement: raceReplacement })
+    });
+    await Promise.race([
+      reassignmentAuditEntered,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("reassignment audit hook was not reached")), 5_000))
+    ]);
+    try {
+      const competingSubmission = await fetch(`${base}/jobs`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": raceReplacement.id },
+        body: JSON.stringify({ task: { tool: "text.echo", input: { text: "must not claim a reserved reassignment id" } } })
+      });
+      const competingBody = await competingSubmission.json();
+      assert.equal(competingSubmission.status, 409, JSON.stringify(competingBody));
+      assert.match(competingBody.error, /reserved for an exact agent graph reassignment/u);
+    } finally {
+      releaseReassignmentAudit();
+    }
+    const racingReassignmentResponse = await racingReassignment;
+    const racingReassignmentBody = await racingReassignmentResponse.json();
+    assert.equal(racingReassignmentResponse.status, 202, JSON.stringify(racingReassignmentBody));
+    const raceLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    try {
+      assert.equal(raceLedger.getAgentGraphReassignment(raceGraphRunId)?.status, "submitted");
+    } finally {
+      raceLedger.close();
+    }
+
+    const staleIntentCapability = await (await fetch(`${base}/capabilities/issue`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runId: "stage7_stale_intent_replacement", stepId: "stage7-stale-intent", toolName: "agent.delegate" })
+    })).json();
+    const staleIntentReplacement = {
+      ...replacement,
+      id: "stage7_stale_intent_replacement",
+      task: {
+        ...replacement.task,
+        input: { ...replacement.task.input, capabilityToken: staleIntentCapability.token }
+      }
+    };
+    const invalidBeforeIntent = await fetch(`${base}/agent-graphs/${encodeURIComponent(staleIntentGraphRunId)}/reassign`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": staleIntentReplacement.id },
+      body: JSON.stringify({
+        expectedRequestDigest: staleIntentRequestDigest,
+        replacement: { ...staleIntentReplacement, task: { ...staleIntentReplacement.task, tool: "text.echo" } }
+      })
+    });
+    assert.equal(invalidBeforeIntent.status, 400);
+    assert.match((await invalidBeforeIntent.json()).error, /kind=agent-graph requires task\.tool=agent\.delegate/u);
+    const auditBeforeCorrectedIntent = await (await fetch(`${base}/audit`)).json();
+    assert.equal(auditBeforeCorrectedIntent.some((event: any) => event.type === "agent.graph.reassignment.requested"
+      && event.data?.operationId === `reassign:${staleIntentReplacement.id}`), false);
+    const correctedIntent = await fetch(`${base}/agent-graphs/${encodeURIComponent(staleIntentGraphRunId)}/reassign`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": staleIntentReplacement.id },
+      body: JSON.stringify({ expectedRequestDigest: staleIntentRequestDigest, replacement: staleIntentReplacement })
+    });
+    const correctedIntentBody = await correctedIntent.json();
+    assert.equal(correctedIntent.status, 202, JSON.stringify(correctedIntentBody));
+    const correctedIntentLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    const correctedReservation = correctedIntentLedger.getAgentGraphReassignment(staleIntentGraphRunId);
+    correctedIntentLedger.close();
+    const auditAfterCorrectedIntent = await (await fetch(`${base}/audit`)).json();
+    const correctedIntentEvents = auditAfterCorrectedIntent.filter((event: any) => event.type === "agent.graph.reassignment.requested"
+      && event.data?.operationId === `reassign:${staleIntentReplacement.id}`);
+    assert.equal(correctedIntentEvents.length, 1);
+    assert.equal(correctedIntentEvents[0].actor, "local-gateway-user");
+    assert.equal(correctedIntentEvents[0].data.replacementRequestHash, correctedReservation?.replacementRequestHash);
+    assert.equal(correctedIntentEvents[0].data.replacementIdentityDigest, correctedReservation?.replacementIdentityDigest);
+    assert.match(correctedIntentEvents[0].data.controlDigest, /^[a-f0-9]{64}$/u);
+
+    const conflictingIntentId = "stage7_conflicting_intent_replacement";
+    const staleAudit = createAuditStore(join(stateDir, "audit.jsonl"));
+    try {
+      await staleAudit.append({
+        at: new Date().toISOString(),
+        runId: conflictingIntentParentRunId,
+        type: "agent.graph.reassignment.requested",
+        actor: "local-gateway-user",
+        tool: "agent.delegate",
+        capability: "agent.delegate",
+        decision: "allow",
+        data: {
+          graphRunId: conflictingIntentGraphRunId,
+          operationId: `reassign:${conflictingIntentId}`,
+          controlDigest: "0".repeat(64)
+        }
+      });
+    } finally {
+      staleAudit.close();
+    }
+    const conflictingIntentCapability = await (await fetch(`${base}/capabilities/issue`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runId: conflictingIntentId, stepId: "stage7-conflicting-intent", toolName: "agent.delegate" })
+    })).json();
+    const conflictingIntent = await fetch(`${base}/agent-graphs/${encodeURIComponent(conflictingIntentGraphRunId)}/reassign`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": conflictingIntentId },
+      body: JSON.stringify({
+        expectedRequestDigest: conflictingIntentRequestDigest,
+        replacement: {
+          ...replacement,
+          id: conflictingIntentId,
+          task: {
+            ...replacement.task,
+            input: { ...replacement.task.input, capabilityToken: conflictingIntentCapability.token }
+          }
+        }
+      })
+    });
+    const conflictingIntentBody = await conflictingIntent.json();
+    assert.equal(conflictingIntent.status, 409, JSON.stringify(conflictingIntentBody));
+    assert.match(conflictingIntentBody.error, /conflicts with the signed immutable request/u);
+    assert.equal((await fetch(`${base}/jobs/${conflictingIntentId}`)).status, 404);
+    const conflictingIntentLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    try {
+      assert.equal(conflictingIntentLedger.getAgentGraphReassignment(conflictingIntentGraphRunId), undefined);
+    } finally {
+      conflictingIntentLedger.close();
+    }
+
     failGraphControlAudit = "reassign";
     const auditBlockedReassignment = await fetch(reassignmentUrl, {
       method: "POST",
