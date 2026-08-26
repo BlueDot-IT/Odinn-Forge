@@ -1232,6 +1232,180 @@ export async function createGatewayServer(options: any = {}) {
     operatorSnapshotRead,
   });
 
+  const durableJobReplayIdentity = (payload: any) => {
+    const task = payload?.task;
+    const principalNamespace = task?.input?.principalNamespace;
+    return {
+      tool: typeof task?.tool === "string" ? task.tool : "",
+      principalNamespaceDigest: typeof principalNamespace === "string"
+        ? createHash("sha256").update(principalNamespace, "utf8").digest("hex")
+        : null,
+      delegationDigest: hashRequest(payload?.delegation ?? null),
+      scopeDigest: hashRequest(payload?.scope ?? null),
+      parentCapabilitiesDigest: hashRequest(payload?.parentCapabilities ?? [])
+    };
+  };
+
+  const durableJobReplayIdentityMatches = ({
+    existing,
+    requestHash,
+    scopedPayload
+  }: {
+    existing: any;
+    requestHash: string;
+    scopedPayload: any;
+  }) => {
+    if (typeof existing?.requestHash !== "string" || existing.requestHash !== requestHash) return false;
+    return stableJson(existing.payload?.replayIdentity ?? null) === stableJson(scopedPayload.replayIdentity ?? null);
+  };
+
+  const ensureGraphControlAuditIntent = async ({
+    action,
+    graphRunId,
+    parentRunId,
+    operationId,
+    type,
+    tool,
+    data
+  }: {
+    action: "cancel" | "reassign" | "checkpoint";
+    graphRunId: string;
+    parentRunId: string;
+    operationId: string;
+    type: string;
+    tool: string;
+    data: Record<string, unknown>;
+  }) => {
+    const auditRun = await auditStore.readRun(parentRunId);
+    const exists = auditRun?.events?.some((event: any) => event.type === type
+      && event.data?.graphRunId === graphRunId
+      && event.data?.operationId === operationId);
+    if (exists) return false;
+    await testHooks?.beforeAgentGraphControlAudit?.({ action, graphRunId, operationId });
+    await auditStore.append({
+      at: new Date().toISOString(),
+      runId: parentRunId,
+      type,
+      actor: tenantScope.principalId,
+      tool,
+      capability: action === "checkpoint" ? tool : "agent.delegate",
+      decision: "allow",
+      data: { ...data, graphRunId, operationId }
+    });
+    return true;
+  };
+
+  const ensureGraphControlLedgerIntent = ({ parentRunId, type, operationId, payload }: {
+    parentRunId: string;
+    type: string;
+    operationId: string;
+    payload: Record<string, unknown>;
+  }) => {
+    const run = runtime.ledger.getRun(parentRunId);
+    if (run?.events.some((event: any) => event.type === type && event.payload?.operationId === operationId)) return false;
+    runtime.ledger.appendEvent({ runId: parentRunId, type, payload: { ...payload, operationId } });
+    return true;
+  };
+
+  const ensureGraphControlAuditOutcome = async ({
+    runId,
+    graphRunId,
+    operationId,
+    type,
+    tool,
+    data
+  }: {
+    runId: string;
+    graphRunId: string;
+    operationId: string;
+    type: string;
+    tool: string;
+    data: Record<string, unknown>;
+  }) => {
+    const auditRun = await auditStore.readRun(runId);
+    const exists = auditRun?.events?.some((event: any) => event.type === type
+      && event.data?.graphRunId === graphRunId
+      && event.data?.operationId === operationId);
+    if (exists) return false;
+    await auditStore.append({
+      at: new Date().toISOString(),
+      runId,
+      type,
+      actor: tenantScope.principalId,
+      tool,
+      capability: type === "agent.graph.checkpoint" ? tool : "agent.delegate",
+      decision: "allow",
+      data: { ...data, graphRunId, operationId }
+    });
+    return true;
+  };
+
+  const submitDurableJob = async (
+    body: any,
+    idempotencyKey?: string,
+    delegation?: { reassignedFromGraphRunId: string; reassignedFromRequestDigest: string }
+  ): Promise<{ status: number; payload: any }> => {
+    const task = body.task && typeof body.task === "object" && !Array.isArray(body.task) ? body.task : body;
+    if (task.tool === "agent.delegate" && body.kind !== "agent-graph") {
+      throw new GatewayError(400, "agent.delegate jobs require kind=agent-graph");
+    }
+    if (body.kind === "agent-graph" && task.tool !== "agent.delegate") {
+      throw new GatewayError(400, "kind=agent-graph requires task.tool=agent.delegate");
+    }
+    if (task.tool === AGENT_GRAPH_TOOL && config?.runtime?.enableAgentGraphs !== true) {
+      throw new GatewayError(403, "agent graph execution is disabled; enable config.runtime.enableAgentGraphs explicitly");
+    }
+    const parentCapabilities = task.tool === AGENT_GRAPH_TOOL
+      ? (() => {
+        try {
+          const capabilities = assertCapabilityIds(body.parentCapabilities, "parentCapabilities");
+          if (!capabilities.length) throw new Error("agent graph jobs require at least one explicit parent capability");
+          return capabilities;
+        } catch (error) {
+          throw new GatewayError(400, error instanceof Error ? error.message : "parentCapabilities is invalid");
+        }
+      })()
+      : undefined;
+    const activeJobs = (await supervisor.list()).filter((job: any) => ["queued", "running"].includes(job.status)).length;
+    if (activeJobs >= quotaGate.maximumActiveJobs) throw new GatewayError(429, "tenant active-job quota exceeded");
+    const id = body.id || idempotencyKey || undefined;
+    const requestHash = hashRequest(delegation ? { ...body, delegation } : body);
+    const scopedPayloadBase = scopedJobPayload({
+      durableExecution: task.tool === "process.exec" || task.tool === "agent.delegate" || task.tool === "mcp.invoke",
+      ...(parentCapabilities ? { parentCapabilities } : {}),
+      ...(delegation ? { delegation } : {}),
+      ...(typeof body.executionKey === "string" ? { executionKey: body.executionKey } : {}),
+      task: { ...task, ...(id ? { id: String(id) } : {}) }
+    }, tenantScope);
+    const scopedPayload = {
+      ...scopedPayloadBase,
+      replayIdentity: durableJobReplayIdentity(scopedPayloadBase)
+    };
+    if (id) {
+      const existing = await supervisor.get(String(id));
+      if (existing) {
+        if (!durableJobReplayIdentityMatches({ existing, requestHash, scopedPayload })) {
+          return { status: 409, payload: { ok: false, error: "idempotency key was already used for a different request" } };
+        }
+        return { status: 200, payload: { ok: true, replayed: true, job: existing } };
+      }
+    }
+    const safety = toolSafetyDescriptor(task.tool, registry.get(task.tool));
+    const sandboxProcessConfig = task.tool === "process.exec" ? normalizeSandboxConfig(config).process : undefined;
+    const requestedTimeout = Number.isSafeInteger(task.input?.timeoutMs) ? Number(task.input.timeoutMs) : sandboxProcessConfig?.limits.timeoutMs;
+    const requestedGraphTimeout = Number.isSafeInteger(task.input?.maxRunMs) ? Number(task.input.maxRunMs) : 120_000;
+    const effectiveTimeout = task.tool === "process.exec"
+      ? Math.min(requestedTimeout ?? 120_000, sandboxProcessConfig?.limits.timeoutMs ?? 120_000) + 30_000
+      : task.tool === "agent.delegate"
+        ? Math.min(Math.max(requestedGraphTimeout, 1), 300_000) + 30_000
+        : body.timeoutMs;
+    const job = await supervisor.submit(
+      scopedPayload,
+      { id: id ? String(id) : undefined, requestHash, timeoutMs: effectiveTimeout, retrySafe: safety.retrySafe === true }
+    );
+    return { status: 202, payload: { ok: true, job } };
+  };
+
   const server: any = createServer(async (request: any, response: any) => {
     const requestId = String(request.headers["x-odinn-request-id"] || randomUUID());
     response.setHeader("x-odinn-request-id", requestId);
@@ -1703,6 +1877,284 @@ export async function createGatewayServer(options: any = {}) {
           task: { id: replayId, tool: started.tool, input: started.data.input, actor: "gateway-replay", reason: `replay:${id}` },
         }));
       }
+      if (request.method === "GET" && url.pathname === "/agent-graphs") {
+        try {
+          return json(response, 200, { graphs: runtime.ledger.listAgentGraphRuns({
+            limit: Number(url.searchParams.get("limit") || 20),
+            status: url.searchParams.get("status") || undefined,
+            parentRunId: url.searchParams.get("parentRunId") || undefined
+          }) });
+        } catch (error) {
+          throw new GatewayError(400, error instanceof Error ? error.message : "agent graph query is invalid");
+        }
+      }
+      if (url.pathname.startsWith("/agent-graphs/")) {
+        const suffix = url.pathname.slice("/agent-graphs/".length);
+        const action = ["cancel", "reassign", "checkpoint"].find((candidate) => suffix.endsWith(`/${candidate}`));
+        const encodedId = action ? suffix.slice(0, -`/${action}`.length) : suffix;
+        const graphRunId = decodeURIComponent(encodedId);
+        const graph = runtime.ledger.getAgentGraphRun(graphRunId);
+        if (!graph) return json(response, 404, { ok: false, error: "agent graph not found" });
+        if (request.method === "GET" && !action) return json(response, 200, { graph });
+        if (request.method === "POST" && action === "cancel") {
+          const operationId = `cancel:${graph.requestDigest}`;
+          ensureGraphControlLedgerIntent({
+            parentRunId: graph.parentRunId,
+            type: "agent-graph-cancellation-requested",
+            operationId,
+            payload: { graphRunId, requestDigest: graph.requestDigest }
+          });
+          await ensureGraphControlAuditIntent({
+            action: "cancel",
+            graphRunId,
+            parentRunId: graph.parentRunId,
+            operationId,
+            type: "agent.graph.cancellation.requested",
+            tool: AGENT_GRAPH_TOOL,
+            data: { requestDigest: graph.requestDigest }
+          });
+          const parentJob = await supervisor.get(graph.parentRunId);
+          if (!parentJob) {
+            if (["validated", "running", "publishing"].includes(graph.status)) {
+              runtime.ledger.cancelAgentGraphRun({ graphRunId, errorCode: "GRAPH_PARENT_JOB_MISSING" });
+            }
+            return json(response, 409, {
+              ok: false,
+              error: "agent graph parent job is unavailable; the graph was quarantined for review",
+              graph: runtime.ledger.getAgentGraphRun(graphRunId)
+            });
+          }
+          const job = await supervisor.cancel(graph.parentRunId);
+          await ensureGraphControlAuditOutcome({
+            runId: graph.parentRunId,
+            graphRunId,
+            operationId,
+            type: "agent.graph.cancellation.completed",
+            tool: AGENT_GRAPH_TOOL,
+            data: {
+              requestDigest: graph.requestDigest,
+              jobStatus: job.status,
+              graphStatus: runtime.ledger.getAgentGraphRun(graphRunId)?.status
+            }
+          });
+          return json(response, 200, { ok: true, job, graph: runtime.ledger.getAgentGraphRun(graphRunId) });
+        }
+        if (request.method === "POST" && action === "reassign") {
+          if (!["failed", "cancelled", "needs-review"].includes(graph.status)) {
+            throw new GatewayError(409, "agent graph must be terminal and incomplete before reassignment");
+          }
+          const body = await readJson(request, { maxBytes: requestMaxBytes });
+          if (body.expectedRequestDigest !== graph.requestDigest) {
+            throw new GatewayError(409, "agent graph request digest changed before reassignment");
+          }
+          if (!body.replacement || typeof body.replacement !== "object" || Array.isArray(body.replacement)) {
+            throw new GatewayError(400, "agent graph reassignment requires a replacement job");
+          }
+          if (body.replacement.kind !== "agent-graph") {
+            throw new GatewayError(400, "agent graph reassignment replacement must declare kind=agent-graph");
+          }
+          const replacement = { ...body.replacement, kind: "agent-graph" };
+          const replacementId = replacement.id || request.headers["idempotency-key"];
+          if (typeof replacementId !== "string" || !replacementId || replacementId === graph.parentRunId) {
+            throw new GatewayError(400, "agent graph reassignment requires a new idempotency key");
+          }
+          replacement.id = replacementId;
+          const parentJob = await supervisor.get(graph.parentRunId);
+          if (!parentJob) throw new GatewayError(409, "agent graph parent job is unavailable for authority comparison");
+          const priorCapabilities = assertCapabilityIds(parentJob.payload?.parentCapabilities, "prior parentCapabilities");
+          const replacementCapabilities = assertCapabilityIds(replacement.parentCapabilities, "replacement parentCapabilities");
+          if (replacementCapabilities.some((capability) => !priorCapabilities.includes(capability))) {
+            throw new GatewayError(403, "agent graph reassignment cannot widen parent authority");
+          }
+          const replacementTask = replacement.task && typeof replacement.task === "object" && !Array.isArray(replacement.task)
+            ? replacement.task
+            : undefined;
+          const replacementPrincipal = replacementTask?.input?.principalNamespace;
+          if (typeof replacementPrincipal !== "string" || `sha256:${hashRequest(replacementPrincipal)}` !== graph.principalNamespace) {
+            throw new GatewayError(403, "agent graph reassignment must preserve the principal namespace");
+          }
+          const trustedParentScope = parentJob.payload?.scope;
+          const trustedParentScopeRecord = trustedParentScope && typeof trustedParentScope === "object" && !Array.isArray(trustedParentScope)
+            ? trustedParentScope as Record<string, unknown>
+            : undefined;
+          if (!trustedParentScopeRecord
+            || trustedParentScopeRecord.tenantId !== tenantScope.tenantId
+            || trustedParentScopeRecord.principalId !== tenantScope.principalId) {
+            throw new GatewayError(403, "agent graph reassignment must preserve the original trusted tenant and principal");
+          }
+          const delegation = {
+            reassignedFromGraphRunId: graphRunId,
+            reassignedFromRequestDigest: graph.requestDigest
+          };
+          const replacementRequestHash = hashRequest({ ...replacement, delegation });
+          const replacementIdentityDigest = hashRequest({
+            tool: replacementTask.tool,
+            delegation,
+            scope: trustedParentScopeRecord,
+            principalNamespace: replacementPrincipal,
+            parentCapabilities: replacementCapabilities
+          });
+          try {
+            runtime.ledger.reserveAgentGraphReassignment({
+              graphRunId,
+              expectedRequestDigest: graph.requestDigest,
+              replacementJobId: replacementId,
+              replacementRequestHash,
+              replacementIdentityDigest,
+              trustedPrincipalId: tenantScope.principalId
+            });
+          } catch (error) {
+            const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+            const status = code === "AGENT_GRAPH_REASSIGNMENT_PRINCIPAL_MISMATCH" ? 403
+              : code === "AGENT_GRAPH_REASSIGNMENT_INVALID" ? 400
+                : 409;
+            throw new GatewayError(status, error instanceof Error ? error.message : "agent graph reassignment reservation failed");
+          }
+          const operationId = `reassign:${replacementId}`;
+          try {
+            await ensureGraphControlAuditIntent({
+              action: "reassign",
+              graphRunId,
+              parentRunId: graph.parentRunId,
+              operationId,
+              type: "agent.graph.reassignment.requested",
+              tool: AGENT_GRAPH_TOOL,
+              data: {
+                requestDigest: graph.requestDigest,
+                replacementJobId: replacementId,
+                replacementRequestHash
+              }
+            });
+          } catch (error) {
+            runtime.ledger.releaseAgentGraphReassignment({ graphRunId, replacementJobId: replacementId });
+            throw error;
+          }
+          let submission;
+          try {
+            submission = await submitDurableJob(replacement, replacementId, delegation);
+          } catch (error) {
+            runtime.ledger.releaseAgentGraphReassignment({ graphRunId, replacementJobId: replacementId });
+            throw error;
+          }
+          if (submission.status >= 400) {
+            runtime.ledger.releaseAgentGraphReassignment({ graphRunId, replacementJobId: replacementId });
+            return json(response, submission.status, submission.payload);
+          }
+          const replacementJobId = String(submission.payload.job.id);
+          runtime.ledger.markAgentGraphReassignmentSubmitted({ graphRunId, replacementJobId, replacementRequestHash });
+          await ensureGraphControlAuditOutcome({
+            runId: graph.parentRunId,
+            graphRunId,
+            operationId,
+            type: "agent.graph.reassigned",
+            tool: AGENT_GRAPH_TOOL,
+            data: { requestDigest: graph.requestDigest, replacementJobId, replacementRequestHash }
+          });
+          return json(response, submission.status, { ...submission.payload, reassignedFrom: graphRunId });
+        }
+        if (request.method === "POST" && action === "checkpoint") {
+          const body = await readJson(request, { maxBytes: requestMaxBytes });
+          if (graph.status !== "completed") throw new GatewayError(409, "agent graph must complete before checkpoint admission");
+          const nodeId = String(body.nodeId || "");
+          const node = graph.nodes.find((candidate: any) => candidate.nodeId === nodeId);
+          if (!node || node.status !== "completed" || typeof node.resultDigest !== "string") {
+            throw new GatewayError(409, "agent graph checkpoint requires a completed child result");
+          }
+          if (body.expectedResultDigest !== node.resultDigest) {
+            throw new GatewayError(409, "agent graph child result digest changed before checkpoint admission");
+          }
+          const tool = body.tool === "workspace.patch" ? "workspace.patch" : body.tool === "workspace.mutate" ? "workspace.mutate" : undefined;
+          if (!tool) throw new GatewayError(400, "agent graph checkpoint tool must be workspace.mutate or workspace.patch");
+          const parentJob = await supervisor.get(graph.parentRunId);
+          if (!parentJob) throw new GatewayError(409, "agent graph parent job is unavailable for authority comparison");
+          const parentCapabilities = assertCapabilityIds(parentJob.payload?.parentCapabilities, "parentCapabilities");
+          if (!parentCapabilities.includes(tool)) throw new GatewayError(403, `agent graph parent authority does not include ${tool}`);
+          const runId = body.runId || body.id || request.headers["idempotency-key"];
+          if (typeof runId !== "string" || !runId) throw new GatewayError(400, "agent graph checkpoint requires a run id");
+          if (typeof body.capabilityToken !== "string" || !body.capabilityToken) {
+            throw new GatewayError(400, "agent graph checkpoint requires a capability token");
+          }
+          const input = tool === "workspace.patch"
+            ? {
+              operation: body.operation,
+              path: body.path,
+              find: body.find,
+              replace: body.replace,
+              replaceAll: body.replaceAll,
+              patches: body.patches,
+              expected: body.expected,
+              apply: body.apply === true,
+              maxBytes: body.maxBytes,
+              maxFiles: body.maxFiles,
+              capabilityToken: body.capabilityToken
+            }
+            : {
+              operation: body.operation,
+              path: body.path,
+              content: body.content,
+              mode: body.mode,
+              expected: body.expected,
+              from: body.from,
+              to: body.to,
+              recursive: body.recursive,
+              apply: body.apply === true,
+              maxBytes: body.maxBytes,
+              maxFiles: body.maxFiles,
+              capabilityToken: body.capabilityToken
+            };
+          const operationId = `checkpoint:${runId}`;
+          const checkpointControlDigest = hashRequest({
+            graphRunId,
+            nodeId,
+            expectedResultDigest: node.resultDigest,
+            runId,
+            tool,
+            input
+          });
+          ensureGraphControlLedgerIntent({
+            parentRunId: graph.parentRunId,
+            type: "agent-graph-checkpoint-requested",
+            operationId,
+            payload: { graphRunId, nodeId, resultDigest: node.resultDigest, checkpointRunId: runId, tool, checkpointControlDigest }
+          });
+          await ensureGraphControlAuditIntent({
+            action: "checkpoint",
+            graphRunId,
+            parentRunId: graph.parentRunId,
+            operationId,
+            type: "agent.graph.checkpoint.requested",
+            tool,
+            data: { nodeId, resultDigest: node.resultDigest, checkpointRunId: runId, checkpointControlDigest, apply: body.apply === true }
+          });
+          const result = await runGovernedTask({
+            task: {
+              id: runId,
+              actor: tenantScope.principalId,
+              tool,
+              input,
+              reason: `agent-graph-checkpoint:${graphRunId}:${nodeId}`
+            },
+            parentRunId: graph.parentRunId,
+            parentCapabilities,
+            durableExecution: true
+          });
+          await ensureGraphControlAuditOutcome({
+            runId,
+            graphRunId,
+            operationId,
+            type: "agent.graph.checkpoint",
+            tool,
+            data: {
+              nodeId,
+              resultDigest: node.resultDigest,
+              checkpointRunId: runId,
+              checkpointControlDigest,
+              apply: body.apply === true
+            }
+          });
+          return json(response, 200, { ok: true, graphRunId, nodeId, result });
+        }
+      }
       if (request.method === "GET" && url.pathname === "/jobs") {
         return json(response, 200, { jobs: await supervisor.list() });
       }
@@ -1803,53 +2255,8 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/jobs") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        const task = body.task && typeof body.task === "object" ? body.task : body;
-        if (task.tool === "agent.delegate" && body.kind !== "agent-graph") {
-          throw new GatewayError(400, "agent.delegate jobs require kind=agent-graph");
-        }
-        if (body.kind === "agent-graph" && task.tool !== "agent.delegate") {
-          throw new GatewayError(400, "kind=agent-graph requires task.tool=agent.delegate");
-        }
-        if (task.tool === AGENT_GRAPH_TOOL && config?.runtime?.enableAgentGraphs !== true) {
-          throw new GatewayError(403, "agent graph execution is disabled; enable config.runtime.enableAgentGraphs explicitly");
-        }
-        const parentCapabilities = task.tool === AGENT_GRAPH_TOOL
-          ? (() => {
-            try {
-              const capabilities = assertCapabilityIds(body.parentCapabilities, "parentCapabilities");
-              if (!capabilities.length) throw new Error("agent graph jobs require at least one explicit parent capability");
-              return capabilities;
-            } catch (error) {
-              throw new GatewayError(400, error instanceof Error ? error.message : "parentCapabilities is invalid");
-            }
-          })()
-          : undefined;
-        const activeJobs = (await supervisor.list()).filter((job: any) => ["queued", "running"].includes(job.status)).length;
-        if (activeJobs >= quotaGate.maximumActiveJobs) throw new GatewayError(429, "tenant active-job quota exceeded");
-        const id = body.id || request.headers["idempotency-key"] || undefined;
-        const requestHash = hashRequest(body);
-        if (id) {
-          const existing = await supervisor.get(String(id));
-          if (existing) {
-            if (existing.requestHash && existing.requestHash !== requestHash) return json(response, 409, { ok: false, error: "idempotency key was already used for a different request" });
-            return json(response, 200, { ok: true, replayed: true, job: existing });
-          }
-        }
-        const safety = toolSafetyDescriptor(task.tool, registry.get(task.tool));
-        const durableExecution = task.tool === "process.exec" || task.tool === "agent.delegate" || task.tool === "mcp.invoke";
-        const sandboxProcessConfig = task.tool === "process.exec" ? normalizeSandboxConfig(config).process : undefined;
-        const requestedTimeout = Number.isSafeInteger(task.input?.timeoutMs) ? Number(task.input.timeoutMs) : sandboxProcessConfig?.limits.timeoutMs;
-        const requestedGraphTimeout = Number.isSafeInteger(task.input?.maxRunMs) ? Number(task.input.maxRunMs) : 120_000;
-        const effectiveTimeout = task.tool === "process.exec"
-          ? Math.min(requestedTimeout ?? 120_000, sandboxProcessConfig?.limits.timeoutMs ?? 120_000) + 30_000
-          : task.tool === "agent.delegate"
-            ? Math.min(Math.max(requestedGraphTimeout, 1), 300_000) + 30_000
-          : body.timeoutMs;
-        const job = await supervisor.submit(
-          scopedJobPayload({ durableExecution, ...(parentCapabilities ? { parentCapabilities } : {}), ...(typeof body.executionKey === "string" ? { executionKey: body.executionKey } : {}), task: { ...task, ...(id ? { id: String(id) } : {}) } }, tenantScope),
-          { id: id ? String(id) : undefined, requestHash, timeoutMs: effectiveTimeout, retrySafe: safety.retrySafe === true }
-        );
-        return json(response, 202, { ok: true, job });
+        const submission = await submitDurableJob(body, request.headers["idempotency-key"] as string | undefined);
+        return json(response, submission.status, submission.payload);
       }
       if (request.method === "POST" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/cancel")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length, -"/cancel".length));

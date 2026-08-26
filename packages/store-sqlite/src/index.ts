@@ -15,7 +15,7 @@ import {
 export { SQLITE_AUDIT_SCHEMA_VERSION, SqliteAuditStore, auditMigrationStatus, inspectExistingSqliteAuditSchema, migrateLegacyAuditToSqlite, rollbackLegacyAuditMigration } from "./audit.ts";
 export type { AuditIntegrityStatus, AuditPage } from "./audit.ts";
 
-export const SQLITE_SCHEMA_VERSION = 8;
+export const SQLITE_SCHEMA_VERSION = 9;
 export type SqliteStoreOptions = { targetVersion?: number };
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
@@ -523,7 +523,20 @@ const MIGRATIONS = [
   DROP TABLE agent_graph_runs;
   ALTER TABLE agent_graph_runs_v8 RENAME TO agent_graph_runs;
   CREATE INDEX idx_agent_graph_runs_parent ON agent_graph_runs(parent_run_id, created_at);
-  CREATE INDEX idx_agent_graph_runs_status ON agent_graph_runs(status, created_at);`
+  CREATE INDEX idx_agent_graph_runs_status ON agent_graph_runs(status, created_at);`,
+  `CREATE TABLE IF NOT EXISTS agent_graph_reassignments (
+    graph_run_id TEXT PRIMARY KEY REFERENCES agent_graph_runs(id),
+    source_parent_job_id TEXT NOT NULL REFERENCES runtime_jobs(id),
+    source_request_digest TEXT NOT NULL CHECK(length(source_request_digest) = 64),
+    replacement_job_id TEXT NOT NULL UNIQUE,
+    replacement_request_hash TEXT NOT NULL CHECK(length(replacement_request_hash) = 64),
+    replacement_identity_digest TEXT NOT NULL CHECK(length(replacement_identity_digest) = 64),
+    trusted_principal_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('reserved', 'submitted')),
+    created_at TEXT NOT NULL,
+    submitted_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_agent_graph_reassignments_parent ON agent_graph_reassignments(source_parent_job_id, created_at);`
 ];
 
 export class SqliteStore {
@@ -1287,6 +1300,186 @@ export class RunLedger {
       graphRunId, nodeId: String(node.node_id), manifestId: String(node.manifest_id), manifestDigest: String(node.manifest_digest), inputRef: String(node.input_ref), inputDigest: String(node.input_digest), resultRef: String(node.result_ref), nodeCallId: node.node_call_id ?? undefined, requestDigest: node.request_digest ?? undefined, status: String(node.status), executionRunId: node.execution_run_id ?? undefined, executionAttemptId: node.execution_attempt_id ?? undefined, resultDigest: node.result_digest ?? undefined, auditRef: node.audit_ref ?? undefined, errorCode: node.error_code ?? undefined, createdAt: String(node.created_at), startedAt: node.started_at ?? undefined, settledAt: node.settled_at ?? undefined
     }));
     return { graphRunId, parentRunId: String(run.parent_run_id), graphDigest: String(run.graph_digest), manifestsDigest: String(run.manifests_digest), graphBytes: Number(run.graph_bytes), manifestsBytes: Number(run.manifests_bytes), principalNamespace: String(run.principal_namespace), requestDigest: String(run.request_digest), status: String(run.status), maxConcurrency: Number(run.max_concurrency), maxRunMs: Number(run.max_run_ms), createdAt: String(run.created_at), startedAt: run.started_at ?? undefined, completedAt: run.completed_at ?? undefined, errorCode: run.error_code ?? undefined, nodes };
+  }
+
+  listAgentGraphRuns({ limit = 20, status, parentRunId }: { limit?: number; status?: string; parentRunId?: string } = {}) {
+    const boundedLimit = Math.max(1, Math.min(Number(limit) || 20, 200));
+    const statuses = new Set(["validated", "running", "publishing", "completed", "failed", "cancelled", "needs-review"]);
+    if (status !== undefined && !statuses.has(status)) throw new Error("agent graph status filter is invalid");
+    if (parentRunId !== undefined && (typeof parentRunId !== "string" || !parentRunId || Buffer.byteLength(parentRunId, "utf8") > 256)) {
+      throw new Error("agent graph parent run filter is invalid");
+    }
+    const clauses: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (status !== undefined) {
+      clauses.push("status = ?");
+      parameters.push(status);
+    }
+    if (parentRunId !== undefined) {
+      clauses.push("parent_run_id = ?");
+      parameters.push(parentRunId);
+    }
+    const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.database.db.prepare(`SELECT id FROM agent_graph_runs${where} ORDER BY created_at DESC, id DESC LIMIT ?`)
+      .all(...parameters, boundedLimit) as SqlRow[];
+    return rows.map((row) => this.getAgentGraphRun(String(row.id))!).filter(Boolean);
+  }
+
+  reserveAgentGraphReassignment({
+    graphRunId,
+    expectedRequestDigest,
+    replacementJobId,
+    replacementRequestHash,
+    replacementIdentityDigest,
+    trustedPrincipalId
+  }: {
+    graphRunId: string;
+    expectedRequestDigest: string;
+    replacementJobId: string;
+    replacementRequestHash: string;
+    replacementIdentityDigest: string;
+    trustedPrincipalId: string;
+  }) {
+    const conflict = (message: string, code: string) => {
+      const error = new Error(message) as Error & { code?: string };
+      error.code = code;
+      throw error;
+    };
+    if (!graphRunId || !replacementJobId || Buffer.byteLength(replacementJobId, "utf8") > 512) {
+      conflict("agent graph reassignment identity is invalid", "AGENT_GRAPH_REASSIGNMENT_INVALID");
+    }
+    if (![expectedRequestDigest, replacementRequestHash, replacementIdentityDigest].every((value) => /^[a-f0-9]{64}$/u.test(value))) {
+      conflict("agent graph reassignment digests are invalid", "AGENT_GRAPH_REASSIGNMENT_INVALID");
+    }
+    if (!trustedPrincipalId || Buffer.byteLength(trustedPrincipalId, "utf8") > 256) {
+      conflict("agent graph reassignment principal is invalid", "AGENT_GRAPH_REASSIGNMENT_INVALID");
+    }
+    return this.database.transaction((db) => {
+      const graph = db.prepare("SELECT parent_run_id, request_digest, status FROM agent_graph_runs WHERE id=?").get(graphRunId) as SqlRow | undefined;
+      if (!graph) conflict("agent graph not found", "AGENT_GRAPH_REASSIGNMENT_GRAPH_MISSING");
+      if (!["failed", "cancelled", "needs-review"].includes(String(graph!.status))) {
+        conflict("agent graph must be terminal and incomplete before reassignment", "AGENT_GRAPH_REASSIGNMENT_GRAPH_ACTIVE");
+      }
+      if (String(graph!.request_digest) !== expectedRequestDigest) {
+        conflict("agent graph request digest changed before reassignment", "AGENT_GRAPH_REASSIGNMENT_DIGEST_CONFLICT");
+      }
+      const parentJobId = String(graph!.parent_run_id);
+      const parent = db.prepare("SELECT status, payload_json FROM runtime_jobs WHERE id=?").get(parentJobId) as SqlRow | undefined;
+      if (!parent) conflict("agent graph parent job is unavailable for reassignment", "AGENT_GRAPH_REASSIGNMENT_PARENT_MISSING");
+      if (!["completed", "failed", "cancelled", "needs-review"].includes(String(parent!.status))) {
+        conflict("agent graph parent job has not reached a terminal state", "AGENT_GRAPH_REASSIGNMENT_PARENT_ACTIVE");
+      }
+      const now = new Date().toISOString();
+      const liveLease = db.prepare(`SELECT token FROM runtime_job_leases
+        WHERE job_id=? AND released_at IS NULL AND expires_at>? ORDER BY acquired_at DESC LIMIT 1`).get(parentJobId, now) as SqlRow | undefined;
+      if (liveLease) {
+        conflict("agent graph parent job still owns an unexpired durable dispatch lease", "AGENT_GRAPH_REASSIGNMENT_PARENT_LEASED");
+      }
+      const parentPayload = parseJson<JsonMap>(parent!.payload_json, {});
+      const parentScope = parentPayload.scope && typeof parentPayload.scope === "object" && !Array.isArray(parentPayload.scope)
+        ? parentPayload.scope as JsonMap
+        : undefined;
+      if (parentScope?.principalId !== trustedPrincipalId) {
+        conflict("agent graph reassignment must preserve the trusted execution principal", "AGENT_GRAPH_REASSIGNMENT_PRINCIPAL_MISMATCH");
+      }
+      const existing = db.prepare("SELECT * FROM agent_graph_reassignments WHERE graph_run_id=?").get(graphRunId) as SqlRow | undefined;
+      if (existing) {
+        if (String(existing.replacement_job_id) !== replacementJobId
+          || String(existing.source_request_digest) !== expectedRequestDigest
+          || String(existing.replacement_request_hash) !== replacementRequestHash
+          || String(existing.replacement_identity_digest) !== replacementIdentityDigest
+          || String(existing.trusted_principal_id) !== trustedPrincipalId) {
+          conflict("agent graph already has a different durable successor", "AGENT_GRAPH_REASSIGNMENT_SUCCESSOR_CONFLICT");
+        }
+        return {
+          graphRunId,
+          parentJobId,
+          replacementJobId,
+          requestHash: replacementRequestHash,
+          identityDigest: replacementIdentityDigest,
+          status: String(existing.status),
+          replay: true
+        };
+      }
+      if (db.prepare("SELECT 1 FROM runtime_jobs WHERE id=?").get(replacementJobId)) {
+        conflict("replacement job id is already bound to another durable job", "AGENT_GRAPH_REASSIGNMENT_TARGET_CONFLICT");
+      }
+      try {
+        db.prepare(`INSERT INTO agent_graph_reassignments(
+          graph_run_id, source_parent_job_id, source_request_digest, replacement_job_id,
+          replacement_request_hash, replacement_identity_digest, trusted_principal_id, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?)`).run(
+          graphRunId,
+          parentJobId,
+          expectedRequestDigest,
+          replacementJobId,
+          replacementRequestHash,
+          replacementIdentityDigest,
+          trustedPrincipalId,
+          now
+        );
+      } catch (error) {
+        if (String((error as Error).message).includes("UNIQUE constraint failed")) {
+          conflict("replacement job id is already reserved for another agent graph", "AGENT_GRAPH_REASSIGNMENT_TARGET_CONFLICT");
+        }
+        throw error;
+      }
+      this.appendEventUnsafe(db, {
+        runId: parentJobId,
+        type: "agent-graph-reassignment-requested",
+        payload: { graphRunId, requestDigest: expectedRequestDigest, replacementJobId, replacementRequestHash },
+        timestamp: now
+      });
+      return {
+        graphRunId,
+        parentJobId,
+        replacementJobId,
+        requestHash: replacementRequestHash,
+        identityDigest: replacementIdentityDigest,
+        status: "reserved",
+        replay: false
+      };
+    });
+  }
+
+  markAgentGraphReassignmentSubmitted({ graphRunId, replacementJobId, replacementRequestHash }: { graphRunId: string; replacementJobId: string; replacementRequestHash: string }) {
+    return this.database.transaction((db) => {
+      const now = new Date().toISOString();
+      const result = db.prepare(`UPDATE agent_graph_reassignments SET status='submitted', submitted_at=COALESCE(submitted_at, ?)
+        WHERE graph_run_id=? AND replacement_job_id=? AND replacement_request_hash=? AND status IN ('reserved','submitted')`)
+        .run(now, graphRunId, replacementJobId, replacementRequestHash);
+      if (Number(result.changes) !== 1) {
+        const error = new Error("agent graph reassignment reservation changed before submission") as Error & { code?: string };
+        error.code = "AGENT_GRAPH_REASSIGNMENT_RESERVATION_LOST";
+        throw error;
+      }
+      return { graphRunId, replacementJobId, status: "submitted", submittedAt: now };
+    });
+  }
+
+  releaseAgentGraphReassignment({ graphRunId, replacementJobId }: { graphRunId: string; replacementJobId: string }) {
+    return this.database.transaction((db) => {
+      if (db.prepare("SELECT 1 FROM runtime_jobs WHERE id=?").get(replacementJobId)) return false;
+      const result = db.prepare(`DELETE FROM agent_graph_reassignments
+        WHERE graph_run_id=? AND replacement_job_id=? AND status='reserved'`).run(graphRunId, replacementJobId);
+      return Number(result.changes) === 1;
+    });
+  }
+
+  getAgentGraphReassignment(graphRunId: string) {
+    const row = this.database.db.prepare("SELECT * FROM agent_graph_reassignments WHERE graph_run_id=?").get(graphRunId) as SqlRow | undefined;
+    return row ? {
+      graphRunId: String(row.graph_run_id),
+      parentJobId: String(row.source_parent_job_id),
+      requestDigest: String(row.source_request_digest),
+      replacementJobId: String(row.replacement_job_id),
+      replacementRequestHash: String(row.replacement_request_hash),
+      replacementIdentityDigest: String(row.replacement_identity_digest),
+      trustedPrincipalId: String(row.trusted_principal_id),
+      status: String(row.status),
+      createdAt: String(row.created_at),
+      ...(row.submitted_at === null ? {} : { submittedAt: String(row.submitted_at) })
+    } : undefined;
   }
 
   listRuns({ limit = 20 }: { limit?: number } = {}) {

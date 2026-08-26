@@ -3,8 +3,15 @@ type ApprovalJobClaimedTestEvent = {
   jobId: string;
 };
 
+export type AgentGraphControlAuditTestEvent = {
+  action: "cancel" | "reassign" | "checkpoint";
+  graphRunId: string;
+  operationId: string;
+};
+
 export type GatewayTestHooks = {
   afterApprovalJobClaimed?: (event: ApprovalJobClaimedTestEvent) => void | Promise<void>;
+  beforeAgentGraphControlAudit?: (event: AgentGraphControlAuditTestEvent) => void | Promise<void>;
   onRequestError?: (event: { pathname: string; error: unknown }) => void | Promise<void>;
 };
 
