@@ -633,7 +633,7 @@ test("maintainer reconciliation serializes the exact target across every trigger
 test("daily Codex remediation is isolated, pinned, and draft-only", async () => {
   const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
   const ciDocs = await read("docs/ci-cd.md");
-  const remediationSha = "b16502b1bb0e897fd7664c240489fe5811418b46";
+  const remediationSha = "71c4349edec1b33213caa6571e2070b2d44378f1";
 
   assert.deepEqual(
     [...dispatcher.matchAll(/^\s+- cron: "([^"]+)"$/gmu)].map((match) => match[1]),
@@ -662,6 +662,36 @@ test("daily Codex remediation is isolated, pinned, and draft-only", async () => 
   assert.match(dispatcher, /oauth_json: \$\{\{ secrets\.ODINN_OPENAI_OAUTH_JSON \}\}/u);
   assert.match(ciDocs, /creates only a\s+draft pull request and never merges it/u);
   assert.match(ciDocs, /scan and patch steps receive OAuth without a repository write credential/u);
+});
+
+test("controlled Codex remediation dry run cannot reuse production authority", async () => {
+  const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
+  const dryRun = await read(".github/workflows/odinn-maintainer-security-dry-run.yml");
+  const remediationSha = "71c4349edec1b33213caa6571e2070b2d44378f1";
+  const workflowReference = new RegExp(
+    `BlueDot-IT/odinn-maintainer/\\.github/workflows/codex-security-remediation\\.yml@${remediationSha}`,
+    "gu",
+  );
+
+  assert.match(dryRun, /^\s{2}workflow_dispatch:\s*$/mu);
+  assert.doesNotMatch(dryRun, /^\s{2}(?:pull_request|push|schedule):/mu);
+  assert.match(dryRun, /^permissions: \{\}$/mu);
+  assert.match(
+    dryRun,
+    /validate-remediation:[\s\S]*?permissions:\s*\n\s+contents: read[\s\S]*?dry_run: true/u,
+  );
+  assert.doesNotMatch(dryRun, /\b(?:actions|contents|pull-requests): write\b/u);
+  assert.match(
+    dryRun,
+    /oauth_json: \$\{\{ secrets\.ODINN_OPENAI_OAUTH_JSON_NONPRODUCTION \}\}/u,
+  );
+  assert.doesNotMatch(
+    dryRun,
+    /oauth_json: \$\{\{ secrets\.ODINN_OPENAI_OAUTH_JSON \}\}/u,
+  );
+
+  const credentialBearingPins = `${dispatcher}\n${dryRun}`.match(workflowReference) ?? [];
+  assert.equal(credentialBearingPins.length, 2);
 });
 
 test("maintainer actions pin exact reviewed commits", async () => {

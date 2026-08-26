@@ -90,7 +90,7 @@ jobs:
       actions: write
       contents: write
       pull-requests: write
-    uses: BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml@b16502b1bb0e897fd7664c240489fe5811418b46 # reviewed protected-main control plane
+    uses: BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml@71c4349edec1b33213caa6571e2070b2d44378f1 # reviewed protected-main control plane
     with:
       target_ref: main
     secrets:

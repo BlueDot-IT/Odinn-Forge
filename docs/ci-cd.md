@@ -173,6 +173,17 @@ the complete Forge check suite before publication. The workflow creates only a
 draft pull request and never merges it. Maintainer review and protected-branch
 requirements remain mandatory.
 
+The separately dispatched `Controlled Odinn Maintainer Security Dry Run`
+workflow exercises the same exact immutable maintainer revision with
+`dry_run: true`. Its caller caps the reusable workflow at read-only repository
+access, passes only the dedicated
+`ODINN_OPENAI_OAUTH_JSON_NONPRODUCTION` repository secret, and never references
+the production remediation credential. The upstream permissionless acceptance
+job fails unless authenticated preparation and any credential-free validation
+succeed while publication remains skipped. Configure the non-production secret
+through GitHub's encrypted secret store before dispatching this workflow; never
+substitute `ODINN_OPENAI_OAUTH_JSON`.
+
 ### Version preparation
 
 Versions are prepared through ordinary reviewed pull requests. A release change
@@ -236,6 +247,7 @@ Configure the following manually in GitHub because they are repository policy, n
 - Block force pushes and deletion of `main`.
 - Enable private vulnerability reporting.
 - Create a `release` environment and require approval for every prerelease and stable release publication.
+- Configure `ODINN_OPENAI_OAUTH_JSON_NONPRODUCTION` only when performing a controlled maintainer dry run; it must represent a dedicated non-production account.
 - Limit workflow permissions to read-only by default.
 
 ## Local equivalence

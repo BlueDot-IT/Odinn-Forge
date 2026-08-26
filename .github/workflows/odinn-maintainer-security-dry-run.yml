@@ -1,0 +1,22 @@
+name: Controlled Odinn Maintainer Security Dry Run
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: odinn-maintainer-security-dry-run
+  cancel-in-progress: false
+
+jobs:
+  validate-remediation:
+    name: Validate remediation without publication
+    permissions:
+      contents: read
+    uses: BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml@71c4349edec1b33213caa6571e2070b2d44378f1 # controlled-dry-run
+    with:
+      target_ref: main
+      dry_run: true
+    secrets:
+      oauth_json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON_NONPRODUCTION }}

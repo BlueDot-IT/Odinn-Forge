@@ -9,8 +9,8 @@ Odinn Forge changes its immutable caller pin.
   `0c5f7b0dea200979ea96107b6856ed3dc5e7bcc0`
 - Originally proposed feature pin:
   `0bbdd667c594dac8daa964edaf972aa56662014e`
-- Accepted protected-main control plane:
-  `b16502b1bb0e897fd7664c240489fe5811418b46`
+- Accepted protected-main control plane and dry-run contract:
+  `71c4349edec1b33213caa6571e2070b2d44378f1`
 - Immutable scanner-material revision used by the accepted workflows:
   `bb1d0a74bc2d5076040af18312bc0a2cfc3a0045`
 
@@ -18,14 +18,16 @@ The accepted revision is deliberately newer than the original proposal. It
 contains the two-stage protected-main landing from
 [odinn-maintainer PR #30](https://github.com/BlueDot-IT/odinn-maintainer/pull/30)
 and
-[odinn-maintainer PR #31](https://github.com/BlueDot-IT/odinn-maintainer/pull/31).
+[odinn-maintainer PR #31](https://github.com/BlueDot-IT/odinn-maintainer/pull/31),
+plus the non-publishing acceptance path from
+[odinn-maintainer PR #32](https://github.com/BlueDot-IT/odinn-maintainer/pull/32).
 The review relies on exact content, tests, and protected-branch history rather
 than commit-signature presentation alone.
 
 ## Commit-by-commit comparison
 
 Every commit in the accepted range
-`0c5f7b0..b16502b` and every changed path was inspected.
+`0c5f7b0..71c4349` and every changed path was inspected.
 
 | Commit | Paths | Review result |
 |---|---|---|
@@ -36,6 +38,7 @@ Every commit in the accepted range
 | `e3bbd81` | daily workflow | Changed the internal scan cadence to weekly. No workflow-call, permission, or credential boundary changed. |
 | `bb1d0a7` | scanner package/lock and scanner contract test | Staged `@openai/codex-security@0.1.16` and its complete lock on protected `main`, making an immutable material revision available before workflow pinning. |
 | `b16502b` | README; daily/remediation workflows; workflow tests | Pinned scanner checkout to `bb1d0a7`, added exact manifest/lock hashes, separated OAuth generation from credential-free validation and write-token publication, bound candidates to the scanned SHA, and checksummed the handoff artifact. |
+| `71c4349` | maintainer README; remediation workflow; workflow test | Added an explicit `dry_run` input, structurally skipped publication in that mode, and added a permissionless fail-closed acceptance job covering zero-finding and validated-finding paths. |
 
 The complete changed-path inventory is:
 
@@ -76,6 +79,10 @@ The complete changed-path inventory is:
 - `publish` receives scoped write permission but no OAuth and reconstructs the
   already checksummed and validated patch without executing repository code.
 - Publication can create only a draft pull request and explicitly cannot merge.
+- The manual Forge dry-run caller caps the complete nested workflow at
+  `contents: read`, passes only the dedicated non-production OAuth secret, and
+  sets `dry_run: true`; therefore the skipped publication job cannot acquire
+  write authority even if its condition regresses.
 
 ### Immutable scanner supply chain
 
@@ -111,13 +118,18 @@ The complete changed-path inventory is:
   secret scan passed.
 - odinn-maintainer PR #31: 49 tests passed on Linux and Windows; workflow
   contract tests, actionlint, and verified secret scan passed.
+- odinn-maintainer PR #32: 50 tests passed locally and on Linux and Windows;
+  focused dry-run contract tests and actionlint passed; independent security
+  review found no blocking issues at exact head `9eb09a6`, which merged to
+  protected main as `71c4349`.
 - Forge caller tests require the accepted exact workflow SHA and keep the
   credential-bearing control plane excluded from grouped dependency updates.
 
 ## Remaining acceptance gate
 
-The source review and immutable caller evidence are complete. Issue #126 must
-remain open until the exact accepted workflow also completes a controlled
-non-production dry run with a dedicated non-production OAuth credential. The
-production remediation secret is not a substitute, and no credential value may
-be placed in this repository, a pull request, logs, or artifacts.
+The source review, immutable caller, and manual non-publishing acceptance path
+are complete. Issue #126 must remain open until that exact workflow completes a
+controlled dry run with the repository's dedicated non-production OAuth secret.
+That secret is not currently configured. The production remediation secret is
+not a substitute, and no credential value may be placed in this repository, a
+pull request, logs, or artifacts.
