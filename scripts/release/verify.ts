@@ -30,7 +30,8 @@ if (!Array.isArray(manifest.artifacts)
   throw new Error("release manifest must name both production archives");
 }
 const standaloneArtifacts = Array.isArray(manifest.standaloneArtifacts) ? manifest.standaloneArtifacts : [];
-if (standaloneArtifacts.length !== 3 || !standaloneArtifacts.every((entry: any) => typeof entry.name === "string" && entry.embeddedRuntime?.version === "24.19.0")) {
+if (manifest.standaloneArtifacts !== undefined
+  && (standaloneArtifacts.length !== 3 || !standaloneArtifacts.every((entry: any) => typeof entry.name === "string" && entry.embeddedRuntime?.version === "24.19.0"))) {
   throw new Error("release manifest must name the controlled standalone runtime matrix");
 }
 if ((manifest.stateSchemas !== undefined && JSON.stringify(manifest.stateSchemas) !== JSON.stringify(targetStateSchemaVersions()))
