@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { isAllowedCredentialEnvironmentKey } from "./environment.ts";
-import { dnsLookupAll, isPrivateAddress } from "./web.ts";
+import { dnsLookupAll, isPrivateAddress, pinnedAddressLookup } from "./web.ts";
 
 const GITHUB_API_ORIGIN = "https://api.github.com";
 const GITHUB_API_HOST = "api.github.com";
@@ -76,6 +76,7 @@ type ClientOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   resolveNetworkAddresses?: (hostname: string) => Promise<string[]>;
   transport?: GitHubHttpTransport;
+  __testOnlyRequestTimeoutMs?: number;
 }>;
 
 function ordinaryObject(value: unknown, label: string): Record<string, unknown> {
@@ -131,6 +132,7 @@ export function createGitHubReadClient(value: unknown = {}, options: ClientOptio
   const environment = options.environment ?? process.env;
   const resolveNetworkAddresses = options.resolveNetworkAddresses ?? dnsLookupAll;
   const transport = options.transport ?? nativeGitHubTransport;
+  const requestTimeoutMs = normalizeRequestTimeout(options.__testOnlyRequestTimeoutMs);
   const allowedRepositories = new Map(config.repositories.map((repository) => [repository.toLowerCase(), repository]));
   const generation = digest(`github-read:${config.tokenEnv}:${[...allowedRepositories.keys()].sort().join("\n")}`);
   const target: GitHubReadTarget = Object.freeze({ endpoint: "api.github.com", generation });
@@ -145,7 +147,7 @@ export function createGitHubReadClient(value: unknown = {}, options: ClientOptio
   const request = async (path: string, signal?: AbortSignal) => {
     const token = validToken(environment[config.tokenEnv]);
     if (token === undefined) throw new Error("GitHub read credential is not configured");
-    return requestGitHubJson(path, token, { signal, resolveNetworkAddresses, transport });
+    return requestGitHubJson(path, token, { signal, resolveNetworkAddresses, transport, requestTimeoutMs });
   };
   const resourceFor = (kind: "repository" | "issue" | "pull-request" | "checks", input: Record<string, unknown>) => {
     rejectUnknownInput(
@@ -259,39 +261,79 @@ function validToken(value: unknown): string | undefined {
 async function requestGitHubJson(
   path: string,
   token: string,
-  options: Readonly<{ signal?: AbortSignal; resolveNetworkAddresses: (hostname: string) => Promise<string[]>; transport: GitHubHttpTransport }>
+  options: Readonly<{
+    signal?: AbortSignal;
+    resolveNetworkAddresses: (hostname: string) => Promise<string[]>;
+    transport: GitHubHttpTransport;
+    requestTimeoutMs: number;
+  }>
 ): Promise<unknown> {
   const url = assertTrustedGitHubApiUrl(new URL(path, `${GITHUB_API_ORIGIN}/`));
-  if (options.signal?.aborted) throw abortError();
-  const addresses = await options.resolveNetworkAddresses(url.hostname);
-  if (options.signal?.aborted) throw abortError();
-  if (!Array.isArray(addresses) || addresses.length === 0 || addresses.some((address) => typeof address !== "string" || isIP(address) === 0 || isPrivateAddress(address))) {
-    throw new Error("GitHub API DNS validation refused a non-public address");
-  }
   const headers = Object.freeze({
     accept: "application/vnd.github+json",
     authorization: `Bearer ${token}`,
     "user-agent": "Odinn-Forge/github-read",
     "x-github-api-version": GITHUB_API_VERSION
   });
-  let response: GitHubHttpResponse;
-  await acquireGitHubRequestSlot(options.signal);
+  const budget = createGitHubRequestBudget(options.signal, options.requestTimeoutMs);
+  let acquired = false;
   try {
-    response = await options.transport({ url, address: addresses[0]!, headers, signal: options.signal });
+    await acquireGitHubRequestSlot(budget.signal);
+    acquired = true;
+    if (budget.signal.aborted) throw budget.failure();
+    const operation = performGitHubRequest(url, headers, {
+      signal: budget.signal,
+      resolveNetworkAddresses: options.resolveNetworkAddresses,
+      transport: options.transport
+    });
+    void operation.then(releaseGitHubRequestSlot, releaseGitHubRequestSlot);
+    acquired = false;
+    const response = await settleWithinGitHubRequestBudget(operation, budget);
+    if (response.status >= 300 && response.status < 400) throw new Error("GitHub API redirects are refused");
+    if (response.status < 200 || response.status >= 300) throw new Error(`GitHub API returned status ${response.status}`);
+    if (!Buffer.isBuffer(response.body)) throw new Error("GitHub API response body was invalid");
+    if (response.body.byteLength > GITHUB_MAX_RESPONSE_BYTES) throw new Error("GitHub API response exceeded the bounded size limit");
+    const contentType = firstHeader(response.headers["content-type"]);
+    if (!contentType.toLowerCase().includes("json")) throw new Error("GitHub API response was not JSON");
+    try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(response.body)); }
+    catch { throw new Error("GitHub API returned invalid JSON"); }
   } catch (error) {
-    if (options.signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw abortError();
-    throw new Error("GitHub API request failed");
+    if (budget.signal.aborted) throw budget.failure();
+    throw error;
   } finally {
-    releaseGitHubRequestSlot();
+    if (acquired) releaseGitHubRequestSlot();
+    budget.dispose();
   }
-  if (response.status >= 300 && response.status < 400) throw new Error("GitHub API redirects are refused");
-  if (response.status < 200 || response.status >= 300) throw new Error(`GitHub API returned status ${response.status}`);
-  if (!Buffer.isBuffer(response.body)) throw new Error("GitHub API response body was invalid");
-  if (response.body.byteLength > GITHUB_MAX_RESPONSE_BYTES) throw new Error("GitHub API response exceeded the bounded size limit");
-  const contentType = firstHeader(response.headers["content-type"]);
-  if (!contentType.toLowerCase().includes("json")) throw new Error("GitHub API response was not JSON");
-  try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(response.body)); }
-  catch { throw new Error("GitHub API returned invalid JSON"); }
+}
+
+async function performGitHubRequest(
+  url: URL,
+  headers: Readonly<Record<string, string>>,
+  options: Readonly<{
+    signal: AbortSignal;
+    resolveNetworkAddresses: (hostname: string) => Promise<string[]>;
+    transport: GitHubHttpTransport;
+  }>
+): Promise<GitHubHttpResponse> {
+  let addresses: string[];
+  try {
+    addresses = await options.resolveNetworkAddresses(url.hostname);
+  } catch {
+    if (options.signal.aborted) throw abortError();
+    throw new Error("GitHub API DNS validation failed");
+  }
+  if (options.signal.aborted) throw abortError();
+  if (!Array.isArray(addresses) || addresses.length === 0 || addresses.some((address) => typeof address !== "string" || isIP(address) === 0 || isPrivateAddress(address))) {
+    throw new Error("GitHub API DNS validation refused a non-public address");
+  }
+  try {
+    const response = await options.transport({ url, address: addresses[0]!, headers, signal: options.signal });
+    if (options.signal.aborted) throw abortError();
+    return response;
+  } catch (error) {
+    if (options.signal.aborted || (error instanceof Error && error.name === "AbortError")) throw abortError();
+    throw new Error("GitHub API request failed");
+  }
 }
 
 function assertTrustedGitHubApiUrl(url: URL): URL {
@@ -316,14 +358,13 @@ async function nativeGitHubTransport(input: GitHubHttpRequest): Promise<GitHubHt
     const finish = (error?: Error, response?: GitHubHttpResponse) => {
       if (settled) return;
       settled = true;
-      clearTimeout(deadline);
       input.signal?.removeEventListener("abort", onAbort);
       if (error) rejectResponse(error); else resolveResponse(response!);
     };
     const request = httpsRequest(input.url, {
       method: "GET",
       headers: input.headers,
-      lookup: (_hostname, _options, callback) => callback(null, input.address, isIP(input.address) as 4 | 6),
+      lookup: pinnedAddressLookup(input.address),
       rejectUnauthorized: true,
       agent: false
     }, (response) => {
@@ -344,10 +385,6 @@ async function nativeGitHubTransport(input: GitHubHttpRequest): Promise<GitHubHt
       }));
       response.on("error", () => finish(new Error("GitHub API response failed")));
     });
-    const deadline = setTimeout(() => {
-      request.destroy();
-      finish(new Error("GitHub API request timed out"));
-    }, GITHUB_TIMEOUT_MS);
     const onAbort = () => {
       request.destroy();
       finish(abortError());
@@ -355,6 +392,64 @@ async function nativeGitHubTransport(input: GitHubHttpRequest): Promise<GitHubHt
     input.signal?.addEventListener("abort", onAbort, { once: true });
     request.on("error", () => finish(new Error("GitHub API request failed")));
     request.end();
+  });
+}
+
+type GitHubRequestBudget = Readonly<{
+  signal: AbortSignal;
+  failure: () => Error;
+  dispose: () => void;
+}>;
+
+function normalizeRequestTimeout(value: unknown): number {
+  if (value === undefined) return GITHUB_TIMEOUT_MS;
+  if (!Number.isSafeInteger(value) || Number(value) < 1 || Number(value) > GITHUB_TIMEOUT_MS) {
+    throw new Error(`GitHub request timeout must be an integer from 1 through ${GITHUB_TIMEOUT_MS}`);
+  }
+  return Number(value);
+}
+
+function createGitHubRequestBudget(callerSignal: AbortSignal | undefined, timeoutMs: number): GitHubRequestBudget {
+  const controller = new AbortController();
+  let reason: "cancelled" | "timed-out" | undefined;
+  const abort = (nextReason: "cancelled" | "timed-out") => {
+    if (controller.signal.aborted) return;
+    reason = nextReason;
+    controller.abort();
+  };
+  const onCallerAbort = () => abort("cancelled");
+  if (callerSignal?.aborted) onCallerAbort();
+  else callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  const deadline = setTimeout(() => abort("timed-out"), timeoutMs);
+  return Object.freeze({
+    signal: controller.signal,
+    failure: () => reason === "timed-out" ? new Error("GitHub API request timed out") : abortError(),
+    dispose: () => {
+      clearTimeout(deadline);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    }
+  });
+}
+
+function settleWithinGitHubRequestBudget<T>(operation: Promise<T>, budget: GitHubRequestBudget): Promise<T> {
+  if (budget.signal.aborted) return Promise.reject(budget.failure());
+  return new Promise<T>((resolveOperation, rejectOperation) => {
+    let settled = false;
+    const succeed = (result: T) => {
+      if (settled) return;
+      settled = true;
+      budget.signal.removeEventListener("abort", onAbort);
+      resolveOperation(result);
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      budget.signal.removeEventListener("abort", onAbort);
+      rejectOperation(error);
+    };
+    const onAbort = () => fail(budget.failure());
+    budget.signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(succeed, fail);
   });
 }
 

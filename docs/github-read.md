@@ -51,8 +51,9 @@ The client:
 
 - resolves and pins a public IP address before connecting;
 - refuses invalid, private, loopback, link-local, and redirect targets;
-- uses verified HTTPS, a fixed GitHub API version, bounded concurrency, an
-  enforceable timeout, cancellation, and a one-mebibyte response ceiling;
+- uses verified HTTPS, a fixed GitHub API version, bounded concurrency, and one
+  enforceable timeout/cancellation budget across queueing, DNS validation, and
+  transport, plus a one-mebibyte response ceiling;
 - accepts only JSON and never includes remote error bodies in local errors;
 - returns bounded fields and marks all remote text as
   `external-untrusted`.

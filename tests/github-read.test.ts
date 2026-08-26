@@ -20,6 +20,7 @@ import {
   type GitHubHttpRequest,
   type GitHubHttpResponse
 } from "../packages/kernel/src/index.ts";
+import { pinnedAddressLookup } from "../packages/kernel/src/web.ts";
 import { createDefaultPolicy, evaluateTaskPolicy } from "../packages/policy/src/index.ts";
 import { projectDurableToolInput, projectDurableToolOutput } from "../packages/protocol/src/index.ts";
 
@@ -152,6 +153,14 @@ test("GitHub read network boundary refuses private resolution, redirects, and re
   await assert.rejects(() => privateClient.repository({ repository }), /non-public address/u);
   assert.equal(calls, 0);
 
+  const mixedAddressClient = createGitHubReadClient(config, {
+    environment,
+    resolveNetworkAddresses: async () => ["93.184.216.34", "127.0.0.1"],
+    transport: async () => { calls += 1; return jsonResponse({}); }
+  });
+  await assert.rejects(() => mixedAddressClient.repository({ repository }), /non-public address/u);
+  assert.equal(calls, 0);
+
   const invalidAddressClient = createGitHubReadClient(config, {
     environment,
     resolveNetworkAddresses: async () => ["public.example.invalid"],
@@ -177,6 +186,17 @@ test("GitHub read network boundary refuses private resolution, redirects, and re
     (error: any) => /status 403/u.test(error.message) && !/synthetic-test-value/u.test(error.message)
   );
   assert.throws(() => normalizeGitHubReadConfig({ ...config, endpoint: "https://attacker.invalid" }), /unsupported field: endpoint/u);
+});
+
+test("GitHub native address pinning honors Node's all-address lookup callback shape", async () => {
+  const lookup = pinnedAddressLookup("93.184.216.34");
+  const addresses = await new Promise<Array<{ address: string; family: number }>>((resolveLookup, rejectLookup) => {
+    lookup("api.github.com", { all: true, verbatim: true }, (error: Error | null, result: Array<{ address: string; family: number }>) => {
+      if (error) rejectLookup(error);
+      else resolveLookup(result);
+    });
+  });
+  assert.deepEqual(addresses, [{ address: "93.184.216.34", family: 4 }]);
 });
 
 test("GitHub read concurrency is bounded and queued cancellation never starts a request", async () => {
@@ -216,6 +236,90 @@ test("GitHub read concurrency is bounded and queued cancellation never starts a 
   await github.repository({ repository });
   assert.equal(calls, 5);
   assert.equal(maximumActive, 4);
+});
+
+test("GitHub caller cancellation settles stalled DNS without releasing its live admission", async (t) => {
+  let activeResolvers = 0;
+  let transportCalls = 0;
+  let releaseResolver: (() => void) | undefined;
+  let announceResolver!: () => void;
+  const resolverStarted = new Promise<void>((resolveStarted) => { announceResolver = resolveStarted; });
+  t.after(() => releaseResolver?.());
+  const github = createGitHubReadClient(config, {
+    environment,
+    resolveNetworkAddresses: async () => {
+      activeResolvers += 1;
+      announceResolver();
+      return new Promise<string[]>((resolveAddresses) => {
+        releaseResolver = () => {
+          activeResolvers -= 1;
+          resolveAddresses(["93.184.216.34"]);
+        };
+      });
+    },
+    transport: async () => {
+      transportCalls += 1;
+      return jsonResponse({});
+    }
+  });
+  const controller = new AbortController();
+  const request = github.repository({ repository }, controller.signal);
+  await resolverStarted;
+  controller.abort();
+  await assert.rejects(() => request, (error: any) => error?.name === "AbortError");
+  assert.equal(activeResolvers, 1);
+  assert.equal(transportCalls, 0);
+  releaseResolver?.();
+  releaseResolver = undefined;
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  assert.equal(activeResolvers, 0);
+});
+
+test("GitHub deadline bounds stalled DNS globally and settles queued calls without resolver release", async (t) => {
+  let startedResolvers = 0;
+  let activeResolvers = 0;
+  let maximumActiveResolvers = 0;
+  let transportCalls = 0;
+  const releases: Array<() => void> = [];
+  t.after(() => {
+    for (const release of releases.splice(0)) release();
+  });
+  const github = createGitHubReadClient(config, {
+    environment,
+    __testOnlyRequestTimeoutMs: 40,
+    resolveNetworkAddresses: async () => {
+      startedResolvers += 1;
+      activeResolvers += 1;
+      maximumActiveResolvers = Math.max(maximumActiveResolvers, activeResolvers);
+      return new Promise<string[]>((resolveAddresses) => releases.push(() => {
+        activeResolvers -= 1;
+        resolveAddresses(["93.184.216.34"]);
+      }));
+    },
+    transport: async () => {
+      transportCalls += 1;
+      return jsonResponse({});
+    }
+  });
+
+  const settled = await Promise.allSettled(Array.from({ length: 12 }, () => github.repository({ repository })));
+  assert.equal(settled.every((result) => result.status === "rejected" && /timed out/u.test(String(result.reason?.message))), true);
+  assert.equal(startedResolvers, 4);
+  assert.equal(activeResolvers, 4);
+  assert.equal(maximumActiveResolvers, 4);
+  assert.equal(transportCalls, 0);
+
+  for (const release of releases.splice(0)) release();
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  assert.equal(activeResolvers, 0);
+
+  const probe = createGitHubReadClient(config, {
+    environment,
+    __testOnlyRequestTimeoutMs: 200,
+    resolveNetworkAddresses: publicResolver,
+    transport: async (request) => fixtures(`${request.url.pathname}${request.url.search}`)
+  });
+  assert.equal((await probe.repository({ repository })).type, "github.repository");
 });
 
 test("GitHub live content is unavailable on replay and persists as digests only", async (t) => {
