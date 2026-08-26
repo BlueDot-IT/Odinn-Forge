@@ -103,6 +103,13 @@ The complete inputs, outputs, defaults, ceilings, cursor binding, ignore
 semantics, durable-evidence behavior, and platform boundary are documented in
 [Bounded workspace inspection](workspace-inspection.md).
 
+### Local Git read contract
+
+`git.status`, `git.diff`, and `git.log` provide a bounded, network-free view of
+the assigned local worktree under the separate `git.read` capability. See
+[Local Git inspection](git-inspection.md) for ref/path admission, durable
+redaction, diagnostics, and recovery behavior.
+
 ### `workspace.readText` compatibility contract
 
 `workspace.readText` reads one UTF-8 text file beneath the assigned workspace
