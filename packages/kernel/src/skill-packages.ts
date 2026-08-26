@@ -162,9 +162,10 @@ export class SkillPackageStore {
     return pending;
   }
 
-  async install(input: any) {
+  async install(input: any, options: SkillPackageMutationOptions = {}) {
     const validated = validateSkillPackage(input);
     return this.mutate(async (state) => {
+      throwIfSkillMutationAborted(options.signal);
       const current = state.packages.find((entry) => entry.id === validated.manifest.id);
       const destination = this.safePackagePath(validated.manifest.id, validated.manifest.version);
       const staging = join(this.root, ".staging", randomUUID());
@@ -173,6 +174,7 @@ export class SkillPackageStore {
         await writeFile(join(staging, "SKILL.md"), validated.skillContent, { mode: 0o600 });
         await writeFile(join(staging, "skill.json"), `${JSON.stringify(skillMetadata(validated), null, 2)}\n`, { mode: 0o600 });
         await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+        throwIfSkillMutationAborted(options.signal);
         try { await rename(staging, destination); }
         catch (error: any) {
           if (error?.code !== "EEXIST" && error?.code !== "ENOTEMPTY") throw error;
@@ -193,14 +195,16 @@ export class SkillPackageStore {
         ...(current ? { previousVersion: current.version } : {})
       };
       const index = state.packages.findIndex((entry) => entry.id === record.id);
+      throwIfSkillMutationAborted(options.signal);
       if (index >= 0) state.packages[index] = record;
       else state.packages.push(record);
       return { ...record, verification: { valid: true, failures: [] } };
-    });
+    }, options);
   }
 
-  async transition(id: string, action: string, expected: SkillTransitionPreconditions = {}) {
+  async transition(id: string, action: string, expected: SkillTransitionPreconditions = {}, options: SkillPackageMutationOptions = {}) {
     return this.mutate(async (state) => {
+      throwIfSkillMutationAborted(options.signal);
       const record = state.packages.find((entry) => entry.id === id);
       if (!record) throw new Error("skill package not found");
       if (!["enable", "disable", "quarantine"].includes(action)) throw new Error("unsupported skill lifecycle action");
@@ -215,6 +219,7 @@ export class SkillPackageStore {
         throw error;
       }
       const verification = await this.verifyRecord(record);
+      throwIfSkillMutationAborted(options.signal);
       if (action === "enable" && !verification.valid) {
         record.status = "quarantined";
         record.trusted = false;
@@ -226,7 +231,7 @@ export class SkillPackageStore {
       record.trusted = action === "enable";
       record.updatedAt = new Date().toISOString();
       return { ...record, verification };
-    });
+    }, options);
   }
 
   async verify(id: string) {
@@ -414,12 +419,18 @@ export class SkillPackageStore {
     }
   }
 
-  private async write(state: RegistryState) {
+  private async write(state: RegistryState, signal?: AbortSignal) {
+    throwIfSkillMutationAborted(signal);
     await mkdir(this.root, { recursive: true, mode: 0o700 });
     const temporary = `${this.registryPath}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-    await rename(temporary, this.registryPath);
-    await chmod(this.registryPath, 0o600);
+    try {
+      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+      throwIfSkillMutationAborted(signal);
+      await rename(temporary, this.registryPath);
+      await chmod(this.registryPath, 0o600);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
   }
 
   private async readDisclosureIndex(): Promise<DisclosureIndex> {
@@ -475,12 +486,14 @@ export class SkillPackageStore {
     return serialized;
   }
 
-  private async writeDisclosureIndex(serialized: string) {
+  private async writeDisclosureIndex(serialized: string, signal?: AbortSignal) {
+    throwIfSkillMutationAborted(signal);
     await mkdir(this.root, { recursive: true, mode: 0o700 });
     await writeFile(this.disclosureDirtyPath, "dirty\n", { mode: 0o600 });
     const temporary = `${this.disclosureIndexPath}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, serialized, { mode: 0o600 });
+      throwIfSkillMutationAborted(signal);
       await rename(temporary, this.disclosureIndexPath);
       await chmod(this.disclosureIndexPath, 0o600);
       await rm(this.disclosureDirtyPath);
@@ -489,14 +502,16 @@ export class SkillPackageStore {
     }
   }
 
-  private async writeStateAndDisclosure(state: RegistryState) {
+  private async writeStateAndDisclosure(state: RegistryState, signal?: AbortSignal) {
+    throwIfSkillMutationAborted(signal);
     const serialized = this.serializeDisclosureIndex(state);
     await mkdir(this.root, { recursive: true, mode: 0o700 });
     await writeFile(this.disclosureDirtyPath, "dirty\n", { mode: 0o600 });
-    await this.write(state);
+    await this.write(state, signal);
     const temporary = `${this.disclosureIndexPath}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, serialized, { mode: 0o600 });
+      throwIfSkillMutationAborted(signal);
       await rename(temporary, this.disclosureIndexPath);
       await chmod(this.disclosureIndexPath, 0o600);
     } finally {
@@ -505,12 +520,18 @@ export class SkillPackageStore {
     await rm(this.disclosureDirtyPath);
   }
 
-  private async mutate<T>(operation: (state: RegistryState) => Promise<T>) {
+  private async mutate<T>(operation: (state: RegistryState) => Promise<T>, options: SkillPackageMutationOptions = {}) {
     const pending = this.writeChain.then(() => withStateMutationLock(this.root, async () => {
+      throwIfSkillMutationAborted(options.signal);
       const state = await this.read();
+      throwIfSkillMutationAborted(options.signal);
       const result = await operation(state);
-      await this.writeStateAndDisclosure(state);
+      throwIfSkillMutationAborted(options.signal);
+      await this.writeStateAndDisclosure(state, options.signal);
       return result;
+    }, {
+      signal: options.signal,
+      __testOnlyAfterLockAcquired: options.__testOnlyAfterLockAcquired
     }));
     this.writeChain = pending.catch(() => undefined);
     return pending;
@@ -522,6 +543,18 @@ export class SkillPackageStore {
     if (!target.startsWith(`${packagesRoot}${sep}`)) throw new Error("skill package path escaped managed storage");
     return target;
   }
+}
+
+export type SkillPackageMutationOptions = {
+  signal?: AbortSignal;
+  /** @internal Test-only barrier after this process owns the skill-state lock. */
+  __testOnlyAfterLockAcquired?: () => void | Promise<void>;
+};
+
+function throwIfSkillMutationAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("skill mutation was aborted");
 }
 
 function renderSkillMarkdown(manifest: SkillManifest) {

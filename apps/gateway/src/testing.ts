@@ -14,7 +14,10 @@ export type GatewayTestHooks = {
   afterApprovalDispatchStarted?: (event: ApprovalJobClaimedTestEvent & { signal: AbortSignal }) => void | Promise<void>;
   beforeAgentGraphControlAudit?: (event: AgentGraphControlAuditTestEvent) => void | Promise<void>;
   beforeChannelResultPersist?: (event: { jobId: string }) => void | Promise<void>;
+  afterControlPlaneMutationLockAcquired?: (event: { surface: string }) => void | Promise<void>;
+  beforeControlPlaneMutationCommit?: (event: { surface: string }) => void | Promise<void>;
   onRequestError?: (event: { pathname: string; error: unknown }) => void | Promise<void>;
+  shutdownTimeoutMs?: number;
 };
 
 const hooksByOptions = new WeakMap<object, Readonly<GatewayTestHooks>>();

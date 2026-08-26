@@ -89,14 +89,34 @@ The OTLP adapter emits OTLP/HTTP JSON to the standard `v1/traces`, `v1/metrics`,
 and `v1/logs` paths. HTTPS is required except for loopback HTTP collectors.
 Endpoint URLs may not include credentials, queries, fragments, encoded path
 segments, or backslashes. Redirects are rejected, request credentials are
-omitted, response bodies are discarded, and exporter errors are reduced to
-categorical failures before they reach product status.
+omitted, and response bodies are read only through a small fixed byte bound.
+The adapter parses the standard OTLP `partialSuccess` rejection count so a
+HTTP 200 cannot erase collector-side loss; collector error prose is ignored.
+Malformed, oversized, or contradictory settlement responses fail the batch
+categorically before they reach product status.
 
 The Gateway exports only the fixed schema above: lifecycle, run acceptance,
 tool or memory execution, audit append, recovery, shutdown, queue, and exporter
 health. It never exports request paths, request IDs, prompts, tool arguments,
 model output, audit payloads, filesystem paths, tenant identities, or endpoint
-details. Startup JSON reports only enabled/state/queue/drop categories.
+details. Registered tools are reduced to fixed categories such as `workspace`,
+`memory`, `channel`, or `other`; unregistered request labels are never copied
+to telemetry. Authentication and origin checks run before run-acceptance
+classification.
+
+Gateway startup JSON, `/status`, and `/diagnostics` expose only bounded local
+telemetry accounting: lifecycle/exporter state, queued, accepted, exported,
+dropped, invalid, post-shutdown, and export-failure counts. A drop total
+includes overflow, export rejection/failure, invalid records, and records
+rejected after shutdown. These projections contain no endpoint or record
+content. Queue depth is a gauge; `odinn.export.dropped` reports counter deltas,
+not repeatedly sampled cumulative values.
+
+Gateway shutdown first closes HTTP admission and returns `503` on any request
+already accepted after the stop barrier. Component drain, telemetry flush,
+listener close, and forced connection teardown share one five-second maximum
+deadline. A stalled component or exporter produces a bounded partial-shutdown
+error instead of leaving SIGTERM pending indefinitely.
 
 Example explicit local-collector activation:
 

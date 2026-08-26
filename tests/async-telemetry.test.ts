@@ -35,6 +35,7 @@ test("disabled telemetry has no exporter, queue, timer, or validation behavior",
     exported: 0,
     droppedOverflow: 0,
     droppedExportFailure: 0,
+    rejectedInvalid: 0,
     rejectedAfterShutdown: 0,
     exportFailures: 0,
     consecutiveFailures: 0,
@@ -72,6 +73,7 @@ test("recording is synchronous, bounded, immutable, and exports only after the s
     exported: 1,
     droppedOverflow: 0,
     droppedExportFailure: 0,
+    rejectedInvalid: 0,
     rejectedAfterShutdown: 0,
     exportFailures: 0,
     consecutiveFailures: 0,
@@ -136,6 +138,7 @@ test("privacy boundary rejects arbitrary names, keys, structures, content fields
     name: "odinn.task",
     prompt: "private input"
   } as any), /unknown field: prompt/u);
+  assert.equal(telemetry.status().rejectedInvalid, 17);
   await telemetry.shutdown();
 });
 
@@ -245,6 +248,25 @@ test("exporter failures are isolated, retried with backoff, and never reject rec
   assert.equal(status.consecutiveFailures, 0);
   assert.equal(status.lastFailure, undefined);
   assert.doesNotMatch(JSON.stringify(status), /secret|destination/u);
+  await telemetry.shutdown();
+});
+
+test("partial exporter settlement counts accepted and rejected records exactly", async () => {
+  const telemetry = createBufferedTelemetry({
+    enabled: true,
+    exporter: { export: () => ({ exported: 1, rejected: 1 }) },
+    maxBatch: 2,
+    autoPump: false
+  });
+  telemetry.recordEvent({ name: "odinn.task", attributes: { operation: "accepted" } });
+  telemetry.recordEvent({ name: "odinn.task", attributes: { operation: "rejected" } });
+  assert.equal(await telemetry.flush(), false);
+  assert.deepEqual({
+    exported: telemetry.status().exported,
+    dropped: telemetry.status().droppedExportFailure,
+    failures: telemetry.status().exportFailures,
+    lastFailure: telemetry.status().lastFailure
+  }, { exported: 1, dropped: 1, failures: 1, lastFailure: "exporter-error" });
   await telemetry.shutdown();
 });
 

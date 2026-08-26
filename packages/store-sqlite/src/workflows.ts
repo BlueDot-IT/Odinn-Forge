@@ -154,12 +154,14 @@ export class SqliteWorkflowStore {
     initialize(database);
   }
 
-  create(input: WorkflowRunRequest): WorkflowRunRecord {
+  create(input: WorkflowRunRequest, options: WorkflowStoreMutationOptions = {}): WorkflowRunRecord {
+    throwIfWorkflowStoreMutationAborted(options.signal);
     const request = validateWorkflowRunRequest(input);
     const definition = validateWorkflowDefinition(request.definition);
     const runProjection = durableProjection(request.input);
     const timestamp = now();
     return this.database.transaction((db) => {
+      throwIfWorkflowStoreMutationAborted(options.signal);
       const existing = db.prepare("SELECT run_id FROM workflow_runs WHERE principal_id = ? AND idempotency_key = ?").get(request.principalId, request.idempotencyKey) as Row | undefined;
       if (existing) return this.get(request.runId === String(existing.run_id) ? request.runId : String(existing.run_id))!;
       const idConflict = db.prepare("SELECT run_id FROM workflow_runs WHERE run_id = ?").get(request.runId) as Row | undefined;
@@ -333,8 +335,10 @@ export class SqliteWorkflowStore {
     });
   }
 
-  resume(runId: string): WorkflowRunRecord {
+  resume(runId: string, options: WorkflowStoreMutationOptions = {}): WorkflowRunRecord {
+    throwIfWorkflowStoreMutationAborted(options.signal);
     return this.database.transaction((db) => {
+      throwIfWorkflowStoreMutationAborted(options.signal);
       const row = db.prepare("SELECT status, cancellation_requested_at, failure_requested_at FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
       if (!row) throw new Error(`workflow run not found: ${runId}`);
       const status = String(row.status) as WorkflowRunStatus;
@@ -349,9 +353,11 @@ export class SqliteWorkflowStore {
     });
   }
 
-  requestCancellation(runId: string, deadlineAt = new Date(Date.now() + DEFAULT_CANCELLATION_GRACE_MS).toISOString()): WorkflowRunRecord {
+  requestCancellation(runId: string, deadlineAt = new Date(Date.now() + DEFAULT_CANCELLATION_GRACE_MS).toISOString(), options: WorkflowStoreMutationOptions = {}): WorkflowRunRecord {
+    throwIfWorkflowStoreMutationAborted(options.signal);
     if (!Number.isFinite(Date.parse(deadlineAt))) throw new TypeError("workflow cancellation deadline must be an ISO-8601 timestamp");
     return this.database.transaction((db) => {
+      throwIfWorkflowStoreMutationAborted(options.signal);
       const row = db.prepare("SELECT status, cancellation_requested_at FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
       if (!row) throw new Error(`workflow run not found: ${runId}`);
       const status = String(row.status) as WorkflowRunStatus;
@@ -367,10 +373,10 @@ export class SqliteWorkflowStore {
     });
   }
 
-  cancel(runId: string): WorkflowRunRecord {
-    const requested = this.requestCancellation(runId);
+  cancel(runId: string, options: WorkflowStoreMutationOptions = {}): WorkflowRunRecord {
+    const requested = this.requestCancellation(runId, undefined, options);
     if (requested.status !== "cancelling") return requested;
-    return this.finalizeCancellation(runId, { quarantineRunning: true });
+    return this.finalizeCancellation(runId, { quarantineRunning: true }, options);
   }
 
   acknowledgeCancellation(runId: string, stepId: string, leaseToken: string, { uncertain = false, errorCode }: { uncertain?: boolean; errorCode?: string } = {}): WorkflowRunRecord {
@@ -409,8 +415,10 @@ export class SqliteWorkflowStore {
     });
   }
 
-  finalizeCancellation(runId: string, { quarantineRunning = false }: { quarantineRunning?: boolean } = {}): WorkflowRunRecord {
+  finalizeCancellation(runId: string, { quarantineRunning = false }: { quarantineRunning?: boolean } = {}, options: WorkflowStoreMutationOptions = {}): WorkflowRunRecord {
+    throwIfWorkflowStoreMutationAborted(options.signal);
     return this.database.transaction((db) => {
+      throwIfWorkflowStoreMutationAborted(options.signal);
       const row = db.prepare("SELECT status, cancellation_requested_at FROM workflow_runs WHERE run_id=?").get(runId) as Row | undefined;
       if (!row) throw new Error(`workflow run not found: ${runId}`);
       if (!row.cancellation_requested_at || TERMINAL_RUN_STATUSES.has(String(row.status) as WorkflowRunStatus)) return this.get(runId)!;
@@ -511,6 +519,14 @@ export class SqliteWorkflowStore {
     return (this.database.db.prepare("SELECT sequence, type, payload_json, created_at FROM workflow_events WHERE run_id=? ORDER BY sequence LIMIT ?").all(runId, bounded) as Row[])
       .map((row) => ({ sequence: Number(row.sequence), type: String(row.type), payload: parse(row.payload_json), at: String(row.created_at) }));
   }
+}
+
+export type WorkflowStoreMutationOptions = { signal?: AbortSignal };
+
+function throwIfWorkflowStoreMutationAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("workflow mutation was aborted");
 }
 
 function appendEventUnsafe(database: any, runId: string, type: string, payload: JsonObject): void {

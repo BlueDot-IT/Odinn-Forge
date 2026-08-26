@@ -12,6 +12,19 @@ export type GatewayTelemetry = Pick<BufferedTelemetry,
   "enabled" | "recordEvent" | "recordSpan" | "recordMetric" | "status" | "flush" | "shutdown"
 >;
 
+const DIRECT_TOOL_CATEGORIES = new Set([
+  "agent", "browser", "computer", "email", "git", "github", "goal", "job", "mcp", "memory",
+  "model", "process", "project", "sandbox", "session", "skill", "text", "web", "workflow", "workspace"
+]);
+const REPORTED_DROPPED = new WeakMap<object, number>();
+
+export function gatewayToolTelemetryCategory(registeredToolName: string): string {
+  const prefix = registeredToolName.split(".", 1)[0]?.toLowerCase() ?? "";
+  if (["discord", "telegram", "channel"].includes(prefix)) return "channel";
+  if (["improve", "improvement"].includes(prefix)) return "improvement";
+  return DIRECT_TOOL_CATEGORIES.has(prefix) ? prefix : "other";
+}
+
 export function createGatewayTelemetry({ environment = process.env, serviceVersion = "unknown", fetch }: {
   environment?: NodeJS.ProcessEnv;
   serviceVersion?: string;
@@ -63,12 +76,50 @@ export function recordGatewaySpan(telemetry: GatewayTelemetry, input: {
   }
 }
 
+export function recordGatewayTelemetryHealth(telemetry: GatewayTelemetry): void {
+  const initialStatus = telemetry.status();
+  const queued = initialStatus.queued + initialStatus.inFlight;
+  try {
+    telemetry.recordMetric({
+      name: "odinn.queue.depth",
+      instrument: "gauge",
+      value: queued,
+      unit: "1",
+      attributes: { component: "gateway", operation: "telemetry.observe", "queue.depth": queued }
+    });
+    const currentStatus = telemetry.status();
+    const dropped = currentStatus.droppedOverflow
+      + currentStatus.droppedExportFailure
+      + currentStatus.rejectedInvalid
+      + currentStatus.rejectedAfterShutdown;
+    const previousDropped = REPORTED_DROPPED.get(telemetry as object) ?? 0;
+    const newlyDropped = Math.max(0, dropped - previousDropped);
+    if (newlyDropped > 0) {
+      const admitted = telemetry.recordMetric({
+        name: "odinn.export.dropped",
+        instrument: "counter",
+        value: newlyDropped,
+        unit: "1",
+        attributes: { component: "gateway", operation: "telemetry.observe", "item.count": newlyDropped }
+      });
+      if (admitted) REPORTED_DROPPED.set(telemetry as object, dropped);
+    }
+  } catch {
+    // Invalid or post-shutdown telemetry is locally accounted by the buffer.
+  }
+}
+
 export function telemetryStatusProjection(telemetry: GatewayTelemetry): Readonly<{
   enabled: boolean;
   state: TelemetryStatus["state"];
   exporterState: TelemetryStatus["exporterState"];
   queued: number;
+  accepted: number;
+  exported: number;
   dropped: number;
+  rejectedInvalid: number;
+  rejectedAfterShutdown: number;
+  exportFailures: number;
 }> {
   const status = telemetry.status();
   return Object.freeze({
@@ -76,7 +127,15 @@ export function telemetryStatusProjection(telemetry: GatewayTelemetry): Readonly
     state: status.state,
     exporterState: status.exporterState,
     queued: status.queued + status.inFlight,
-    dropped: status.droppedOverflow + status.droppedExportFailure
+    accepted: status.accepted,
+    exported: status.exported,
+    dropped: status.droppedOverflow
+      + status.droppedExportFailure
+      + status.rejectedInvalid
+      + status.rejectedAfterShutdown,
+    rejectedInvalid: status.rejectedInvalid,
+    rejectedAfterShutdown: status.rejectedAfterShutdown,
+    exportFailures: status.exportFailures
   });
 }
 

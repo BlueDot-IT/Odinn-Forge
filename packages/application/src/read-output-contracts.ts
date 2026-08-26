@@ -143,6 +143,19 @@ export interface RuntimeSurfacesSummaryV1 {
   readonly projectContext: { readonly enabled: boolean };
 }
 
+export interface TelemetryStatusSummaryV1 {
+  readonly enabled: boolean;
+  readonly state: "disabled" | "running" | "stopping" | "stopped";
+  readonly exporterState: "idle" | "exporting" | "backing-off" | "wedged";
+  readonly queued: number;
+  readonly accepted: number;
+  readonly exported: number;
+  readonly dropped: number;
+  readonly rejectedInvalid: number;
+  readonly rejectedAfterShutdown: number;
+  readonly exportFailures: number;
+}
+
 export interface SelfImprovementSummaryV1 {
   readonly enabled: boolean;
   readonly mode: "disabled" | "propose" | "auto";
@@ -237,6 +250,7 @@ export interface GatewayStatusSnapshotV1 extends StatusSnapshotBaseV1 {
   readonly pluginModules: readonly PluginModuleSummaryV1[];
   readonly experimental: ExperimentalFlagsV1;
   readonly runtimeSurfaces: RuntimeSurfacesSummaryV1;
+  readonly telemetry?: TelemetryStatusSummaryV1;
   readonly selfImprovement: SelfImprovementSummaryV1;
   readonly pendingApprovals: readonly PendingApprovalSummaryV1[];
 }
@@ -436,6 +450,7 @@ export interface DiagnosticsReportV1 {
   readonly processRecovery: ProcessRecoveryDiagnosticV1;
   readonly githubRead?: GitHubReadDiagnosticV1;
   readonly microsoftGraphRead?: MicrosoftGraphReadDiagnosticV1;
+  readonly telemetry?: TelemetryStatusSummaryV1;
   readonly state: DiagnosticStateSummaryV1;
 }
 
@@ -560,9 +575,9 @@ export function validateSessionPageV1(input: unknown): SessionPageV1 {
 
 function assertStatusSnapshotV1(input: JsonObject): StatusSnapshotV1 {
   const gateway = Object.hasOwn(input, "version");
-  object(input, "status snapshot", gateway
-    ? ["ok", "version", "state", "workspaceRoot", "tools", "toolDetails", "capabilityRegistryVersion", "capabilityRegistry", "capabilityMigration", "allowedCapabilities", "allowedTools", "defaultModel", "models", "providers", "coreAdvanced", "pluginModules", "experimental", "runtimeSurfaces", "security", "selfImprovement", "pendingApprovals"]
-    : ["ok", "state", "workspaceRoot", "auditLog", "tools", "toolDetails", "allowedTools", "allowedCapabilities", "capabilityRegistryVersion", "capabilityMigration", "policy", "security", "experimental", "defaultModel", "models", "providers", "channels"]);
+  const gatewayFields = ["ok", "version", "state", "workspaceRoot", "tools", "toolDetails", "capabilityRegistryVersion", "capabilityRegistry", "capabilityMigration", "allowedCapabilities", "allowedTools", "defaultModel", "models", "providers", "coreAdvanced", "pluginModules", "experimental", "runtimeSurfaces", "security", "selfImprovement", "pendingApprovals"];
+  const cliFields = ["ok", "state", "workspaceRoot", "auditLog", "tools", "toolDetails", "allowedTools", "allowedCapabilities", "capabilityRegistryVersion", "capabilityMigration", "policy", "security", "experimental", "defaultModel", "models", "providers", "channels"];
+  object(input, "status snapshot", gateway ? [...gatewayFields, "telemetry"] : cliFields, gateway ? gatewayFields : cliFields);
   literal(input.ok, "status snapshot.ok", true);
   text(input.state, "status snapshot.state");
   text(input.workspaceRoot, "status snapshot.workspaceRoot");
@@ -588,6 +603,7 @@ function assertStatusSnapshotV1(input: JsonObject): StatusSnapshotV1 {
     });
     validateExperimentalFlags(input.experimental, "status snapshot.experimental");
     validateRuntimeSurfaces(input.runtimeSurfaces, "status snapshot.runtimeSurfaces");
+    if (input.telemetry !== undefined) validateTelemetryStatus(input.telemetry, "status snapshot.telemetry");
     validateSelfImprovement(input.selfImprovement, "status snapshot.selfImprovement");
     objectList(input.pendingApprovals, "status snapshot.pendingApprovals", validatePendingApproval);
   } else {
@@ -605,7 +621,7 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
   object(
     input,
     "diagnostics report",
-    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "microsoftGraphRead", "state"],
+    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "microsoftGraphRead", "telemetry", "state"],
     ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserRecovery", "jobs", "sandbox", "processRecovery", "state"]
   );
   bool(input.ok, "diagnostics report.ok");
@@ -652,6 +668,7 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
     literal(graph.endpoint, "diagnostics report.microsoftGraphRead.endpoint", "graph.microsoft.com"); literal(graph.readOnly, "diagnostics report.microsoftGraphRead.readOnly", true); literal(graph.mutationsAvailable, "diagnostics report.microsoftGraphRead.mutationsAvailable", false); literal(graph.redirectsAllowed, "diagnostics report.microsoftGraphRead.redirectsAllowed", false);
     if (![0, 1].includes(Number(graph.accountCount))) throw new ApplicationContractValidationError("diagnostics report.microsoftGraphRead.accountCount must be 0 or 1");
   }
+  if (input.telemetry !== undefined) validateTelemetryStatus(input.telemetry, "diagnostics report.telemetry");
   const state = object(input.state, "diagnostics report.state", ["ownerOnly", "runtimeStateOutsideSourceCheckout", "secretsExcludedFromDiagnostics"]);
   bool(state.ownerOnly, "diagnostics report.state.ownerOnly"); bool(state.runtimeStateOutsideSourceCheckout, "diagnostics report.state.runtimeStateOutsideSourceCheckout"); literal(state.secretsExcludedFromDiagnostics, "diagnostics report.state.secretsExcludedFromDiagnostics", true);
   return input as unknown as DiagnosticsReportV1;
@@ -737,6 +754,42 @@ function validateRuntimeSurfaces(input: unknown, path: string): void {
   const value = object(input, path, ["durableWorkflows", "eventIngress", "projectContext"]);
   for (const name of ["durableWorkflows", "eventIngress", "projectContext"] as const) {
     const surface = object(value[name], `${path}.${name}`, ["enabled"]); bool(surface.enabled, `${path}.${name}.enabled`);
+  }
+}
+
+function validateTelemetryStatus(input: unknown, path: string): void {
+  const value = object(input, path, ["enabled", "state", "exporterState", "queued", "accepted", "exported", "dropped", "rejectedInvalid", "rejectedAfterShutdown", "exportFailures"]);
+  bool(value.enabled, `${path}.enabled`);
+  oneOf(value.state, `${path}.state`, ["disabled", "running", "stopping", "stopped"]);
+  oneOf(value.exporterState, `${path}.exporterState`, ["idle", "exporting", "backing-off", "wedged"]);
+  for (const key of ["queued", "accepted", "exported", "dropped", "rejectedInvalid", "rejectedAfterShutdown", "exportFailures"] as const) {
+    count(value[key], `${path}.${key}`);
+  }
+  if (value.enabled === false && !["disabled", "stopped"].includes(String(value.state))) {
+    fail(`${path}.state is inconsistent with disabled telemetry`, `${path}.state`);
+  }
+  if (value.enabled === true && value.state === "disabled") {
+    fail(`${path}.state is inconsistent with enabled telemetry`, `${path}.state`);
+  }
+  if (value.enabled === false && value.exporterState !== "idle") {
+    fail(`${path}.exporterState is inconsistent with disabled telemetry`, `${path}.exporterState`);
+  }
+  if (Number(value.exported) > Number(value.accepted)) {
+    fail(`${path}.exported cannot exceed accepted`, `${path}.exported`);
+  }
+  if (Number(value.queued) + Number(value.exported) > Number(value.accepted)) {
+    fail(`${path}.queued plus exported cannot exceed accepted`, `${path}.queued`);
+  }
+  if (Number(value.exportFailures) > Number(value.dropped)) {
+    fail(`${path}.exportFailures cannot exceed dropped`, `${path}.exportFailures`);
+  }
+  if (Number(value.rejectedInvalid) + Number(value.rejectedAfterShutdown) > Number(value.dropped)) {
+    fail(`${path}.dropped must include invalid and post-shutdown rejection counts`, `${path}.dropped`);
+  }
+  if (value.enabled === false) {
+    for (const key of ["queued", "accepted", "exported", "dropped", "rejectedInvalid", "rejectedAfterShutdown", "exportFailures"] as const) {
+      if (Number(value[key]) !== 0) fail(`${path}.${key} must be zero when telemetry is disabled`, `${path}.${key}`);
+    }
   }
 }
 

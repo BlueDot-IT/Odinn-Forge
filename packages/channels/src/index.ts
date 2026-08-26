@@ -126,6 +126,7 @@ export interface ChannelStartContext {
   updateStatus(status: Partial<ChannelStatus>): void;
 }
 export interface ChannelWebhookRequest {
+  signal?: AbortSignal;
   method?: string;
   url?: string;
   headers?: Record<string, string | string[] | undefined>;

@@ -2,6 +2,7 @@ import type {
   TelemetryAttributes,
   TelemetryEnvelope,
   TelemetryEvent,
+  TelemetryExportResult,
   TelemetryExporter,
   TelemetryMetric,
   TelemetrySpan
@@ -17,6 +18,7 @@ export type OtlpHttpExporterOptions = Readonly<{
 const SERVICE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._:+-]*$/u;
 const MAX_ENDPOINT_BYTES = 2_048;
 const MAX_SERVICE_LABEL_BYTES = 128;
+const MAX_RESPONSE_BYTES = 16 * 1024;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "[::1]", "::1", "localhost"]);
 
 type OtlpAttribute = Readonly<{
@@ -173,9 +175,48 @@ function logPayload(events: readonly TelemetryEvent[], serviceName: string, serv
   };
 }
 
-async function discardResponseBody(response: Response): Promise<void> {
-  try { await response.body?.cancel(); }
-  catch { /* response cleanup is best-effort and never changes export outcome */ }
+async function boundedResponseText(response: Response): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) throw new Error("OTLP export response exceeded the bounded body limit");
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } catch {
+    try { await reader.cancel(); } catch { /* cleanup is best-effort */ }
+    throw new Error("OTLP export response was invalid");
+  }
+}
+
+function rejectedCount(path: "v1/traces" | "v1/metrics" | "v1/logs", body: string, itemCount: number): number {
+  if (!body.trim()) return 0;
+  let parsed: unknown;
+  try { parsed = JSON.parse(body); }
+  catch { throw new Error("OTLP export response was invalid"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("OTLP export response was invalid");
+  const partial = (parsed as Record<string, unknown>).partialSuccess;
+  if (partial === undefined) return 0;
+  if (!partial || typeof partial !== "object" || Array.isArray(partial)) throw new Error("OTLP export response was invalid");
+  const key = path === "v1/traces"
+    ? "rejectedSpans"
+    : path === "v1/metrics"
+      ? "rejectedDataPoints"
+      : "rejectedLogRecords";
+  const value = (partial as Record<string, unknown>)[key] ?? 0;
+  const count = typeof value === "string" && /^[0-9]+$/u.test(value) ? Number(value) : value;
+  if (!Number.isSafeInteger(count) || Number(count) < 0 || Number(count) > itemCount) {
+    throw new Error("OTLP export response was invalid");
+  }
+  return Number(count);
 }
 
 export function createOtlpHttpExporter(options: OtlpHttpExporterOptions): TelemetryExporter {
@@ -186,7 +227,12 @@ export function createOtlpHttpExporter(options: OtlpHttpExporterOptions): Teleme
   const fetchImplementation = options.fetch ?? globalThis.fetch;
   if (typeof fetchImplementation !== "function") throw new Error("OTLP exporter requires fetch");
 
-  const post = async (path: "v1/traces" | "v1/metrics" | "v1/logs", payload: unknown, signal: AbortSignal): Promise<void> => {
+  const post = async (
+    path: "v1/traces" | "v1/metrics" | "v1/logs",
+    payload: unknown,
+    itemCount: number,
+    signal: AbortSignal
+  ): Promise<number> => {
     let response: Response;
     try {
       response = await fetchImplementation(new URL(path, endpoint), {
@@ -201,18 +247,39 @@ export function createOtlpHttpExporter(options: OtlpHttpExporterOptions): Teleme
     } catch {
       throw new Error("OTLP export request failed");
     }
-    await discardResponseBody(response);
-    if (!response.ok) throw new Error(`OTLP export failed with HTTP status ${response.status}`);
+    if (!response.ok) {
+      try { await response.body?.cancel(); } catch { /* cleanup is best-effort */ }
+      throw new Error(`OTLP export failed with HTTP status ${response.status}`);
+    }
+    return rejectedCount(path, await boundedResponseText(response), itemCount);
   };
 
   return Object.freeze({
-    export: async (batch: readonly TelemetryEnvelope[], signal: AbortSignal): Promise<void> => {
+    export: async (batch: readonly TelemetryEnvelope[], signal: AbortSignal): Promise<TelemetryExportResult> => {
       const spans = batch.filter((item): item is TelemetrySpan => item.kind === "span");
       const metrics = batch.filter((item): item is TelemetryMetric => item.kind === "metric");
       const events = batch.filter((item): item is TelemetryEvent => item.kind === "event");
-      if (spans.length) await post("v1/traces", tracePayload(spans, serviceName, serviceVersion), signal);
-      if (metrics.length) await post("v1/metrics", metricPayload(metrics, serviceName, serviceVersion), signal);
-      if (events.length) await post("v1/logs", logPayload(events, serviceName, serviceVersion), signal);
+      const groups = [
+        { path: "v1/traces" as const, items: spans, payload: () => tracePayload(spans, serviceName, serviceVersion) },
+        { path: "v1/metrics" as const, items: metrics, payload: () => metricPayload(metrics, serviceName, serviceVersion) },
+        { path: "v1/logs" as const, items: events, payload: () => logPayload(events, serviceName, serviceVersion) }
+      ];
+      let exported = 0;
+      let rejected = 0;
+      for (let index = 0; index < groups.length; index += 1) {
+        const group = groups[index];
+        if (!group.items.length) continue;
+        try {
+          const groupRejected = await post(group.path, group.payload(), group.items.length, signal);
+          rejected += groupRejected;
+          exported += group.items.length - groupRejected;
+        } catch (error) {
+          if (signal.aborted) throw error;
+          rejected += groups.slice(index).reduce((count, remaining) => count + remaining.items.length, 0);
+          return Object.freeze({ exported, rejected });
+        }
+      }
+      return Object.freeze({ exported, rejected });
     }
   });
 }

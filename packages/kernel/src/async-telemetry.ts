@@ -68,9 +68,17 @@ export type TelemetryMetric = TelemetryCommon & {
 export type TelemetryEnvelope = TelemetryEvent | TelemetrySpan | TelemetryMetric;
 
 export interface TelemetryExporter {
-  export(batch: readonly TelemetryEnvelope[], signal: AbortSignal): Promise<void> | void;
+  export(
+    batch: readonly TelemetryEnvelope[],
+    signal: AbortSignal
+  ): Promise<TelemetryExportResult | void> | TelemetryExportResult | void;
   shutdown?(signal: AbortSignal): Promise<void> | void;
 }
+
+export type TelemetryExportResult = Readonly<{
+  exported: number;
+  rejected: number;
+}>;
 
 export type BufferedTelemetryOptions = {
   enabled?: boolean;
@@ -97,6 +105,7 @@ export type TelemetryStatus = {
   exported: number;
   droppedOverflow: number;
   droppedExportFailure: number;
+  rejectedInvalid: number;
   rejectedAfterShutdown: number;
   exportFailures: number;
   consecutiveFailures: number;
@@ -292,6 +301,7 @@ export class BufferedTelemetry {
   #exported = 0;
   #droppedOverflow = 0;
   #droppedExportFailure = 0;
+  #rejectedInvalid = 0;
   #rejectedAfterShutdown = 0;
   #exportFailures = 0;
   #consecutiveFailures = 0;
@@ -299,7 +309,7 @@ export class BufferedTelemetry {
   #scheduled = false;
   #backoffTimer?: ReturnType<typeof setTimeout>;
   #retryDelay?: number;
-  #physicalExportPromise?: Promise<void>;
+  #physicalExportPromise?: Promise<TelemetryExportResult | void>;
   #wedged = false;
   #pumpPromise?: Promise<void>;
   #shutdownPromise?: Promise<TelemetryShutdownResult>;
@@ -343,14 +353,19 @@ export class BufferedTelemetry {
     attributes?: TelemetryAttributes;
   }): boolean {
     if (!this.#canRecord()) return false;
-    const value = strictObject(input, "telemetry event", EVENT_KEYS);
-    return this.#enqueue(freezeEnvelope({
+    try {
+      const value = strictObject(input, "telemetry event", EVENT_KEYS);
+      return this.#enqueue(freezeEnvelope({
       schemaVersion: TELEMETRY_SCHEMA_VERSION,
       kind: "event",
       name: telemetryName(value.name),
       timeUnixMs: timestamp(value.timeUnixMs, this.#now),
       attributes: attributes(value.attributes)
-    }));
+      }));
+    } catch (error) {
+      this.#rejectedInvalid += 1;
+      throw error;
+    }
   }
 
   recordSpan(input: {
@@ -364,10 +379,11 @@ export class BufferedTelemetry {
     status?: "ok" | "error" | "unset";
   }): boolean {
     if (!this.#canRecord()) return false;
-    const value = strictObject(input, "telemetry span", SPAN_KEYS);
-    const status = value.status ?? "unset";
-    if (!["ok", "error", "unset"].includes(String(status))) throw new Error("telemetry span status is invalid");
-    return this.#enqueue(freezeEnvelope({
+    try {
+      const value = strictObject(input, "telemetry span", SPAN_KEYS);
+      const status = value.status ?? "unset";
+      if (!["ok", "error", "unset"].includes(String(status))) throw new Error("telemetry span status is invalid");
+      return this.#enqueue(freezeEnvelope({
       schemaVersion: TELEMETRY_SCHEMA_VERSION,
       kind: "span",
       name: telemetryName(value.name),
@@ -380,7 +396,11 @@ export class BufferedTelemetry {
       }),
       durationMs: finiteNumber(value.durationMs, "telemetry span durationMs", 0),
       status: status as "ok" | "error" | "unset"
-    }));
+      }));
+    } catch (error) {
+      this.#rejectedInvalid += 1;
+      throw error;
+    }
   }
 
   recordMetric(input: {
@@ -392,12 +412,13 @@ export class BufferedTelemetry {
     unit: "1" | "ms" | "By";
   }): boolean {
     if (!this.#canRecord()) return false;
-    const value = strictObject(input, "telemetry metric", METRIC_KEYS);
-    if (!["counter", "gauge", "histogram"].includes(String(value.instrument))) {
-      throw new Error("telemetry metric instrument is invalid");
-    }
-    if (!["1", "ms", "By"].includes(String(value.unit))) throw new Error("telemetry metric unit is invalid");
-    return this.#enqueue(freezeEnvelope({
+    try {
+      const value = strictObject(input, "telemetry metric", METRIC_KEYS);
+      if (!["counter", "gauge", "histogram"].includes(String(value.instrument))) {
+        throw new Error("telemetry metric instrument is invalid");
+      }
+      if (!["1", "ms", "By"].includes(String(value.unit))) throw new Error("telemetry metric unit is invalid");
+      return this.#enqueue(freezeEnvelope({
       schemaVersion: TELEMETRY_SCHEMA_VERSION,
       kind: "metric",
       name: telemetryName(value.name),
@@ -406,7 +427,11 @@ export class BufferedTelemetry {
       instrument: value.instrument as "counter" | "gauge" | "histogram",
       value: finiteNumber(value.value, "telemetry metric value"),
       unit: value.unit as "1" | "ms" | "By"
-    }));
+      }));
+    } catch (error) {
+      this.#rejectedInvalid += 1;
+      throw error;
+    }
   }
 
   status(): TelemetryStatus {
@@ -420,6 +445,7 @@ export class BufferedTelemetry {
       exported: this.#exported,
       droppedOverflow: this.#droppedOverflow,
       droppedExportFailure: this.#droppedExportFailure,
+      rejectedInvalid: this.#rejectedInvalid,
       rejectedAfterShutdown: this.#rejectedAfterShutdown,
       exportFailures: this.#exportFailures,
       consecutiveFailures: this.#consecutiveFailures,
@@ -558,12 +584,35 @@ export class BufferedTelemetry {
     this.#inFlight = batch.length;
     this.#inFlightBytes = recordBytes;
     try {
-      await this.#exportBatch(Object.freeze([...batch]), timeoutMs);
-      this.#exported += batch.length;
+      const result = await this.#exportBatch(Object.freeze([...batch]), timeoutMs);
+      const exported = result?.exported ?? batch.length;
+      const rejected = result?.rejected ?? 0;
+      if (
+        !Number.isSafeInteger(exported)
+        || !Number.isSafeInteger(rejected)
+        || exported < 0
+        || rejected < 0
+        || exported + rejected !== batch.length
+      ) {
+        throw new Error("telemetry exporter returned an invalid settlement result");
+      }
+      this.#exported += exported;
+      this.#droppedExportFailure += rejected;
       this.#settledThrough = queuedBatch.at(-1)!.sequence;
-      this.#consecutiveFailures = 0;
-      this.#lastFailure = undefined;
-      this.#retryDelay = undefined;
+      if (rejected > 0) {
+        this.#firstFailedSequence ??= queuedBatch[0].sequence;
+        this.#exportFailures += 1;
+        this.#consecutiveFailures += 1;
+        this.#lastFailure = "exporter-error";
+        if (this.#state === "running" && this.#autoPump) {
+          const exponent = Math.min(this.#consecutiveFailures - 1, 16);
+          this.#retryDelay = Math.min(this.#maxBackoffMs, this.#baseBackoffMs * (2 ** exponent));
+        }
+      } else {
+        this.#consecutiveFailures = 0;
+        this.#lastFailure = undefined;
+        this.#retryDelay = undefined;
+      }
     } catch (error) {
       this.#droppedExportFailure += batch.length;
       this.#settledThrough = queuedBatch.at(-1)!.sequence;
@@ -581,7 +630,7 @@ export class BufferedTelemetry {
     }
   }
 
-  async #exportBatch(batch: readonly TelemetryEnvelope[], timeoutMs: number): Promise<void> {
+  async #exportBatch(batch: readonly TelemetryEnvelope[], timeoutMs: number): Promise<TelemetryExportResult | void> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let physicallySettled = false;
@@ -601,8 +650,11 @@ export class BufferedTelemetry {
       }, timeoutMs);
     });
     try {
-      await Promise.race([
-        physical.then(() => { physicallySettled = true; }),
+      return await Promise.race([
+        physical.then((result) => {
+          physicallySettled = true;
+          return result;
+        }),
         timeout
       ]);
     } finally {
@@ -610,7 +662,7 @@ export class BufferedTelemetry {
     }
   }
 
-  #physicalExportSettled(physical: Promise<void>): void {
+  #physicalExportSettled(physical: Promise<TelemetryExportResult | void>): void {
     if (this.#physicalExportPromise !== physical) return;
     this.#physicalExportPromise = undefined;
     const wasWedged = this.#wedged;

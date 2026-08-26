@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -16,6 +16,12 @@ async function fixture() {
   const workspace = join(root, "workspace");
   await writeFile(join(root, "seed.txt"), "before\n");
   return { root, state, workspace, runtime: createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags }) };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
 }
 
 test("Sentinel blocks a denied command before execution and records the decision", async () => {
@@ -345,6 +351,157 @@ test("counterfactual execution runs real audited tasks and supports selection pr
     assert.match(preview.warning, /--apply/);
     assert.equal(runtime.counterfactual.compare(group.groupId).candidates.filter((candidate: any) => candidate.status === "completed").length, 2);
   } finally { runtime.ledger.close(); }
+});
+
+test("counterfactual creation removes copied workspaces and durable rows when cancelled before activation", async (t) => {
+  const { root, runtime } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const entered = deferred();
+  const release = deferred();
+  const controller = new AbortController();
+  try {
+    runtime.ledger.ensureRun({ runId: "counterfactual-create-cancel", objective: "cancel branch creation" });
+    const creation = runtime.counterfactual.create({
+      sourceRunId: "counterfactual-create-cancel",
+      sourceStepId: "step-1",
+      workspaceRoot: root,
+      plans: [{ id: "cancelled", title: "Cancelled", summary: "must not activate" }],
+      signal: controller.signal,
+      __testOnlyAfterWorkspaceCopy: async () => {
+        entered.resolve();
+        await release.promise;
+      }
+    });
+    await entered.promise;
+    controller.abort(new Error("gateway shutdown is in progress"));
+    release.resolve();
+    await assert.rejects(creation, /gateway shutdown is in progress/u);
+
+    const database = runtime.ledger.database.db;
+    assert.equal(Number((database.prepare("SELECT COUNT(*) AS count FROM counterfactual_groups").get() as any).count), 0);
+    assert.equal(Number((database.prepare("SELECT COUNT(*) AS count FROM counterfactual_candidates").get() as any).count), 0);
+    assert.equal(Number((database.prepare("SELECT COUNT(*) AS count FROM run_branches").get() as any).count), 0);
+    assert.equal(runtime.ledger.getRun("counterfactual-create-cancel").events.some((event: any) => event.type === "branch-created"), false);
+    const retainedWorktrees = await readdir(join(root, ".odinn-worktrees")).catch((error: any) => {
+      if (error?.code === "ENOENT") return [];
+      throw error;
+    });
+    assert.deepEqual(retainedWorktrees, []);
+  } finally {
+    release.resolve();
+    runtime.ledger.close();
+  }
+});
+
+test("counterfactual execution quarantines an in-flight task without failure or final group settlement", async (t) => {
+  const { root, runtime } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const entered = deferred();
+  const release = deferred();
+  const controller = new AbortController();
+  let startedRunId = "";
+  try {
+    runtime.ledger.ensureRun({ runId: "counterfactual-execute-cancel", objective: "cancel branch execution" });
+    const group = await runtime.counterfactual.create({
+      sourceRunId: "counterfactual-execute-cancel",
+      sourceStepId: "step-1",
+      workspaceRoot: root,
+      plans: ["first", "second"].map((id) => ({
+        id,
+        title: id,
+        summary: `${id} candidate`,
+        tasks: [{ tool: "text.echo", input: { text: id }, readOnly: true }]
+      }))
+    });
+    const execution = runtime.counterfactual.execute(group.groupId, {
+      signal: controller.signal,
+      executor: async (task: any, context: any) => {
+        assert.equal(context.signal, controller.signal);
+        startedRunId = String(task.id).split(":task:")[0];
+        entered.resolve();
+        await release.promise;
+        return { output: { text: "must not settle" } };
+      }
+    });
+    await entered.promise;
+    const waitingRunId = group.candidates.find((candidate: any) => candidate.runId !== startedRunId)?.runId;
+    assert.ok(startedRunId);
+    assert.ok(waitingRunId);
+    const eventsBeforeAbort = runtime.ledger.getRun(startedRunId).events.length;
+    controller.abort(new Error("gateway shutdown is in progress"));
+    release.resolve();
+    await assert.rejects(execution, /gateway shutdown is in progress/u);
+
+    const database = runtime.ledger.database.db;
+    assert.equal((database.prepare("SELECT status FROM counterfactual_groups WHERE id = ?").get(group.groupId) as any).status, "created");
+    assert.equal((database.prepare("SELECT status FROM counterfactual_candidates WHERE run_id = ?").get(startedRunId) as any).status, "executing");
+    assert.equal((database.prepare("SELECT status FROM counterfactual_candidates WHERE run_id = ?").get(waitingRunId) as any).status, "created");
+    const firstEvents = runtime.ledger.getRun(startedRunId).events;
+    assert.equal(firstEvents.length, eventsBeforeAbort);
+    assert.equal(firstEvents.some((event: any) => ["counterfactual-completed", "counterfactual-failed"].includes(event.type)), false);
+    assert.equal(runtime.ledger.getRun(waitingRunId).events.some((event: any) => event.type === "counterfactual-started"), false);
+  } finally {
+    release.resolve();
+    runtime.ledger.close();
+  }
+});
+
+test("counterfactual selection cancelled after backup leaves the workspace and durable selection unchanged", async (t) => {
+  const { root, state, runtime } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const entered = deferred();
+  const release = deferred();
+  const controller = new AbortController();
+  try {
+    runtime.ledger.ensureRun({ runId: "counterfactual-select-cancel", objective: "cancel branch selection" });
+    const group = await runtime.counterfactual.create({
+      sourceRunId: "counterfactual-select-cancel",
+      sourceStepId: "step-1",
+      workspaceRoot: root,
+      plans: [{
+        id: "candidate",
+        title: "Candidate",
+        summary: "candidate selection",
+        tasks: [{ tool: "text.echo", input: { text: "candidate" }, readOnly: true }]
+      }]
+    });
+    await runtime.counterfactual.execute(group.groupId, {
+      executor: async () => ({ output: { text: "completed" } })
+    });
+    const candidate = group.candidates[0];
+    await writeFile(join(candidate.workspaceRoot, "seed.txt"), "candidate\n");
+    const sourceIdentity = await stat(join(root, "seed.txt"));
+    const selection = runtime.counterfactual.select(group.groupId, candidate.runId, {
+      apply: true,
+      signal: controller.signal,
+      __testOnlyAfterBackup: async () => {
+        entered.resolve();
+        await release.promise;
+      }
+    });
+    await entered.promise;
+    const sourceEventsBeforeAbort = runtime.ledger.getRun("counterfactual-select-cancel").events.length;
+    controller.abort(new Error("gateway shutdown is in progress"));
+    release.resolve();
+    await assert.rejects(selection, /gateway shutdown is in progress/u);
+
+    assert.equal(await readFile(join(root, "seed.txt"), "utf8"), "before\n");
+    assert.equal((await stat(join(root, "seed.txt"))).ino, sourceIdentity.ino, "abort before activation must not replace source files");
+    const database = runtime.ledger.database.db;
+    assert.equal((database.prepare("SELECT status FROM counterfactual_groups WHERE id = ?").get(group.groupId) as any).status, "executed");
+    assert.equal((database.prepare("SELECT status FROM counterfactual_candidates WHERE run_id = ?").get(candidate.runId) as any).status, "completed");
+    const sourceEvents = runtime.ledger.getRun("counterfactual-select-cancel").events;
+    assert.equal(sourceEvents.length, sourceEventsBeforeAbort);
+    assert.equal(sourceEvents.some((event: any) => event.type === "branch-selected"), false);
+    const retainedBackups = await readdir(join(state, "worktrees")).catch((error: any) => {
+      if (error?.code === "ENOENT") return [];
+      throw error;
+    });
+    assert.deepEqual(retainedBackups, []);
+  } finally {
+    release.resolve();
+    runtime.ledger.close();
+  }
 });
 
 test("kernel execution enforces Sentinel and capability tokens at the real tool boundary", async () => {

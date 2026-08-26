@@ -83,7 +83,7 @@ test("OTLP exporter emits bounded trace, metric, and log JSON without redirects 
   assert.doesNotMatch(JSON.stringify(requests), /secret|token=/u);
 });
 
-test("OTLP exporter fails categorically without copying endpoint details", async () => {
+test("OTLP exporter settles categorical request failures without copying endpoint details", async () => {
   let requests = 0;
   const exporter = createOtlpHttpExporter({
     endpoint: "https://collector.example/private/",
@@ -101,8 +101,79 @@ test("OTLP exporter fails categorically without copying endpoint details", async
     timeUnixMs: 1,
     attributes: Object.freeze({})
   };
-  await assert.rejects(
-    exporter.export([event], new AbortController().signal),
-    (error: Error) => error.message === "OTLP export request failed"
-  );
+  assert.deepEqual(await exporter.export([event], new AbortController().signal), {
+    exported: 0,
+    rejected: 1
+  });
+});
+
+test("OTLP exporter preserves earlier kind settlement when a later request fails", async () => {
+  const requests: string[] = [];
+  const exporter = createOtlpHttpExporter({
+    endpoint: "https://collector.example/",
+    fetch: (async (input: string | URL | Request) => {
+      requests.push(String(input));
+      return String(input).endsWith("/v1/metrics")
+        ? new Response(null, { status: 503 })
+        : new Response(null, { status: 200 });
+    }) as typeof fetch
+  });
+  const batch: TelemetryEnvelope[] = [
+    {
+      schemaVersion: 1,
+      kind: "span",
+      name: "odinn.tool.execution",
+      timeUnixMs: 1,
+      traceId: TRACE_ID,
+      spanId: SPAN_ID,
+      durationMs: 1,
+      status: "ok",
+      attributes: Object.freeze({})
+    },
+    {
+      schemaVersion: 1,
+      kind: "metric",
+      name: "odinn.queue.depth",
+      timeUnixMs: 2,
+      instrument: "gauge",
+      value: 1,
+      unit: "1",
+      attributes: Object.freeze({})
+    },
+    {
+      schemaVersion: 1,
+      kind: "event",
+      name: "odinn.runtime.lifecycle",
+      timeUnixMs: 3,
+      attributes: Object.freeze({})
+    }
+  ];
+  assert.deepEqual(await exporter.export(batch, new AbortController().signal), {
+    exported: 1,
+    rejected: 2
+  });
+  assert.deepEqual(requests, [
+    "https://collector.example/v1/traces",
+    "https://collector.example/v1/metrics"
+  ]);
+});
+
+test("OTLP exporter honors bounded partial-success settlement", async () => {
+  const exporter = createOtlpHttpExporter({
+    endpoint: "https://collector.example/",
+    fetch: (async () => new Response(JSON.stringify({
+      partialSuccess: { rejectedLogRecords: "1", errorMessage: "private collector detail" }
+    }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch
+  });
+  const event: TelemetryEnvelope = {
+    schemaVersion: 1,
+    kind: "event",
+    name: "odinn.runtime.lifecycle",
+    timeUnixMs: 1,
+    attributes: Object.freeze({})
+  };
+  assert.deepEqual(await exporter.export([event], new AbortController().signal), {
+    exported: 0,
+    rejected: 1
+  });
 });

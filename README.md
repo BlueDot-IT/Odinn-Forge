@@ -178,9 +178,11 @@ installation, headless systems, and troubleshooting.
 
 ## Privacy in plain language
 
-Ódinn has no built-in product telemetry. Its settings, memories, conversations,
-browser profile, and activity records stay in its local state folder by
-default.
+Ódinn enables no product telemetry by default. Its settings, memories,
+conversations, browser profile, and activity records stay in its local state
+folder by default. Operators may explicitly configure the Gateway's optional,
+fixed content-free operational telemetry with `ODINN_OTLP_ENDPOINT`; status and
+diagnostics expose only bounded local counters and categorical state.
 
 Local-first does **not** mean nothing ever leaves your computer:
 

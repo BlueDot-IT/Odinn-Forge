@@ -31,7 +31,7 @@ import { createGatewayOperatorSnapshotReadRequest, normalizeHostedUserId } from 
 import { assertTenantClaims, createGatewayTenantScope, createTenantScopedAuditStore, scopedJobPayload, type GatewayTenantScope } from "./http/tenant-scope.ts";
 import { AuthenticatedRouter } from "./http/router.ts";
 import { registerApplicationReadRoutes } from "./routes/application-reads.ts";
-import { createGatewayTelemetry, instrumentAuditStore, recordGatewayEvent, recordGatewaySpan, telemetryStatusProjection } from "./telemetry.ts";
+import { createGatewayTelemetry, gatewayToolTelemetryCategory, instrumentAuditStore, recordGatewayEvent, recordGatewaySpan, recordGatewayTelemetryHealth, telemetryStatusProjection } from "./telemetry.ts";
 import type { TelemetryName } from "@odinn/kernel/async-telemetry";
 
 export { gatewayOperatorSnapshotFailure } from "./http/errors.ts";
@@ -44,6 +44,7 @@ export {
 
 declare const __ODINN_COMPILED__: boolean | undefined;
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
+const REQUEST_ABORT_SIGNAL = Symbol("odinn.gateway.requestAbortSignal");
 const compiledRuntime = typeof __ODINN_COMPILED__ !== "undefined";
 const SKILL_DISCOVERY_MAX_BYTES = MAX_BOUNDED_UTF8_BYTES;
 const PUBLIC_DIR = fileURLToPath(new URL(compiledRuntime ? "./public/" : "../public/", import.meta.url));
@@ -126,6 +127,49 @@ const CRON_SCHEMA_VERSION = OPERATOR_SCHEDULE_SCHEMA_VERSION;
 const CRON_MAX_JOBS = 500;
 const CRON_MAX_FILE_BYTES = 4 * 1024 * 1024;
 const CRON_DISPATCH_LEASE_MS = 10 * 60 * 1000;
+type GatewayMutationOptions = {
+  signal?: AbortSignal;
+  /** @internal Test-only barrier after the cross-process state lock is held. */
+  __testOnlyAfterLockAcquired?: () => void | Promise<void>;
+};
+
+type GatewayMutationLease = { release(): void };
+
+class GatewayMutationBarrier {
+  #closed = false;
+  #active = new Map<Promise<void>, { label: string; settle: () => void }>();
+
+  admit(signal: AbortSignal, label: string): GatewayMutationLease {
+    assertGatewayRequestActive(signal);
+    if (this.#closed) throw new GatewayError(503, "gateway shutdown is in progress");
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    const entry = { label: label.slice(0, 192), settle };
+    this.#active.set(settled, entry);
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        this.#active.delete(settled);
+        settle();
+      }
+    };
+  }
+
+  close(): string[] {
+    this.#closed = true;
+    return this.activeLabels();
+  }
+
+  activeLabels(): string[] {
+    return [...new Set([...this.#active.values()].map(({ label }) => label))].sort().slice(0, 64);
+  }
+
+  async drain(): Promise<void> {
+    await Promise.allSettled([...this.#active.keys()]);
+  }
+}
 
 export class CronStore {
   path: string;
@@ -163,22 +207,33 @@ export class CronStore {
     const boundedOffset = Math.max(0, Number.isSafeInteger(Number(offset)) ? Number(offset) : 0);
     return jobs.slice(boundedOffset, boundedOffset + boundedLimit);
   }
-  async mutate(operation: (jobs: any[]) => any) {
+  async mutate(operation: (jobs: any[]) => any, options: GatewayMutationOptions = {}) {
     const pending = this.writeChain.then(() => withStateMutationLock(dirname(this.path), async () => {
+      assertGatewayRequestActive(options.signal);
       const state = await this.read();
+      assertGatewayRequestActive(options.signal);
       const result = await operation(state.jobs);
+      assertGatewayRequestActive(options.signal);
       state.schemaVersion = CRON_SCHEMA_VERSION;
       await mkdir(dirname(this.path), { recursive: true });
       const temporary = `${this.path}.${process.pid}.${Date.now()}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-      await rename(temporary, this.path);
-      await chmod(this.path, 0o600);
-      return result;
+      try {
+        await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+        assertGatewayRequestActive(options.signal);
+        await rename(temporary, this.path);
+        await chmod(this.path, 0o600);
+        return result;
+      } finally {
+        await rm(temporary, { force: true }).catch(() => undefined);
+      }
+    }, {
+      signal: options.signal,
+      __testOnlyAfterLockAcquired: options.__testOnlyAfterLockAcquired
     }));
     this.writeChain = pending.catch(() => undefined);
     return pending;
   }
-  async create(input: any) {
+  async create(input: any, options: GatewayMutationOptions = {}) {
     return this.mutate((jobs) => {
       const job = normalizeCronJob({ ...input, id: input.id || `cron_${randomBytes(8).toString("hex")}`, createdAt: new Date().toISOString() });
       assertDurableScheduleTool(job.tool);
@@ -186,9 +241,9 @@ export class CronStore {
       if (jobs.some((item) => item.id === job.id)) throw new GatewayError(409, "cron job id already exists");
       jobs.push(job);
       return job;
-    });
+    }, options);
   }
-  async update(id: string, patch: any) {
+  async update(id: string, patch: any, options: GatewayMutationOptions = {}) {
     if (patch?.tool !== undefined) assertDurableScheduleTool(String(patch.tool).trim());
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item) => item.id === id);
@@ -206,7 +261,7 @@ export class CronStore {
       assertDurableScheduleTool(updated.tool);
       jobs[index] = updated;
       return updated;
-    });
+    }, options);
   }
   async quarantineLiveOnly(id: string) {
     return this.mutate((jobs) => {
@@ -241,12 +296,12 @@ export class CronStore {
       return updated;
     });
   }
-  async remove(id: string) {
+  async remove(id: string, options: GatewayMutationOptions = {}) {
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
       jobs.splice(index, 1);
-    });
+    }, options);
   }
   async nextWake() {
     const enabled = (await this.list()).filter((job: any) => job.enabled);
@@ -254,7 +309,7 @@ export class CronStore {
     return values[0] ?? null;
   }
 
-  async claimDueOccurrence(id: string, now = new Date(), ownerId = `gateway:${process.pid}:${randomUUID()}`) {
+  async claimDueOccurrence(id: string, now = new Date(), ownerId = `gateway:${process.pid}:${randomUUID()}`, options: GatewayMutationOptions = {}) {
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item: any) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
@@ -291,10 +346,10 @@ export class CronStore {
       });
       jobs[index] = updated;
       return { claimed: true, recovered: Boolean(existingLease), occurrenceKey, scheduledFor, nextRunAt, lease, job: updated };
-    });
+    }, options);
   }
 
-  async acknowledgeSubmitted(id: string, occurrenceKey: string, token: string) {
+  async acknowledgeSubmitted(id: string, occurrenceKey: string, token: string, options: GatewayMutationOptions = {}) {
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item: any) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
@@ -304,10 +359,10 @@ export class CronStore {
       const updated = normalizeCronJob({ ...current, dispatchLease: undefined, updatedAt: new Date().toISOString() });
       jobs[index] = updated;
       return updated;
-    });
+    }, options);
   }
 
-  async recordOutcome(id: string, scheduledFor: string, patch: Record<string, unknown>) {
+  async recordOutcome(id: string, scheduledFor: string, patch: Record<string, unknown>, options: GatewayMutationOptions = {}) {
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item: any) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
@@ -318,7 +373,7 @@ export class CronStore {
       const updated = normalizeCronJob({ ...current, ...patch, lastRunAt: scheduledFor, updatedAt: new Date().toISOString() });
       jobs[index] = updated;
       return updated;
-    });
+    }, options);
   }
 }
 
@@ -331,28 +386,31 @@ export class AgentPackageStore {
   }
   async read() { return this.registry.read(); }
   async list() { return this.registry.list(); }
-  async mutate(operation: (agents: any[]) => any) {
-    return this.registry.mutate((agents) => operation(agents));
+  async mutate(operation: (agents: any[]) => any, options: GatewayMutationOptions = {}) {
+    return this.registry.mutate((agents) => operation(agents), options);
   }
-  async install(input: any) {
+  async install(input: any, options: GatewayMutationOptions = {}) {
     if (String(input?.id || "").trim() === "main") throw new GatewayError(409, "the primary main agent cannot be replaced by an SDK package");
     const manifest = validateAgentPackage(input);
     return this.registry.mutate(async (agents) => {
+      assertGatewayRequestActive(options.signal);
       const current = agents.find((agent) => agent.id === manifest.id);
       const record = { ...manifest, status: "disabled", installedAt: new Date().toISOString(), previousVersion: current?.version };
       if (manifest.kind === "runtime") {
         await provisionRuntimeAgent(dirname(this.path), manifest, {
           assumeLocked: true,
           previousRecord: current,
-          nextRecord: record
+          nextRecord: record,
+          signal: options.signal
         });
       }
+      assertGatewayRequestActive(options.signal);
       const index = agents.findIndex((agent) => agent.id === manifest.id);
       if (index >= 0) agents[index] = record; else agents.push(record);
       return record;
-    });
+    }, options);
   }
-  async transition(id: string, action: string) {
+  async transition(id: string, action: string, options: GatewayMutationOptions = {}) {
     return this.mutate((agents) => {
       const agent = agents.find((item) => item.id === id);
       if (!agent) throw new GatewayError(404, "agent package not found");
@@ -361,7 +419,7 @@ export class AgentPackageStore {
       agent.status = action === 'enable' ? 'enabled' : action === 'disable' ? 'disabled' : 'quarantined';
       agent.updatedAt = new Date().toISOString();
       return agent;
-    });
+    }, options);
   }
 }
 
@@ -698,7 +756,8 @@ export function nextCronWake(schedule: string, timezone = "UTC", after = new Dat
   return null;
 }
 
-async function runCronJob(store: CronStore, id: string, executor: any, tenantScope?: GatewayTenantScope) {
+async function runCronJob(store: CronStore, id: string, executor: any, tenantScope?: GatewayTenantScope, signal?: AbortSignal) {
+  assertGatewayRequestActive(signal);
   const job = (await store.list()).find((item: any) => item.id === id);
   if (!job) throw new GatewayError(404, "cron job not found");
   assertDurableScheduleTool(job.tool);
@@ -706,32 +765,37 @@ async function runCronJob(store: CronStore, id: string, executor: any, tenantSco
   try {
     const task = { id: `${job.id}:${Date.now()}`, tool: job.tool, input: job.input, actor: "cron", reason: `cron:${job.id}` };
     const result = await executor(tenantScope ? scopedJobPayload({ task }, tenantScope) : { task });
-    await store.update(id, { lastRunAt: startedAt, lastStatus: "ok", lastError: "", lastMinuteKey: startedAt.slice(0, 16) });
+    assertGatewayRequestActive(signal);
+    await store.update(id, { lastRunAt: startedAt, lastStatus: "ok", lastError: "", lastMinuteKey: startedAt.slice(0, 16) }, { signal });
     return result;
   } catch (error) {
-    await store.update(id, { lastRunAt: startedAt, lastStatus: "error", lastError: error instanceof Error ? error.message : String(error), lastMinuteKey: startedAt.slice(0, 16) });
+    if (signal?.aborted) throw error;
+    await store.update(id, { lastRunAt: startedAt, lastStatus: "error", lastError: error instanceof Error ? error.message : String(error), lastMinuteKey: startedAt.slice(0, 16) }, { signal });
     throw error;
   }
 }
 
-async function settleCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, jobId: string): Promise<void> {
+async function settleCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, jobId: string, signal?: AbortSignal): Promise<void> {
   const deadline = Date.now() + CRON_DISPATCH_LEASE_MS;
   while (Date.now() < deadline) {
+    assertGatewayRequestActive(signal);
     const job = await supervisor.get(claim.occurrenceKey);
     if (job && ["completed", "failed", "cancelled", "needs-review"].includes(job.status)) {
+      assertGatewayRequestActive(signal);
       const ok = job.status === "completed";
       await store.recordOutcome(jobId, claim.scheduledFor, {
         lastStatus: ok ? "ok" : "error",
         lastError: ok ? "" : String(job.error || `scheduled job ended with status ${job.status}`),
         lastMinuteKey: claim.scheduledFor.slice(0, 16)
-      });
+      }, { signal });
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await waitForGatewaySignal(250, signal);
   }
 }
 
-async function dispatchCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, job: any, retrySafe = false, tenantScope?: GatewayTenantScope): Promise<void> {
+async function dispatchCronOccurrence(store: CronStore, supervisor: JobSupervisor, claim: any, job: any, retrySafe = false, tenantScope?: GatewayTenantScope, signal?: AbortSignal): Promise<void> {
+  assertGatewayRequestActive(signal);
   const payload = { task: {
     id: claim.occurrenceKey,
     tool: job.tool,
@@ -749,24 +813,28 @@ async function dispatchCronOccurrence(store: CronStore, supervisor: JobSuperviso
       scheduledFor: claim.scheduledFor,
       nextRunAt: claim.nextRunAt,
       retrySafe,
-      idempotent: true
+      idempotent: true,
+      signal
     }
   );
-  await store.acknowledgeSubmitted(job.id, claim.occurrenceKey, claim.lease.token);
-  await settleCronOccurrence(store, supervisor, claim, job.id);
+  assertGatewayRequestActive(signal);
+  await store.acknowledgeSubmitted(job.id, claim.occurrenceKey, claim.lease.token, { signal });
+  await settleCronOccurrence(store, supervisor, claim, job.id, signal);
 }
 
-export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor, now = new Date(), retrySafeFor: (tool: string) => boolean = () => false, tenantScope?: GatewayTenantScope) {
+export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor, now = new Date(), retrySafeFor: (tool: string) => boolean = () => false, tenantScope?: GatewayTenantScope, signal?: AbortSignal) {
+  assertGatewayRequestActive(signal);
   const dispatches: Promise<void>[] = [];
   for (const job of await store.list()) {
+    assertGatewayRequestActive(signal);
     if (isLiveOnlyAutomationTool(job.tool)) {
       await store.quarantineLiveOnly(job.id);
       continue;
     }
     if (!job.enabled) continue;
-    const claim = await store.claimDueOccurrence(job.id, now);
+    const claim = await store.claimDueOccurrence(job.id, now, undefined, { signal });
     if (!claim.claimed) continue;
-    dispatches.push(dispatchCronOccurrence(store, supervisor, claim, job, retrySafeFor(job.tool), tenantScope));
+    dispatches.push(dispatchCronOccurrence(store, supervisor, claim, job, retrySafeFor(job.tool), tenantScope, signal));
   }
   await Promise.allSettled(dispatches);
 }
@@ -889,7 +957,7 @@ export async function createGatewayServer(options: any = {}) {
     }
   });
   const runIsolatedTask = (request: any, options?: { signal?: AbortSignal }): Promise<any> => isolatedTaskExecutor(request, options) as Promise<any>;
-  const runGovernedTask = (request: any): Promise<any> => executeTask({ ...request, task: scopeTask(request.task, tenantScope), auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
+  const runGovernedTask = (request: any, options?: { signal?: AbortSignal }): Promise<any> => executeTask({ ...request, ...options, task: scopeTask(request.task, tenantScope), auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
   const workflowRuntime = config.runtime?.enableDurableWorkflows === true
     ? new DurableWorkflowRuntime({
       store: new SqliteWorkflowStore(runtime.ledger.database),
@@ -919,7 +987,7 @@ export async function createGatewayServer(options: any = {}) {
     auditStore,
     loadPlugin: channelPluginLoader
   });
-  const runControlTask = (task: any) => executeTask({ task: scopeTask(task, tenantScope), auditStore, policy, registry, runLedger: runtime.ledger });
+  const runControlTask = (task: any, options?: { signal?: AbortSignal }) => executeTask({ task: scopeTask(task, tenantScope), auditStore, policy, registry, runLedger: runtime.ledger, ...options });
   await supervisor.start();
   // Tokenless event-delivery recovery may submit projected jobs immediately
   // from the DurableEventIngress constructor. Complete job-store recovery
@@ -966,13 +1034,22 @@ export async function createGatewayServer(options: any = {}) {
     );
     if (!hasLedgerRecovery) runtime.ledger.appendEvent({ runId: recovery.parentRunId, type: ledgerType, payload: { graphRunId: recovery.graphRunId, status: recovery.status, errorCode: recovery.errorCode, recovered: true } });
   }
-  const cronTimer = setInterval(() => runDueCronJobs(
-    cronStore,
-    supervisor,
-    new Date(),
-    (tool) => toolSafetyDescriptor(tool, registry.get(tool)).retrySafe === true,
-    tenantScope
-  ).catch(() => undefined), 30_000);
+  const cronDispatchAbort = new AbortController();
+  const activeCronDispatches = new Set<Promise<void>>();
+  const runScheduledCronCycle = () => {
+    if (cronDispatchAbort.signal.aborted) return;
+    let cycle!: Promise<void>;
+    cycle = runDueCronJobs(
+      cronStore,
+      supervisor,
+      new Date(),
+      (tool) => toolSafetyDescriptor(tool, registry.get(tool)).retrySafe === true,
+      tenantScope,
+      cronDispatchAbort.signal
+    ).catch(() => undefined).finally(() => { activeCronDispatches.delete(cycle); });
+    activeCronDispatches.add(cycle);
+  };
+  const cronTimer = setInterval(runScheduledCronCycle, 30_000);
   cronTimer.unref();
   const eventHeartbeatTimer = eventIngress
     ? setInterval(() => eventIngress.heartbeat().catch(() => undefined), 30_000)
@@ -1036,6 +1113,7 @@ export async function createGatewayServer(options: any = {}) {
         eventIngress: { enabled: Boolean(eventIngress) },
         projectContext: { enabled: Boolean(projectContext) }
       },
+      telemetry: telemetryStatusProjection(telemetry),
       security: statusSecurity,
       selfImprovement: {
         ...selfImprovement,
@@ -1048,7 +1126,7 @@ export async function createGatewayServer(options: any = {}) {
     })
   });
   const diagnosticsRead = createDiagnosticsReadUseCase({
-    readDiagnostics: async () => diagnostics({ state, workspaceRoot: root, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError, sandboxRecoveryStartupError })
+    readDiagnostics: async () => diagnostics({ state, workspaceRoot: root, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, telemetry, processRecoveryStartupError, sandboxRecoveryStartupError })
   });
   const sessionList = createSessionListUseCase(createGatewaySessionListPort({
     execute: runIsolatedTask,
@@ -1069,21 +1147,21 @@ export async function createGatewayServer(options: any = {}) {
     );
   };
 
-  const listGatewayApprovals = () => typeof approvalStore.listAsync === "function"
-    ? approvalStore.listAsync()
-    : Promise.resolve(approvalStore.list());
-  const claimGatewayApproval = (id: string) => typeof approvalStore.claimAsync === "function"
-    ? approvalStore.claimAsync(id)
-    : Promise.resolve(approvalStore.claim(id));
-  const recoverGatewayApproval = (id: string) => typeof approvalStore.recoverAsync === "function"
-    ? approvalStore.recoverAsync(id)
-    : Promise.resolve(approvalStore.recover(id));
-  const revokeGatewayApproval = (id: string) => typeof approvalStore.revokeAsync === "function"
-    ? approvalStore.revokeAsync(id)
-    : Promise.resolve(approvalStore.revoke(id));
+  const listGatewayApprovals = (signal?: AbortSignal) => typeof approvalStore.listAsync === "function"
+    ? approvalStore.listAsync({ signal })
+    : Promise.resolve(approvalStore.list({ signal }));
+  const claimGatewayApproval = (id: string, signal?: AbortSignal) => typeof approvalStore.claimAsync === "function"
+    ? approvalStore.claimAsync(id, { signal })
+    : Promise.resolve(approvalStore.claim(id, { signal }));
+  const recoverGatewayApproval = (id: string, signal?: AbortSignal) => typeof approvalStore.recoverAsync === "function"
+    ? approvalStore.recoverAsync(id, { signal })
+    : Promise.resolve(approvalStore.recover(id, { signal }));
+  const revokeGatewayApproval = (id: string, signal?: AbortSignal) => typeof approvalStore.revokeAsync === "function"
+    ? approvalStore.revokeAsync(id, { signal })
+    : Promise.resolve(approvalStore.revoke(id, { signal }));
 
-  const recoverGatewayApprovalContinuation = async (id: string, pending: any, linkedTask: Record<string, unknown> | undefined) => {
-    const recovered = await recoverGatewayApproval(id);
+  const recoverGatewayApprovalContinuation = async (id: string, pending: any, linkedTask: Record<string, unknown> | undefined, signal?: AbortSignal) => {
+    const recovered = await recoverGatewayApproval(id, signal);
     const runId = String(pending?.runId ?? "");
     const tool = String(pending?.tool ?? "");
     const recoveredRunId = String(recovered?.runId ?? "");
@@ -1100,7 +1178,7 @@ export async function createGatewayServer(options: any = {}) {
       || Array.isArray(input)
       || (recoveredActor && linkedActor && recoveredActor !== linkedActor);
     if (invalid) {
-      await revokeGatewayApproval(id);
+      await revokeGatewayApproval(id, signal);
       throw new GatewayError(409, "approved execution input or authority could not be recovered; refusing dispatch");
     }
     return {
@@ -1112,45 +1190,57 @@ export async function createGatewayServer(options: any = {}) {
   };
 
   const activeGatewayApprovalExecutions = new Set<string>();
-  const approveGatewayApproval = async (id: string) => {
+  const approveGatewayApproval = async (id: string, signal?: AbortSignal) => {
+    assertGatewayRequestActive(signal);
     if (activeGatewayApprovalExecutions.has(id)) {
       throw new GatewayError(409, "approval execution is already in flight");
     }
     activeGatewayApprovalExecutions.add(id);
     let claimedLinkedJob: any;
     try {
-      const preview = (await listGatewayApprovals()).find((approval: any) => approval.id === id);
+      const preview = (await listGatewayApprovals(signal)).find((approval: any) => approval.id === id);
       const linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
+      assertGatewayRequestActive(signal);
       if (linkedJob && linkedJob.status !== "awaiting-approval") {
-        if (linkedJob.status !== "running") await revokeGatewayApproval(id);
+        if (linkedJob.status !== "running") await revokeGatewayApproval(id, signal);
         throw new GatewayError(409, "the originating job is no longer awaiting approval");
       }
       if (linkedJob) {
         let result: unknown;
         try {
-          result = await supervisor.runApproval(linkedJob.id, async ({ signal, job, markDispatched }) => {
+          result = await supervisor.runApproval(linkedJob.id, async ({ signal: approvalSignal, job, markDispatched }) => {
             claimedLinkedJob = job;
+            const continuationSignal = signal
+              ? AbortSignal.any([signal, approvalSignal])
+              : approvalSignal;
+            assertGatewayRequestActive(continuationSignal);
             await testHooks?.afterApprovalJobClaimed?.({ approvalId: id, jobId: job.id });
             let pending: any;
             try {
-              pending = await claimGatewayApproval(id);
+              pending = await claimGatewayApproval(id, continuationSignal);
             } catch (error) {
               throw approvalSettlementError(error);
             }
+            assertGatewayRequestActive(continuationSignal);
             if (!pending) throw new GatewayError(404, "approval not found or expired");
             if (pending.type === "skill-lifecycle") {
               markDispatched();
-              await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
-              if (signal.aborted) throw signal.reason ?? new Error("approval continuation aborted before skill activation");
-              return skillLifecycle.applyApproved(id, pending);
+              await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal: continuationSignal });
+              assertGatewayRequestActive(continuationSignal);
+              return skillLifecycle.applyApproved(id, pending, {
+                signal: continuationSignal,
+                __testOnlyAfterLockAcquired: testHooks?.afterControlPlaneMutationLockAcquired
+                  ? () => testHooks.afterControlPlaneMutationLockAcquired!({ surface: "skill.approved-enable" })
+                  : undefined
+              });
             }
             const linkedTask = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task)
               ? job.payload.task as Record<string, unknown>
               : undefined;
-            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask);
+            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask, continuationSignal);
             markDispatched();
-            await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
-            if (signal.aborted) throw signal.reason ?? new Error("approval continuation aborted before executor dispatch");
+            await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal: continuationSignal });
+            assertGatewayRequestActive(continuationSignal);
             return isolatedTaskExecutor({
               approvalId: id,
               approvalRunId: continuation.runId,
@@ -1162,24 +1252,33 @@ export async function createGatewayServer(options: any = {}) {
                 actor: continuation.actor,
                 reason: "explicit user approval"
               }
-            }, { signal, job });
+            }, { signal: continuationSignal, job });
           });
         } catch (error) {
           if (!claimedLinkedJob) {
             const current = await supervisor.get(linkedJob.id);
-            if (current?.status !== "running") await revokeGatewayApproval(id);
+            if (current?.status !== "running") await revokeGatewayApproval(id, signal);
             throw new GatewayError(409, "the originating job approval was already claimed or cancelled");
           }
           throw error;
         }
         return { approvalId: id, result };
       }
-      const pending = await claimGatewayApproval(id);
+      const pending = await claimGatewayApproval(id, signal);
+      assertGatewayRequestActive(signal);
       if (!pending) throw new GatewayError(404, "approval not found or expired");
       if (pending.type === "skill-lifecycle") {
-        return { approvalId: id, result: await skillLifecycle.applyApproved(id, pending) };
+        return {
+          approvalId: id,
+          result: await skillLifecycle.applyApproved(id, pending, {
+            signal,
+            __testOnlyAfterLockAcquired: testHooks?.afterControlPlaneMutationLockAcquired
+              ? () => testHooks.afterControlPlaneMutationLockAcquired!({ surface: "skill.approved-enable" })
+              : undefined
+          })
+        };
       }
-      const continuation = await recoverGatewayApprovalContinuation(id, pending, undefined);
+      const continuation = await recoverGatewayApprovalContinuation(id, pending, undefined, signal);
       const result = await isolatedTaskExecutor({
         approvalId: id,
         approvalRunId: continuation.runId,
@@ -1191,7 +1290,7 @@ export async function createGatewayServer(options: any = {}) {
           actor: continuation.actor,
           reason: "explicit user approval"
         }
-      });
+      }, { signal });
       return { approvalId: id, result };
     } catch (error) {
       if (claimedLinkedJob) {
@@ -1215,10 +1314,12 @@ export async function createGatewayServer(options: any = {}) {
     }
   };
 
-  const denyGatewayApproval = async (id: string) => {
-    const pending = (await listGatewayApprovals()).find((approval: any) => approval.id === id);
+  const denyGatewayApproval = async (id: string, signal?: AbortSignal) => {
+    assertGatewayRequestActive(signal);
+    const pending = (await listGatewayApprovals(signal)).find((approval: any) => approval.id === id);
     if (!pending) throw new GatewayError(404, "approval not found or expired");
     const linkedJob = pending.runId ? await supervisor.get(String(pending.runId)) : undefined;
+    assertGatewayRequestActive(signal);
     const auditContext = {
       runId: String(pending.runId || `approval:${id}`),
       actor: "operator",
@@ -1236,7 +1337,7 @@ export async function createGatewayServer(options: any = {}) {
       throw new GatewayError(503, "approval denial could not be recorded; no approval state was changed");
     }
     if (linkedJob && linkedJob.status !== "awaiting-approval") {
-      if (!await revokeGatewayApproval(id)) throw new GatewayError(404, "approval not found or expired");
+      if (!await revokeGatewayApproval(id, signal)) throw new GatewayError(404, "approval not found or expired");
       await auditStore.append({
         ...auditContext,
         type: "operator.approval_denial_stale",
@@ -1245,9 +1346,11 @@ export async function createGatewayServer(options: any = {}) {
       }).catch(() => undefined);
       throw new GatewayError(409, "the originating job is no longer awaiting approval");
     }
-    if (!await revokeGatewayApproval(id)) throw new GatewayError(404, "approval not found or expired");
+    assertGatewayRequestActive(signal);
+    if (!await revokeGatewayApproval(id, signal)) throw new GatewayError(404, "approval not found or expired");
     try {
-      if (linkedJob) await supervisor.cancel(linkedJob.id);
+      assertGatewayRequestActive(signal);
+      if (linkedJob) await supervisor.cancel(linkedJob.id, { signal });
     } catch (error) {
       await auditStore.append({
         ...auditContext,
@@ -1572,7 +1675,8 @@ export async function createGatewayServer(options: any = {}) {
 
   const commitDurableJobSubmission = async (
     prepared: PreparedDurableJobSubmission,
-    creationControl?: AgentGraphReassignmentCreationControl
+    creationControl?: AgentGraphReassignmentCreationControl,
+    signal?: AbortSignal
   ): Promise<{ status: number; payload: any }> => {
     if (prepared.existingSubmission) return prepared.existingSubmission;
     let job;
@@ -1584,7 +1688,8 @@ export async function createGatewayServer(options: any = {}) {
           requestHash: prepared.requestHash,
           timeoutMs: prepared.effectiveTimeout,
           retrySafe: prepared.retrySafe,
-          ...(creationControl ? { creationControl } : {})
+          ...(creationControl ? { creationControl } : {}),
+          ...(signal ? { signal } : {})
         }
       );
     } catch (error) {
@@ -1600,14 +1705,48 @@ export async function createGatewayServer(options: any = {}) {
   const submitDurableJob = async (
     body: any,
     idempotencyKey?: string,
-    delegation?: { reassignedFromGraphRunId: string; reassignedFromRequestDigest: string }
+    delegation?: { reassignedFromGraphRunId: string; reassignedFromRequestDigest: string },
+    signal?: AbortSignal
   ): Promise<{ status: number; payload: any }> => commitDurableJobSubmission(
-    await prepareDurableJobSubmission(body, idempotencyKey, delegation)
+    await prepareDurableJobSubmission(body, idempotencyKey, delegation),
+    undefined,
+    signal
   );
 
+  let shuttingDown = false;
+  const activeRequests = new Set<AbortController>();
+  const mutationBarrier = new GatewayMutationBarrier();
   const server: any = createServer(async (request: any, response: any) => {
+    const requestAbort = new AbortController();
+    request[REQUEST_ABORT_SIGNAL] = requestAbort.signal;
+    activeRequests.add(requestAbort);
+    const abortRequest = () => requestAbort.abort();
+    const releaseRequest = () => {
+      activeRequests.delete(requestAbort);
+      request.off("aborted", abortRequest);
+      response.off("close", abortRequest);
+    };
+    request.once("aborted", abortRequest);
+    response.once("close", abortRequest);
+    response.once("close", releaseRequest);
+    response.once("finish", releaseRequest);
     const requestId = String(request.headers["x-odinn-request-id"] || randomUUID());
     const requestStartedAt = Date.now();
+    const assertRequestActive = () => assertGatewayRequestActive(requestAbort.signal);
+    const runRequestIsolatedTask = (input: any): Promise<any> => runIsolatedTask(input, { signal: requestAbort.signal });
+    const runRequestGovernedTask = (input: any): Promise<any> => runGovernedTask(input, { signal: requestAbort.signal });
+    const runRequestControlTask = (task: any): Promise<any> => runControlTask(task, { signal: requestAbort.signal });
+    const mutationLockHook = (surface: string) => testHooks?.afterControlPlaneMutationLockAcquired
+      ? () => testHooks.afterControlPlaneMutationLockAcquired!({ surface })
+      : undefined;
+    const runRequestMutation = async <T>(surface: string, operation: (signal: AbortSignal) => T | Promise<T>): Promise<T> => {
+      assertRequestActive();
+      await testHooks?.beforeControlPlaneMutationCommit?.({ surface });
+      assertRequestActive();
+      const result = await operation(requestAbort.signal);
+      assertRequestActive();
+      return result;
+    };
     let requestTelemetryName: TelemetryName = "odinn.task";
     let requestTelemetryOperation = "http.request";
     let requestTelemetryTool: string | undefined;
@@ -1626,13 +1765,18 @@ export async function createGatewayServer(options: any = {}) {
           ...(requestTelemetryTool ? { "tool.name": requestTelemetryTool } : {})
         }
       });
+      recordGatewayTelemetryHealth(telemetry);
     });
     response.setHeader("x-odinn-request-id", requestId);
+    let mutationLease: GatewayMutationLease | undefined;
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
-      if (request.method === "POST" && url.pathname === "/jobs") {
-        requestTelemetryName = "odinn.run.acceptance";
-        requestTelemetryOperation = "job.submit";
+      if (shuttingDown) {
+        response.setHeader("connection", "close");
+        return json(response, 503, { ok: false, error: "gateway shutdown is in progress" });
+      }
+      if (isMutatingMethod(request.method)) {
+        mutationLease = mutationBarrier.admit(requestAbort.signal, `${String(request.method || "POST")} ${url.pathname}`);
       }
       if (!validHostHeader(request)) return json(response, 421, { ok: false, error: "invalid gateway Host header" });
       if (request.method === "GET" && url.pathname === "/odinn-logo.png") {
@@ -1656,7 +1800,7 @@ export async function createGatewayServer(options: any = {}) {
         return html(response, 200, renderConsoleHtml(version), { ...bootstrapHeaders, "content-security-policy": CONSOLE_CSP });
       }
       if (url.pathname.startsWith("/channels/webhook/")) {
-        if (await channelSupervisor.handleWebhook(request, response, url)) return;
+        if (await runRequestMutation("channel.webhook", () => channelSupervisor.handleWebhook(request, response, url))) return;
         return json(response, 404, { ok: false, error: "channel webhook not found" });
       }
       const authentication = process.env.ODINN_GATEWAY_AUTH === "off" ? "disabled" : authenticationMode(request, gatewayToken);
@@ -1667,26 +1811,22 @@ export async function createGatewayServer(options: any = {}) {
       if (isMutatingMethod(request.method) && !validMutationOrigin(request, authentication)) {
         return json(response, 403, { ok: false, error: "origin rejected for control-plane mutation" });
       }
-      const routeAbort = new AbortController();
-      const abortRoute = () => routeAbort.abort();
-      request.once("aborted", abortRoute);
-      response.once("close", abortRoute);
-      try {
-        if (await applicationReadRouter.dispatch(Object.freeze({
-          request,
-          response,
-          url,
-          requestId,
-          applicationRequestId: randomUUID(),
-          authentication,
-          hostedUserId: trustedHostedUserId,
-          hostedTenantId: trustedHostedTenantId,
-          signal: routeAbort.signal,
-        }))) return;
-      } finally {
-        request.off("aborted", abortRoute);
-        response.off("close", abortRoute);
+      if (isMutatingMethod(request.method)) assertRequestActive();
+      if (request.method === "POST" && url.pathname === "/jobs") {
+        requestTelemetryName = "odinn.run.acceptance";
+        requestTelemetryOperation = "job.submit";
       }
+      if (await applicationReadRouter.dispatch(Object.freeze({
+        request,
+        response,
+        url,
+        requestId,
+        applicationRequestId: randomUUID(),
+        authentication,
+        hostedUserId: trustedHostedUserId,
+        hostedTenantId: trustedHostedTenantId,
+        signal: requestAbort.signal,
+      }))) return;
       if (request.method === "GET" && url.pathname === "/config") {
         const editable = await readEditableConfig(state, { hosted });
         return json(response, 200, {
@@ -1697,7 +1837,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "PUT" && url.pathname === "/config") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        const saved = await writeEditableConfig(state, body, { hosted });
+        const saved = await runRequestMutation("config.write", (signal) => writeEditableConfig(state, body, { hosted, signal }));
         return json(response, 200, {
           ok: true,
           ...saved,
@@ -1719,16 +1859,19 @@ export async function createGatewayServer(options: any = {}) {
           if (!targetId) throw new GatewayError(400, "operator action targetId is required");
           return targetId;
         };
+        assertRequestActive();
         if (action === "cancel-job") {
-          for (const approval of approvalStore.list()) if (approval.runId === targetId && approval.id) approvalStore.revoke(approval.id);
-          result = await supervisor.cancel(requiredTargetId());
+          result = await runRequestMutation("job.cancel", async (signal) => {
+            for (const approval of approvalStore.list({ signal })) if (approval.runId === targetId && approval.id) approvalStore.revoke(approval.id, { signal });
+            return supervisor.cancel(requiredTargetId(), { signal });
+          });
         } else if (action === "approve") {
-          result = await approveGatewayApproval(requiredTargetId());
+          result = await runRequestMutation("approval.approve", (signal) => approveGatewayApproval(requiredTargetId(), signal));
         } else if (action === "deny-approval") {
-          result = await denyGatewayApproval(requiredTargetId());
+          result = await runRequestMutation("approval.deny", (signal) => denyGatewayApproval(requiredTargetId(), signal));
         } else if (action === "cancel-workflow") {
           if (!workflowRuntime) throw new GatewayError(403, "durable workflows are disabled");
-          result = await workflowRuntime.cancel(requiredTargetId());
+          result = await runRequestMutation("workflow.cancel", (signal) => workflowRuntime.cancel(requiredTargetId(), { signal }));
         } else {
           result = await auditStore.verifyIntegrity({ allowUnsigned: true });
         }
@@ -1767,12 +1910,21 @@ export async function createGatewayServer(options: any = {}) {
         return json(response, 200, { ok: true, manifest: validateAgentPackage(await readJson(request, { maxBytes: requestMaxBytes })) });
       }
       if (request.method === "POST" && url.pathname === "/agents") {
-        return json(response, 200, { ok: true, agent: await agentStore.install(await readJson(request, { maxBytes: requestMaxBytes })) });
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const agent = await runRequestMutation("agent.install", (signal) => agentStore.install(body, {
+          signal,
+          __testOnlyAfterLockAcquired: mutationLockHook("agent.install")
+        }));
+        return json(response, 200, { ok: true, agent });
       }
       if (request.method === "POST" && url.pathname.startsWith("/agents/") && url.pathname.endsWith("/lifecycle")) {
         const id = decodeURIComponent(url.pathname.slice("/agents/".length, -"/lifecycle".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, { ok: true, agent: await agentStore.transition(id, body.action) });
+        const agent = await runRequestMutation("agent.lifecycle", (signal) => agentStore.transition(id, body.action, {
+          signal,
+          __testOnlyAfterLockAcquired: mutationLockHook("agent.lifecycle")
+        }));
+        return json(response, 200, { ok: true, agent });
       }
       if (request.method === "GET" && url.pathname === "/skills") {
         const [managed, files, extensions] = await Promise.all([skillLifecycle.inspect(), discoverSkills(root, state), extensionRegistry.list()]);
@@ -1804,7 +1956,14 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "POST" && url.pathname === "/skills") {
         skillLifecycle.assertWritable();
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, { ok: true, skill: await skillLifecycle.create(body, { operationId: requestId, actor: "gateway", idempotencyKey: String(request.headers["idempotency-key"] ?? "") }) });
+        const skill = await runRequestMutation("skill.create", (signal) => skillLifecycle.create(body, {
+          operationId: requestId,
+          actor: "gateway",
+          idempotencyKey: String(request.headers["idempotency-key"] ?? ""),
+          signal,
+          __testOnlyAfterLockAcquired: mutationLockHook("skill.create")
+        }));
+        return json(response, 200, { ok: true, skill });
       }
       if (request.method === "GET" && url.pathname.startsWith("/skills/") && url.pathname.endsWith("/verify")) {
         const id = decodeURIComponent(url.pathname.slice("/skills/".length, -"/verify".length));
@@ -1814,7 +1973,13 @@ export async function createGatewayServer(options: any = {}) {
         const id = decodeURIComponent(url.pathname.slice("/skills/".length, -"/lifecycle".length));
         skillLifecycle.assertWritable();
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        const skill = await skillLifecycle.transition({ ...body, id }, { operationId: requestId, actor: "gateway", idempotencyKey: String(request.headers["idempotency-key"] ?? "") });
+        const skill = await runRequestMutation("skill.lifecycle", (signal) => skillLifecycle.transition({ ...body, id }, {
+          operationId: requestId,
+          actor: "gateway",
+          idempotencyKey: String(request.headers["idempotency-key"] ?? ""),
+          signal,
+          __testOnlyAfterLockAcquired: mutationLockHook("skill.lifecycle")
+        }));
         return json(response, "type" in skill && skill.type === "approval.required" ? 202 : 200, { ok: true, skill });
       }
       if (request.method === "POST" && url.pathname === "/skills/workshop/validate") {
@@ -1825,7 +1990,14 @@ export async function createGatewayServer(options: any = {}) {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const validation = validateSkillDraft(body);
         if (!validation.valid) throw new GatewayError(400, validation.errors.join("; "));
-        return json(response, 200, { ok: true, ...(await skillLifecycle.saveDraft(body, { operationId: requestId, actor: "gateway", idempotencyKey: String(request.headers["idempotency-key"] ?? "") })) });
+        const draft = await runRequestMutation("skill.draft", (signal) => skillLifecycle.saveDraft(body, {
+          operationId: requestId,
+          actor: "gateway",
+          idempotencyKey: String(request.headers["idempotency-key"] ?? ""),
+          signal,
+          __testOnlyAfterLockAcquired: mutationLockHook("skill.draft")
+        }));
+        return json(response, 200, { ok: true, ...draft });
       }
       if (request.method === "GET" && url.pathname === "/runtime/runs") {
         return json(response, 200, runtime.ledger.listRuns({ limit: Number.parseInt(url.searchParams.get("limit") ?? "100", 10) }));
@@ -1851,8 +2023,11 @@ export async function createGatewayServer(options: any = {}) {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         validatePolicy(body.policy);
         const runId = body.runId ?? `policy-${randomBytes(12).toString("hex")}`;
-        runtime.ledger.ensureRun({ runId, objective: "policy evaluation" });
-        return json(response, 200, runtime.sentinel.evaluate({ runId, stepId: body.stepId, toolName: body.toolName, input: body.input ?? {}, policy: body.policy, workspaceRoot: root }));
+        const evaluated = await runRequestMutation("policy.evaluate", () => {
+          runtime.ledger.ensureRun({ runId, objective: "policy evaluation" });
+          return runtime.sentinel.evaluate({ runId, stepId: body.stepId, toolName: body.toolName, input: body.input ?? {}, policy: body.policy, workspaceRoot: root });
+        });
+        return json(response, 200, evaluated);
       }
       if (request.method === "POST" && url.pathname === "/gatewatch/preview") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
@@ -1873,12 +2048,15 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/capabilities/issue") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        runtime.ledger.ensureRun({ runId: body.runId, objective: body.objective ?? `capability: ${body.toolName}` });
-        return json(response, 200, runtime.capabilities.issue(body));
+        const issued = await runRequestMutation("capability.issue", () => {
+          runtime.ledger.ensureRun({ runId: body.runId, objective: body.objective ?? `capability: ${body.toolName}` });
+          return runtime.capabilities.issue(body);
+        });
+        return json(response, 200, issued);
       }
       if (request.method === "POST" && url.pathname === "/capabilities/use") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, runtime.capabilities.consume(body.token, body));
+        return json(response, 200, await runRequestMutation("capability.consume", () => runtime.capabilities.consume(body.token, body)));
       }
       if (request.method === "GET" && url.pathname.startsWith("/capabilities/")) {
         const runId = decodeURIComponent(url.pathname.slice("/capabilities/".length));
@@ -1886,13 +2064,13 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname.startsWith("/capabilities/") && url.pathname.endsWith("/revoke")) {
         const capabilityId = decodeURIComponent(url.pathname.slice("/capabilities/".length, -"/revoke".length));
-        return json(response, 200, runtime.capabilities.revoke(capabilityId));
+        return json(response, 200, await runRequestMutation("capability.revoke", () => runtime.capabilities.revoke(capabilityId)));
       }
       if (request.method === "POST" && url.pathname === "/checkpoints") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const snapshotRunId = body.runId;
         const runId = body.taskId || body.id || request.headers["idempotency-key"] || (snapshotRunId ? `checkpoint-create-${snapshotRunId}` : randomUUID());
-        const result = await runGovernedTask({
+        const result = await runRequestGovernedTask({
           task: {
             id: runId,
             actor: body.actor || "gateway",
@@ -1913,7 +2091,7 @@ export async function createGatewayServer(options: any = {}) {
         const snapshotId = decodeURIComponent(url.pathname.slice("/rewind/".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
-        const result = await runGovernedTask({
+        const result = await runRequestGovernedTask({
           task: {
             id: runId,
             actor: body.actor || "gateway",
@@ -1932,7 +2110,7 @@ export async function createGatewayServer(options: any = {}) {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
         if (!runId || typeof runId !== "string") return json(response, 400, { ok: false, error: "runId is required for governed mutation" });
-        const result = await runGovernedTask({
+        const result = await runRequestGovernedTask({
           task: {
             id: runId,
             actor: body.actor || "gateway",
@@ -1960,7 +2138,7 @@ export async function createGatewayServer(options: any = {}) {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
         if (!runId || typeof runId !== "string") return json(response, 400, { ok: false, error: "runId is required for governed mutation" });
-        const result = await runGovernedTask({
+        const result = await runRequestGovernedTask({
           task: {
             id: runId,
             actor: body.actor || "gateway",
@@ -1987,7 +2165,7 @@ export async function createGatewayServer(options: any = {}) {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
         if (!runId || typeof runId !== "string") return json(response, 400, { ok: false, error: "runId is required for governed restore" });
-        const result = await runGovernedTask({
+        const result = await runRequestGovernedTask({
           task: {
             id: runId,
             actor: body.actor || "gateway",
@@ -2006,7 +2184,7 @@ export async function createGatewayServer(options: any = {}) {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const runId = body.runId || body.id || request.headers["idempotency-key"] || randomUUID();
         if (!runId || typeof runId !== "string") return json(response, 400, { ok: false, error: "runId is required for governed restore" });
-        const result = await runGovernedTask({
+        const result = await runRequestGovernedTask({
           task: {
             id: runId,
             actor: body.actor || "gateway",
@@ -2025,7 +2203,7 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "POST" && url.pathname === "/capsules/export") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const output = body.output ? safeCapsulePath(state, body.output) : join(state, "capsules", `${body.runId}.odinn`);
-        return json(response, 200, await runtime.capsules.export(body.runId, { ...body, output }));
+        return json(response, 200, await runRequestMutation("capsule.export", () => runtime.capsules.export(body.runId, { ...body, output })));
       }
       if (request.method === "POST" && url.pathname === "/capsules/verify") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
@@ -2033,11 +2211,11 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/capsules/replay") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await runtime.capsules.replay(safeCapsulePath(state, body.path), { mode: body.mode, workspace: body.workspace }));
+        return json(response, 200, await runRequestMutation("capsule.replay", () => runtime.capsules.replay(safeCapsulePath(state, body.path), { mode: body.mode, workspace: body.workspace })));
       }
       if (request.method === "POST" && url.pathname === "/counterfactual") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await runtime.counterfactual.create({ ...body, workspaceRoot: root }));
+        return json(response, 200, await runRequestMutation("counterfactual.create", (signal) => runtime.counterfactual.create({ ...body, workspaceRoot: root, signal })));
       }
       if (request.method === "GET" && url.pathname.startsWith("/counterfactual/")) {
         if (url.pathname.endsWith("/execute")) return json(response, 405, { ok: false, error: "counterfactual execute requires POST" });
@@ -2047,7 +2225,7 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "POST" && url.pathname.startsWith("/counterfactual/") && url.pathname.endsWith("/execute")) {
         const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length, -"/execute".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await runtime.counterfactual.execute(groupId, {
+        return json(response, 200, await runRequestMutation("counterfactual.execute", (signal) => runtime.counterfactual.execute(groupId, {
           capabilities: runtime.capabilities,
           proof: {
             run: async (runId: string, contract: any, { workspaceRoot = root }: any = {}) => {
@@ -2059,16 +2237,18 @@ export async function createGatewayServer(options: any = {}) {
             }
           },
           policy,
-          executor: (task: any, context: any) => isolatedTaskExecutor({ task, workspaceRoot: context.workspaceRoot })
-        }));
+          signal,
+          executor: (task: any, context: any) => runRequestIsolatedTask({ task, workspaceRoot: context.workspaceRoot })
+        })));
       }
       if (request.method === "POST" && url.pathname.startsWith("/counterfactual/") && url.pathname.endsWith("/select")) {
         const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length, -"/select".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await runtime.counterfactual.select(groupId, body.runId, { apply: body.apply === true }));
+        return json(response, 200, await runRequestMutation("counterfactual.select", (signal) => runtime.counterfactual.select(groupId, body.runId, { apply: body.apply === true, signal })));
       }
       if (request.method === "POST" && url.pathname === "/routing/observe") {
-        return json(response, 200, runtime.darwin.observe(await readJson(request, { maxBytes: requestMaxBytes })));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, await runRequestMutation("routing.observe", () => runtime.darwin.observe(body)));
       }
       if (request.method === "GET" && url.pathname === "/routing/stats") {
         return json(response, 200, runtime.darwin.stats(url.searchParams.get("taskClass") ?? "general"));
@@ -2076,8 +2256,11 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "POST" && url.pathname === "/routing/choose") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const runId = body.runId ?? `routing-${randomBytes(12).toString("hex")}`;
-        runtime.ledger.ensureRun({ runId, objective: `choose a model for ${body.taskClass ?? "general"}` });
-        return json(response, 200, { ...runtime.darwin.choose(body.taskClass ?? "general", { pinnedModel: body.pinnedModel, runId }), runId });
+        const choice = await runRequestMutation("routing.choose", () => {
+          runtime.ledger.ensureRun({ runId, objective: `choose a model for ${body.taskClass ?? "general"}` });
+          return runtime.darwin.choose(body.taskClass ?? "general", { pinnedModel: body.pinnedModel, runId });
+        });
+        return json(response, 200, { ...choice, runId });
       }
       if (request.method === "GET" && url.pathname === "/runs") {
         return json(response, 200, await auditStore.readRuns());
@@ -2096,7 +2279,7 @@ export async function createGatewayServer(options: any = {}) {
         if (safety.retrySafe !== true) return json(response, 409, { ok: false, error: `tool ${started.tool} is not declared retry-safe and cannot be replayed from the console` });
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const replayId = body.id || request.headers["idempotency-key"] || `${id}:replay:${Date.now()}`;
-        return json(response, 200, await isolatedTaskExecutor({
+        return json(response, 200, await runRequestIsolatedTask({
           task: { id: replayId, tool: started.tool, input: started.data.input, actor: "gateway-replay", reason: `replay:${id}` },
         }));
       }
@@ -2415,14 +2598,14 @@ export async function createGatewayServer(options: any = {}) {
         if (request.method === "POST" && url.pathname === "/workflows") {
           const body = await readJson(request, { maxBytes: requestMaxBytes });
           const key = String(body.idempotencyKey || request.headers["idempotency-key"] || body.runId || `workflow:${randomUUID()}`);
-          const run = await workflowRuntime.submit({
+          const run = await runRequestMutation("workflow.submit", (signal) => workflowRuntime.submit({
             schemaVersion: 1,
             runId: String(body.runId || `workflow_${randomUUID()}`),
             principalId: tenantScope.hosted ? `${tenantScope.principalId}:${tenantScope.tenantId}` : tenantScope.principalId,
             idempotencyKey: key,
             definition: body.definition,
             input: body.input ?? {}
-          });
+          }, { signal }));
           return json(response, 202, { ok: true, run });
         }
         const workflowId = decodeURIComponent(url.pathname.slice("/workflows/".length));
@@ -2431,10 +2614,12 @@ export async function createGatewayServer(options: any = {}) {
           return json(response, 200, { events: workflowRuntime.events(id) });
         }
         if (request.method === "POST" && workflowId.endsWith("/cancel")) {
-          return json(response, 200, { ok: true, run: await workflowRuntime.cancel(workflowId.slice(0, -"/cancel".length)) });
+          const run = await runRequestMutation("workflow.cancel", (signal) => workflowRuntime.cancel(workflowId.slice(0, -"/cancel".length), { signal }));
+          return json(response, 200, { ok: true, run });
         }
         if (request.method === "POST" && workflowId.endsWith("/resume")) {
-          return json(response, 200, { ok: true, run: await workflowRuntime.resume(workflowId.slice(0, -"/resume".length)) });
+          const run = await runRequestMutation("workflow.resume", (signal) => workflowRuntime.resume(workflowId.slice(0, -"/resume".length), { signal }));
+          return json(response, 200, { ok: true, run });
         }
         if (request.method === "GET") {
           const run = workflowRuntime.get(workflowId);
@@ -2445,18 +2630,25 @@ export async function createGatewayServer(options: any = {}) {
         if (!eventIngress) throw new GatewayError(403, "event ingress is disabled; enable config.runtime.enableEventIngress explicitly");
         if (request.method === "POST" && url.pathname === "/event-sources") {
           const body = await readJson(request, { maxBytes: requestMaxBytes });
-          return json(response, 200, { ok: true, source: eventIngress.registerSource({ source: String(body.source || ""), authDigest: String(body.authDigest || ""), oldestSequence: body.oldestSequence }) });
+          const source = await runRequestMutation("event.source", (signal) => eventIngress.registerSource({ source: String(body.source || ""), authDigest: String(body.authDigest || ""), oldestSequence: body.oldestSequence }, { signal }));
+          return json(response, 200, { ok: true, source });
         }
         if (request.method === "GET" && url.pathname === "/event-watches") return json(response, 200, { watches: eventIngress.listWatches() });
         if (request.method === "POST" && url.pathname === "/event-watches") {
           const body = await readJson(request, { maxBytes: requestMaxBytes });
-          return json(response, 200, { ok: true, watchId: body.watchId, declaration: eventIngress.registerWatch(String(body.watchId || ""), body.declaration) });
+          const declaration = await runRequestMutation("event.watch", (signal) => eventIngress.registerWatch(String(body.watchId || ""), body.declaration, { signal }));
+          return json(response, 200, { ok: true, watchId: body.watchId, declaration });
         }
         if (request.method === "POST" && url.pathname === "/events/ingest") {
           const body = await readJson(request, { maxBytes: requestMaxBytes });
-          return json(response, 202, { ok: true, ...(await eventIngress.ingest(body.event, String(body.authDigest || ""))) });
+          const ingested = await runRequestMutation("event.ingest", (signal) => eventIngress.ingest(body.event, String(body.authDigest || ""), { signal }));
+          return json(response, 202, { ok: true, ...ingested });
         }
-        if (request.method === "POST" && url.pathname === "/heartbeat") return json(response, 202, { ok: true, candidates: await eventIngress.heartbeat(Number((await readJson(request, { maxBytes: requestMaxBytes })).nowUnixMs ?? Date.now())) });
+        if (request.method === "POST" && url.pathname === "/heartbeat") {
+          const body = await readJson(request, { maxBytes: requestMaxBytes });
+          const candidates = await runRequestMutation("event.heartbeat", (signal) => eventIngress.heartbeat(Number(body.nowUnixMs ?? Date.now()), { signal }));
+          return json(response, 202, { ok: true, candidates });
+        }
       }
       if (url.pathname === "/context" || url.pathname.startsWith("/projects/") && url.pathname.endsWith("/context")) {
         if (!projectContext) throw new GatewayError(403, "project context is disabled; enable config.runtime.enableProjectContext explicitly");
@@ -2470,20 +2662,34 @@ export async function createGatewayServer(options: any = {}) {
         return json(response, 200, { enabled: true, jobs: await cronStore.list(), nextWake: await cronStore.nextWake() });
       }
       if (request.method === "POST" && url.pathname === "/cron") {
-        return json(response, 200, { ok: true, job: await cronStore.create(cronMutationInput(await readJson(request, { maxBytes: requestMaxBytes }), true)) });
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const job = await runRequestMutation("cron.create", (signal) => cronStore.create(cronMutationInput(body, true), {
+          signal,
+          __testOnlyAfterLockAcquired: mutationLockHook("cron.create")
+        }));
+        return json(response, 200, { ok: true, job });
       }
       if (request.method === "PATCH" && url.pathname.startsWith("/cron/")) {
         const id = decodeURIComponent(url.pathname.slice("/cron/".length));
-        return json(response, 200, { ok: true, job: await cronStore.update(id, cronMutationInput(await readJson(request, { maxBytes: requestMaxBytes }), false)) });
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const job = await runRequestMutation("cron.update", (signal) => cronStore.update(id, cronMutationInput(body, false), {
+          signal,
+          __testOnlyAfterLockAcquired: mutationLockHook("cron.update")
+        }));
+        return json(response, 200, { ok: true, job });
       }
       if (request.method === "DELETE" && url.pathname.startsWith("/cron/")) {
         const id = decodeURIComponent(url.pathname.slice("/cron/".length));
-        await cronStore.remove(id);
+        await runRequestMutation("cron.delete", (signal) => cronStore.remove(id, {
+          signal,
+          __testOnlyAfterLockAcquired: mutationLockHook("cron.delete")
+        }));
         return json(response, 200, { ok: true });
       }
       if (request.method === "POST" && url.pathname.startsWith("/cron/") && url.pathname.endsWith("/run")) {
         const id = decodeURIComponent(url.pathname.slice("/cron/".length, -"/run".length));
-        return json(response, 200, { ok: true, result: await runCronJob(cronStore, id, isolatedTaskExecutor, tenantScope) });
+        const result = await runRequestMutation("cron.run", (signal) => runCronJob(cronStore, id, runRequestIsolatedTask, tenantScope, signal));
+        return json(response, 200, { ok: true, result });
       }
       if (request.method === "GET" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/result")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length, -"/result".length));
@@ -2524,15 +2730,23 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/jobs") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        const submission = await submitDurableJob(body, request.headers["idempotency-key"] as string | undefined);
+        const submission = await runRequestMutation("job.submit", (signal) => submitDurableJob(
+          body,
+          request.headers["idempotency-key"] as string | undefined,
+          undefined,
+          signal
+        ));
         return json(response, submission.status, submission.payload);
       }
       if (request.method === "POST" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/cancel")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length, -"/cancel".length));
-        for (const approval of approvalStore.list()) {
-          if (approval.runId === id && approval.id) approvalStore.revoke(approval.id);
-        }
-        return json(response, 200, { ok: true, job: await supervisor.cancel(id) });
+        const job = await runRequestMutation("job.cancel", async (signal) => {
+          for (const approval of approvalStore.list({ signal })) {
+            if (approval.runId === id && approval.id) approvalStore.revoke(approval.id, { signal });
+          }
+          return supervisor.cancel(id, { signal });
+        });
+        return json(response, 200, { ok: true, job });
       }
       if (request.method === "GET" && url.pathname === "/audit") {
         return json(response, 200, await auditStore.readAll());
@@ -2611,7 +2825,7 @@ export async function createGatewayServer(options: any = {}) {
         const sequence = Number(body.sequence);
         if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(subscriber)) throw new GatewayError(400, "audit subscriber id is invalid");
         if (!Number.isSafeInteger(sequence) || sequence < 0) throw new GatewayError(400, "audit subscriber sequence is invalid");
-        try { await auditStore.ackCursor(subscriber, sequence); }
+        try { await runRequestMutation("audit.acknowledge", async () => auditStore.ackCursor(subscriber, sequence)); }
         catch (error: any) { throw new GatewayError(409, error?.message || "audit subscriber cursor could not be acknowledged"); }
         return json(response, 200, { ok: true, subscriber, sequence: await auditStore.getCursor(subscriber) });
       }
@@ -2620,15 +2834,16 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/approve")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/approve".length));
-        const preview = (await listGatewayApprovals()).find((approval: any) => approval.id === id);
-        const approved = await approveGatewayApproval(id);
+        const preview = (await listGatewayApprovals(requestAbort.signal)).find((approval: any) => approval.id === id);
+        const approved = await runRequestMutation("approval.approve", (signal) => approveGatewayApproval(id, signal));
         return json(response, 200, preview?.type === "skill-lifecycle"
           ? { ok: true, ...approved }
           : approved.result);
       }
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/deny")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/deny".length));
-        return json(response, 200, { ok: true, ...(await denyGatewayApproval(id)) });
+        const denied = await runRequestMutation("approval.deny", (signal) => denyGatewayApproval(id, signal));
+        return json(response, 200, { ok: true, ...denied });
       }
       if (request.method === "GET" && url.pathname === "/memory") {
         const query = url.searchParams.get("query") ?? "";
@@ -2639,7 +2854,7 @@ export async function createGatewayServer(options: any = {}) {
         const projectId = url.searchParams.get("projectId") ?? "";
         const sessionId = url.searchParams.get("sessionId") ?? "";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.search", input: { query, kind, subject, scopeType, scopeId, projectId, sessionId, limit }, actor: "gateway" },
           auditStore,
           policy,
@@ -2652,7 +2867,7 @@ export async function createGatewayServer(options: any = {}) {
         const projectId = url.searchParams.get("projectId") ?? "";
         const sessionId = url.searchParams.get("sessionId") ?? "";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "8", 10);
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.recall", input: { query, kind, projectId, sessionId, limit }, actor: "gateway" },
           auditStore,
           policy,
@@ -2662,7 +2877,7 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "GET" && url.pathname === "/memory/browse") {
         const namespace = url.searchParams.get("namespace") ?? "";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.browse", input: { namespace, limit }, actor: "gateway" },
           auditStore,
           policy,
@@ -2689,7 +2904,7 @@ export async function createGatewayServer(options: any = {}) {
           autoCompact: agentRun && allows("memory.compact") && config.memory?.autoCompact !== false
         };
         if (!integration.readAllowed) return json(response, 200, { working: false, records: null, namespaces: null, latestAt: null, integration });
-        const curated = await runIsolatedTask({ task: { tool: "memory.curate", input: { limit: 1000 }, actor: "gateway" }, auditStore, policy, registry });
+        const curated = await runRequestIsolatedTask({ task: { tool: "memory.curate", input: { limit: 1000 }, actor: "gateway" }, auditStore, policy, registry });
         const records = Object.values(curated.output.kinds || {}).flat() as any[];
         const namespaces = new Set<string>();
         for (const record of records) {
@@ -2706,7 +2921,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "GET" && url.pathname.startsWith("/memory/") && !["/memory/recall", "/memory/browse", "/memory/curated", "/memory/status", "/memory/candidates"].includes(url.pathname)) {
         const id = decodeURIComponent(url.pathname.slice("/memory/".length));
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.open", input: { id }, actor: "gateway" },
           auditStore,
           policy,
@@ -2714,7 +2929,7 @@ export async function createGatewayServer(options: any = {}) {
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/memory/compact") {
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.compact", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -2722,7 +2937,7 @@ export async function createGatewayServer(options: any = {}) {
         })).output);
       }
       if (request.method === "GET" && url.pathname === "/memory/curated") {
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.curate", input: {}, actor: "gateway" },
           auditStore,
           policy,
@@ -2732,7 +2947,7 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "GET" && url.pathname === "/memory/candidates") {
         const status = url.searchParams.get("status") ?? "pending";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.candidates", input: { status, limit }, actor: "gateway" },
           auditStore,
           policy,
@@ -2742,7 +2957,7 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "POST" && url.pathname.startsWith("/memory/candidates/") && url.pathname.endsWith("/decision")) {
         const candidateId = decodeURIComponent(url.pathname.slice("/memory/candidates/".length, -"/decision".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.decide", input: { ...body, candidateId }, actor: "gateway" },
           auditStore,
           policy,
@@ -2750,7 +2965,7 @@ export async function createGatewayServer(options: any = {}) {
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/memory") {
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.remember", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -2758,7 +2973,7 @@ export async function createGatewayServer(options: any = {}) {
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/memory/corrections") {
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.correct", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -2768,7 +2983,7 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "POST" && url.pathname.startsWith("/memory/") && url.pathname.endsWith("/forget")) {
         const targetId = decodeURIComponent(url.pathname.slice("/memory/".length, -"/forget".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "memory.forget", input: { ...body, targetId }, actor: "gateway" },
           auditStore,
           policy,
@@ -2777,7 +2992,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/sessions") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: {
             tool: "session.create",
             input: { ...body, actor: tenantScope.principalId },
@@ -2791,7 +3006,7 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "PATCH" && url.pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "session.update", input: { ...body, sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -2800,7 +3015,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "DELETE" && url.pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length));
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "session.delete", input: { sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -2809,7 +3024,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "GET" && url.pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length));
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "session.read", input: { sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -2818,7 +3033,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname.startsWith("/sessions/") && url.pathname.endsWith("/messages")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length, -"/messages".length));
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "session.message", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -2830,7 +3045,7 @@ export async function createGatewayServer(options: any = {}) {
         const projectId = url.searchParams.get("projectId") ?? "";
         const sessionId = url.searchParams.get("sessionId") ?? "";
         const status = url.searchParams.get("status") ?? "";
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "goal.list", input: { limit, projectId, sessionId, status }, actor: "gateway" },
           auditStore,
           policy,
@@ -2838,7 +3053,7 @@ export async function createGatewayServer(options: any = {}) {
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/goals") {
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "goal.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
           auditStore,
           policy,
@@ -2847,7 +3062,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname.startsWith("/goals/") && url.pathname.endsWith("/updates")) {
         const id = decodeURIComponent(url.pathname.slice("/goals/".length, -"/updates".length));
-        return json(response, 200, (await runIsolatedTask({
+        return json(response, 200, (await runRequestIsolatedTask({
           task: { tool: "goal.update", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), goalId: id }, actor: "gateway" },
           auditStore,
           policy,
@@ -2856,28 +3071,28 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "GET" && url.pathname === "/projects") {
         const includeArchived = url.searchParams.get("includeArchived") === "true";
-        return json(response, 200, (await runIsolatedTask({ task: { tool: "project.list", input: { includeArchived, limit: 100 }, actor: "gateway" }, auditStore, policy, registry })).output);
+        return json(response, 200, (await runRequestIsolatedTask({ task: { tool: "project.list", input: { includeArchived, limit: 100 }, actor: "gateway" }, auditStore, policy, registry })).output);
       }
       if (request.method === "POST" && url.pathname === "/projects") {
-        return json(response, 200, (await runIsolatedTask({ task: { tool: "project.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" }, auditStore, policy, registry })).output);
+        return json(response, 200, (await runRequestIsolatedTask({ task: { tool: "project.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" }, auditStore, policy, registry })).output);
       }
       if (request.method === "PATCH" && url.pathname.startsWith("/projects/")) {
         const id = decodeURIComponent(url.pathname.slice("/projects/".length));
-        return json(response, 200, (await runIsolatedTask({ task: { tool: "project.update", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), projectId: id }, actor: "gateway" }, auditStore, policy, registry })).output);
+        return json(response, 200, (await runRequestIsolatedTask({ task: { tool: "project.update", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), projectId: id }, actor: "gateway" }, auditStore, policy, registry })).output);
       }
       if (request.method === "GET" && url.pathname === "/improvements") {
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
-        return json(response, 200, (await runControlTask({ tool: "improve.list", input: { limit }, actor: "gateway" })).output);
+        return json(response, 200, (await runRequestControlTask({ tool: "improve.list", input: { limit }, actor: "gateway" })).output);
       }
       if (request.method === "POST" && url.pathname === "/improvements") {
-        return json(response, 200, (await runControlTask({ tool: "improve.propose", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" })).output);
+        return json(response, 200, (await runRequestControlTask({ tool: "improve.propose", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" })).output);
       }
       if (request.method === "POST" && url.pathname === "/improvements/learn") {
-        return json(response, 200, (await runControlTask({ tool: "improve.learn", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" })).output);
+        return json(response, 200, (await runRequestControlTask({ tool: "improve.learn", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" })).output);
       }
       if (request.method === "POST" && url.pathname.startsWith("/improvements/") && url.pathname.endsWith("/decisions")) {
         const id = decodeURIComponent(url.pathname.slice("/improvements/".length, -"/decisions".length));
-        return json(response, 200, (await runControlTask({
+        return json(response, 200, (await runRequestControlTask({
           tool: "improve.decide",
           input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), improvementId: id },
           actor: "gateway"
@@ -2885,7 +3100,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname.startsWith("/improvements/") && url.pathname.endsWith("/rollback")) {
         const id = decodeURIComponent(url.pathname.slice("/improvements/".length, -"/rollback".length));
-        return json(response, 200, (await runControlTask({
+        return json(response, 200, (await runRequestControlTask({
           tool: "improve.rollback",
           input: { improvementId: id, source: "gateway" },
           actor: "gateway"
@@ -2893,6 +3108,11 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/run/stream") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
+        if (typeof body.tool === "string" && registry.has(body.tool)) {
+          requestTelemetryName = body.tool.startsWith("memory.") ? "odinn.memory.recall" : "odinn.tool.execution";
+          requestTelemetryOperation = "tool.execute";
+          requestTelemetryTool = gatewayToolTelemetryCategory(body.tool);
+        }
         quotaGate.checkTool(body.tool);
         response.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
@@ -2901,6 +3121,8 @@ export async function createGatewayServer(options: any = {}) {
           "x-accel-buffering": "no"
         });
         const controller = new AbortController();
+        const abortForShutdown = () => controller.abort(requestAbort.signal.reason ?? new Error("gateway shutting down"));
+        requestAbort.signal.addEventListener("abort", abortForShutdown, { once: true });
         request.once("aborted", () => controller.abort(new Error("client disconnected")));
         response.once("close", () => { if (!response.writableEnded) controller.abort(new Error("client disconnected")); });
         const sendEvent = (event: string, value: any) => response.write(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
@@ -2920,17 +3142,20 @@ export async function createGatewayServer(options: any = {}) {
         } catch (error) {
           sendEvent("error", publicError(error, requestId));
         } finally {
+          requestAbort.signal.removeEventListener("abort", abortForShutdown);
           response.end();
         }
         return;
       }
       if (request.method === "POST" && url.pathname === "/run") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        requestTelemetryTool = typeof body.tool === "string" ? body.tool : undefined;
-        requestTelemetryName = requestTelemetryTool?.startsWith("memory.") ? "odinn.memory.recall" : "odinn.tool.execution";
-        requestTelemetryOperation = "tool.execute";
+        if (typeof body.tool === "string" && registry.has(body.tool)) {
+          requestTelemetryName = body.tool.startsWith("memory.") ? "odinn.memory.recall" : "odinn.tool.execution";
+          requestTelemetryOperation = "tool.execute";
+          requestTelemetryTool = gatewayToolTelemetryCategory(body.tool);
+        }
         quotaGate.checkTool(body.tool);
-        const result = await runIsolatedTask({
+        const result = await runRequestIsolatedTask({
           task: { id: body.id ?? request.headers["idempotency-key"], tool: body.tool, input: body.input, reason: body.reason, actor: "gateway" },
           auditStore,
           policy,
@@ -2941,7 +3166,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/plan") {
         const plan = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await isolatedTaskExecutor({
+        return json(response, 200, await runRequestIsolatedTask({
           plan: { ...plan, id: plan.id ?? request.headers["idempotency-key"], actor: "gateway" }
         }));
       }
@@ -2949,44 +3174,142 @@ export async function createGatewayServer(options: any = {}) {
     } catch (error: any) {
       await testHooks?.onRequestError?.({ pathname: String(request.url ?? "/").split("?", 1)[0], error });
       return json(response, error.status ?? 400, publicError(error, requestId));
+    } finally {
+      mutationLease?.release();
     }
   });
 
-  const close = server.close.bind(server);
+  const nativeClose = server.close.bind(server);
+  const requestedShutdownTimeoutMs = Number(testHooks?.shutdownTimeoutMs ?? 5_000);
+  const shutdownTimeoutMs = Number.isFinite(requestedShutdownTimeoutMs)
+    ? Math.max(25, Math.min(5_000, requestedShutdownTimeoutMs))
+    : 5_000;
+  let shutdownPromise: Promise<unknown> | undefined;
   server.close = (callback: any) => {
-    const shutdownStartedAt = Date.now();
-    recordGatewayEvent(telemetry, { name: "odinn.runtime.lifecycle", attributes: { component: "gateway", operation: "shutdown", outcome: "stopping" } });
-    if (improvementStartupTimer) clearTimeout(improvementStartupTimer);
-    if (improvementTimer) clearInterval(improvementTimer);
-    clearInterval(cronTimer);
-    if (eventHeartbeatTimer) clearInterval(eventHeartbeatTimer);
-    Promise.allSettled([channelSupervisor.stop(), supervisor.shutdown(), workflowRuntime?.shutdown(), eventIngress?.shutdown(), isolatedTaskExecutor.shutdown?.(), mcpRuntime?.close()])
-      .then(async (results) => {
+    if (!shutdownPromise) {
+      shuttingDown = true;
+      const shutdownStartedAt = Date.now();
+      const shutdownDeadline = shutdownStartedAt + shutdownTimeoutMs;
+      let forceConnections: ReturnType<typeof setTimeout> | undefined;
+      const nativeClosed = new Promise<unknown>((resolveNativeClose) => {
+        let settled = false;
+        const settle = (error?: unknown) => {
+          if (settled) return;
+          settled = true;
+          if (forceConnections) clearTimeout(forceConnections);
+          resolveNativeClose(error);
+        };
+        try {
+          forceConnections = setTimeout(() => {
+            server.closeAllConnections?.();
+            settle(new Error(`gateway shutdown exceeded ${shutdownTimeoutMs}ms`));
+          }, shutdownTimeoutMs);
+          nativeClose((error: any) => settle(error?.code === "ERR_SERVER_NOT_RUNNING" ? undefined : error));
+          server.closeIdleConnections?.();
+        } catch (error: any) {
+          settle(error?.code === "ERR_SERVER_NOT_RUNNING" ? undefined : error);
+        }
+      });
+      const beforeDeadline = async <T>(operation: Promise<T>, label: string): Promise<T> => {
+        const remaining = Math.max(0, shutdownDeadline - Date.now());
+        if (!remaining) throw new Error(`gateway shutdown timed out before ${label}`);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          return await Promise.race([
+            operation,
+            new Promise<never>((_resolve, reject) => {
+              timer = setTimeout(() => reject(new Error(`gateway shutdown timed out during ${label}`)), remaining);
+            })
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+
+      recordGatewayEvent(telemetry, { name: "odinn.runtime.lifecycle", attributes: { component: "gateway", operation: "shutdown", outcome: "stopping" } });
+      const quarantinedMutations = mutationBarrier.close();
+      if (activeCronDispatches.size) quarantinedMutations.push("scheduled cron dispatch");
+      const shutdownAbort = new GatewayError(503, "gateway shutdown is in progress");
+      for (const controller of activeRequests) controller.abort(shutdownAbort);
+      cronDispatchAbort.abort(shutdownAbort);
+      if (improvementStartupTimer) clearTimeout(improvementStartupTimer);
+      if (improvementTimer) clearInterval(improvementTimer);
+      clearInterval(cronTimer);
+      if (eventHeartbeatTimer) clearInterval(eventHeartbeatTimer);
+
+      shutdownPromise = (async () => {
+        let shutdownError: unknown;
+        let componentResults: PromiseSettledResult<unknown>[] = [];
+        if (quarantinedMutations.length) {
+          try {
+            await beforeDeadline(Promise.resolve(auditStore.append({
+              at: new Date().toISOString(),
+              runId: `gateway-shutdown:${shutdownStartedAt}`,
+              type: "gateway.control-plane.mutation-quarantined",
+              actor: "gateway",
+              tool: "gateway.shutdown",
+              capability: "gateway.control-plane",
+              decision: "pending",
+              message: "shutdown aborted active control-plane mutations; inspect any non-cancellable external effect before retrying",
+              data: { routes: quarantinedMutations }
+            })), "control-plane quarantine journal");
+          } catch (error) {
+            shutdownError = error;
+          }
+        }
+        try {
+          await beforeDeadline(mutationBarrier.drain(), "control-plane mutation drain");
+        } catch (error) {
+          shutdownError ??= error;
+          recordGatewayEvent(telemetry, {
+            name: "odinn.runtime.lifecycle",
+            attributes: { component: "gateway", operation: "control-plane-drain", outcome: "quarantined" }
+          });
+        }
+        try {
+          componentResults = await beforeDeadline(Promise.allSettled([
+            Promise.allSettled([...activeCronDispatches]),
+            channelSupervisor.stop(),
+            supervisor.shutdown(),
+            workflowRuntime?.shutdown(),
+            eventIngress?.shutdown(),
+            isolatedTaskExecutor.shutdown?.(),
+            mcpRuntime?.close()
+          ]), "component drain");
+        } catch (error) {
+          shutdownError = error;
+        }
+        const componentFailure = componentResults.some((result) => result.status === "rejected");
         recordGatewaySpan(telemetry, {
           name: "odinn.shutdown",
           startedAt: shutdownStartedAt,
-          status: results.some((result) => result.status === "rejected") ? "error" : "ok",
+          status: shutdownError || componentFailure ? "error" : "ok",
           attributes: {
             component: "gateway",
             operation: "shutdown",
-            outcome: results.some((result) => result.status === "rejected") ? "partial" : "completed"
+            outcome: shutdownError || componentFailure ? "partial" : "completed"
           }
         });
-        await telemetry.shutdown();
-        let registryError: unknown;
-        try { registry.close(); } catch (error) { registryError = error; }
-        try { governedRegistry.close(); } catch (error) { registryError ??= error; }
-        try { auditStore.close?.(); } catch (error) { registryError ??= error; }
-        try { contextRecords?.close?.(); } catch (error) { registryError ??= error; }
-        try { channelResultRecords.close(); } catch (error) { registryError ??= error; }
-        try { operatorReadStore.close(); } catch (error) { registryError ??= error; }
-        close((serverError: unknown) => callback?.(serverError ?? registryError));
-      })
-      .catch((error: any) => callback?.(error));
+        const nativeError = await beforeDeadline(nativeClosed, "HTTP listener close").catch((error) => error);
+        shutdownError ??= nativeError;
+        if (Date.now() >= shutdownDeadline) server.closeAllConnections?.();
+
+        try { await beforeDeadline(Promise.resolve(telemetry.shutdown()), "telemetry flush"); }
+        catch (error) { shutdownError ??= error; }
+
+        try { registry.close(); } catch (error) { shutdownError ??= error; }
+        try { governedRegistry.close(); } catch (error) { shutdownError ??= error; }
+        try { auditStore.close?.(); } catch (error) { shutdownError ??= error; }
+        try { contextRecords?.close?.(); } catch (error) { shutdownError ??= error; }
+        try { channelResultRecords.close(); } catch (error) { shutdownError ??= error; }
+        try { operatorReadStore.close(); } catch (error) { shutdownError ??= error; }
+        try { runtime.ledger.close(); } catch (error) { shutdownError ??= error; }
+        return shutdownError;
+      })();
+    }
+    shutdownPromise.then((error) => callback?.(error)).catch((error) => callback?.(error));
     return server;
   };
-  server.on("close", () => supervisor.shutdown().catch(() => undefined));
-  server.on("close", () => runtime.ledger.close());
   server.on("listening", () => {
     const address = server.address();
     if (!address || typeof address === "string") return;
@@ -3782,7 +4105,8 @@ async function readEditableConfig(state: string, { hosted = false }: any = {}) {
   return { config, fingerprint: configFingerprint(contents) };
 }
 
-async function writeEditableConfig(state: string, input: any, { hosted = false }: any = {}) {
+async function writeEditableConfig(state: string, input: any, { hosted = false, signal }: { hosted?: boolean; signal?: AbortSignal } = {}) {
+  assertGatewayRequestActive(signal);
   validateGatewayConfig(input?.config);
   if (hosted) validateHostedProviderConfig(input?.config);
   const expectedFingerprint = String(input?.fingerprint ?? "");
@@ -3791,6 +4115,7 @@ async function writeEditableConfig(state: string, input: any, { hosted = false }
   }
   const serialized = `${JSON.stringify(input.config, null, 2)}\n`;
   return withStateMutationLock(state, async () => {
+    assertGatewayRequestActive(signal);
     const path = join(state, "config.json");
     const handle = await openEditableConfigFile(path);
     let current;
@@ -3804,7 +4129,9 @@ async function writeEditableConfig(state: string, input: any, { hosted = false }
     }
     const temporary = join(state, `.config.json.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
     try {
+      assertGatewayRequestActive(signal);
       await writeFile(temporary, serialized, { flag: "wx", mode: 0o600 });
+      assertGatewayRequestActive(signal);
       await rename(temporary, path);
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
@@ -3813,8 +4140,9 @@ async function writeEditableConfig(state: string, input: any, { hosted = false }
   });
 }
 
-async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: any = {}) {
-  const raw = (await readRequestBuffer(request, { maxBytes })).toString("utf8");
+async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES, signal = request?.[REQUEST_ABORT_SIGNAL] }: any = {}) {
+  const raw = (await readRequestBuffer(request, { maxBytes, signal })).toString("utf8");
+  assertGatewayRequestActive(signal);
   let value: any;
   try {
     value = raw ? JSON.parse(raw) : {};
@@ -3826,18 +4154,87 @@ async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: 
     try { assertTenantClaims(value, scope); }
     catch (error) { throw new GatewayError(403, error instanceof Error ? error.message : "request tenant scope is invalid"); }
   }
+  assertGatewayRequestActive(signal);
   return value;
 }
 
-async function readRequestBuffer(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: any = {}) {
+function assertGatewayRequestActive(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw new GatewayError(503, "gateway shutdown is in progress");
+}
+
+function waitForGatewaySignal(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  assertGatewayRequestActive(signal);
+  if (!signal) return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+  return new Promise((resolveWait, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(new GatewayError(503, "gateway shutdown is in progress"));
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveWait();
+    }, milliseconds);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function nextRequestChunk(iterator: AsyncIterator<any>, signal?: AbortSignal): Promise<IteratorResult<any>> {
+  assertGatewayRequestActive(signal);
+  if (!signal) return iterator.next();
+  return new Promise<IteratorResult<any>>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new GatewayError(503, "gateway shutdown is in progress"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    iterator.next().then((result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    }, (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    });
+  });
+}
+
+async function readRequestBuffer(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES, signal = request?.[REQUEST_ABORT_SIGNAL] }: any = {}) {
   const chunks = [];
   let bytes = 0;
-  for await (const chunk of request) {
-    bytes += chunk.byteLength;
-    if (bytes > maxBytes) throw new GatewayError(413, `request body exceeds ${maxBytes} bytes`);
-    chunks.push(chunk);
+  const iterator = request.iterator() as AsyncIterator<any>;
+  try {
+    while (true) {
+      const next = await nextRequestChunk(iterator, signal);
+      if (next.done) break;
+      const chunk = next.value;
+      bytes += chunk.byteLength;
+      if (bytes > maxBytes) throw new GatewayError(413, `request body exceeds ${maxBytes} bytes`);
+      chunks.push(chunk);
+    }
+    assertGatewayRequestActive(signal);
+    return Buffer.concat(chunks);
+  } catch (error) {
+    if (signal?.aborted) {
+      try { void Promise.resolve(iterator.return?.()).catch(() => undefined); }
+      catch { /* request teardown is best-effort after the barrier fires */ }
+    }
+    throw error;
   }
-  return Buffer.concat(chunks);
 }
 
 function json(response: any, status: any, body: any) {
@@ -3962,10 +4359,14 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
     async handleWebhook(request: any, response: any, url: URL) {
       const webhook = webhooks.get(url.pathname);
       if (!webhook?.adapter.handleWebhook) return false;
+      const signal = request?.[REQUEST_ABORT_SIGNAL] as AbortSignal | undefined;
+      assertGatewayRequestActive(signal);
       const body = webhook.requestMode === "buffer"
-        ? await readRequestBuffer(request, { maxBytes: requestMaxBytes })
+        ? await readRequestBuffer(request, { maxBytes: requestMaxBytes, signal })
         : undefined;
+      assertGatewayRequestActive(signal);
       const result = await webhook.adapter.handleWebhook({
+        signal,
         method: request.method,
         url: request.url,
         headers: request.headers,
@@ -3973,6 +4374,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
         rawRequest: request,
         rawResponse: response
       });
+      assertGatewayRequestActive(signal);
       if (!response.writableEnded && result) {
         response.writeHead(result.status, {
           "content-type": "text/plain; charset=utf-8",
@@ -4113,7 +4515,7 @@ function channelCredentialStatus(config: any): { configured: boolean; present: b
   };
 }
 
-async function diagnostics({ state, workspaceRoot, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false, sandboxRecoveryStartupError = false }: any): Promise<DiagnosticsReportV1> {
+async function diagnostics({ state, workspaceRoot, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, telemetry, processRecoveryStartupError = false, sandboxRecoveryStartupError = false }: any): Promise<DiagnosticsReportV1> {
   let audit = { valid: true, events: 0, unsigned: 0, failureCount: 0 };
   try {
     const auditPath = join(state, config.auditLog ?? "audit.jsonl");
@@ -4209,6 +4611,7 @@ async function diagnostics({ state, workspaceRoot, config, featureFlags, auditSt
     },
     githubRead: diagnoseGitHubReadIntegration(config?.integrations?.github ?? {}),
     microsoftGraphRead: diagnoseMicrosoftGraphReadIntegration(config?.integrations?.microsoftGraph ?? {}),
+    ...(telemetry ? { telemetry: telemetryStatusProjection(telemetry) } : {}),
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: !isPhysicalPathInside(workspaceRoot, state), secretsExcludedFromDiagnostics: true }
   };
 }
