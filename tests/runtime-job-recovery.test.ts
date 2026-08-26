@@ -391,6 +391,90 @@ test("unexpired owner leases prevent recovery and stale workers cannot settle a 
   );
 });
 
+test("direct execution attempts bind a live owner and reconcile dead, stale, and closed owners without stealing runtime jobs", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-direct-attempt-owner-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const owner = createRunLedger({ stateDir, workspaceRoot: root });
+  owner.ensureRun({ runId: "direct-dead", objective: "direct owner" });
+  const dead = owner.admitExecution(executionEnvelope(root, "direct-dead", false));
+  owner.transitionExecutionAttempt({ attemptId: dead.attempt.id, from: "queued", to: "running" });
+  const ownership = owner.database.db.prepare(`SELECT owner_token, owner_pid, owner_heartbeat_at, owner_released_at
+    FROM execution_attempts WHERE id = ?`).get(dead.attempt.id) as any;
+  assert.equal(ownership.owner_token, owner.executionOwnerToken);
+  assert.equal(Number(ownership.owner_pid), process.pid);
+  assert.ok(Date.parse(String(ownership.owner_heartbeat_at)) > 0);
+  assert.equal(ownership.owner_released_at, null);
+
+  const recovery = createRunLedger({ stateDir, workspaceRoot: root });
+  assert.equal(recovery.getExecutionAttempt(dead.attempt.id)?.state, "running", "a second ledger must not steal a live process owner");
+  const reconciledDead = recovery.reconcileExecutionAttemptOwnership({ isProcessAlive: () => false });
+  assert.deepEqual(reconciledDead.map((entry) => entry.errorCode), ["EXECUTION_OWNER_DEAD"]);
+  assert.equal(recovery.getExecutionAttempt(dead.attempt.id)?.state, "needs-review");
+
+  owner.ensureRun({ runId: "direct-stale", objective: "stale owner" });
+  const stale = owner.admitExecution(executionEnvelope(root, "direct-stale", false));
+  owner.transitionExecutionAttempt({ attemptId: stale.attempt.id, from: "queued", to: "running" });
+  owner.database.db.prepare("UPDATE execution_attempts SET owner_heartbeat_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 60_000).toISOString(), stale.attempt.id);
+  const reconciledStale = recovery.reconcileExecutionAttemptOwnership({ isProcessAlive: () => true });
+  assert.deepEqual(reconciledStale.map((entry) => entry.errorCode), ["EXECUTION_OWNER_STALE"]);
+
+  owner.ensureRun({ runId: "linked-runtime", objective: "durable job owns recovery" });
+  const linked = owner.admitExecution(executionEnvelope(root, "linked-runtime", false));
+  owner.transitionExecutionAttempt({ attemptId: linked.attempt.id, from: "queued", to: "running" });
+  const jobs = new SqliteJobStore(owner);
+  await jobs.create({ id: "linked-runtime", status: "running", payload: { task: { id: "linked-runtime", tool: "text.echo", input: {} } }, retrySafe: false });
+  assert.equal(owner.reconcileExecutionAttemptOwnership({ isProcessAlive: () => false }).length, 0);
+  assert.equal(owner.getExecutionAttempt(linked.attempt.id)?.state, "running");
+
+  owner.ensureRun({ runId: "direct-close", objective: "close owner" });
+  const closing = owner.admitExecution(executionEnvelope(root, "direct-close", false));
+  owner.transitionExecutionAttempt({ attemptId: closing.attempt.id, from: "queued", to: "running" });
+  owner.close();
+  assert.equal(recovery.getExecutionAttempt(closing.attempt.id)?.state, "needs-review");
+  assert.equal(recovery.getExecutionAttempt(closing.attempt.id)?.errorCode, "EXECUTION_OWNER_CLOSED");
+  recovery.close();
+});
+
+test("direct execution attempt settlement is fenced to its exact live owner generation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-direct-attempt-owner-fence-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const owner = createRunLedger({ stateDir, workspaceRoot: root });
+  const interloper = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => { owner.close(); interloper.close(); });
+  owner.ensureRun({ runId: "owner-fence", objective: "owner fence" });
+  const admitted = owner.admitExecution(executionEnvelope(root, "owner-fence", false));
+  owner.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+
+  assert.throws(
+    () => interloper.transitionExecutionAttempt({
+      attemptId: admitted.attempt.id,
+      from: "running",
+      to: "completed",
+      outcomeDigest: "b".repeat(64)
+    }),
+    (error: unknown) => (error as { code?: string }).code === "EXECUTION_ATTEMPT_OWNER_CONFLICT"
+  );
+  assert.equal(owner.getExecutionAttempt(admitted.attempt.id)?.state, "running");
+  const before = owner.database.db.prepare("SELECT owner_token, owner_released_at FROM execution_attempts WHERE id = ?")
+    .get(admitted.attempt.id) as { owner_token: string; owner_released_at: string | null };
+  assert.equal(before.owner_token, owner.executionOwnerToken);
+  assert.equal(before.owner_released_at, null);
+
+  owner.transitionExecutionAttempt({
+    attemptId: admitted.attempt.id,
+    from: "running",
+    to: "completed",
+    outcomeDigest: "b".repeat(64)
+  });
+  const after = owner.database.db.prepare("SELECT owner_token, owner_released_at FROM execution_attempts WHERE id = ?")
+    .get(admitted.attempt.id) as { owner_token: string; owner_released_at: string | null };
+  assert.equal(after.owner_token, owner.executionOwnerToken);
+  assert.ok(after.owner_released_at);
+});
+
 test("retry-safe shutdown and failed-attempt crash windows remain dispatchable", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-retry-recovery-"));
   t.after(() => rm(root, { recursive: true, force: true }));

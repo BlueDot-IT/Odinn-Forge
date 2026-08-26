@@ -86,6 +86,37 @@ test("job supervisor projects a graph needs-review receipt instead of completed"
   await supervisor.shutdown();
 });
 
+test("job supervisor does not persist an approval request as a terminal channel result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-channel-approval-"));
+  const store = new FileJobStore(join(root, "jobs.json"));
+  let persistedResults = 0;
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async () => ({
+      ok: true,
+      output: {
+        type: "approval.required",
+        approvalId: "approval_fixture",
+        summary: "Approve fixture",
+        expiresInSeconds: 300
+      }
+    }),
+    persistResult: async () => { persistedResults += 1; }
+  });
+  await supervisor.start();
+  const id = "job_channel_approval";
+  await supervisor.submit({
+    executionKey: id,
+    task: { tool: "agent.run", input: { sessionId: "session_fixture" } }
+  }, { id });
+  const awaiting = await waitFor(async () => (await supervisor.get(id))?.status === "awaiting-approval"
+    ? supervisor.get(id)
+    : undefined);
+  assert.equal(awaiting.result.output.type, "approval.required");
+  assert.equal(persistedResults, 0);
+  await supervisor.shutdown();
+});
+
 test("job supervisor quarantines uncertain cancellation and supports retry-safe timeout recovery", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-jobs-control-"));
   const store = new FileJobStore(join(root, "jobs.json"));

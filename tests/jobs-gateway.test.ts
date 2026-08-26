@@ -9,7 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { withGatewayTestHooks } from "../apps/gateway/src/testing.ts";
-import { createAuditStore, createRunLedger, SqliteJobStore } from "../packages/kernel/src/index.ts";
+import { createAuditStore, createRunLedger, SqliteJobStore, SqliteRecordStore } from "../packages/kernel/src/index.ts";
 import { digestAgentRunValue, validateAgentRunGraph, validateExecutableAgentManifest } from "../packages/kernel/src/agent-run-graphs.ts";
 import { AGENT_GRAPH_REGISTRY_REF } from "../packages/kernel/src/agent-graph-runtime.ts";
 
@@ -895,13 +895,17 @@ test("gateway runs one explicitly enabled read-only agent graph through durable 
   }
 });
 
-test("gateway serves completed agent.run channel output only through the ephemeral result route", async () => {
+test("gateway persists a bound channel result before completion and serves it after restart", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-channel-result-"));
+  let providerCalls = 0;
+  const attemptStatesBeforeResultPersist = new Map<string, string>();
+  let rejectPersistFor = "";
   const provider = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
       response.writeHead(404).end();
       return;
     }
+    providerCalls += 1;
     for await (const _chunk of request) {
       // Consume the complete bounded request before writing the deterministic response.
     }
@@ -923,17 +927,114 @@ test("gateway serves completed agent.run channel output only through the ephemer
     providers: { test: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${providerPort}/v1`, apiKeyEnv: "ODINN_STAGE7_CHANNEL_API_KEY", models: ["test-model"] } },
     channels: {}
   }, null, 2)}\n`, { mode: 0o600 });
-  const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  let server = await createGatewayServer(withGatewayTestHooks(
+    { stateDir, workspaceRoot: stateDir },
+    {
+      beforeChannelResultPersist({ jobId }) {
+        const ledger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+        try {
+          const row = ledger.database.db.prepare(`SELECT attempt.state
+            FROM execution_attempts AS attempt
+            JOIN runtime_jobs AS job ON job.execution_run_id = attempt.run_id
+            WHERE job.id = ?
+            ORDER BY attempt.attempt_number DESC LIMIT 1`).get(jobId) as { state: string } | undefined;
+          attemptStatesBeforeResultPersist.set(jobId, String(row?.state ?? "missing"));
+        } finally {
+          ledger.close();
+        }
+        if (jobId === rejectPersistFor) throw new Error("fixture protected result persistence failure");
+      }
+    }
+  ));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const base = `http://127.0.0.1:${(server.address() as any).port}`;
+  let base = `http://127.0.0.1:${(server.address() as any).port}`;
+  const closeGateway = async () => {
+    if (!server.listening) return;
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  };
   try {
     const executionKey = "stage7-channel-result";
+    const sessionResponse = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Durable channel result" })
+    });
+    assert.equal(sessionResponse.status, 200);
+    const sessionId = String((await sessionResponse.json()).id);
+    assert.ok(sessionId);
+    const submitChannel = (executionKey: string, input: Record<string, unknown>, headerKey = executionKey) => fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": headerKey },
+      body: JSON.stringify({
+        executionKey,
+        task: { tool: "agent.run", input: { model: "test:test-model", prompt: "PRIVATE_CHANNEL_PROMPT", maxTurns: 1, maxTokens: 128, ...input } }
+      })
+    });
+
+    assert.equal((await submitChannel("channel-missing-session", {})).status, 400);
+    assert.equal((await submitChannel("channel-oversized-session", { sessionId: "s".repeat(257) })).status, 400);
+    assert.equal((await submitChannel("channel-unknown-session", { sessionId: "sess_missing" })).status, 409);
+    assert.equal((await submitChannel("channel-identity-mismatch", { sessionId }, "different-idempotency-key")).status, 409);
+    const foreignRecords = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    await foreignRecords.append({
+      id: "sess_foreign",
+      type: "session.created",
+      status: "open",
+      title: "Foreign session",
+      actor: "foreign-principal",
+      source: "test",
+      projectId: "project_default"
+    });
+    foreignRecords.close();
+    assert.equal((await submitChannel("channel-foreign-session", { sessionId: "sess_foreign" })).status, 403);
+    const closedSessionResponse = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Closed channel session" })
+    });
+    const closedSessionId = String((await closedSessionResponse.json()).id);
+    assert.equal((await fetch(`${base}/sessions/${encodeURIComponent(closedSessionId)}`, { method: "DELETE" })).status, 200);
+    assert.equal((await submitChannel("channel-closed-session", { sessionId: closedSessionId })).status, 409);
+    assert.equal(providerCalls, 0, "invalid channel bindings must be rejected before provider dispatch");
+
+    const ordinaryId = "ordinary-agent-run";
+    const ordinary = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": ordinaryId },
+      body: JSON.stringify({
+        task: { tool: "agent.run", input: { sessionId, model: "test:test-model", prompt: "ordinary run", maxTurns: 1, maxTokens: 128 } }
+      })
+    });
+    assert.equal(ordinary.status, 202);
+    let ordinaryJob: any;
+    const ordinaryDeadline = Date.now() + 20_000;
+    while (Date.now() < ordinaryDeadline) {
+      ordinaryJob = await (await fetch(`${base}/jobs/${ordinaryId}`)).json();
+      if (["completed", "failed", "needs-review"].includes(ordinaryJob.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(ordinaryJob.status, "completed", "ordinary agent.run jobs remain backward compatible without executionKey");
+
+    rejectPersistFor = "channel-persist-failure";
+    assert.equal((await submitChannel(rejectPersistFor, { sessionId })).status, 202);
+    let rejectedPersistJob: any;
+    const rejectedPersistDeadline = Date.now() + 20_000;
+    while (Date.now() < rejectedPersistDeadline) {
+      rejectedPersistJob = await (await fetch(`${base}/jobs/${rejectPersistFor}`)).json();
+      if (["completed", "failed", "needs-review"].includes(rejectedPersistJob.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(rejectedPersistJob.status, "needs-review");
+    assert.equal(attemptStatesBeforeResultPersist.get(rejectPersistFor), "running");
+    assert.equal((await fetch(`${base}/jobs/${rejectPersistFor}/result`)).status, 409);
+    rejectPersistFor = "";
+
     const submission = await fetch(`${base}/jobs`, {
       method: "POST",
       headers: { "content-type": "application/json", "idempotency-key": executionKey },
       body: JSON.stringify({
         executionKey,
-        task: { tool: "agent.run", input: { model: "test:test-model", prompt: "PRIVATE_CHANNEL_PROMPT", maxTurns: 1, maxTokens: 128 } }
+        task: { tool: "agent.run", input: { sessionId, model: "test:test-model", prompt: "PRIVATE_CHANNEL_PROMPT", maxTurns: 1, maxTokens: 128 } }
       })
     });
     assert.equal(submission.status, 202);
@@ -945,6 +1046,7 @@ test("gateway serves completed agent.run channel output only through the ephemer
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.equal(job.status, "completed");
+    assert.equal(attemptStatesBeforeResultPersist.get(executionKey), "running", "the protected result must commit before attempt terminality");
     assert.doesNotMatch(JSON.stringify(job), /PRIVATE_CHANNEL_OUTPUT|PRIVATE_CHANNEL_PROMPT/u);
 
     const result = await fetch(`${base}/jobs/${executionKey}/result`);
@@ -953,8 +1055,66 @@ test("gateway serves completed agent.run channel output only through the ephemer
     assert.equal(resultBody.ok, true);
     assert.equal(resultBody.result.output.content, "PRIVATE_CHANNEL_OUTPUT");
     assert.doesNotMatch(JSON.stringify(resultBody), /PRIVATE_CHANNEL_PROMPT/u);
+
+    await closeGateway();
+    // Model execution returned and the protected result committed, but the
+    // public runtime job did not reach its terminal update before the process
+    // died. Startup must adopt the bound result without replaying the model.
+    const interrupted = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    interrupted.database.db.prepare(`UPDATE runtime_jobs
+      SET status = 'running', result_json = NULL, completed_at = NULL
+      WHERE id = ?`).run(executionKey);
+    interrupted.database.db.prepare(`UPDATE execution_attempts
+      SET state = 'running', settled_at = NULL, outcome_digest = NULL, error_code = NULL,
+        owner_released_at = NULL, owner_heartbeat_at = ?
+      WHERE id = (SELECT execution_attempt_id FROM runtime_jobs WHERE id = ?)`)
+      .run(new Date().toISOString(), executionKey);
+    interrupted.close();
+    server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    base = `http://127.0.0.1:${(server.address() as any).port}`;
+    const recoveredJob = await (await fetch(`${base}/jobs/${executionKey}`)).json();
+    assert.equal(recoveredJob.status, "completed");
+    assert.doesNotMatch(JSON.stringify(recoveredJob), /PRIVATE_CHANNEL_OUTPUT|PRIVATE_CHANNEL_PROMPT/u);
+    const recoveredResult = await fetch(`${base}/jobs/${executionKey}/result`);
+    assert.equal(recoveredResult.status, 200);
+    assert.equal((await recoveredResult.json()).result.output.content, "PRIVATE_CHANNEL_OUTPUT");
+    assert.equal(providerCalls, 3, "startup must adopt the protected result without replaying the model");
+
+    await closeGateway();
+    const records = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    const persisted = (await records.queryRecords({ types: ["channel.result.persisted"] }))[0] as any;
+    assert.equal(persisted.jobId, executionKey);
+    assert.equal(persisted.sessionId, sessionId);
+    assert.equal(persisted.result.output.content, "PRIVATE_CHANNEL_OUTPUT");
+    records.db.prepare("UPDATE record_events SET payload_json = ? WHERE id = ?")
+      .run(JSON.stringify({ ...persisted, sessionId: "session_substitution" }), persisted.id);
+    records.close();
+    server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    base = `http://127.0.0.1:${(server.address() as any).port}`;
+    const corruptedJob = await (await fetch(`${base}/jobs/${executionKey}`)).json();
+    assert.equal(corruptedJob.status, "needs-review");
+    const substituted = await fetch(`${base}/jobs/${executionKey}/result`);
+    assert.equal(substituted.status, 409);
+    assert.doesNotMatch(await substituted.text(), /PRIVATE_CHANNEL_OUTPUT/u);
+
+    await closeGateway();
+    const missing = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    missing.db.prepare("DELETE FROM record_events WHERE id = ?").run(persisted.id);
+    missing.close();
+    const missingLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    missingLedger.database.db.prepare("UPDATE runtime_jobs SET status = 'completed', error = NULL WHERE id = ?").run(executionKey);
+    missingLedger.close();
+    server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    base = `http://127.0.0.1:${(server.address() as any).port}`;
+    const missingJob = await (await fetch(`${base}/jobs/${executionKey}`)).json();
+    assert.equal(missingJob.status, "needs-review");
+    assert.match(missingJob.error, /protected channel result is unavailable/u);
+    assert.equal(providerCalls, 3, "missing-result quarantine must not replay the provider");
   } finally {
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await closeGateway();
     await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
     if (previousKey === undefined) delete process.env.ODINN_STAGE7_CHANNEL_API_KEY;
     else process.env.ODINN_STAGE7_CHANNEL_API_KEY = previousKey;

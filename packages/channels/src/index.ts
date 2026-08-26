@@ -815,11 +815,11 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
           : undefined;
         // Older/custom Gateway implementations may still return a live result
         // in the job envelope. Keep that compatibility path; the production
-        // Gateway stores model content as a digest and uses the ephemeral
+        // Gateway stores model content as a digest and uses the protected
         // endpoint below instead.
         const result = stored && typeof storedOutput?.content === "string"
           ? stored
-          : requiredRecord((await this.#get(`/jobs/${encodeURIComponent(executionKey)}/result`, signal)).result, "gateway completed a channel run without an ephemeral result");
+          : requiredRecord((await this.#get(`/jobs/${encodeURIComponent(executionKey)}/result`, signal)).result, "gateway completed a channel run without a durable result");
         await this.#reportExecutionState({ executionKey, state: "completed", message });
         return result;
       }

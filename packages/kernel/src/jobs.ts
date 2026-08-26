@@ -64,6 +64,7 @@ export type JobExecute = (payload: JsonObject, context: JobExecutionContext) => 
 export interface JobSupervisorOptions {
   store: JobStore;
   execute: JobExecute;
+  persistResult?: (job: JobRecord, result: unknown) => Promise<void> | void;
   onCancel?: (job: JobRecord) => Promise<void> | void;
   concurrency?: number;
   maxAttempts?: number;
@@ -81,6 +82,7 @@ const PROCESS_WORKER_ABORT_GRACE_MS = 30_000;
 export class JobSupervisor {
   readonly store: JobStore;
   readonly execute: JobExecute;
+  readonly persistResult?: (job: JobRecord, result: unknown) => Promise<void> | void;
   readonly onCancel?: (job: JobRecord) => Promise<void> | void;
   readonly concurrency: number;
   readonly maxAttempts: number;
@@ -96,11 +98,12 @@ export class JobSupervisor {
   private stopping: boolean;
 
   constructor(options: Partial<JobSupervisorOptions> = {}) {
-    const { store, execute, onCancel, concurrency = 1, maxAttempts = 3, defaultTimeoutMs = 120_000 } = options;
+    const { store, execute, persistResult, onCancel, concurrency = 1, maxAttempts = 3, defaultTimeoutMs = 120_000 } = options;
     if (!store || typeof store.create !== "function") throw new Error("JobSupervisor requires a durable store");
     if (typeof execute !== "function") throw new Error("JobSupervisor requires an execute function");
     this.store = store;
     this.execute = execute;
+    this.persistResult = persistResult;
     this.onCancel = onCancel;
     this.concurrency = Math.max(1, Number(concurrency) || 1);
     this.maxAttempts = Math.max(1, Number(maxAttempts) || 1);
@@ -393,7 +396,18 @@ export class JobSupervisor {
         const result = await this.execute(job.payload, { signal: controller.signal, job });
         backendReturned = true;
         if (controller.signal.aborted) throw controller.signal.reason ?? new Error("job aborted");
-        if (job.payload.executionKey === job.id && (job.payload.task as JsonObject | undefined)?.tool === "agent.run") {
+        const awaitingApproval = Boolean(result && typeof result === "object"
+          && (result as { output?: { type?: unknown } }).output?.type === "approval.required");
+        // Content-bearing results that must survive restart are committed to
+        // their protected store before the public job is allowed to become
+        // terminal. A persistence failure therefore quarantines non-retry-safe
+        // work instead of publishing a completed receipt with no retrievable
+        // outcome. Approval requests are non-terminal control results and must
+        // not be mistaken for an assistant reply.
+        if (!awaitingApproval) await this.persistResult?.(job, result);
+        if (!awaitingApproval
+          && job.payload.executionKey === job.id
+          && (job.payload.task as JsonObject | undefined)?.tool === "agent.run") {
           const now = Date.now();
           for (const [id, entry] of this.volatileResults) {
             if (entry.expiresAt <= now) this.volatileResults.delete(id);
@@ -401,8 +415,6 @@ export class JobSupervisor {
           this.volatileResults.set(job.id, { result, expiresAt: now + 5 * 60_000 });
           while (this.volatileResults.size > 256) this.volatileResults.delete(this.volatileResults.keys().next().value as string);
         }
-        const awaitingApproval = Boolean(result && typeof result === "object"
-          && (result as { output?: { type?: unknown } }).output?.type === "approval.required");
         const terminalStatus = result && typeof result === "object"
           && ["completed", "failed", "cancelled", "needs-review"].includes(String((result as { terminalStatus?: unknown }).terminalStatus))
           ? String((result as { terminalStatus?: unknown }).terminalStatus)
@@ -531,6 +543,8 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
   const children = new Set<ChildProcess>();
   const execute = ((payload: WorkerPayload, { signal, job }: ExecutorOptions = {}) => {
     const trustedRecovery = Number(job?.attempts ?? 0) > 1;
+    const deferExecutionSettlement = job?.payload.executionKey === job?.id
+      && payload.task?.tool === "agent.run";
     const taskWorkspaceRoot = resolve(payload.workspaceRoot || authoritativeRoot);
     if (taskWorkspaceRoot !== authoritativeRoot && !taskWorkspaceRoot.startsWith(`${authoritativeRoot}${sep}`)) {
       return Promise.reject(new Error("task workspaceRoot must remain inside the gateway workspace"));
@@ -584,7 +598,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
         if (!settled) finish(new Error(`forked task worker exited unexpectedly: ${code ?? exitSignal}`));
       });
       signal?.addEventListener("abort", abort, { once: true });
-      child.send({ type: "task", payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy, trustedRecovery });
+      child.send({ type: "task", payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy, trustedRecovery, deferExecutionSettlement });
     });
   }) as TaskExecutor;
   execute.shutdown = async () => {

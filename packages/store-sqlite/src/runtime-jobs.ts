@@ -260,25 +260,35 @@ function correlation(ledger: RunLedger, runId: string | undefined) {
   };
 }
 
-function transitionAttempt(db: any, attemptId: string | undefined, from: ExecutionAttemptState | undefined, to: ExecutionAttemptState, errorCode?: string) {
+function transitionAttempt(db: any, attemptId: string | undefined, from: ExecutionAttemptState | undefined, to: ExecutionAttemptState, errorCode?: string, executionOwnershipEnabled = false) {
   if (!attemptId || !from || TERMINAL_ATTEMPT_STATES.has(from) || from === to) return;
   const now = new Date().toISOString();
   const settledAt = TERMINAL_ATTEMPT_STATES.has(to) ? now : null;
+  const ownerRelease = executionOwnershipEnabled && TERMINAL_ATTEMPT_STATES.has(to)
+    ? ", owner_released_at = COALESCE(owner_released_at, ?)"
+    : "";
   const result = db.prepare(`UPDATE execution_attempts
     SET state = ?, started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
-      settled_at = ?, error_code = ?
-    WHERE id = ? AND state = ?`).run(to, to, now, settledAt, errorCode ?? null, attemptId, from);
+      settled_at = ?, error_code = ?${ownerRelease}
+    WHERE id = ? AND state = ?`).run(
+      to, to, now, settledAt, errorCode ?? null,
+      ...(ownerRelease ? [now] : []),
+      attemptId, from
+    );
   if (Number(result.changes) !== 1) throw new Error(`execution attempt ${attemptId} changed concurrently during job recovery`);
 }
 
 export class SqliteJobStore {
   readonly ledger: RunLedger;
   readonly legacyPath?: string;
+  private readonly executionOwnershipEnabled: boolean;
 
   constructor(ledger: RunLedger, { legacyPath }: { legacyPath?: string } = {}) {
     if (!ledger?.database?.db) throw new Error("SqliteJobStore requires a run ledger");
     this.ledger = ledger;
     this.legacyPath = legacyPath ? resolve(legacyPath) : undefined;
+    this.executionOwnershipEnabled = (ledger.database.db.prepare("PRAGMA table_info(execution_attempts)").all() as SqlRow[])
+      .some((column) => String(column.name) === "owner_token");
   }
 
   async list({ limit = 500, offset = 0 }: { limit?: number; offset?: number } = {}): Promise<RuntimeJobRecord[]> {
@@ -477,7 +487,12 @@ export class SqliteJobStore {
       const linkedTerminalState = linked?.attemptState && TERMINAL_ATTEMPT_STATES.has(linked.attemptState)
         ? linked.attemptState
         : undefined;
-      const targetStatus = linkedTerminalState && TERMINAL_JOB_STATES.has(requestedStatus)
+      // A later integrity failure is allowed to quarantine an apparently
+      // completed attempt. Completion is not truthful when its protected
+      // result is missing or failed verification.
+      const targetStatus = requestedStatus === "needs-review"
+        ? requestedStatus
+        : linkedTerminalState && TERMINAL_JOB_STATES.has(requestedStatus)
         ? linkedTerminalState
         : requestedStatus;
       const effectivePatch = targetStatus === requestedStatus ? patch : {
@@ -495,7 +510,8 @@ export class SqliteJobStore {
           linked.attemptId,
           linked.attemptState,
           targetStatus as ExecutionAttemptState,
-          targetStatus === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : targetStatus === "cancelled" ? "EXECUTION_CANCELLED" : undefined
+          targetStatus === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : targetStatus === "cancelled" ? "EXECUTION_CANCELLED" : undefined,
+          this.executionOwnershipEnabled
         );
         db.prepare("UPDATE cancellation_controls SET settled_at = COALESCE(settled_at, ?) WHERE run_id = ?")
           .run(new Date().toISOString(), current.executionRunId ?? "");
@@ -567,9 +583,9 @@ export class SqliteJobStore {
           acknowledged_at = COALESCE(acknowledged_at, ?), settled_at = CASE WHEN ? = 'cancelled' THEN COALESCE(settled_at, ?) ELSE settled_at END
           WHERE run_id = ?`).run(now, requestedBy, reason, now, status, now, current.executionRunId);
       }
-      if (linked?.attemptState === "running") transitionAttempt(db, linked.attemptId, "running", "cancelling", "EXECUTION_CANCELLATION_REQUESTED");
+      if (linked?.attemptState === "running") transitionAttempt(db, linked.attemptId, "running", "cancelling", "EXECUTION_CANCELLATION_REQUESTED", this.executionOwnershipEnabled);
       else if (status === "cancelled" && linked?.attemptState && !TERMINAL_ATTEMPT_STATES.has(linked.attemptState)) {
-        transitionAttempt(db, linked.attemptId, linked.attemptState, "cancelled", "EXECUTION_CANCELLED");
+        transitionAttempt(db, linked.attemptId, linked.attemptState, "cancelled", "EXECUTION_CANCELLED", this.executionOwnershipEnabled);
       }
       const normalized = normalizeJob({
         ...current,
@@ -631,7 +647,7 @@ export class SqliteJobStore {
               ? current.error ?? linked?.attemptErrorCode ?? "execution failed while cancellation was pending"
               : "execution was interrupted while cancellation was pending; outcome requires operator review";
           completedAt = now;
-          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "CANCELLATION_OUTCOME_UNCERTAIN" : "EXECUTION_CANCELLED");
+          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "CANCELLATION_OUTCOME_UNCERTAIN" : "EXECUTION_CANCELLED", this.executionOwnershipEnabled);
         } else if (linked?.attemptState && TERMINAL_ATTEMPT_STATES.has(linked.attemptState)) {
           status = linked.attemptState;
           error = current.error ?? linked.attemptErrorCode ?? "execution attempt settled before runtime job projection";
@@ -642,7 +658,7 @@ export class SqliteJobStore {
           status = "needs-review";
           error = "an approval continuation lease expired before a terminal result was persisted; outcome requires operator review";
           completedAt = now;
-          transitionAttempt(db, linked.attemptId, linked.attemptState, "needs-review", "APPROVAL_CONTINUATION_OUTCOME_UNCERTAIN");
+          transitionAttempt(db, linked.attemptId, linked.attemptState, "needs-review", "APPROVAL_CONTINUATION_OUTCOME_UNCERTAIN", this.executionOwnershipEnabled);
         } else if (current.recoveryInputAvailable !== true) {
           const crossedDispatch = linked?.attemptState === "running";
           status = crossedDispatch && !retrySafe ? "needs-review" : "failed";
@@ -650,7 +666,7 @@ export class SqliteJobStore {
             ? "execution crossed the dispatch boundary before volatile input was lost; outcome requires operator review"
             : "volatile execution input is unavailable after restart; resubmit the job with fresh input";
           completedAt = now;
-          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : "RECOVERY_INPUT_UNAVAILABLE");
+          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : "RECOVERY_INPUT_UNAVAILABLE", this.executionOwnershipEnabled);
         } else if (!linked && current.importedFromLegacy && (!retrySafe || current.attempts >= maxAttempts)) {
           status = retrySafe ? "failed" : "needs-review";
           error = retrySafe
@@ -665,14 +681,14 @@ export class SqliteJobStore {
           status = "queued";
           error = "retry-safe execution was interrupted and is eligible for a new attempt";
           completedAt = undefined;
-          transitionAttempt(db, linked?.attemptId, linked?.attemptState, "failed", "EXECUTION_INTERRUPTED_RETRY_SAFE");
+          transitionAttempt(db, linked?.attemptId, linked?.attemptState, "failed", "EXECUTION_INTERRUPTED_RETRY_SAFE", this.executionOwnershipEnabled);
         } else {
           status = retrySafe ? "failed" : "needs-review";
           error = retrySafe
             ? "retry-safe execution exhausted its attempt limit during restart recovery"
             : "execution was interrupted after dispatch; outcome requires operator review";
           completedAt = now;
-          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : "EXECUTION_RETRY_EXHAUSTED");
+          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : "EXECUTION_RETRY_EXHAUSTED", this.executionOwnershipEnabled);
         }
         const normalized = normalizeJob({
           ...current,

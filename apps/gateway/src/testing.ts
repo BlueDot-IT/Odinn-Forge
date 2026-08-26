@@ -12,6 +12,7 @@ export type AgentGraphControlAuditTestEvent = {
 export type GatewayTestHooks = {
   afterApprovalJobClaimed?: (event: ApprovalJobClaimedTestEvent) => void | Promise<void>;
   beforeAgentGraphControlAudit?: (event: AgentGraphControlAuditTestEvent) => void | Promise<void>;
+  beforeChannelResultPersist?: (event: { jobId: string }) => void | Promise<void>;
   onRequestError?: (event: { pathname: string; error: unknown }) => void | Promise<void>;
 };
 

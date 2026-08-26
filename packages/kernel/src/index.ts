@@ -1934,7 +1934,8 @@ export class ExecutionAdmissionService {
       });
     } catch (error) {
       const current = runLedger.getExecutionAttempt(persisted.attempt.id);
-      if (current && !["completed", "failed", "cancelled", "needs-review"].includes(current.state)) {
+      if (this.options.deferExecutionSettlement !== true
+        && current && !["completed", "failed", "cancelled", "needs-review"].includes(current.state)) {
         runLedger.transitionExecutionAttempt({ attemptId: persisted.attempt.id, from: current.state, to: "failed", errorCode: "AUDIT_CORRELATION_FAILED" });
       }
       throw error;
@@ -1953,6 +1954,7 @@ export class ExecutionAdmissionService {
 
   complete(admission: any, outcomeDigest?: string) {
     if (!admission || !this.options.runLedger) return;
+    if (this.options.deferExecutionSettlement === true) return;
     const current = this.options.runLedger.getExecutionAttempt(admission.attemptId);
     if (!current || ["completed", "failed", "cancelled", "needs-review"].includes(current.state)) return;
     this.options.runLedger.transitionExecutionAttempt({ attemptId: admission.attemptId, from: current.state, to: "completed", outcomeDigest });
@@ -1965,6 +1967,7 @@ export class ExecutionAdmissionService {
 
   fail(admission: any, error: unknown, { cancelled = false, uncertain = false }: { cancelled?: boolean; uncertain?: boolean } = {}) {
     if (!admission || !this.options.runLedger) return;
+    if (this.options.deferExecutionSettlement === true) return;
     const current = this.options.runLedger.getExecutionAttempt(admission.attemptId);
     if (!current || ["completed", "failed", "cancelled", "needs-review"].includes(current.state)) return;
     this.options.runLedger.transitionExecutionAttempt({

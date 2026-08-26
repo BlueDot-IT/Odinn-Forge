@@ -179,7 +179,7 @@ test("runtime schema migrations are additive and the live task path uses admitte
   versionThree.close();
   const migrated = new SqliteStore(databasePath);
   migrated.close();
-  assert.equal(inspectExistingSqliteSchema(databasePath), 9);
+  assert.equal(inspectExistingSqliteSchema(databasePath), 10);
 
   const ledger = createRunLedger({ stateDir, workspaceRoot: root });
   const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
