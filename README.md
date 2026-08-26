@@ -109,16 +109,21 @@ assistant followed the expected path.
 ### What you need
 
 - Linux, macOS, or Windows
-- [Node.js 24 or newer](https://nodejs.org/)
+- A supported x64 machine for the normal standalone download. Node.js is
+  embedded and verified; do not install it separately.
+- For arm64 or another unsupported standalone target, use the advanced generic
+  package with [Node.js 24 or newer](https://nodejs.org/).
 - An account with a supported AI provider, or a local AI model through Ollama
 
 ### Install a release
 
-Download the latest package from
+Download the latest `standalone` package for Linux x64, macOS x64, or Windows
+x64 from
 [GitHub Releases](https://github.com/BlueDot-IT/Odinn-Forge/releases), then
 follow the platform instructions in the [user guide](docs/user-guide.md).
-Release packages contain the built application and its runtime dependencies;
-normal installation does not require pnpm or a source checkout.
+Standalone release packages contain the built application, runtime
+dependencies, and a verified Node.js runtime; normal installation does not
+require Node.js, pnpm, or a source checkout.
 
 After installation, run:
 

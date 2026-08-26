@@ -283,7 +283,7 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
     /^  validate-downloaded-release:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- stage-release-assets/m
   );
   assert.match(release, /name: Validate downloaded release \(\$\{\{ matrix\.os \}\}\)/u);
-  assert.match(release, /matrix:\s*\n\s+os:\s*\n\s+- ubuntu-latest\s*\n\s+- macos-latest\s*\n\s+- windows-latest/u);
+  assert.match(release, /matrix:\s*\n\s+include:\s*\n\s+- os: ubuntu-latest\s*\n\s+target: linux-x64\s*\n\s+- os: macos-15-large\s*\n\s+target: darwin-x64\s*\n\s+- os: windows-latest\s*\n\s+target: win32-x64/u);
   const stageJob = release.match(/^  stage-release-assets:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
   assert.match(stageJob, /runs-on: ubuntu-latest/u);
   assert.match(stageJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
@@ -294,6 +294,7 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(validateJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
   assert.match(validateJob, /node scripts\/release\/verify-downloaded-assets\.ts downloaded-release-assets/u);
   assert.match(validateJob, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
+  assert.match(validateJob, /node scripts\/release\/standalone-smoke\.ts downloaded-release-assets \$\{\{ matrix\.target \}\}/u);
   assert.doesNotMatch(release.match(/^  source-package:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /id-token: write/);
   assert.match(
     release,

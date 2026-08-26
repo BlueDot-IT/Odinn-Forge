@@ -27,6 +27,8 @@ const ZIP_EOCD_MAXIMUM_BYTES = 65_557;
 const ZIP_CENTRAL_DIRECTORY_MAXIMUM_BYTES = 64 * 1024 * 1024;
 const TAR_BLOCK_BYTES = 512;
 const TAR_METADATA_MAXIMUM_BYTES = 2 * 1024 * 1024;
+const ARCHIVE_PATH_MAXIMUM_BYTES = 4_096;
+const ARCHIVE_PATH_MAXIMUM_DEPTH = 128;
 
 type ResolvedOptions = Required<SecureArchiveOptions>;
 type ZipEntry = SecureArchiveEntry & {
@@ -55,15 +57,26 @@ function resolvedOptions(options: SecureArchiveOptions): ResolvedOptions {
 }
 
 function normalizeArchivePath(raw: string): string {
-  if (!raw || raw.includes("\\") || /[\0-\x1f\x7f]/u.test(raw)) throw new Error(`release archive contains an unsafe path: ${raw}`);
-  const name = raw.replace(/\/+$/u, "");
-  if (!name || name.startsWith("/") || name.startsWith("//") || /^[A-Za-z]:/u.test(name)) {
-    throw new Error(`release archive contains an unsafe path: ${raw}`);
+  const label = archivePathLabel(raw);
+  if (!raw || Buffer.byteLength(raw, "utf8") > ARCHIVE_PATH_MAXIMUM_BYTES || raw.includes("\\") || /[\0-\x1f\x7f]/u.test(raw)) {
+    throw new Error(`release archive contains an unsafe path: ${label}`);
   }
-  if (name.split("/").some((part) => !part || part === "." || part === "..")) {
-    throw new Error(`release archive contains an unsafe path: ${raw}`);
+  let end = raw.length;
+  while (end > 0 && raw.charCodeAt(end - 1) === 0x2f) end -= 1;
+  const name = end === raw.length ? raw : raw.slice(0, end);
+  if (!name || name.startsWith("/") || name.startsWith("//") || /^[A-Za-z]:/u.test(name)) {
+    throw new Error(`release archive contains an unsafe path: ${label}`);
+  }
+  const parts = name.split("/");
+  if (parts.length > ARCHIVE_PATH_MAXIMUM_DEPTH || parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error(`release archive contains an unsafe path: ${label}`);
   }
   return name;
+}
+
+function archivePathLabel(raw: string): string {
+  const prefix = raw.slice(0, 160).replace(/[\0-\x1f\x7f]/gu, "?");
+  return `${JSON.stringify(prefix)}${raw.length > prefix.length ? `…(${raw.length} characters)` : ""}`;
 }
 
 function archiveIdentity(name: string): string {
@@ -78,33 +91,36 @@ function validateEntries(entries: SecureArchiveEntry[], options: ResolvedOptions
   for (const entry of entries) {
     entry.name = normalizeArchivePath(entry.name);
     const identity = archiveIdentity(entry.name);
-    if (seen.has(identity)) throw new Error(`release archive contains a duplicate or case-colliding path: ${entry.name}`);
+    if (seen.has(identity)) throw new Error(`release archive contains a duplicate or case-colliding path: ${archivePathLabel(entry.name)}`);
     seen.set(identity, entry);
     if (entry.name !== options.expectedRoot && !entry.name.startsWith(`${options.expectedRoot}/`)) {
-      throw new Error(`release archive contains an unexpected top-level path: ${entry.name}`);
+      throw new Error(`release archive contains an unexpected top-level path: ${archivePathLabel(entry.name)}`);
     }
-    if (entry.type === "link") throw new Error(`release archive contains a symbolic or hard link: ${entry.name}`);
-    if (entry.type === "device") throw new Error(`release archive contains a device, FIFO, socket, or unsupported entry: ${entry.name}`);
+    if (entry.type === "link") throw new Error(`release archive contains a symbolic or hard link: ${archivePathLabel(entry.name)}`);
+    if (entry.type === "device") throw new Error(`release archive contains a device, FIFO, socket, or unsupported entry: ${archivePathLabel(entry.name)}`);
     if (!Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || entry.bytes > options.maximumEntryBytes) {
-      throw new Error(`release archive entry exceeds the expanded-size limit: ${entry.name}`);
+      throw new Error(`release archive entry exceeds the expanded-size limit: ${archivePathLabel(entry.name)}`);
     }
     expandedBytes += entry.bytes;
     if (!Number.isSafeInteger(expandedBytes) || expandedBytes > options.maximumExpandedBytes) {
       throw new Error("release archive exceeds the expanded-size limit");
     }
   }
-  for (const entry of entries) {
+  const orderedIdentities = [...seen.keys()].sort();
+  for (let orderedIndex = 0; orderedIndex < orderedIdentities.length; orderedIndex += 1) {
+    const identity = orderedIdentities[orderedIndex]!;
+    const entry = seen.get(identity)!;
     const parts = entry.name.split("/");
     for (let index = 1; index < parts.length; index += 1) {
       const ancestor = seen.get(archiveIdentity(parts.slice(0, index).join("/")));
       if (ancestor && ancestor.type !== "directory") {
-        throw new Error(`release archive path descends through a non-directory: ${entry.name}`);
+        throw new Error(`release archive path descends through a non-directory: ${archivePathLabel(entry.name)}`);
       }
     }
     if (entry.type === "file") {
-      const prefix = `${archiveIdentity(entry.name)}/`;
-      if ([...seen.keys()].some((name) => name.startsWith(prefix))) {
-        throw new Error(`release archive file shadows another path: ${entry.name}`);
+      const prefix = `${identity}/`;
+      if (orderedIdentities[orderedIndex + 1]?.startsWith(prefix)) {
+        throw new Error(`release archive file shadows another path: ${archivePathLabel(entry.name)}`);
       }
     }
   }

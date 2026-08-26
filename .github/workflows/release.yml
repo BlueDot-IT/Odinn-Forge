@@ -248,10 +248,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: macos-15-large
+            target: darwin-x64
+          - os: windows-latest
+            target: win32-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     permissions:
@@ -288,7 +291,7 @@ jobs:
       - name: Run install and recovery smoke against downloaded archives
         run: node scripts/release/install-smoke.ts downloaded-release-assets
       - name: Run controlled-runtime standalone smoke without ambient Node use
-        run: node scripts/release/standalone-smoke.ts downloaded-release-assets
+        run: node scripts/release/standalone-smoke.ts downloaded-release-assets ${{ matrix.target }}
       - name: Run prior baseline rollback validation against downloaded candidate
         run: node scripts/release/validate-prior-rollback.ts --candidate-release downloaded-release-assets
 

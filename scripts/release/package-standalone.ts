@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { cp, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, cp, lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -112,8 +112,17 @@ for (const target of targets) {
     const secondDigest = await digest(second);
     if (firstDigest !== secondDigest) throw new Error(`standalone archive is not reproducible for ${target}`);
     const firstBytes = (await lstat(first)).size;
-    await rm(join(output, archiveName), { force: true });
-    await rename(first, join(output, archiveName));
+    const publicationStage = await mkdtemp(join(output, ".standalone-stage-"));
+    try {
+      const stagedArchive = join(publicationStage, archiveName);
+      await copyFile(first, stagedArchive);
+      const stagedHandle = await open(stagedArchive, "r");
+      try { await stagedHandle.sync(); } finally { await stagedHandle.close(); }
+      await rm(join(output, archiveName), { force: true });
+      await rename(stagedArchive, join(output, archiveName));
+    } finally {
+      await rm(publicationStage, { recursive: true, force: true });
+    }
     standaloneArtifacts.push({ name: archiveName, target, bytes: firstBytes, sha256: firstDigest, embeddedRuntime: evidence });
   } finally {
     if (runtimeTemporary) await rm(runtimeTemporary, { recursive: true, force: true });

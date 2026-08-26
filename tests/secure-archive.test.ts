@@ -3,6 +3,7 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { access, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 import { extractSecureArchive, inspectSecureArchive } from "../packages/kernel/src/secure-archive.ts";
 
@@ -87,6 +88,26 @@ test("secure archive admission rejects unsafe paths and collisions before writin
         await assert.rejects(() => access(destination), { code: "ENOENT" });
       }
     }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("secure archive admission rejects adversarial long paths in bounded time and without log amplification", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-long-path-"));
+  try {
+    const archive = join(temporary, "long-path.zip");
+    await writeFile(archive, zip([{ name: `pkg/${"/".repeat(60_000)}x`, data: "x" }]));
+    const started = performance.now();
+    const error = await inspectSecureArchive(archive, { expectedRoot: "pkg" }).then(
+      () => undefined,
+      (failure: unknown) => failure
+    );
+    const elapsed = performance.now() - started;
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /unsafe path/u);
+    assert.ok(error.message.length < 512, `unsafe path error was ${error.message.length} characters`);
+    assert.ok(elapsed < 2_000, `unsafe path rejection took ${elapsed.toFixed(1)}ms`);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

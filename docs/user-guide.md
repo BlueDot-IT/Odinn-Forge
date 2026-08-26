@@ -35,7 +35,9 @@ The three hard limits are:
 
 Odinn Forge v1 supports this local, single-user workflow:
 
-- Linux, macOS, or Windows with Node.js 24 or newer.
+- Linux x64, macOS x64, or Windows x64 with the standalone release; Node.js is
+  embedded and verified. Advanced generic-package installs and unsupported
+  standalone targets require Node.js 24 or newer.
 - One local operator using the loopback gateway at `127.0.0.1`.
 - Public web reading, an isolated browser profile, scoped durable memory, audited tools, projects, sessions, goals, and cron jobs. A disabled-by-default [local macOS computer-control](computer-control.md) slice is available with separate operating-system permissions, explicit capability grants, exact approvals, and recovery. The console can register and inspect declarative Agent SDK packages and build integrity-checked Skill SDK packages; both install disabled, and registration and discovery do not execute or activate them.
 - Explicit approval for browser mutations and other external side effects.
@@ -52,26 +54,31 @@ It is not the default path. Do not expose the single-user gateway to a network.
 
 ## Install a verified release
 
-Download the current release from the repository's Releases page. Release
-assets include ZIP and tar.gz production archives, `SHA256SUMS.txt`, production
-SBOMs, and a release manifest. The archives contain compiled JavaScript and
-runtime dependencies; they do not require pnpm or a source checkout. GitHub
-also exposes build-provenance attestations for the workflow-built assets.
+Download the current release from the repository's Releases page. Normal users
+on supported x64 targets should choose the matching `standalone` ZIP or tar.gz
+asset. It contains compiled JavaScript, runtime dependencies, and a verified
+Node.js runtime; it does not require Node.js, pnpm, or a source checkout. The
+generic archives remain an advanced Node-dependent fallback for arm64 and other
+unsupported standalone targets. Releases also include `SHA256SUMS.txt`, SBOMs,
+a release manifest, and workflow-built provenance attestations.
 
 ### Linux and macOS
 
 Replace `vX.Y.Z` with the exact release tag shown on the Releases page. Release
-tags and archives use the same `vX.Y.Z` identity, so tag `v1.2.3` is packaged
-as `odinn-v1.2.3.tar.gz` and extracts to `odinn-v1.2.3`:
+tags and archives use the same `vX.Y.Z` identity. On Linux x64, tag `v1.2.3`
+is packaged as `odinn-v1.2.3-standalone-linux-x64.tar.gz` and extracts to
+`odinn-v1.2.3-standalone-linux-x64`. On macOS x64, replace `linux` with
+`darwin`:
 
 ```bash
 tag="vX.Y.Z"
-archive="odinn-$tag.tar.gz"
+platform="linux-x64"
+archive="odinn-$tag-standalone-$platform.tar.gz"
 curl -fLO "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$tag/$archive"
 curl -fLO "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$tag/SHA256SUMS.txt"
 grep "  $archive$" SHA256SUMS.txt | sha256sum -c -
 tar -xzf "$archive"
-cd "odinn-$tag"
+cd "odinn-$tag-standalone-$platform"
 ./install/install.sh --prefix "$HOME/.local/share/odinn"
 export PATH="$HOME/.local/share/odinn/bin:$PATH"
 odinn --version
@@ -101,14 +108,14 @@ Replace `vX.Y.Z` with the exact published tag:
 
 ```powershell
 $Tag = "vX.Y.Z"
-$Archive = "odinn-$Tag.zip"
+$Archive = "odinn-$Tag-standalone-win32-x64.zip"
 Invoke-WebRequest "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$Tag/$Archive" -OutFile $Archive
 Invoke-WebRequest "https://github.com/BlueDot-IT/Odinn-Forge/releases/download/$Tag/SHA256SUMS.txt" -OutFile SHA256SUMS.txt
 $Expected = ((Select-String -Path SHA256SUMS.txt -Pattern "  $([regex]::Escape($Archive))$").Line -split "  ")[0]
 $Actual = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($Actual -ne $Expected) { throw "checksum mismatch for $Archive" }
 Expand-Archive $Archive -DestinationPath . -Force
-Set-Location "odinn-$Tag"
+Set-Location "odinn-$Tag-standalone-win32-x64"
 ./install/install.ps1 -Prefix "$HOME/.local/share/odinn"
 $env:Path = "$HOME/.local/share/odinn/bin;$env:Path"
 odinn.cmd --version

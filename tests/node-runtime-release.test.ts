@@ -90,5 +90,10 @@ test("standalone launchers use only the relative embedded runtime and sanitize N
   assert.match(source, /const first = join\(temporary, `first\.\$\{extension\}`\)/u);
   assert.match(source, /const second = join\(temporary, `second\.\$\{extension\}`\)/u);
   assert.match(source, /if \(firstDigest !== secondDigest\) throw new Error/u);
+  assert.match(source, /const publicationStage = await mkdtemp\(join\(output, "\.standalone-stage-"\)\)/u);
+  assert.match(source, /await copyFile\(first, stagedArchive\)/u);
+  assert.match(source, /await stagedHandle\.sync\(\)/u);
+  assert.match(source, /await rename\(stagedArchive, join\(output, archiveName\)\)/u);
+  assert.doesNotMatch(source, /await rename\(first, join\(output, archiveName\)\)/u);
   assert.doesNotMatch(launchers, /exec node /);
 });

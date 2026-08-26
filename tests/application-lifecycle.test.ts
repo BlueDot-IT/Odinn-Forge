@@ -175,7 +175,7 @@ test("verified local update installs immutably, reports identity, and remains ro
   }
 });
 
-test("standalone update checks accept the trusted macOS /var alias and select the controlled platform artifact", async () => {
+test("standalone update checks accept the trusted macOS /var alias and enforce the controlled platform matrix", async () => {
   const fixture = await lifecycleFixture();
   try {
     const packageRoot = join(fixture.prefix, "versions", fixture.priorId);
@@ -209,7 +209,7 @@ test("standalone update checks accept the trusted macOS /var alias and select th
     });
     await writeFile(release.manifest, `${JSON.stringify(manifest, null, 2)}\n`);
 
-    const check = await checkForUpdate({
+    const options = {
       identity: { applicationVersion: "0.9.0", applicationCommit: PRIOR_COMMIT },
       stateDir: fixture.state,
       packageRoot,
@@ -217,7 +217,15 @@ test("standalone update checks accept the trusted macOS /var alias and select th
       manifest: release.manifest,
       checksums: release.checksums,
       artifact: release.artifact
-    });
+    };
+    const target = `${process.platform}-${process.arch}`;
+    const supportedTargets = new Set(["darwin-x64", "linux-x64", "win32-x64"]);
+    if (!supportedTargets.has(target)) {
+      await assert.rejects(() => checkForUpdate(options), new RegExp(`no controlled standalone artifact for ${target}`, "u"));
+      return;
+    }
+
+    const check = await checkForUpdate(options);
     assert.equal(
       check.artifact,
       `odinn-v1.0.0-standalone-${process.platform}-${process.arch}.${process.platform === "win32" ? "zip" : "tar.gz"}`
@@ -225,15 +233,7 @@ test("standalone update checks accept the trusted macOS /var alias and select th
     assert.notEqual(check.artifact, basename(release.artifact));
     assert.ok(check.verificationRequirements.includes("embedded runtime and policy identity"));
     await assert.rejects(
-      () => updateApplication({
-        identity: { applicationVersion: "0.9.0", applicationCommit: PRIOR_COMMIT },
-        stateDir: fixture.state,
-        packageRoot,
-        prefix: fixture.prefix,
-        manifest: release.manifest,
-        checksums: release.checksums,
-        artifact: release.artifact
-      }),
+      () => updateApplication(options),
       /does not match the required standalone artifact/u
     );
   } finally {
