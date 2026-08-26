@@ -164,6 +164,11 @@ async function scheduleDeferredLauncherActivation(
     "--activation-token",
     token
   ], {
+    // The upgrade caller removes its verified extraction tree immediately
+    // after the installer returns. Windows keeps a process working directory
+    // open, so the detached finalizer must remain rooted in the durable
+    // install prefix rather than inheriting that temporary package path.
+    cwd: prefix,
     detached: true,
     stdio: "ignore",
     windowsHide: true,
