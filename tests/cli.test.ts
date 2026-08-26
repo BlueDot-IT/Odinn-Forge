@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -641,9 +641,13 @@ test("CLI doctor reports safe diagnostics without state paths or credentials", a
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-doctor-"));
   const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(init.status, 0, init.stderr || init.stdout);
+  const chromiumFixture = await mkdtemp(join(tmpdir(), "odinn-cli-chromium-"));
+  const chromiumProbe = join(chromiumFixture, "chromium-probe");
+  await writeFile(chromiumProbe, "#!/bin/sh\nexit 0\n");
+  await chmod(chromiumProbe, 0o700);
   const provider = spawnSync("node", ["apps/cli/src/cli.ts", "config", "provider", "add", "ci", "--base-url", "http://127.0.0.1:1/v1", "--model", "safe-model", "--api-key-env", "ODINN_DOCTOR_SECRET", "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(provider.status, 0, provider.stderr || provider.stdout);
-  const doctor = spawnSync("node", ["apps/cli/src/cli.ts", "doctor", "--state", state], { cwd: root, encoding: "utf8", env: { ...process.env, ODINN_COMMIT: "test-commit" } });
+  const doctor = spawnSync("node", ["apps/cli/src/cli.ts", "doctor", "--state", state], { cwd: root, encoding: "utf8", env: { ...process.env, ODINN_COMMIT: "test-commit", ODINN_CHROMIUM_PATH: chromiumProbe } });
   assert.equal(doctor.status, 0, doctor.stderr || doctor.stdout);
   const report = JSON.parse(doctor.stdout);
   assert.equal(report.command, "doctor");
@@ -651,10 +655,12 @@ test("CLI doctor reports safe diagnostics without state paths or credentials", a
   assert.equal(report.providerMode[0].configured, false);
   assert.equal(report.providerMode[0].supportTier, "custom");
   assert.equal(report.providerMode[0].genericCompatibilityMode, true);
+  assert.deepEqual(report.browserEngine, { available: true, configured: true, source: "configured" });
   assert.equal(report.state.secretsExcludedFromDiagnostics, true);
   assert.equal("requestId" in report, false);
   assert.equal("correlationId" in report, false);
   assert.doesNotMatch(doctor.stdout, new RegExp(state.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(doctor.stdout, /chromium-probe/u);
   assert.doesNotMatch(doctor.stdout, /ODINN_DOCTOR_SECRET/);
 });
 

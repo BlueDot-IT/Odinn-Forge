@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { connect as netConnect, isIP } from "node:net";
@@ -129,10 +130,11 @@ class BrowserNetworkProxy {
   }
 }
 
-async function resolveChromiumExecutable() {
+type ChromiumCandidateSource = "configured" | "platform";
+
+function chromiumExecutableCandidates(): readonly Readonly<{ path: string; source: ChromiumCandidateSource }>[] {
   const configured = process.env.ODINN_CHROMIUM_PATH;
-  const candidates = [
-    configured,
+  const platformCandidates = [
     process.platform === "win32" ? join(process.env.PROGRAMFILES ?? "C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe") : undefined,
     process.platform === "win32" ? join(process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)", "Microsoft", "Edge", "Application", "msedge.exe") : undefined,
     process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : undefined,
@@ -141,16 +143,44 @@ async function resolveChromiumExecutable() {
     process.platform === "linux" ? "/usr/bin/chromium-browser" : undefined,
     process.platform === "linux" ? "/usr/bin/google-chrome" : undefined,
     process.platform === "linux" ? join(homedir(), ".cache", "ms-playwright", "chromium", "chrome-linux", "chrome") : undefined
-  ].filter(Boolean) as string[];
+  ].filter((candidate): candidate is string => typeof candidate === "string")
+    .map((path) => ({ path, source: "platform" as const }));
+  return configured
+    ? [{ path: configured, source: "configured" as const }, ...platformCandidates]
+    : platformCandidates;
+}
+
+async function resolveChromiumExecutableCandidate() {
+  const candidates = chromiumExecutableCandidates();
   for (const candidate of candidates) {
     try {
-      await access(candidate);
+      const metadata = await stat(candidate.path);
+      if (!metadata.isFile()) continue;
+      await access(candidate.path, constants.X_OK);
       return candidate;
     } catch {
       // Try the next platform-native browser location.
     }
   }
   throw new Error(`Chromium was not found for ${process.platform}; install Chromium or set ODINN_CHROMIUM_PATH`);
+}
+
+async function resolveChromiumExecutable() {
+  return (await resolveChromiumExecutableCandidate()).path;
+}
+
+export async function probeChromiumEngine(): Promise<Readonly<{
+  available: boolean;
+  configured: boolean;
+  source: ChromiumCandidateSource | "unavailable";
+}>> {
+  const configured = Boolean(process.env.ODINN_CHROMIUM_PATH);
+  try {
+    const candidate = await resolveChromiumExecutableCandidate();
+    return Object.freeze({ available: true, configured, source: candidate.source });
+  } catch {
+    return Object.freeze({ available: false, configured, source: "unavailable" });
+  }
 }
 
 class BrowserManager {

@@ -90,6 +90,7 @@ export type {
   ApprovalEffectSummaryV1,
   ApprovalTotalsV1,
   AuditDiagnosticV1,
+  BrowserEngineDiagnosticV1,
   BrowserRecoveryDiagnosticV1,
   ChannelCapabilitiesSummaryV1,
   ChannelDiagnosticV1,

@@ -203,7 +203,10 @@ odinn runs
 
 The diagnostic report includes the Odinn version and commit, platform and Node
 version, provider mode without credentials, experimental flags, audit status,
-pending approvals, browser recovery, and job counts. It deliberately omits
+pending approvals, path-free Chromium availability and configuration state,
+browser recovery, and job counts. If the browser engine is unavailable, install
+Chromium or set `ODINN_CHROMIUM_PATH` to an executable before retrying browser
+tools. The report deliberately omits
 state paths, tokens, prompts, cookies, and provider secrets. The running
 gateway exposes the same safe report at `GET /diagnostics`.
 

@@ -313,6 +313,12 @@ export interface BrowserRecoveryDiagnosticV1 {
   readonly id?: string;
 }
 
+export interface BrowserEngineDiagnosticV1 {
+  readonly available: boolean;
+  readonly configured: boolean;
+  readonly source: "configured" | "platform" | "unavailable";
+}
+
 export interface JobTotalsV1 {
   readonly total: number;
   readonly queued: number;
@@ -401,6 +407,7 @@ export interface DiagnosticsReportV1 {
   readonly channels: readonly ChannelDiagnosticV1[];
   readonly audit: AuditDiagnosticV1;
   readonly approvals: ApprovalTotalsV1;
+  readonly browserEngine: BrowserEngineDiagnosticV1;
   readonly browserRecovery: BrowserRecoveryDiagnosticV1;
   readonly jobs: JobTotalsV1;
   readonly sandbox: SandboxDiagnosticV1;
@@ -571,7 +578,7 @@ function assertStatusSnapshotV1(input: JsonObject): StatusSnapshotV1 {
 }
 
 function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
-  object(input, "diagnostics report", ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserRecovery", "jobs", "sandbox", "processRecovery", "state"]);
+  object(input, "diagnostics report", ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "state"]);
   bool(input.ok, "diagnostics report.ok");
   oneOf(input.command, "diagnostics report.command", ["doctor", "diagnostics"]);
   text(input.version, "diagnostics report.version");
@@ -588,6 +595,8 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
   bool(audit.valid, "diagnostics report.audit.valid"); count(audit.events, "diagnostics report.audit.events"); count(audit.unsigned, "diagnostics report.audit.unsigned"); count(audit.failureCount, "diagnostics report.audit.failureCount");
   const approvals = object(input.approvals, "diagnostics report.approvals", ["pending", "ids"]);
   count(approvals.pending, "diagnostics report.approvals.pending"); stringList(approvals.ids, "diagnostics report.approvals.ids");
+  const browserEngine = object(input.browserEngine, "diagnostics report.browserEngine", ["available", "configured", "source"]);
+  bool(browserEngine.available, "diagnostics report.browserEngine.available"); bool(browserEngine.configured, "diagnostics report.browserEngine.configured"); oneOf(browserEngine.source, "diagnostics report.browserEngine.source", ["configured", "platform", "unavailable"]);
   const browser = object(input.browserRecovery, "diagnostics report.browserRecovery", ["status", "pending", "id"], ["status", "pending"]);
   text(browser.status, "diagnostics report.browserRecovery.status"); bool(browser.pending, "diagnostics report.browserRecovery.pending"); optionalText(browser.id, "diagnostics report.browserRecovery.id");
   validateJobTotals(input.jobs, "diagnostics report.jobs");
