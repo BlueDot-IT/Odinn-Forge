@@ -1,15 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { createWriteStream, existsSync } from "node:fs";
+import { createWriteStream, existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
-import { cwd as currentWorkingDirectory } from "node:process";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
   createStateBackup,
+  extractSecureArchive,
   inspectStateSchemas,
   restoreStateBackup,
   sanitizedChildEnvironment,
@@ -22,10 +22,26 @@ const DEFAULT_RELEASE_API = "https://api.github.com/repos/BlueDot-IT/Odinn-Forge
 const DEFAULT_REPOSITORY_API = "https://api.github.com/repos/BlueDot-IT/Odinn-Forge";
 const MAX_METADATA_BYTES = 2 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024;
+const SHA256 = /^[a-f0-9]{64}$/u;
 
 export type ApplicationIdentity = {
   applicationVersion: string;
   applicationCommit: string;
+};
+
+type StandaloneReleaseArtifact = {
+  name: string;
+  target: string;
+  bytes: number;
+  sha256: string;
+  embeddedRuntime: {
+    version: string;
+    target: string;
+    archiveSha256: string;
+    executableBytes: number;
+    executableSha256: string;
+    runtimePolicySha256: string;
+  };
 };
 
 export type ReleaseManifest = {
@@ -35,6 +51,8 @@ export type ReleaseManifest = {
   distribution: "compiled";
   runtimeSha256: string;
   artifacts: string[];
+  standaloneArtifacts?: StandaloneReleaseArtifact[];
+  nodeRuntimePolicySha256?: string;
   archiveSha256: Record<string, string>;
   stateSchemas?: StateSchemaVersions;
   minimumApplicationVersionForTargetState?: string;
@@ -62,6 +80,7 @@ export type UpdateCheckOptions = {
 
 export async function checkForUpdate(options: UpdateCheckOptions) {
   const release = await discoverRelease(options);
+  const currentDistribution = await packageDistribution(options.packageRoot);
   const installation = await readInstallState(installPrefix(options.prefix));
   const inspection = await inspectStateSchemas(options.stateDir);
   const targetSchemas = release.manifest.stateSchemas ?? STATE_SCHEMA_TARGETS;
@@ -78,7 +97,7 @@ export async function checkForUpdate(options: UpdateCheckOptions) {
   const currentMinimum = String(currentStateMetadata?.minimumApplicationVersion ?? "0.0.0");
   const minimum = compareVersions(currentMinimum, releaseMinimum) > 0 ? currentMinimum : releaseMinimum;
   const rollbackCompatible = previousVersion ? compareVersions(previousVersion, minimum) >= 0 : false;
-  const artifactName = selectArtifact(release.manifest.artifacts);
+  const artifactName = selectArtifact(release.manifest, currentDistribution);
   return {
     ok: true,
     currentVersion: options.identity.applicationVersion,
@@ -94,7 +113,14 @@ export async function checkForUpdate(options: UpdateCheckOptions) {
     applicationRollbackCompatible: rollbackCompatible,
     downloadSize: release.sizes[artifactName] ?? null,
     releaseNotesLocation: release.releaseNotesLocation,
-    verificationRequirements: ["immutable Git tag commit", "SHA-256 checksum", "GitHub build attestation", "Odinn release manifest identity", "package release-info identity"],
+    verificationRequirements: [
+      "immutable Git tag commit",
+      "SHA-256 checksum",
+      "GitHub build attestation",
+      "Odinn release manifest identity",
+      "package release-info identity",
+      ...(currentDistribution === "standalone" ? ["embedded runtime and policy identity"] : [])
+    ],
     artifact: artifactName,
     manifestLocation: release.manifestLocation
   };
@@ -105,6 +131,7 @@ export async function updateApplication(options: UpdateCheckOptions) {
   await validateInstallLayout(prefix);
   await assertActivePackage(prefix, options.packageRoot);
   const release = await discoverRelease(options);
+  const currentDistribution = await packageDistribution(options.packageRoot);
   const versionComparison = compareVersions(release.manifest.version, options.identity.applicationVersion);
   if (versionComparison < 0) throw new Error("update refused a release older than the current application; use rollback for an installed previous version");
   if (versionComparison === 0) {
@@ -113,7 +140,12 @@ export async function updateApplication(options: UpdateCheckOptions) {
     }
     throw new Error("Odinn is already running this verified release");
   }
-  const artifactName = options.artifact ? basename(options.artifact) : selectArtifact(release.manifest.artifacts);
+  const expectedArtifactName = selectArtifact(release.manifest, currentDistribution);
+  const artifactName = options.artifact ? basename(options.artifact) : expectedArtifactName;
+  if (artifactName !== expectedArtifactName) {
+    throw new Error(`update artifact ${artifactName} does not match the required ${currentDistribution} artifact ${expectedArtifactName}`);
+  }
+  const standaloneArtifact = release.manifest.standaloneArtifacts?.find((entry) => entry.name === artifactName) ?? null;
   const artifactLocation = options.artifact
     ? resolve(options.artifact)
     : release.artifactLocations[artifactName];
@@ -134,23 +166,27 @@ export async function updateApplication(options: UpdateCheckOptions) {
     const checksumText = await readTextResource(checksumsLocation, MAX_METADATA_BYTES);
     const expectedChecksum = checksumFor(checksumText, artifactName);
     if (artifact.sha256 !== expectedChecksum) throw new Error(`artifact checksum mismatch for ${artifactName}`);
+    if (standaloneArtifact && artifact.bytes !== standaloneArtifact.bytes) throw new Error(`standalone artifact size mismatch for ${artifactName}`);
     if (release.manifest.archiveSha256?.[artifactName] !== expectedChecksum) {
       throw new Error("release manifest checksum does not match checksum metadata");
     }
 
-    await extractVerifiedArchive(downloadedArtifact, extracted, release.manifest.version);
-    const packageRoot = join(extracted, `odinn-v${release.manifest.version}`);
-    await verifyExtractedPackage(packageRoot, release.manifest);
+    const expectedPackageRoot = standaloneArtifact
+      ? `odinn-v${release.manifest.version}-standalone-${standaloneArtifact.target}`
+      : `odinn-v${release.manifest.version}`;
+    await extractVerifiedArchive(downloadedArtifact, extracted, expectedPackageRoot);
+    const packageRoot = join(extracted, expectedPackageRoot);
+    await verifyExtractedPackage(packageRoot, release.manifest, standaloneArtifact);
     const cliEntry = join(packageRoot, "dist", "cli", "index.js");
-    const preSwitchVersion = runNode(cliEntry, ["--version"], packageRoot).stdout.trim();
+    const preSwitchVersion = runPackageNode(packageRoot, cliEntry, ["--version"]).stdout.trim();
     if (preSwitchVersion !== release.manifest.version) throw new Error("pre-switch smoke returned the wrong version");
-    const migrationPlan = JSON.parse(runNode(cliEntry, [
+    const migrationPlan = JSON.parse(runPackageNode(packageRoot, cliEntry, [
       "state",
       "migrate",
       "--dry-run",
       "--state",
       options.stateDir
-    ], packageRoot).stdout);
+    ]).stdout);
     if (migrationPlan.blockingIncompatibilities?.length) {
       throw new Error(`state migration is blocked: ${migrationPlan.blockingIncompatibilities.join("; ")}`);
     }
@@ -168,7 +204,7 @@ export async function updateApplication(options: UpdateCheckOptions) {
 
     const before = await readInstallState(prefix);
     const installer = join(packageRoot, "dist", "install", "install.js");
-    runNode(installer, [
+    runPackageNode(packageRoot, installer, [
       "upgrade",
       "--source",
       packageRoot,
@@ -176,18 +212,18 @@ export async function updateApplication(options: UpdateCheckOptions) {
       prefix,
       "--artifact-sha256",
       expectedChecksum
-    ], packageRoot);
+    ]);
     switched = true;
     const installed = await readInstallState(prefix);
     if (installed.currentVersion !== release.manifest.version || installed.currentCommit !== release.manifest.commit) {
       throw new Error("installed application pointer does not match the verified release");
     }
     const installedRoot = join(prefix, "versions", String(installed.current));
-    const health = JSON.parse(runNode(join(installedRoot, "dist", "cli", "index.js"), [
+    const health = JSON.parse(runPackageNode(installedRoot, join(installedRoot, "dist", "cli", "index.js"), [
       "doctor",
       "--state",
       options.stateDir
-    ], installedRoot).stdout);
+    ]).stdout);
     if (!health.ok) throw new Error("post-update health check failed");
     const state = await inspectStateSchemas(options.stateDir);
     await appendLifecycleHistory(prefix, {
@@ -218,7 +254,7 @@ export async function updateApplication(options: UpdateCheckOptions) {
       try {
         const current = await readInstallState(prefix);
         const currentRoot = join(prefix, "versions", String(current.current));
-        runNode(installerEntry(currentRoot), ["rollback", "--prefix", prefix], currentRoot);
+        runPackageNode(currentRoot, installerEntry(currentRoot), ["rollback", "--prefix", prefix]);
         if (recoveryBackup) {
           await restoreStateBackup(recoveryBackup, options.stateDir, {
             applicationVersion: options.identity.applicationVersion,
@@ -266,19 +302,19 @@ export async function rollbackApplication(options: {
     );
   }
   const currentRoot = join(prefix, "versions", String(installed.current));
-  runNode(installerEntry(currentRoot), ["rollback", "--prefix", prefix], currentRoot);
+  runPackageNode(currentRoot, installerEntry(currentRoot), ["rollback", "--prefix", prefix]);
   const rolledBack = await readInstallState(prefix);
   try {
     const priorRoot = join(prefix, "versions", String(rolledBack.current));
-    const health = JSON.parse(runNode(join(priorRoot, "dist", "cli", "index.js"), [
+    const health = JSON.parse(runPackageNode(priorRoot, join(priorRoot, "dist", "cli", "index.js"), [
       "doctor",
       "--state",
       options.stateDir
-    ], priorRoot).stdout);
+    ]).stdout);
     if (!health.ok) throw new Error("rolled-back application failed its health check");
   } catch (error) {
     const priorRoot = join(prefix, "versions", String(rolledBack.current));
-    runNode(installerEntry(priorRoot), ["rollback", "--prefix", prefix], priorRoot);
+    runPackageNode(priorRoot, installerEntry(priorRoot), ["rollback", "--prefix", prefix]);
     throw error;
   }
   await appendLifecycleHistory(prefix, {
@@ -312,7 +348,8 @@ export async function uninstallApplication(options: {
   const targets = [
     join(prefix, "versions"),
     join(prefix, "bin"),
-    join(prefix, "install-state.json")
+    join(prefix, "install-state.json"),
+    join(prefix, "current")
   ];
   await validateInstallLayout(prefix);
   if (options.removeState) {
@@ -374,6 +411,10 @@ async function validateInstallLayout(prefix: string): Promise<void> {
       throw new Error("version root must be a physical directory");
     }
     for (const entry of await readdir(versions, { withFileTypes: true })) {
+      if (/^\.staging-[A-Za-z0-9_-]+$/u.test(entry.name)) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`stale installer entry has an unsafe type: ${entry.name}`);
+        throw new Error(`installer transaction must be recovered before lifecycle mutation: ${entry.name}`);
+      }
       if (!entry.isDirectory() || entry.isSymbolicLink() || !safeVersionId(entry.name)) {
         throw new Error(`uninstall refused an unexpected version entry: ${entry.name}`);
       }
@@ -402,7 +443,8 @@ async function discoverRelease(options: UpdateCheckOptions): Promise<ReleaseSour
     const manifestLocation = normalizeResource(options.manifest);
     const manifest = validateReleaseManifest(JSON.parse(await readTextResource(manifestLocation, MAX_METADATA_BYTES)));
     const base = resourceBase(manifestLocation);
-    const artifactLocations = Object.fromEntries(manifest.artifacts.map((name) => [
+    const artifactNames = [...manifest.artifacts, ...(manifest.standaloneArtifacts ?? []).map((entry) => entry.name)];
+    const artifactLocations = Object.fromEntries(artifactNames.map((name) => [
       name,
       options.artifact && basename(options.artifact) === name ? normalizeResource(options.artifact) : resourceChild(base, name)
     ]));
@@ -440,7 +482,7 @@ async function discoverRelease(options: UpdateCheckOptions): Promise<ReleaseSour
   if (!checksumAsset?.browser_download_url) throw new Error("release does not contain SHA256SUMS.txt");
   const artifactLocations: Record<string, string> = {};
   const sizes: Record<string, number> = {};
-  for (const name of manifest.artifacts) {
+  for (const name of [...manifest.artifacts, ...(manifest.standaloneArtifacts ?? []).map((entry) => entry.name)]) {
     const asset = assets.get(name);
     if (!asset?.browser_download_url) throw new Error(`release does not contain ${name}`);
     artifactLocations[name] = String(asset.browser_download_url);
@@ -544,6 +586,39 @@ function validateReleaseManifest(value: unknown): ReleaseManifest {
       throw new Error(`release manifest checksum is invalid for ${artifact}`);
     }
   }
+  if (manifest.standaloneArtifacts !== undefined) {
+    if (!SHA256.test(String(manifest.nodeRuntimePolicySha256 ?? ""))
+      || !Array.isArray(manifest.standaloneArtifacts)
+      || manifest.standaloneArtifacts.length === 0) {
+      throw new Error("release manifest standalone runtime policy is invalid");
+    }
+    const names = new Set<string>();
+    const targets = new Set<string>();
+    for (const entry of manifest.standaloneArtifacts) {
+      const expectedName = `odinn-v${manifest.version}-standalone-${entry.target}.${entry.target === "win32-x64" ? "zip" : "tar.gz"}`;
+      if (!safeAssetName(entry?.name)
+        || names.has(entry.name)
+        || entry.name !== expectedName
+        || targets.has(entry.target)
+        || !/^(?:linux|darwin|win32)-x64$/u.test(String(entry.target))
+        || entry.embeddedRuntime?.target !== entry.target
+        || !/^24\.\d+\.\d+$/u.test(String(entry.embeddedRuntime?.version))
+        || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0 || entry.bytes > MAX_ARTIFACT_BYTES
+        || !SHA256.test(String(entry.sha256))
+        || manifest.archiveSha256[entry.name] !== entry.sha256
+        || !SHA256.test(String(entry.embeddedRuntime?.archiveSha256))
+        || !Number.isSafeInteger(entry.embeddedRuntime?.executableBytes) || entry.embeddedRuntime.executableBytes <= 0
+        || !SHA256.test(String(entry.embeddedRuntime?.executableSha256))
+        || entry.embeddedRuntime?.runtimePolicySha256 !== manifest.nodeRuntimePolicySha256) {
+        throw new Error("release manifest standalone artifact identity is invalid");
+      }
+      names.add(entry.name);
+      targets.add(entry.target);
+    }
+    if (JSON.stringify([...targets].sort()) !== JSON.stringify(["darwin-x64", "linux-x64", "win32-x64"])) {
+      throw new Error("release manifest standalone target matrix is incomplete");
+    }
+  }
   if (manifest.stateSchemas) validateStateSchemaRecord(manifest.stateSchemas);
   if (manifest.minimumApplicationVersionForTargetState && !validVersion(manifest.minimumApplicationVersionForTargetState)) {
     throw new Error("release manifest minimum application version is invalid");
@@ -551,7 +626,7 @@ function validateReleaseManifest(value: unknown): ReleaseManifest {
   return manifest as ReleaseManifest;
 }
 
-async function verifyExtractedPackage(packageRoot: string, manifest: ReleaseManifest): Promise<void> {
+async function verifyExtractedPackage(packageRoot: string, manifest: ReleaseManifest, standaloneArtifact: StandaloneReleaseArtifact | null): Promise<void> {
   await validatePhysicalTree(packageRoot);
   const packageMetadata = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
   const releaseInfo = JSON.parse(await readFile(join(packageRoot, "release-info.json"), "utf8"));
@@ -562,7 +637,7 @@ async function verifyExtractedPackage(packageRoot: string, manifest: ReleaseMani
   if (releaseInfo.name !== manifest.name
     || releaseInfo.version !== manifest.version
     || releaseInfo.commit !== manifest.commit
-    || releaseInfo.distribution !== manifest.distribution
+    || releaseInfo.distribution !== (standaloneArtifact ? "standalone" : manifest.distribution)
     || releaseInfo.runtimeSha256 !== manifest.runtimeSha256) {
     throw new Error("package release identity does not match the release manifest");
   }
@@ -570,44 +645,37 @@ async function verifyExtractedPackage(packageRoot: string, manifest: ReleaseMani
     const path = join(packageRoot, required);
     if (!existsSync(path) || !(await lstat(path)).isFile()) throw new Error(`release package is missing ${required}`);
   }
-}
-
-async function extractVerifiedArchive(archive: string, destination: string, version: string): Promise<void> {
-  const names = listArchive(archive);
-  const expectedRoot = `odinn-v${version}`;
-  if (!names.length) throw new Error("release archive is empty");
-  for (const name of names) {
-    const normalized = name.replaceAll("\\", "/").replace(/\/$/u, "");
-    if (!safeArchivePath(normalized) || (normalized !== expectedRoot && !normalized.startsWith(`${expectedRoot}/`))) {
-      throw new Error(`release archive contains an unsafe path: ${name}`);
+  if (standaloneArtifact) {
+    const expectedTarget = `${process.platform}-${process.arch}`;
+    if (standaloneArtifact.target !== expectedTarget
+      || packageMetadata.odinnStandalone?.target !== expectedTarget
+      || packageMetadata.odinnStandalone?.runtimePolicySha256 !== manifest.nodeRuntimePolicySha256
+      || JSON.stringify(releaseInfo.embeddedRuntime) !== JSON.stringify(standaloneArtifact.embeddedRuntime)) {
+      throw new Error("standalone package runtime identity does not match the release manifest");
     }
+    const runtimeName = process.platform === "win32" ? "node.exe" : "node";
+    const runtimePath = join(packageRoot, "runtime", runtimeName);
+    const runtimeMetadata = await lstat(runtimePath);
+    if (!runtimeMetadata.isFile() || runtimeMetadata.isSymbolicLink() || runtimeMetadata.nlink !== 1
+      || runtimeMetadata.size !== standaloneArtifact.embeddedRuntime.executableBytes) {
+      throw new Error("standalone package runtime is not a physical file with the declared size");
+    }
+    const runtimeDigest = createHash("sha256").update(await readFile(runtimePath)).digest("hex");
+    const policyDigest = createHash("sha256").update(await readFile(join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json"))).digest("hex");
+    if (runtimeDigest !== standaloneArtifact.embeddedRuntime.executableSha256 || policyDigest !== manifest.nodeRuntimePolicySha256) {
+      throw new Error("standalone package runtime or policy digest mismatch");
+    }
+  } else if (existsSync(join(packageRoot, "runtime")) || releaseInfo.embeddedRuntime !== undefined || packageMetadata.odinnStandalone !== undefined) {
+    throw new Error("compiled release package contains undeclared embedded runtime material");
   }
-  rejectArchiveLinks(archive);
-  await mkdir(destination, { recursive: true, mode: 0o700 });
-  if (isZip(archive) && process.platform !== "win32") {
-    runCommand("unzip", ["-q", archive, "-d", destination], currentWorkingDirectory());
-  } else {
-    const args = isZip(archive) ? ["-xf", archive, "-C", destination] : ["-xzf", archive, "-C", destination];
-    runCommand("tar", args, currentWorkingDirectory());
-  }
-  await validatePhysicalTree(join(destination, expectedRoot));
 }
 
-function listArchive(archive: string): string[] {
-  const result = isZip(archive) && process.platform !== "win32"
-    ? runCommand("unzip", ["-Z1", archive], currentWorkingDirectory()).stdout
-    : runCommand("tar", [isZip(archive) ? "-tf" : "-tzf", archive], currentWorkingDirectory()).stdout;
-  return result.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
-}
-
-function rejectArchiveLinks(archive: string): void {
-  const listing = isZip(archive) && process.platform !== "win32"
-    ? runCommand("zipinfo", ["-l", archive], currentWorkingDirectory()).stdout
-    : runCommand("tar", [isZip(archive) ? "-tvf" : "-tvzf", archive], currentWorkingDirectory()).stdout;
-  for (const line of listing.split(/\r?\n/u)) {
-    const type = line.trimStart()[0];
-    if (type === "l" || type === "h") throw new Error("release archive contains a symbolic or hard link");
-  }
+async function extractVerifiedArchive(archive: string, destination: string, expectedRoot: string): Promise<void> {
+  await extractSecureArchive(archive, destination, {
+    expectedRoot,
+    maximumArchiveBytes: MAX_ARTIFACT_BYTES,
+    maximumExpandedBytes: 2 * MAX_ARTIFACT_BYTES
+  });
 }
 
 async function validatePhysicalTree(root: string): Promise<void> {
@@ -712,9 +780,15 @@ function checksumFor(text: string, name: string): string {
   return found;
 }
 
-function selectArtifact(artifacts: string[]): string {
+function selectArtifact(manifest: ReleaseManifest, distribution: "standalone" | "compiled" | "source"): string {
+  if (distribution === "standalone") {
+    const target = `${process.platform}-${process.arch}`;
+    const artifact = manifest.standaloneArtifacts?.find((entry) => entry.target === target);
+    if (!artifact) throw new Error(`release has no controlled standalone artifact for ${target}`);
+    return artifact.name;
+  }
   const preferred = process.platform === "win32" ? ".zip" : ".tar.gz";
-  const artifact = artifacts.find((name) => name.endsWith(preferred));
+  const artifact = manifest.artifacts.find((name) => name.endsWith(preferred));
   if (!artifact) throw new Error(`release has no ${preferred} artifact for this platform`);
   return artifact;
 }
@@ -727,8 +801,93 @@ function installerEntry(root: string): string {
   throw new Error("installed application does not contain its lifecycle installer");
 }
 
-function runNode(entry: string, args: string[], cwd: string) {
-  return runCommand(process.execPath, [entry, ...args], cwd);
+function runPackageNode(packageRoot: string, entry: string, args: string[]) {
+  const selected = validatedPackageRuntime(packageRoot);
+  return runCommand(selected.runtime, [entry, ...args], packageRoot);
+}
+
+function validatedPackageRuntime(packageRoot: string): {
+  distribution: "standalone" | "compiled" | "source";
+  runtime: string;
+} {
+  const releaseInfoPath = join(packageRoot, "release-info.json");
+  const packagePath = join(packageRoot, "package.json");
+  const releaseInfo = existsSync(releaseInfoPath) ? JSON.parse(readFileSync(releaseInfoPath, "utf8")) : {};
+  const packageMetadata = JSON.parse(readFileSync(packagePath, "utf8"));
+  const distribution = releaseInfo.distribution === "standalone" || releaseInfo.distribution === "compiled"
+    ? releaseInfo.distribution
+    : releaseInfo.distribution === undefined ? "source" : null;
+  if (!distribution) throw new Error("package distribution metadata is invalid");
+  const runtimeDirectory = join(packageRoot, "runtime");
+  if (distribution !== "standalone") {
+    if (existsSync(runtimeDirectory) || releaseInfo.embeddedRuntime !== undefined || packageMetadata.odinnStandalone !== undefined) {
+      throw new Error("runtime-dependent package contains undeclared embedded runtime material");
+    }
+    return { distribution, runtime: process.execPath };
+  }
+
+  const expectedTarget = `${process.platform}-${process.arch}`;
+  const runtimeName = process.platform === "win32" ? "node.exe" : "node";
+  const runtime = join(runtimeDirectory, runtimeName);
+  const expectedDigest = String(releaseInfo.embeddedRuntime?.executableSha256 ?? "");
+  const expectedPolicyDigest = String(releaseInfo.embeddedRuntime?.runtimePolicySha256 ?? "");
+  if (releaseInfo.embeddedRuntime?.target !== expectedTarget
+    || releaseInfo.embeddedRuntime?.version !== process.version.slice(1)
+    || packageMetadata.odinnStandalone?.target !== expectedTarget
+    || packageMetadata.odinnStandalone?.version !== releaseInfo.embeddedRuntime?.version
+    || packageMetadata.odinnStandalone?.runtime !== "node"
+    || packageMetadata.odinnStandalone?.executableSha256 !== expectedDigest
+    || packageMetadata.odinnStandalone?.runtimePolicySha256 !== expectedPolicyDigest
+    || !Number.isSafeInteger(releaseInfo.embeddedRuntime?.executableBytes)
+    || releaseInfo.embeddedRuntime.executableBytes <= 0
+    || !SHA256.test(expectedDigest) || !SHA256.test(expectedPolicyDigest)) {
+    throw new Error("standalone package runtime metadata is invalid for this platform");
+  }
+  assertNoLinkedAncestorsSync(packageRoot, "standalone package root");
+  assertNoLinkedAncestorsSync(runtimeDirectory, "standalone runtime directory");
+  const packageRootMetadata = lstatSync(packageRoot);
+  const runtimeDirectoryMetadata = lstatSync(runtimeDirectory);
+  const runtimeMetadata = lstatSync(runtime);
+  if (!packageRootMetadata.isDirectory() || packageRootMetadata.isSymbolicLink()
+    || !runtimeDirectoryMetadata.isDirectory() || runtimeDirectoryMetadata.isSymbolicLink()
+    || !runtimeMetadata.isFile() || runtimeMetadata.isSymbolicLink() || runtimeMetadata.nlink !== 1
+    || runtimeMetadata.size !== releaseInfo.embeddedRuntime.executableBytes
+    || readdirSync(runtimeDirectory).length !== 1 || readdirSync(runtimeDirectory)[0] !== runtimeName
+    || !samePhysicalPath(realpathSync(runtimeDirectory), runtimeDirectory)
+    || !samePhysicalPath(realpathSync(runtime), runtime)) {
+    throw new Error("standalone embedded runtime must be a physical regular file without linked ancestors");
+  }
+  if (createHash("sha256").update(readFileSync(runtime)).digest("hex") !== expectedDigest) {
+    throw new Error("standalone embedded runtime digest mismatch");
+  }
+  const policy = join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json");
+  assertNoLinkedAncestorsSync(dirname(policy), "standalone runtime policy directory");
+  const policyMetadata = lstatSync(policy);
+  if (!policyMetadata.isFile() || policyMetadata.isSymbolicLink() || policyMetadata.nlink !== 1
+    || !samePhysicalPath(realpathSync(policy), policy)
+    || createHash("sha256").update(readFileSync(policy)).digest("hex") !== expectedPolicyDigest) {
+    throw new Error("standalone embedded runtime policy digest mismatch");
+  }
+  return { distribution, runtime };
+}
+
+function assertNoLinkedAncestorsSync(path: string, label: string): void {
+  const absolute = resolve(path);
+  const root = parse(absolute).root;
+  let current = root;
+  for (const component of absolute.slice(root.length).split(sep).filter(Boolean)) {
+    current = join(current, component);
+    if (!existsSync(current)) return;
+    const metadata = lstatSync(current);
+    if (metadata.isSymbolicLink()) throw new Error(`${label} must not traverse a symbolic link or reparse point`);
+    if (!metadata.isDirectory() && current !== absolute) throw new Error(`${label} has a non-directory ancestor`);
+    if (!samePhysicalPath(realpathSync(current), current)) throw new Error(`${label} must not traverse a linked ancestor`);
+  }
+}
+
+function samePhysicalPath(left: string, right: string): boolean {
+  const normalize = (value: string) => process.platform === "win32" ? resolve(value).toLowerCase() : resolve(value);
+  return normalize(left) === normalize(right);
 }
 
 function runCommand(command: string, args: string[], cwd: string): { stdout: string; stderr: string } {
@@ -863,6 +1022,10 @@ async function readJsonIfPresent(path: string): Promise<Record<string, any> | nu
   }
 }
 
+async function packageDistribution(packageRoot: string): Promise<"standalone" | "compiled" | "source"> {
+  return validatedPackageRuntime(packageRoot).distribution;
+}
+
 function validateStateSchemaRecord(value: StateSchemaVersions): void {
   const expected = Object.keys(STATE_SCHEMA_TARGETS);
   if (Object.keys(value).length !== expected.length) throw new Error("release manifest state schemas are incomplete");
@@ -922,15 +1085,6 @@ function safeAssetName(value: unknown): value is string {
 
 function safeVersionId(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value);
-}
-
-function safeArchivePath(value: string): boolean {
-  if (!value || value.startsWith("/") || /^[A-Za-z]:/u.test(value)) return false;
-  return value.split("/").every((segment) => segment && segment !== "." && segment !== "..");
-}
-
-function isZip(path: string): boolean {
-  return path.toLowerCase().endsWith(".zip");
 }
 
 function normalizeResource(value: string): string {

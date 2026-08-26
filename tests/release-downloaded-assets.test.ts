@@ -12,18 +12,42 @@ const commit = "a".repeat(40);
 
 async function fixture(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "odinn-downloaded-release-"));
-  const policy = JSON.parse(await readFile(join(root, "release/node-runtime-policy.json"), "utf8"));
-  const standaloneArtifacts = Object.entries(policy.targets).map(([target, entry]: [string, any]) => ({
+  const policyBytes = await readFile(join(root, "release/node-runtime-policy.json"));
+  const policy = JSON.parse(policyBytes.toString("utf8"));
+  const policySha256 = createHash("sha256").update(policyBytes).digest("hex");
+  const standaloneTargets = Object.entries(policy.targets).map(([target, entry]: [string, any]) => ({
     name: `odinn-v${pkg.version}-standalone-${target}.${target === "win32-x64" ? "zip" : "tar.gz"}`,
     target,
-    embeddedRuntime: { version: policy.version, sourceUrl: `${policy.origin}/dist/v${policy.version}/${entry.archive}`, archiveSha256: entry.sha256 }
+    policy: entry
   }));
-  const archives = [`odinn-v${pkg.version}.zip`, `odinn-v${pkg.version}.tar.gz`, ...standaloneArtifacts.map((entry) => entry.name)];
+  const archives = [`odinn-v${pkg.version}.zip`, `odinn-v${pkg.version}.tar.gz`, ...standaloneTargets.map((entry) => entry.name)];
   for (const name of archives) await writeFile(join(directory, name), `archive:${name}`);
   const archiveSha256 = Object.fromEntries(await Promise.all(archives.map(async (name) => [
     name,
     createHash("sha256").update(await readFile(join(directory, name))).digest("hex")
   ])));
+  const standaloneArtifacts = await Promise.all(standaloneTargets.map(async ({ name, target, policy: entry }) => ({
+    name,
+    target,
+    bytes: (await readFile(join(directory, name))).byteLength,
+    sha256: archiveSha256[name],
+    embeddedRuntime: {
+      version: policy.version,
+      target,
+      sourceUrl: `${policy.origin}/dist/v${policy.version}/${entry.archive}`,
+      archive: entry.archive,
+      archiveBytes: entry.bytes,
+      archiveSha256: entry.sha256,
+      executableBytes: entry.executableBytes,
+      executableSha256: entry.executableSha256,
+      signedManifestSha256: policy.signedManifest.sha256,
+      signedManifestCleartextSha256: policy.signedManifest.cleartextSha256,
+      signerFingerprint: policy.keyring.allowedPrimaryFingerprints[0],
+      keyringUrl: policy.keyring.url,
+      keyringSha256: policy.keyring.sha256,
+      runtimePolicySha256: policySha256
+    }
+  })));
   await writeFile(join(directory, "odinn.spdx.json"), JSON.stringify({
     spdxVersion: "SPDX-2.3",
     name: `${pkg.name}-${pkg.version}-production`,
@@ -32,7 +56,12 @@ async function fixture(): Promise<string> {
     files: [{ fileName: "bin/odinn", checksums: [{ algorithm: "SHA256", checksumValue: "b".repeat(64) }] }]
   }));
   await writeFile(join(directory, "odinn-anchore.spdx.json"), JSON.stringify({ spdxVersion: "SPDX-2.3" }));
-  await writeFile(join(directory, "odinn-standalone.spdx.json"), JSON.stringify({ spdxVersion: "SPDX-2.3", packages: [{ name: "Node.js", versionInfo: policy.version }] }));
+  await writeFile(join(directory, "odinn-standalone.spdx.json"), JSON.stringify({
+    spdxVersion: "SPDX-2.3",
+    packages: standaloneTargets.map(({ target }) => ({ SPDXID: `SPDXRef-Package-Node-${target}`, name: "Node.js", versionInfo: policy.version })),
+    files: standaloneTargets.map(({ target }, index) => ({ SPDXID: `SPDXRef-Standalone-File-${index + 1}`, fileName: `${target}/runtime/${target === "win32-x64" ? "node.exe" : "node"}` })),
+    relationships: standaloneTargets.map(({ target }) => ({ spdxElementId: "SPDXRef-Package-Odinn", relationshipType: "CONTAINS", relatedSpdxElement: `SPDXRef-Package-Node-${target}` }))
+  }));
   await writeFile(join(directory, "release-manifest.json"), JSON.stringify({
     name: pkg.name,
     distributionName: "@bluedot-it/odinn",
@@ -43,6 +72,7 @@ async function fixture(): Promise<string> {
     artifacts: archives.slice(0, 2),
     standaloneArtifacts,
     standaloneSbom: "odinn-standalone.spdx.json",
+    nodeRuntimePolicySha256: policySha256,
     archiveSha256,
     sbom: "odinn.spdx.json",
     provenance: "release-provenance.json"
@@ -54,7 +84,10 @@ async function fixture(): Promise<string> {
     distribution: "compiled",
     runtimeSha256: "c".repeat(64),
     archiveSha256,
-    checksumFile: "SHA256SUMS.txt"
+    checksumFile: "SHA256SUMS.txt",
+    nodeRuntimePolicySha256: policySha256,
+    standaloneSbom: "odinn-standalone.spdx.json",
+    standaloneArtifacts
   }));
   const files = [
     ...archives,
@@ -99,4 +132,23 @@ test("downloaded release verification rejects an asset changed after checksummin
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("release validation jobs are read-only and staged recovery uses secure extraction", async () => {
+  const workflow = await readFile(join(root, ".github/workflows/release.yml"), "utf8");
+  const releasePolicy = workflow.slice(workflow.indexOf("  release-policy:"), workflow.indexOf("  source-package:"));
+  const stagedValidation = workflow.slice(workflow.indexOf("  stage-release-assets:"), workflow.indexOf("  validate-downloaded-release:"));
+  const downloadedValidation = workflow.slice(workflow.indexOf("  validate-downloaded-release:"), workflow.indexOf("  publish-release:"));
+  const publication = workflow.slice(workflow.indexOf("  publish-release:"));
+  assert.match(releasePolicy, /permissions:\n\s+contents: read/u);
+  assert.doesNotMatch(releasePolicy, /contents: write/u);
+  assert.match(downloadedValidation, /permissions:\n\s+contents: read/u);
+  assert.doesNotMatch(downloadedValidation, /contents: write/u);
+  for (const section of [stagedValidation, downloadedValidation, publication]) {
+    assert.match(section, /pnpm\/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86/u);
+    assert.match(section, /pnpm install --frozen-lockfile --ignore-scripts/u);
+  }
+  assert.match(workflow, /scripts\/release\/extract-secure-archive\.ts/u);
+  assert.doesNotMatch(workflow, /tar -xzf "dist\/resume-assets/u);
+  assert.doesNotMatch(workflow, /\$\(dirname\b/u);
 });

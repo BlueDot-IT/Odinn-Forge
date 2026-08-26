@@ -141,6 +141,98 @@ test("verified local update installs immutably, reports identity, and remains ro
   }
 });
 
+test("standalone update checks select the controlled platform artifact without falling back to a legacy archive", async () => {
+  const fixture = await lifecycleFixture();
+  try {
+    const packageRoot = join(fixture.prefix, "versions", fixture.priorId);
+    const installedReleaseInfoPath = join(packageRoot, "release-info.json");
+    const installedReleaseInfo = JSON.parse(await readFile(installedReleaseInfoPath, "utf8"));
+    const runtimeBytes = await readFile(process.execPath);
+    const runtimeSha256 = createHash("sha256").update(runtimeBytes).digest("hex");
+    const policyBytes = Buffer.from("test runtime policy\n");
+    const runtimePolicySha256 = createHash("sha256").update(policyBytes).digest("hex");
+    const target = `${process.platform}-${process.arch}`;
+    const runtimeName = process.platform === "win32" ? "node.exe" : "node";
+    await mkdir(join(packageRoot, "runtime"), { recursive: true });
+    await writeFile(join(packageRoot, "runtime", runtimeName), runtimeBytes, { mode: 0o755 });
+    await mkdir(join(packageRoot, "THIRD_PARTY_NOTICES"), { recursive: true });
+    await writeFile(join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json"), policyBytes);
+    installedReleaseInfo.distribution = "standalone";
+    installedReleaseInfo.embeddedRuntime = {
+      version: process.version.slice(1),
+      target,
+      executableBytes: runtimeBytes.byteLength,
+      executableSha256: runtimeSha256,
+      runtimePolicySha256
+    };
+    await writeFile(installedReleaseInfoPath, `${JSON.stringify(installedReleaseInfo, null, 2)}\n`);
+    const installedPackagePath = join(packageRoot, "package.json");
+    const installedPackage = JSON.parse(await readFile(installedPackagePath, "utf8"));
+    installedPackage.odinnStandalone = {
+      runtime: "node",
+      version: process.version.slice(1),
+      target,
+      executableSha256: runtimeSha256,
+      runtimePolicySha256
+    };
+    await writeFile(installedPackagePath, `${JSON.stringify(installedPackage, null, 2)}\n`);
+
+    const release = await createRelease(fixture.temporary, "1.0.0", NEXT_COMMIT, { health: true });
+    const manifest = JSON.parse(await readFile(release.manifest, "utf8"));
+    manifest.nodeRuntimePolicySha256 = "f".repeat(64);
+    manifest.standaloneArtifacts = ["darwin-x64", "linux-x64", "win32-x64"].map((target, index) => {
+      const name = `odinn-v1.0.0-standalone-${target}.${target === "win32-x64" ? "zip" : "tar.gz"}`;
+      const sha256 = String(index + 3).repeat(64);
+      manifest.archiveSha256[name] = sha256;
+      return {
+        name,
+        target,
+        bytes: 1,
+        sha256,
+        embeddedRuntime: {
+          version: "24.19.0",
+          target,
+          archiveSha256: String(index + 6).repeat(64),
+          executableBytes: 1,
+          executableSha256: String(index + 7).repeat(64),
+          runtimePolicySha256: manifest.nodeRuntimePolicySha256
+        }
+      };
+    });
+    await writeFile(release.manifest, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const check = await checkForUpdate({
+      identity: { applicationVersion: "0.9.0", applicationCommit: PRIOR_COMMIT },
+      stateDir: fixture.state,
+      packageRoot,
+      prefix: fixture.prefix,
+      manifest: release.manifest,
+      checksums: release.checksums,
+      artifact: release.artifact
+    });
+    assert.equal(
+      check.artifact,
+      `odinn-v1.0.0-standalone-${process.platform}-${process.arch}.${process.platform === "win32" ? "zip" : "tar.gz"}`
+    );
+    assert.notEqual(check.artifact, basename(release.artifact));
+    assert.ok(check.verificationRequirements.includes("embedded runtime and policy identity"));
+    await assert.rejects(
+      () => updateApplication({
+        identity: { applicationVersion: "0.9.0", applicationCommit: PRIOR_COMMIT },
+        stateDir: fixture.state,
+        packageRoot,
+        prefix: fixture.prefix,
+        manifest: release.manifest,
+        checksums: release.checksums,
+        artifact: release.artifact
+      }),
+      /does not match the required standalone artifact/u
+    );
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
 test("update check follows semantic prerelease ordering", async () => {
   const fixture = await lifecycleFixture();
   try {

@@ -5,6 +5,7 @@ coverage/
 .reports/
 .firecrawl/
 .pnpm-store/
+.cache/
 *.log
 .env
 .env.*

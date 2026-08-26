@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { extractSecureArchive } from "../../packages/kernel/src/secure-archive.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const releaseDir = resolve(process.argv[2] ?? join(root, "dist", "release"));
@@ -88,17 +89,7 @@ for (const extension of ["zip", "tar.gz"]) {
   const archive = join(releaseDir, `${expectedRoot}.${extension}`);
   const destination = await mkdtemp(join(tmpdir(), "odinn-install-smoke-"));
   try {
-    if (extension === "zip") {
-      if (process.platform === "win32") {
-        const escapedArchive = archive.replaceAll("'", "''");
-        const escapedDestination = destination.replaceAll("'", "''");
-        run("powershell", ["-NoProfile", "-Command", `Expand-Archive -LiteralPath '${escapedArchive}' -DestinationPath '${escapedDestination}' -Force`], root);
-      } else {
-        run("unzip", ["-q", archive, "-d", destination], root);
-      }
-    } else {
-      run("tar", ["-xzf", archive, "-C", destination], root);
-    }
+    await extractSecureArchive(archive, destination, { expectedRoot });
 
     const packageRoot = join(destination, expectedRoot);
     const prefix = join(destination, "installed");
