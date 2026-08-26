@@ -211,7 +211,8 @@ export async function updateApplication(options: UpdateCheckOptions) {
       "--prefix",
       prefix,
       "--artifact-sha256",
-      expectedChecksum
+      expectedChecksum,
+      ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
     ]);
     switched = true;
     const installed = await readInstallState(prefix);
@@ -247,7 +248,8 @@ export async function updateApplication(options: UpdateCheckOptions) {
       previousVersionId: installed.previous,
       stateSchemas: state.currentVersions,
       stateBackup: recoveryBackup,
-      health: "passed"
+      health: "passed",
+      launcherActivation: process.platform === "win32" ? "deferred" : "complete"
     };
   } catch (error) {
     if (switched) {

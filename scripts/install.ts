@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { existsSync, type Stats } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { spawnPnpmSync } from "./lib/package-manager.ts";
@@ -11,20 +12,24 @@ const [command = "status", ...args] = process.argv.slice(2);
 const prefix = resolve(option("--prefix", process.env.ODINN_INSTALL_PREFIX || join(homedir(), ".local", "share", "odinn")));
 const statePath = join(prefix, "install-state.json");
 const currentPath = join(prefix, "current");
+const launcherActivationPath = join(prefix, ".launcher-activation.json");
 // Kept separate so the TypeScript template emits the POSIX parameter-length expression verbatim.
 const RUNTIME_SHA256 = { length: "$" + "{#RUNTIME_SHA256}" } as const;
-await assertNoLinkedAncestors(prefix, "install prefix");
-await ensurePhysicalDirectory(prefix, "install prefix");
-const releaseInstallLock = await acquireInstallLock();
-try {
-  await validatePrefix(prefix);
-  await cleanupStaleInstallEntries();
-  if (command === "install" || command === "upgrade") await install(command);
-  else if (command === "rollback") await rollback();
-  else if (command === "status") console.log(JSON.stringify(await readState(), null, 2));
-  else throw new Error("usage: install.ts install|upgrade|rollback|status [--source DIR] [--prefix DIR] [--version VERSION] [--commit SHA] [--artifact-sha256 HASH] [--skip-deps]");
-} finally {
-  await releaseInstallLock();
+if (command === "finalize-launchers") await finalizeDeferredLaunchers();
+else {
+  await assertNoLinkedAncestors(prefix, "install prefix");
+  await ensurePhysicalDirectory(prefix, "install prefix");
+  const releaseInstallLock = await acquireInstallLock();
+  try {
+    await validatePrefix(prefix);
+    await cleanupStaleInstallEntries();
+    if (command === "install" || command === "upgrade") await install(command);
+    else if (command === "rollback") await rollback();
+    else if (command === "status") console.log(JSON.stringify(await readState(), null, 2));
+    else throw new Error("usage: install.ts install|upgrade|rollback|status [--source DIR] [--prefix DIR] [--version VERSION] [--commit SHA] [--artifact-sha256 HASH] [--skip-deps]");
+  } finally {
+    await releaseInstallLock();
+  }
 }
 
 async function install(operation: any) {
@@ -87,10 +92,132 @@ async function install(operation: any) {
   }
   const previous = await readState();
   const next = { schemaVersion: 1, current: versionId, currentVersion: version, currentCommit: commit, previous: previous.current && previous.current !== versionId ? previous.current : previous.previous ?? null, installedAt: new Date().toISOString(), operation };
-  await writeLaunchers();
+  const deferredParentPid = deferredLauncherParentPid(operation);
+  const activation = deferredParentPid
+    ? await scheduleDeferredLauncherActivation(destination, standalone, versionId, deferredParentPid)
+    : null;
+  if (!activation) await writeLaunchers();
   await writeState(next);
   await writeCurrentPointer(versionId, toolchain.distribution, standalone ? releaseInfo.embeddedRuntime.executableSha256 : "");
-  console.log(JSON.stringify({ ok: true, prefix, version, versionId, commit, previous: next.previous }, null, 2));
+  console.log(JSON.stringify({
+    ok: true,
+    prefix,
+    version,
+    versionId,
+    commit,
+    previous: next.previous,
+    launcherActivation: activation ? "deferred" : "complete"
+  }, null, 2));
+}
+
+function deferredLauncherParentPid(operation: string): number | null {
+  const value = option("--defer-launchers-until-pid");
+  if (!value) return null;
+  if (process.platform !== "win32" || operation !== "upgrade") {
+    throw new Error("deferred launcher activation is supported only for Windows upgrades");
+  }
+  const pid = Number(value);
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("deferred launcher activation requires a valid parent process ID");
+  if (!processIsAlive(pid)) throw new Error("deferred launcher activation parent process is not running");
+  return pid;
+}
+
+async function scheduleDeferredLauncherActivation(
+  destination: string,
+  standalone: boolean,
+  versionId: string,
+  waitForPid: number
+) {
+  try {
+    await lstat(launcherActivationPath);
+    throw new Error("a deferred launcher activation is already pending");
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const token = randomUUID();
+  const marker = {
+    schemaVersion: 1,
+    token,
+    versionId,
+    waitForPid,
+    createdAt: new Date().toISOString()
+  };
+  const temporary = `${launcherActivationPath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(marker, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  await rename(temporary, launcherActivationPath);
+  await chmod(launcherActivationPath, 0o600).catch(() => undefined);
+
+  const runtime = standalone ? join(destination, "runtime", "node.exe") : process.execPath;
+  const installer = join(destination, "dist", "install", "install.js");
+  const child = spawn(runtime, [
+    installer,
+    "finalize-launchers",
+    "--prefix",
+    prefix,
+    "--wait-for-pid",
+    String(waitForPid),
+    "--version-id",
+    versionId,
+    "--activation-token",
+    token
+  ], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    env: {
+      SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+      TEMP: process.env.TEMP ?? tmpdir(),
+      TMP: process.env.TMP ?? tmpdir()
+    }
+  });
+  await new Promise<void>((resolveSpawn, rejectSpawn) => {
+    child.once("spawn", resolveSpawn);
+    child.once("error", rejectSpawn);
+  });
+  child.unref();
+  return marker;
+}
+
+async function finalizeDeferredLaunchers() {
+  if (process.platform !== "win32") throw new Error("deferred launcher activation is supported only on Windows");
+  const waitForPid = Number(option("--wait-for-pid"));
+  const versionId = option("--version-id");
+  const token = option("--activation-token");
+  if (!Number.isSafeInteger(waitForPid) || waitForPid <= 0 || !safeVersionId(versionId) || !/^[0-9a-f-]{36}$/iu.test(token)) {
+    throw new Error("deferred launcher activation arguments are invalid");
+  }
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (processIsAlive(waitForPid)) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting to finalize Windows launchers");
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  // cmd.exe can execute the line after the Node child exits before releasing the
+  // batch file. Keep the reviewed launcher stable through that final read.
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+
+  await assertNoLinkedAncestors(prefix, "install prefix");
+  await ensurePhysicalDirectory(prefix, "install prefix");
+  const releaseInstallLock = await acquireInstallLock();
+  try {
+    await validatePrefix(prefix);
+    await requirePhysicalFile(launcherActivationPath, "launcher activation marker");
+    const marker = JSON.parse(await readFile(launcherActivationPath, "utf8"));
+    if (marker?.schemaVersion !== 1 || marker.token !== token || marker.versionId !== versionId || marker.waitForPid !== waitForPid) {
+      throw new Error("launcher activation marker does not match the requested activation");
+    }
+    const state = await readState();
+    const pointer = await readCurrentPointer();
+    if (state.current !== versionId || pointer?.versionId !== versionId) {
+      throw new Error("launcher activation target is no longer the active verified release");
+    }
+    await writeLaunchers();
+    const retired = `${launcherActivationPath}.retired-${token}`;
+    await rename(launcherActivationPath, retired);
+    await requirePhysicalFile(retired, "retired launcher activation marker");
+    await rm(retired, { force: false });
+  } finally {
+    await releaseInstallLock();
+  }
 }
 
 async function rollback() {
@@ -416,7 +543,7 @@ async function cleanupStaleInstallEntries() {
   const candidates: string[] = [];
   try {
     for (const entry of await readdir(prefix, { withFileTypes: true })) {
-      if (/^(?:\.install-state-|current\.).+\.tmp$/u.test(entry.name)) candidates.push(join(prefix, entry.name));
+      if (/^(?:\.install-state-|current\.|\.launcher-activation\.).+\.tmp$/u.test(entry.name)) candidates.push(join(prefix, entry.name));
     }
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;

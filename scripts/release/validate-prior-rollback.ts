@@ -277,6 +277,12 @@ export async function validatePriorRollback(options: {
     if (!updateData.ok || updateData.version !== candidateVersion) {
       recordOutcome(6, "Candidate update output", false, `Update output mismatch: ${JSON.stringify(updateData)}`);
     }
+    if (process.platform === "win32") {
+      if (updateData.launcherActivation !== "deferred") {
+        recordOutcome(6, "Candidate launcher handoff", false, "Windows update did not defer active batch launcher replacement");
+      }
+      await waitForLauncherActivation(prefix);
+    }
     recordOutcome(6, "Execute candidate update from v1.0.0 binary", true);
 
     // Step 7: Verify candidate version, commit, installed pointer, and health
@@ -423,6 +429,21 @@ export async function validatePriorRollback(options: {
   console.log(`[Step 15] Prior rollback validation PASSED. Evidence written to: ${evidenceOutputPath}`);
 
   return evidence;
+}
+
+async function waitForLauncherActivation(prefix: string) {
+  const marker = join(prefix, ".launcher-activation.json");
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      await readFile(marker);
+    } catch (error: any) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  throw new Error("timed out waiting for deferred Windows launcher activation");
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
