@@ -14,7 +14,14 @@ The Gateway surface is disabled by default. Enable it explicitly with
 `config.runtime.enableDurableWorkflows: true`, then use `POST /workflows`,
 `GET /workflows`, `GET /workflows/<id>`, and the cancel/resume/event endpoints.
 Workflow action references still pass through the normal execution admission,
-policy, capability, approval, audit, and ledger boundaries.
+policy, capability, approval, audit, and ledger boundaries. Each admitted step
+records the workflow run as its durable `parentRunId`, so execution attempts,
+approval continuations, and workflow recovery share one correlation spine.
+The Gateway preserves explicit `completed`, `failed`, `cancelled`,
+`needs-review`, and `awaiting-approval` results instead of flattening every
+returned action to success. Cancellation is accepted as certain only when the
+action explicitly reports that no effect was applied; otherwise the step is
+quarantined for review.
 
 Raw secrets and unbounded content are not a workflow recovery store. Durable
 records retain bounded projections and digests; input changed by persistence

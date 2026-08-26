@@ -44,6 +44,33 @@ test("job supervisor persists completion and replays recovered work", async () =
   await recovered.shutdown();
 });
 
+test("job supervisor idempotent collisions require the exact supplied request hash", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-request-binding-"));
+  const store = new FileJobStore(join(root, "jobs.json"));
+  const supervisor = new JobSupervisor({ store, execute: async () => ({}) });
+  const expectedHash = "a".repeat(64);
+  await store.create({ id: "job_missing_hash", status: "queued", payload: {} });
+  await assert.rejects(
+    () => supervisor.submit({}, { id: "job_missing_hash", requestHash: expectedHash, idempotent: true }),
+    /job already exists/u
+  );
+
+  await store.create({ id: "job_unrelated_hash", status: "queued", payload: {}, requestHash: "b".repeat(64) });
+  await assert.rejects(
+    () => supervisor.submit({}, { id: "job_unrelated_hash", requestHash: expectedHash, idempotent: true }),
+    /job already exists/u
+  );
+
+  await store.create({ id: "job_exact_hash", status: "queued", payload: {}, requestHash: expectedHash });
+  const adopted = await supervisor.submit({}, {
+    id: "job_exact_hash",
+    requestHash: expectedHash,
+    idempotent: true
+  });
+  assert.equal(adopted.id, "job_exact_hash");
+  assert.equal(adopted.requestHash, expectedHash);
+});
+
 test("job supervisor projects a graph needs-review receipt instead of completed", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-jobs-graph-status-"));
   const store = new FileJobStore(join(root, "jobs.json"));

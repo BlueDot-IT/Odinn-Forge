@@ -4,6 +4,7 @@ import {
   formatAutomationCursor,
   matchAutomationEvent,
   nextAutomationDue,
+  validateAutomationCandidate,
   validateAutomationDeclaration,
   validateAutomationEvent,
   type AutomationCandidate,
@@ -26,10 +27,26 @@ type ActiveDispatch = {
 };
 
 const AUTH_DIGEST = /^[a-f0-9]{64}$/u;
+const CANDIDATE_DIGEST = /^[a-f0-9]{64}$/u;
 const WATCH_ID = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
 
 function timestamp(): string { return new Date().toISOString(); }
 function parse(value: unknown, fallback: any = {}) { try { return typeof value === "string" ? JSON.parse(value) : fallback; } catch { return fallback; } }
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value as Record<string, unknown>).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function candidateProjection(input: unknown): { candidate: AutomationCandidate; json: string; digest: string } {
+  const candidate = validateAutomationCandidate(input);
+  const json = canonicalJson(candidate);
+  return { candidate, json, digest: createHash("sha256").update(json, "utf8").digest("hex") };
+}
 
 function initialize(database: SqliteStore): void {
   database.db.exec(`
@@ -70,7 +87,9 @@ function initialize(database: SqliteStore): void {
   `);
   for (const statement of [
     "ALTER TABLE event_deliveries ADD COLUMN dispatch_token TEXT",
-    "ALTER TABLE event_deliveries ADD COLUMN dispatch_lease_expires_at TEXT"
+    "ALTER TABLE event_deliveries ADD COLUMN dispatch_lease_expires_at TEXT",
+    "ALTER TABLE event_deliveries ADD COLUMN candidate_json TEXT",
+    "ALTER TABLE event_deliveries ADD COLUMN candidate_digest TEXT"
   ]) {
     try { database.db.exec(statement); } catch (error: any) { if (!String(error?.message ?? error).includes("duplicate column name")) throw error; }
   }
@@ -104,6 +123,7 @@ export class DurableEventIngress {
     this.dispatchLeaseMs = positiveDuration(options.dispatchLeaseMs, 30_000, "event dispatch lease");
     initialize(options.database);
     this.reconcileExpiredDispatches();
+    this.recoverTokenlessDeliveries();
   }
 
   registerSource({ source, authDigest, oldestSequence = 0, enabled = true }: { source: string; authDigest: string; oldestSequence?: number; enabled?: boolean }): Source {
@@ -191,6 +211,103 @@ export class DurableEventIngress {
 
   countWatches(): number {
     return Number((this.database.db.prepare("SELECT count(*) AS count FROM event_watches").get() as Row).count || 0);
+  }
+
+  private persistCandidate(
+    database: any,
+    candidateInput: AutomationCandidate,
+    { watchId, source, sequence }: { watchId: string; source: string; sequence?: number }
+  ): boolean {
+    const { candidate, json, digest } = candidateProjection(candidateInput);
+    const at = timestamp();
+    const result = database.prepare(`INSERT OR IGNORE INTO event_deliveries(
+      idempotency_key, candidate_id, watch_id, source, sequence, status,
+      candidate_json, candidate_digest, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`).run(
+      candidate.idempotencyKey,
+      candidate.candidateId,
+      watchId,
+      source,
+      sequence ?? null,
+      json,
+      digest,
+      at,
+      at
+    );
+    const row = database.prepare(`SELECT candidate_id, watch_id, source, sequence, candidate_json, candidate_digest
+      FROM event_deliveries WHERE idempotency_key=?`).get(candidate.idempotencyKey) as Row | undefined;
+    if (!row
+      || String(row.candidate_id) !== candidate.candidateId
+      || String(row.watch_id) !== watchId
+      || String(row.source) !== source
+      || (row.sequence === null ? undefined : Number(row.sequence)) !== sequence) {
+      throw new Error("event delivery idempotency key is bound to a different candidate or trigger scope");
+    }
+    if (row.candidate_json === null && row.candidate_digest === null) {
+      const upgraded = database.prepare(`UPDATE event_deliveries SET candidate_json=?, candidate_digest=?, updated_at=?
+        WHERE idempotency_key=? AND candidate_id=? AND watch_id=? AND source=?
+          AND ((sequence IS NULL AND ? IS NULL) OR sequence=?)
+          AND candidate_json IS NULL AND candidate_digest IS NULL`).run(
+        json,
+        digest,
+        at,
+        candidate.idempotencyKey,
+        candidate.candidateId,
+        watchId,
+        source,
+        sequence ?? null,
+        sequence ?? null
+      );
+      if (Number(upgraded.changes) !== 1) throw new Error("event delivery candidate projection changed concurrently");
+    } else if (String(row.candidate_json ?? "") !== json || String(row.candidate_digest ?? "") !== digest) {
+      throw new Error("event delivery candidate projection integrity check failed");
+    }
+    return Number(result.changes) === 1;
+  }
+
+  private candidateFromDelivery(row: Row): AutomationCandidate {
+    if (typeof row.candidate_json !== "string" || typeof row.candidate_digest !== "string") {
+      throw new Error("EVENT_CANDIDATE_RECOVERY_UNAVAILABLE");
+    }
+    if (!CANDIDATE_DIGEST.test(row.candidate_digest)) throw new Error("EVENT_CANDIDATE_INTEGRITY_INVALID");
+    let parsed: unknown;
+    try { parsed = JSON.parse(row.candidate_json); }
+    catch { throw new Error("EVENT_CANDIDATE_INTEGRITY_INVALID"); }
+    const projection = candidateProjection(parsed);
+    if (projection.json !== row.candidate_json
+      || projection.digest !== row.candidate_digest
+      || projection.candidate.idempotencyKey !== String(row.idempotency_key)
+      || projection.candidate.candidateId !== String(row.candidate_id)) {
+      throw new Error("EVENT_CANDIDATE_INTEGRITY_INVALID");
+    }
+    return projection.candidate;
+  }
+
+  private startDispatch(candidate: AutomationCandidate): void {
+    if (!this.dispatch || this.#closed) return;
+    void this.dispatchCandidate(candidate).catch(() => undefined);
+  }
+
+  private recoverTokenlessDeliveries(): void {
+    if (!this.dispatch || this.#closed) return;
+    const rows = this.database.db.prepare(`SELECT * FROM event_deliveries
+      WHERE status='queued' AND dispatch_token IS NULL ORDER BY created_at, idempotency_key`).all() as Row[];
+    for (const row of rows) {
+      try {
+        this.startDispatch(this.candidateFromDelivery(row));
+      } catch (error) {
+        const errorCode = error instanceof Error && error.message === "EVENT_CANDIDATE_RECOVERY_UNAVAILABLE"
+          ? error.message
+          : "EVENT_CANDIDATE_INTEGRITY_INVALID";
+        this.database.db.prepare(`UPDATE event_deliveries
+          SET status='needs-review', error_code=?, updated_at=?
+          WHERE idempotency_key=? AND status='queued' AND dispatch_token IS NULL`).run(
+          errorCode,
+          timestamp(),
+          String(row.idempotency_key)
+        );
+      }
+    }
   }
 
   private claimDelivery(idempotencyKey: string): string | undefined {
@@ -338,15 +455,12 @@ export class DurableEventIngress {
       }
       for (const candidate of candidates) {
         const watch = watches.find((entry) => entry.declaration.declarationDigest === candidate.declarationDigest)!;
-        const result = db.prepare(`INSERT OR IGNORE INTO event_deliveries(idempotency_key, candidate_id, watch_id, source, sequence, status, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`).run(candidate.idempotencyKey, candidate.candidateId, watch.watchId, source.source, event.sequence, timestamp(), timestamp());
-        if (Number(result.changes) === 1) deliveries.push({ idempotencyKey: candidate.idempotencyKey, status: "queued" });
+        if (this.persistCandidate(db, candidate, { watchId: watch.watchId, source: source.source, sequence: event.sequence })) {
+          deliveries.push({ idempotencyKey: candidate.idempotencyKey, status: "queued" });
+        }
       }
     });
-    if (this.dispatch) for (const candidate of candidates) {
-      const status = await this.dispatchCandidate(candidate);
-      if (status) deliveries.push({ idempotencyKey: candidate.idempotencyKey, status });
-    }
+    for (const candidate of candidates) this.startDispatch(candidate);
     return { event, candidates, deliveries };
   }
 
@@ -361,14 +475,13 @@ export class DurableEventIngress {
       const candidate = createScheduleCandidate(watch.declaration, occurrence);
       if (!candidate) continue;
       this.database.transaction((db) => {
-        db.prepare(`INSERT OR IGNORE INTO event_deliveries(idempotency_key, candidate_id, watch_id, source, sequence, status, created_at, updated_at)
-          VALUES (?, ?, ?, ?, NULL, 'queued', ?, ?)`).run(candidate.idempotencyKey, candidate.candidateId, watch.watchId, "heartbeat", timestamp(), timestamp());
+        this.persistCandidate(db, candidate, { watchId: watch.watchId, source: "heartbeat" });
         db.prepare(`INSERT INTO heartbeat_checkpoints(name, last_tick_unix_ms, updated_at) VALUES (?, ?, ?)
           ON CONFLICT(name) DO UPDATE SET last_tick_unix_ms=excluded.last_tick_unix_ms, updated_at=excluded.updated_at
           WHERE heartbeat_checkpoints.last_tick_unix_ms < excluded.last_tick_unix_ms`).run(watch.watchId, occurrence, timestamp());
       });
       candidates.push(candidate);
-      await this.dispatchCandidate(candidate);
+      this.startDispatch(candidate);
     }
     return candidates;
   }

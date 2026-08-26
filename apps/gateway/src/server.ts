@@ -24,7 +24,7 @@ import { authenticationMode, isMutatingMethod, permitsGatewayTokenBootstrap, val
 import { runGatewayEntrypoint } from "./bootstrap.ts";
 import { CONSOLE_CSP, readConsoleAsset, renderConsoleHtml } from "./public/console.ts";
 import { gatewayTestHooksFor } from "./testing.ts";
-import { runWithWorkflowLeaseHeartbeat } from "./workflow.ts";
+import { dispatchGovernedWorkflowStep, submitDurableEventJob, waitForDurableJobTerminal } from "./durable-dispatch.ts";
 import { gatewayOperatorSnapshotFailure } from "./http/errors.ts";
 import { createGatewayOperatorSnapshotReadRequest, normalizeHostedUserId } from "./http/request-context.ts";
 import { assertTenantClaims, createGatewayTenantScope, createTenantScopedAuditStore, scopedJobPayload, type GatewayTenantScope } from "./http/tenant-scope.ts";
@@ -817,27 +817,9 @@ export async function createGatewayServer(options: any = {}) {
     ? new DurableWorkflowRuntime({
       store: new SqliteWorkflowStore(runtime.ledger.database),
       concurrency: 1,
-      dispatch: async ({ run, step, signal, renewLease }) => {
-        const output = await runWithWorkflowLeaseHeartbeat(() => runGovernedTask({
-          task: { id: `${run.runId}:${step.stepId}:${step.attempt}`, tool: step.actionRef, input: step.input, actor: "workflow", reason: `workflow:${run.runId}` },
-          signal,
-          durableExecution: true
-        }), renewLease);
-        return output?.output?.type === "approval.required" || output?.type === "approval.required"
-          ? { status: "awaiting-approval" as const }
-          : { status: "completed" as const, result: output };
-      },
+      dispatch: (context) => dispatchGovernedWorkflowStep(context, runGovernedTask),
       onEvent: async (event) => {
         await auditStore.append({ at: new Date().toISOString(), runId: event.runId, type: event.type, actor: "workflow-runtime", tool: "workflow", capability: "workflow.execute", decision: "allow", data: event.data });
-      }
-    })
-    : undefined;
-  const eventIngress = config.runtime?.enableEventIngress === true
-    ? new DurableEventIngress({
-      database: runtime.ledger.database,
-      dispatch: async (candidate) => {
-        const job = await supervisor.submit(scopedJobPayload({ durableExecution: true, task: { id: candidate.candidateId, tool: candidate.actionRef, input: { candidateId: candidate.candidateId, idempotencyKey: candidate.idempotencyKey }, actor: "event-ingress", reason: `automation:${candidate.declarationId}` } }, tenantScope), { id: candidate.idempotencyKey, requestHash: candidate.idempotencyKey, retrySafe: false, idempotent: true });
-        return ["queued", "running", "awaiting-approval", "completed"].includes(job.status) ? "completed" : "needs-review";
       }
     })
     : undefined;
@@ -862,6 +844,19 @@ export async function createGatewayServer(options: any = {}) {
   });
   const runControlTask = (task: any) => executeTask({ task: scopeTask(task, tenantScope), auditStore, policy, registry, runLedger: runtime.ledger });
   await supervisor.start();
+  // Tokenless event-delivery recovery may submit projected jobs immediately
+  // from the DurableEventIngress constructor. Complete job-store recovery
+  // first so those fresh volatile payloads cannot be mistaken for abandoned
+  // pre-restart input by SqliteJobStore.recover().
+  const eventIngress = config.runtime?.enableEventIngress === true
+    ? new DurableEventIngress({
+      database: runtime.ledger.database,
+      dispatch: async (candidate, { signal, renewLease }) => {
+        const { job, request } = await submitDurableEventJob(supervisor, candidate, tenantScope);
+        return waitForDurableJobTerminal({ initialJob: job, getJob: (id) => supervisor.get(id), signal, renewLease, expectedRequest: request });
+      }
+    })
+    : undefined;
   await workflowRuntime?.start();
   runtime.ledger.reconcileAgentGraphRuns();
   for (const recovery of runtime.ledger.listAgentGraphRecoveryEvents()) {

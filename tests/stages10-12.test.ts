@@ -18,6 +18,36 @@ async function stateRoot(prefix: string) {
   return mkdtemp(join(tmpdir(), `odinn-${prefix}-`));
 }
 
+async function waitForDelivery(
+  ingress: DurableEventIngress,
+  idempotencyKey: string,
+  statuses: string | string[],
+  timeoutMs = 5_000
+) {
+  const expected = new Set(Array.isArray(statuses) ? statuses : [statuses]);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const delivery = ingress.delivery(idempotencyKey);
+    if (delivery && expected.has(delivery.status)) return delivery;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`timed out waiting for event delivery ${idempotencyKey} to reach ${[...expected].join(" or ")}`);
+}
+
+async function resolvesWithin<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not resolve within ${timeoutMs}ms`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 test("Stage 10 persists and completes a dependency-bound workflow", async () => {
   const state = await stateRoot("workflow");
   const ledger = createRunLedger({ stateDir: state });
@@ -580,6 +610,74 @@ test("Stage 10 gateway dispatch heartbeats its workflow lease until settlement",
   assert.equal(renewals, settledRenewals);
 });
 
+test("Stage 10 persists only strict bounded error codes and never arbitrary dispatcher text", async () => {
+  const state = await stateRoot("workflow-error-codes");
+  const ledger = createRunLedger({ stateDir: state });
+  const store = new SqliteWorkflowStore(ledger.database);
+  const directDefinition = workflowDefinitionFromSteps({
+    id: "fixture.workflow-error-code-store",
+    name: "Workflow error-code store fixture",
+    steps: [{ id: "step", actionRef: "text.echo", input: {} }]
+  });
+  store.create({
+    schemaVersion: 1,
+    runId: "workflow-error-code-store-1",
+    principalId: "test",
+    idempotencyKey: "workflow-error-code-store-key",
+    definition: directDefinition,
+    input: {}
+  });
+  const claimed = store.claimNext("workflow-error-code-store-1");
+  assert.ok(claimed);
+  for (const invalid of ["", "lowercase", "ARBITRARY OPERATOR MESSAGE", "_PREFIX", "A-B", "A".repeat(65)]) {
+    assert.throws(
+      () => store.failStep(claimed.runId, claimed.stepId, claimed.leaseToken, invalid),
+      /must match/u
+    );
+    assert.equal(store.get(claimed.runId)?.steps[0]?.status, "running");
+    assert.equal(store.get(claimed.runId)?.steps[0]?.errorCode, undefined);
+  }
+  const maximumCode = `E${"0".repeat(63)}`;
+  const directFailure = store.failStep(claimed.runId, claimed.stepId, claimed.leaseToken, maximumCode);
+  assert.equal(directFailure.steps[0]?.errorCode, maximumCode);
+
+  const arbitraryText = "private dispatcher detail must never persist";
+  const runtimeDefinition = workflowDefinitionFromSteps({
+    id: "fixture.workflow-error-code-runtime",
+    name: "Workflow error-code runtime fixture",
+    steps: [{ id: "step", actionRef: "text.echo", input: {} }]
+  });
+  const runtime = new DurableWorkflowRuntime({
+    store,
+    dispatch: async () => ({ status: "failed", errorCode: arbitraryText })
+  });
+  await runtime.submit({
+    runId: "workflow-error-code-runtime-1",
+    principalId: "test",
+    idempotencyKey: "workflow-error-code-runtime-key",
+    definition: runtimeDefinition,
+    input: {}
+  });
+  for (let attempt = 0; attempt < 100 && store.get("workflow-error-code-runtime-1")?.status !== "failed"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(store.get("workflow-error-code-runtime-1")?.status, "failed");
+  assert.equal(store.get("workflow-error-code-runtime-1")?.steps[0]?.errorCode, "WORKFLOW_DISPATCH_FAILED");
+
+  const persisted = {
+    runs: ledger.database.db.prepare("SELECT error_code FROM workflow_runs ORDER BY run_id").all(),
+    steps: ledger.database.db.prepare("SELECT error_code FROM workflow_steps ORDER BY run_id, step_id").all(),
+    events: ledger.database.db.prepare("SELECT payload_json FROM workflow_events ORDER BY sequence").all()
+  };
+  const persistedJson = JSON.stringify(persisted);
+  assert.equal(persistedJson.includes(arbitraryText), false);
+  for (const row of [...persisted.runs, ...persisted.steps] as Array<{ error_code: string | null }>) {
+    if (row.error_code !== null) assert.match(row.error_code, /^[A-Z][A-Z0-9_]{0,63}$/u);
+  }
+  await runtime.shutdown();
+  ledger.close();
+});
+
 test("Stage 10 tolerates a concurrent duplicate workflow column migration", () => {
   const fake = {
     db: {
@@ -603,8 +701,10 @@ test("Stage 11 authenticates event sources and suppresses duplicate candidates",
   const duplicate = await ingress.ingest(event, authDigest);
   assert.equal(first.candidates.length, 1);
   assert.equal(duplicate.candidates.length, 1);
+  await waitForDelivery(ingress, first.candidates[0]!.idempotencyKey, "completed");
   assert.equal(dispatches, 1);
   await assert.rejects(() => ingress.ingest({ ...event, sequence: 2, cursor: "odinn-event-v1/fixture/2" }, authDigest), /next authoritative sequence/u);
+  await ingress.shutdown();
   ledger.close();
 });
 
@@ -635,9 +735,11 @@ test("Stage 11 claims duplicate delivery ownership before dispatch", async () =>
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(dispatches, 1);
   release();
-  await Promise.all([first, duplicate]);
+  const [firstResult] = await Promise.all([first, duplicate]);
+  await waitForDelivery(ingress, firstResult.candidates[0]!.idempotencyKey, "completed");
   const delivery = ledger.database.db.prepare("SELECT status FROM event_deliveries").get() as { status: string };
   assert.equal(delivery.status, "completed");
+  await ingress.shutdown();
   ledger.close();
 });
 
@@ -677,9 +779,134 @@ test("Stage 11 dispatches active watches outside the bounded administrative list
   const heartbeat = await ingress.heartbeat(100);
   assert.equal(result.candidates.length, 1);
   assert.equal(heartbeat.length, 1);
+  await Promise.all([
+    waitForDelivery(ingress, result.candidates[0]!.idempotencyKey, "completed"),
+    waitForDelivery(ingress, heartbeat[0]!.idempotencyKey, "completed")
+  ]);
   assert.equal(eventDispatches, 1);
   assert.equal(scheduleDispatches, 1);
+  await ingress.shutdown();
   ledger.close();
+});
+
+test("Stage 11 ingest and heartbeat return while durable dispatch remains pending", async (t) => {
+  const state = await stateRoot("event-nonblocking");
+  const ledger = createRunLedger({ stateDir: state });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let dispatches = 0;
+  const ingress = new DurableEventIngress({
+    database: ledger.database,
+    dispatch: async () => {
+      dispatches += 1;
+      await gate;
+      return "completed";
+    }
+  });
+  t.after(async () => {
+    release();
+    await ingress.shutdown();
+    ledger.close();
+  });
+  const authDigest = sourceAuthDigest("fixture-secret");
+  ingress.registerSource({ source: "fixture", authDigest });
+  ingress.registerWatch("watch-nonblocking-event", {
+    schemaVersion: 1, id: "watch-nonblocking-event", revision: 1, enabled: true,
+    actionRef: "remote.mutate", kind: "event", source: "fixture", event: "message", match: []
+  });
+  ingress.registerWatch("watch-nonblocking-schedule", {
+    schemaVersion: 1, id: "watch-nonblocking-schedule", revision: 1, enabled: true,
+    actionRef: "remote.mutate", kind: "schedule", schedule: { type: "at", atUnixMs: 100 }
+  });
+  const event = {
+    schemaVersion: 1,
+    source: "fixture",
+    event: "message",
+    sequence: 0,
+    cursor: "odinn-event-v1/fixture/0",
+    occurredAtUnixMs: 1,
+    attributes: {}
+  };
+  const ingested = await resolvesWithin(ingress.ingest(event, authDigest), 250, "event ingest");
+  const heartbeat = await resolvesWithin(ingress.heartbeat(100), 250, "event heartbeat");
+  assert.deepEqual(ingested.deliveries, [{
+    idempotencyKey: ingested.candidates[0]!.idempotencyKey,
+    status: "queued"
+  }]);
+  assert.equal(heartbeat.length, 1);
+  assert.equal(ingress.delivery(ingested.candidates[0]!.idempotencyKey)?.status, "queued");
+  assert.equal(ingress.delivery(heartbeat[0]!.idempotencyKey)?.status, "queued");
+  for (let attempt = 0; attempt < 100 && dispatches < 2; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(dispatches, 2);
+  release();
+  await Promise.all([
+    waitForDelivery(ingress, ingested.candidates[0]!.idempotencyKey, "completed"),
+    waitForDelivery(ingress, heartbeat[0]!.idempotencyKey, "completed")
+  ]);
+});
+
+test("Stage 11 startup recovers one tokenless queued delivery without duplicate effects", async (t) => {
+  const state = await stateRoot("event-tokenless-recovery");
+  const ledger = createRunLedger({ stateDir: state });
+  const setup = new DurableEventIngress({ database: ledger.database });
+  const authDigest = sourceAuthDigest("fixture-secret");
+  setup.registerSource({ source: "fixture", authDigest });
+  setup.registerWatch("watch-tokenless-recovery", {
+    schemaVersion: 1, id: "watch-tokenless-recovery", revision: 1, enabled: true,
+    actionRef: "remote.mutate", kind: "event", source: "fixture", event: "message", match: []
+  });
+  const event = {
+    schemaVersion: 1,
+    source: "fixture",
+    event: "message",
+    sequence: 0,
+    cursor: "odinn-event-v1/fixture/0",
+    occurredAtUnixMs: 1,
+    attributes: {}
+  };
+  const queued = await setup.ingest(event, authDigest);
+  const idempotencyKey = queued.candidates[0]!.idempotencyKey;
+  await setup.shutdown();
+  const persisted = ledger.database.db.prepare(`SELECT status, dispatch_token, candidate_json, candidate_digest
+    FROM event_deliveries WHERE idempotency_key=?`).get(idempotencyKey) as {
+      status: string;
+      dispatch_token: string | null;
+      candidate_json: string | null;
+      candidate_digest: string | null;
+    };
+  assert.equal(persisted.status, "queued");
+  assert.equal(persisted.dispatch_token, null);
+  assert.equal(typeof persisted.candidate_json, "string");
+  assert.match(persisted.candidate_digest ?? "", /^[a-f0-9]{64}$/u);
+
+  let effects = 0;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const dispatch = async () => {
+    effects += 1;
+    markStarted();
+    await gate;
+    return "completed" as const;
+  };
+  const firstRecovery = new DurableEventIngress({ database: ledger.database, dispatch });
+  const competingRecovery = new DurableEventIngress({ database: ledger.database, dispatch });
+  t.after(async () => {
+    release();
+    await Promise.all([firstRecovery.shutdown(), competingRecovery.shutdown()]);
+    ledger.close();
+  });
+  await resolvesWithin(started, 250, "startup recovery dispatch");
+  assert.equal(effects, 1);
+  release();
+  await waitForDelivery(firstRecovery, idempotencyKey, "completed");
+  const duplicate = await competingRecovery.ingest(event, authDigest);
+  assert.equal(duplicate.candidates[0]?.idempotencyKey, idempotencyKey);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(effects, 1);
 });
 
 test("Stage 11 times out a hung dispatch and fences its late completion", async () => {
@@ -700,7 +927,8 @@ test("Stage 11 times out a hung dispatch and fences its late completion", async 
   ingress.registerWatch("watch-timeout", { schemaVersion: 1, id: "watch-timeout", revision: 1, enabled: true, actionRef: "remote.mutate", kind: "event", source: "fixture", event: "message", match: [] });
   const event = { schemaVersion: 1, source: "fixture", event: "message", sequence: 0, cursor: "odinn-event-v1/fixture/0", occurredAtUnixMs: 1, attributes: {} };
   const result = await ingress.ingest(event, authDigest);
-  assert.equal(result.deliveries.at(-1)?.status, "needs-review");
+  assert.equal(result.deliveries.at(-1)?.status, "queued");
+  await waitForDelivery(ingress, result.candidates[0]!.idempotencyKey, "needs-review");
   assert.equal(aborted, true);
   const delivery = ingress.delivery(result.candidates[0]!.idempotencyKey);
   assert.equal(delivery?.status, "needs-review");
@@ -733,6 +961,7 @@ test("Stage 11 renews a live dispatch lease beyond its original deadline", async
   ingress.registerWatch("watch-renew", { schemaVersion: 1, id: "watch-renew", revision: 1, enabled: true, actionRef: "remote.mutate", kind: "event", source: "fixture", event: "message", match: [] });
   const event = { schemaVersion: 1, source: "fixture", event: "message", sequence: 0, cursor: "odinn-event-v1/fixture/0", occurredAtUnixMs: 1, attributes: {} };
   const result = await ingress.ingest(event, authDigest);
+  await waitForDelivery(ingress, result.candidates[0]!.idempotencyKey, "completed");
   assert.equal(renewals, 6);
   assert.equal(ingress.delivery(result.candidates[0]!.idempotencyKey)?.status, "completed");
   await ingress.shutdown();
@@ -756,7 +985,7 @@ test("Stage 11 rejects completion after event-loop starvation outlives the lease
   ingress.registerWatch("watch-starvation", { schemaVersion: 1, id: "watch-starvation", revision: 1, enabled: true, actionRef: "remote.mutate", kind: "event", source: "fixture", event: "message", match: [] });
   const event = { schemaVersion: 1, source: "fixture", event: "message", sequence: 0, cursor: "odinn-event-v1/fixture/0", occurredAtUnixMs: 1, attributes: {} };
   const result = await ingress.ingest(event, authDigest);
-  const delivery = ingress.delivery(result.candidates[0]!.idempotencyKey);
+  const delivery = await waitForDelivery(ingress, result.candidates[0]!.idempotencyKey, "needs-review");
   assert.equal(delivery?.status, "needs-review");
   assert.equal(delivery?.errorCode, "EVENT_DISPATCH_LEASE_EXPIRED");
   await ingress.close();
@@ -842,10 +1071,11 @@ test("Stage 11 fire-and-forget close remains safe after the owning ledger closes
   const ingesting = ingress.ingest(event, authDigest);
   await dispatched;
   void ingress.close();
+  assert.equal(ingress.delivery((await ingesting).candidates[0]!.idempotencyKey)?.status, "needs-review");
   ledger.close();
   finish("completed");
   const result = await ingesting;
-  assert.equal(result.deliveries.at(-1)?.status, "needs-review");
+  assert.equal(result.deliveries.at(-1)?.status, "queued");
   await new Promise((resolve) => setTimeout(resolve, 10));
 });
 

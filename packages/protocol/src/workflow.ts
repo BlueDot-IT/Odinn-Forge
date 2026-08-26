@@ -69,6 +69,7 @@ export type WorkflowRunRecord = {
 
 const IDENTIFIER = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
 const ACTION = /^[A-Za-z][A-Za-z0-9._:/-]{0,127}$/u;
+const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/u;
 
 function plain(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`${label} must be an object`);
@@ -95,6 +96,13 @@ function identifier(value: unknown, label: string): string {
 
 function action(value: unknown, label: string): string {
   if (typeof value !== "string" || !ACTION.test(value)) throw new TypeError(`${label} must be a bounded action reference`);
+  return value;
+}
+
+export function validateWorkflowErrorCode(value: unknown, label = "workflow errorCode"): string {
+  if (typeof value !== "string" || !ERROR_CODE.test(value)) {
+    throw new TypeError(`${label} must match ${ERROR_CODE.source}`);
+  }
   return value;
 }
 
