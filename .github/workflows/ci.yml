@@ -35,6 +35,8 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Install pinned Chromium for console regressions
+        run: pnpm --filter @odinn/kernel exec playwright-core install --with-deps chromium
       - run: pnpm release:preflight
       - run: pnpm check:architecture
       - run: pnpm format:check

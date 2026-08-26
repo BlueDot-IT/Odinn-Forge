@@ -65,10 +65,32 @@ test("operator console keeps typed view and component boundaries", async () => {
 
   const styles = await read(`${root}/styles.css`);
   const graphBase = styles.indexOf(".agent-graph-layout { display: grid;");
-  const responsiveGraphLayout = styles.lastIndexOf("@media (max-width: 980px)");
-  assert.ok(graphBase >= 0 && responsiveGraphLayout > graphBase, "delegation responsive rules must follow the base graph layout");
-  assert.match(styles.slice(responsiveGraphLayout), /\.agent-graph-layout \{ grid-template-columns: minmax\(0, 1fr\); \}/u);
-  assert.match(styles, /@media \(max-width: 600px\)[\s\S]*\.agent-graph-row \{[\s\S]*grid-template-columns: minmax\(0, 1fr\) auto/u);
+  const responsiveGraphLayout = styles.indexOf("@container agent-graph-list-panel (max-width: 540px)");
+  assert.ok(graphBase >= 0 && responsiveGraphLayout > graphBase, "delegation component-responsive rules must follow the base graph layout");
+  assert.match(styles, /\.agent-graph-layout \{ display: grid; grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/u);
+  assert.match(styles, /\.agent-graph-head, \.agent-graph-row \{[^\n]*grid-template-columns: minmax\(0, 1\.5fr\) minmax\(0, \.85fr\) minmax\(0, \.5fr\) minmax\(0, \.75fr\)/u);
+  assert.match(styles.slice(responsiveGraphLayout), /\.agent-graph-row \{[\s\S]*grid-template-columns: minmax\(0, 1fr\) auto/u);
+});
+
+test("required quality lanes provision the pinned browser before console regressions", async () => {
+  const kernel = JSON.parse(await read("packages/kernel/package.json"));
+  assert.equal(kernel.dependencies["playwright-core"], "1.62.1");
+
+  for (const [path, nextJob] of [[".github/workflows/ci.yml", "cross-platform"], [".forgejo/workflows/ci.yml", "integration"]]) {
+    const workflow = await read(path);
+    const qualityStart = workflow.indexOf("  quality:");
+    const qualityEnd = workflow.indexOf(`  ${nextJob}:`, qualityStart);
+    assert.ok(qualityStart >= 0 && qualityEnd > qualityStart, `${path} must keep a bounded required quality job`);
+    const quality = workflow.slice(qualityStart, qualityEnd);
+    const browserInstall = quality.indexOf("pnpm --filter @odinn/kernel exec playwright-core install --with-deps chromium");
+    const regressionGate = quality.indexOf("pnpm test");
+    assert.ok(browserInstall >= 0 && regressionGate > browserInstall, `${path} must install pinned Chromium before the required test gate`);
+    assert.doesNotMatch(quality, /continue-on-error/u);
+  }
+
+  const browserRegression = await read("tests/console-product-regressions.test.ts");
+  assert.match(browserRegression, /const responsiveWidths = \[375, 600, 601, 980, 981, 1440\]/u);
+  assert.doesNotMatch(browserRegression, /t\.skip|\/usr\/bin\/chromium/u);
 });
 
 test("routine dependency groups exclude runtime and Node typing migrations", async () => {

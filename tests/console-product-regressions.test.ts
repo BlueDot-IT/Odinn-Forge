@@ -357,18 +357,17 @@ test("console presents the human-first product surfaces and dedicated Advanced p
   }
 });
 
-test("delegation remains operable at 375px and clears checkpoint tokens across every exit", async (t) => {
-  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
+test("delegation remains operable across responsive boundaries and clears checkpoint tokens across every exit", async () => {
+  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || chromium.executablePath();
   try {
     await access(chromiumPath);
-  } catch {
-    t.skip(`Chromium not available at ${chromiumPath}`);
-    return;
+  } catch (error) {
+    assert.fail(`Pinned Chromium is required for the console regression (${chromiumPath}): ${String(error)}`);
   }
 
   const graph = {
-    graphRunId: "graph-mobile-completed",
-    parentRunId: "parent-mobile",
+    graphRunId: "graph-responsive-completed-with-a-long-identifier",
+    parentRunId: "parent-responsive-with-a-long-identifier",
     requestDigest: "a".repeat(64),
     status: "completed",
     maxConcurrency: 2,
@@ -381,6 +380,19 @@ test("delegation remains operable at 375px and clears checkpoint tokens across e
       status: "completed",
       resultRef: "result:child-mobile",
       resultDigest: "b".repeat(64),
+    }],
+  };
+  const publishingGraph = {
+    ...graph,
+    graphRunId: "graph-responsive-publishing-with-a-long-identifier",
+    parentRunId: "parent-responsive-publishing-with-a-long-identifier",
+    status: "publishing",
+    completedAt: undefined,
+    startedAt: "2026-01-01T00:00:30.000Z",
+    nodes: [{
+      nodeId: "child-responsive-publishing",
+      manifestId: "research",
+      status: "running",
     }],
   };
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-console-delegation-browser-"));
@@ -410,47 +422,90 @@ test("delegation remains operable at 375px and clears checkpoint tokens across e
         return;
       }
       if (url.pathname === "/agent-graphs") {
-        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ graphs: [graph] }) });
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ graphs: [graph, publishingGraph] }) });
         return;
       }
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ graph }) });
     });
 
     await page.goto(`http://127.0.0.1:${address.port}/#view=delegation`, { waitUntil: "domcontentloaded" });
-    const graphRow = page.locator(".agent-graph-row");
+    const graphRow = page.locator(".agent-graph-row").first();
     await graphRow.waitFor({ state: "visible" });
     await page.locator('.agent-graph-row[aria-current="true"]').waitFor({ state: "visible" });
     assert.equal(await page.locator('.agent-graph-row[aria-current="true"]').count(), 1);
 
-    const mobileMetrics = await page.evaluate(() => {
-      const layout = document.querySelector<HTMLElement>(".agent-graph-layout")!;
-      const panels = [...layout.querySelectorAll<HTMLElement>(":scope > .panel")];
-      const listPanel = panels[0];
-      const row = document.querySelector<HTMLElement>(".agent-graph-row")!;
-      const listBounds = listPanel.getBoundingClientRect();
-      const rowBounds = row.getBoundingClientRect();
-      return {
-        viewportWidth: window.innerWidth,
-        columns: getComputedStyle(layout).gridTemplateColumns,
-        layoutClientWidth: layout.clientWidth,
-        layoutScrollWidth: layout.scrollWidth,
-        listClientWidth: listPanel.clientWidth,
-        listScrollWidth: listPanel.scrollWidth,
-        listRight: listBounds.right,
-        rowLeft: rowBounds.left,
-        rowRight: rowBounds.right,
-        listBottom: listBounds.bottom,
-        detailTop: panels[1].getBoundingClientRect().top,
-        graphHeadDisplay: getComputedStyle(document.querySelector<HTMLElement>(".agent-graph-head")!).display,
-      };
-    });
-    assert.equal(mobileMetrics.viewportWidth, 375);
-    assert.equal(mobileMetrics.columns.trim().split(/\s+/u).length, 1, "delegation panels must stack below 980px");
-    assert.ok(mobileMetrics.layoutScrollWidth <= mobileMetrics.layoutClientWidth, "delegation layout must not overflow horizontally");
-    assert.ok(mobileMetrics.listScrollWidth <= mobileMetrics.listClientWidth, "compact graph rows must fit their panel");
-    assert.ok(mobileMetrics.rowRight <= mobileMetrics.listRight + 0.5 && mobileMetrics.rowLeft >= 0, "graph row must stay inside the viewport");
-    assert.ok(mobileMetrics.detailTop >= mobileMetrics.listBottom, "graph detail must follow the graph list on narrow screens");
-    assert.equal(mobileMetrics.graphHeadDisplay, "none", "mobile graph rows replace the wide table header");
+    const responsiveWidths = [375, 600, 601, 980, 981, 1440];
+    for (const width of responsiveWidths) {
+      await page.setViewportSize({ width, height: 900 });
+      await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      const metrics = await page.evaluate(() => {
+        const content = document.querySelector<HTMLElement>(".content")!;
+        const layout = document.querySelector<HTMLElement>(".agent-graph-layout")!;
+        const panels = [...layout.querySelectorAll<HTMLElement>(":scope > .panel")];
+        const listPanel = panels[0];
+        const listBounds = listPanel.getBoundingClientRect();
+        const detailBounds = panels[1].getBoundingClientRect();
+        const rows = [...document.querySelectorAll<HTMLElement>(".agent-graph-row")].map((row) => {
+          const bounds = row.getBoundingClientRect();
+          return { left: bounds.left, right: bounds.right, clientWidth: row.clientWidth, scrollWidth: row.scrollWidth };
+        });
+        const controls = [
+          "refresh-agent-graphs",
+          "agent-graph-status-filter",
+          "agent-graph-cancel",
+          "agent-graph-reassign",
+          "agent-graph-checkpoint",
+        ].map((id) => {
+          const control = document.getElementById(id)!;
+          const bounds = control.getBoundingClientRect();
+          const style = getComputedStyle(control);
+          return { id, left: bounds.left, right: bounds.right, width: bounds.width, height: bounds.height, display: style.display, visibility: style.visibility };
+        });
+        return {
+          viewportWidth: window.innerWidth,
+          columns: getComputedStyle(layout).gridTemplateColumns,
+          contentClientWidth: content.clientWidth,
+          contentScrollWidth: content.scrollWidth,
+          layoutClientWidth: layout.clientWidth,
+          layoutScrollWidth: layout.scrollWidth,
+          listClientWidth: listPanel.clientWidth,
+          listScrollWidth: listPanel.scrollWidth,
+          listLeft: listBounds.left,
+          listRight: listBounds.right,
+          listBottom: listBounds.bottom,
+          detailLeft: detailBounds.left,
+          detailTop: detailBounds.top,
+          rows,
+          controls,
+          graphHeadDisplay: getComputedStyle(document.querySelector<HTMLElement>(".agent-graph-head")!).display,
+        };
+      });
+
+      assert.equal(metrics.viewportWidth, width);
+      const expectedColumns = width <= 980 ? 1 : 2;
+      assert.equal(metrics.columns.trim().split(/\s+/u).length, expectedColumns, `delegation layout columns at ${width}px`);
+      assert.ok(metrics.contentScrollWidth <= metrics.contentClientWidth, `console content must not overflow at ${width}px`);
+      assert.ok(metrics.layoutScrollWidth <= metrics.layoutClientWidth, `delegation layout must not overflow at ${width}px`);
+      assert.ok(metrics.listScrollWidth <= metrics.listClientWidth, `graph list must fit its panel at ${width}px`);
+      for (const row of metrics.rows) {
+        assert.ok(row.scrollWidth <= row.clientWidth, `graph row content must shrink at ${width}px`);
+        assert.ok(row.left >= metrics.listLeft - 0.5 && row.right <= metrics.listRight + 0.5, `graph row must remain inside its panel at ${width}px`);
+      }
+      if (expectedColumns === 1) {
+        assert.ok(metrics.detailTop >= metrics.listBottom, `graph detail must follow the list at ${width}px`);
+      } else {
+        assert.ok(metrics.detailLeft >= metrics.listRight, `graph panels must not overlap at ${width}px`);
+      }
+      for (const control of metrics.controls) {
+        assert.ok(control.width > 0 && control.height > 0 && control.display !== "none" && control.visibility !== "hidden", `#${control.id} must remain rendered at ${width}px`);
+        assert.ok(control.left >= -0.5 && control.right <= width + 0.5, `#${control.id} must remain horizontally accessible at ${width}px`);
+      }
+
+      if (width === 375 || width === 981) assert.equal(metrics.graphHeadDisplay, "none", `narrow graph components must use compact rows at ${width}px`);
+      if (width === 600 || width === 601 || width === 980 || width === 1440) assert.notEqual(metrics.graphHeadDisplay, "none", `wide graph components must keep labeled tracks at ${width}px`);
+    }
+
+    await page.setViewportSize({ width: 375, height: 812 });
 
     const dialog = page.locator("#agent-graph-checkpoint-dialog");
     const token = page.locator("#agent-graph-checkpoint-token");
