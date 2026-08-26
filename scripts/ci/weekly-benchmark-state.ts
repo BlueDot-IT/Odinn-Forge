@@ -107,6 +107,7 @@ async function prepare(args: string[]): Promise<void> {
   const openclaw = resolve(required(option("--openclaw"), "--openclaw"));
   const hermes = resolve(required(option("--hermes"), "--hermes"));
   const configOutput = resolve(required(option("--config-output"), "--config-output"));
+  const openclawAdapter = new URL("./openclaw-benchmark-adapter.ts", import.meta.url).pathname;
   const credential = parseOAuthCredential(required(
     process.env.ODINN_OPENAI_OAUTH_JSON,
     "ODINN_OPENAI_OAUTH_JSON"
@@ -238,8 +239,8 @@ async function prepare(args: string[]): Promise<void> {
         metadata,
         capabilities: ["text.generate", "workspace.read", "workspace.write", "process.exec"],
         preflight,
-        command: openclaw,
-        args: ["agent", "--agent", "main", "--local", "--session-key", "{trialId}", "--message-file", "{promptFile}", "--model", "openai/gpt-5.6-luna", "--timeout", "300", "--json"],
+        command: process.execPath,
+        args: [openclawAdapter, "--openclaw", openclaw, "--trial-id", "{trialId}", "--prompt-file", "{promptFile}"],
         env: {
           OPENCLAW_STATE_DIR: "{state}",
           AGENT_BENCH_WORKSPACE: "{workspace}",

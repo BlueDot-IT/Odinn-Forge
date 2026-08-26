@@ -96,6 +96,8 @@ test("weekly benchmark preparation keeps credentials out of adapter configuratio
   assert.doesNotMatch(adapterConfig, new RegExp(refreshToken, "u"));
   assert.match(adapterConfig, /"provider": "openai-oauth"/u);
   assert.match(adapterConfig, /"model": "gpt-5\.6-luna"/u);
+  assert.match(adapterConfig, /openclaw-benchmark-adapter\.ts/u);
+  assert.doesNotMatch(adapterConfig, /"--local"/u);
   assert.equal((await stat(config)).mode & 0o777, 0o600);
   const openclawAuth = await readFile(join(state, "openclaw", "agents", "main", "agent", "auth-profiles.json"), "utf8");
   assert.match(openclawAuth, new RegExp(accessToken, "u"));

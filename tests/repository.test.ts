@@ -75,6 +75,7 @@ test("comparative harness remains external while Odinn publishes weekly results"
 
   const ciScripts = await readdir(new URL("../scripts/ci/", import.meta.url));
   assert.deepEqual(ciScripts.filter((name) => name.includes("benchmark")).sort(), [
+    "openclaw-benchmark-adapter.ts",
     "weekly-benchmark-docs.ts",
     "weekly-benchmark-state.ts",
   ]);
