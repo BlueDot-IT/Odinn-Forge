@@ -98,8 +98,13 @@ test("agent graph view renders bounded durable child-session projections", () =>
   assert.equal(agentGraphStatusLabel("publishing"), "Collecting results");
   assert.equal(isAgentGraphActive("running"), true);
   assert.equal(canReassignAgentGraph("needs-review"), true);
-  assert.doesNotMatch(renderAgentGraphRow(graph, true, Date.parse("2026-01-01T00:01:00.000Z")), /<script>/u);
-  assert.match(renderAgentGraphRow(graph, true, Date.parse("2026-01-01T00:01:00.000Z")), /1\/1/u);
+  const selectedRow = renderAgentGraphRow(graph, true, Date.parse("2026-01-01T00:01:00.000Z"));
+  const unselectedRow = renderAgentGraphRow(graph, false, Date.parse("2026-01-01T00:01:00.000Z"));
+  assert.doesNotMatch(selectedRow, /<script>/u);
+  assert.match(selectedRow, /1\/1/u);
+  assert.match(selectedRow, /aria-current="true"/u);
+  assert.match(unselectedRow, /aria-current="false"/u);
+  assert.match(selectedRow, /aria-label="1 of 1 children completed"/u);
   assert.match(renderAgentGraphDetail(graph), /GRAPH_OUTCOME_UNCERTAIN/u);
   assert.match(renderAgentGraphDetail(graph), /result:child-1/u);
 });

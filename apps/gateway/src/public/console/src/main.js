@@ -2211,12 +2211,17 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
       openDialog($("agent-graph-reassign-dialog"));
     }
 
+    function clearAgentGraphCheckpointToken() {
+      $("agent-graph-checkpoint-token").value = "";
+    }
+
     function openAgentGraphCheckpoint() {
       const graph = selectedAgentGraph();
       if (!graph || graph.status !== "completed") return;
       const completed = graph.nodes.filter((node) => node.status === "completed" && node.resultDigest);
       if (!completed.length) return;
       $("agent-graph-checkpoint-form").reset();
+      clearAgentGraphCheckpointToken();
       $("agent-graph-checkpoint-node").innerHTML = completed.map((node) => '<option value="' + escapeHtml(node.nodeId) + '">' + escapeHtml(node.nodeId) + '</option>').join("");
       $("agent-graph-checkpoint-run").value = "agent-graph-checkpoint-" + Date.now();
       openDialog($("agent-graph-checkpoint-dialog"));
@@ -2768,6 +2773,8 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
     $("agent-graph-cancel").addEventListener("click", () => cancelSelectedAgentGraph().catch((error) => showOutput(error.message)));
     $("agent-graph-reassign").addEventListener("click", openAgentGraphReassignment);
     $("agent-graph-checkpoint").addEventListener("click", openAgentGraphCheckpoint);
+    $("agent-graph-checkpoint-dialog").addEventListener("cancel", clearAgentGraphCheckpointToken);
+    $("agent-graph-checkpoint-dialog").addEventListener("close", clearAgentGraphCheckpointToken);
     $("agent-graph-reassign-form").addEventListener("submit", async (event) => {
       if (event.submitter?.value === "cancel") return;
       event.preventDefault();
@@ -2788,25 +2795,30 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
       } catch (error) { showOutput(error.message); }
     });
     $("agent-graph-checkpoint-form").addEventListener("submit", async (event) => {
-      if (event.submitter?.value === "cancel") return;
+      if (event.submitter?.value === "cancel") {
+        clearAgentGraphCheckpointToken();
+        return;
+      }
       event.preventDefault();
       const graph = selectedAgentGraph();
       const node = graph?.nodes.find((item) => item.nodeId === $("agent-graph-checkpoint-node").value);
-      if (!graph || !node?.resultDigest) return;
       try {
+        if (!graph || !node?.resultDigest) throw new Error("The selected child result is no longer available.");
         const payload = JSON.parse($("agent-graph-checkpoint-json").value);
         const runId = $("agent-graph-checkpoint-run").value.trim();
         const capabilityToken = $("agent-graph-checkpoint-token").value;
+        const serializedRequest = JSON.stringify({ ...payload, runId, nodeId: node.nodeId, expectedResultDigest: node.resultDigest, capabilityToken });
+        clearAgentGraphCheckpointToken();
         const result = await api("/agent-graphs/" + encodeURIComponent(graph.graphRunId) + "/checkpoint", {
           method: "POST",
           headers: { "content-type": "application/json", "idempotency-key": runId },
-          body: JSON.stringify({ ...payload, runId, nodeId: node.nodeId, expectedResultDigest: node.resultDigest, capabilityToken })
+          body: serializedRequest
         });
         closeDialog($("agent-graph-checkpoint-dialog"));
         showOutput(result);
         await selectAgentGraph(graph.graphRunId);
       } catch (error) { showOutput(error.message); }
-      finally { $("agent-graph-checkpoint-token").value = ""; }
+      finally { clearAgentGraphCheckpointToken(); }
     });
     $("refresh-goals").addEventListener("click", () => refreshGoals().catch((error) => showOutput(error.message)));
     $("goal-query").addEventListener("input", () => refreshGoals().catch((error) => showOutput(error.message)));

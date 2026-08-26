@@ -29,11 +29,11 @@ export function agentGraphStatusClass(status: string): string {
 
 export function renderAgentGraphRow(graph: AgentGraphRun, selected: boolean, now = Date.now()): string {
   const completed = graph.nodes.filter((node) => node.status === "completed").length;
-  return '<button class="agent-graph-row' + (selected ? " selected" : "") + '" data-agent-graph-id="' + escapeHtml(graph.graphRunId) + '" type="button">' +
+  return '<button class="agent-graph-row' + (selected ? " selected" : "") + '" data-agent-graph-id="' + escapeHtml(graph.graphRunId) + '" type="button" aria-current="' + String(selected) + '">' +
     '<span class="data-primary"><strong>' + escapeHtml(graph.graphRunId) + '</strong><small>Parent ' + escapeHtml(graph.parentRunId) + '</small></span>' +
     '<span class="chip ' + agentGraphStatusClass(graph.status) + '">' + escapeHtml(agentGraphStatusLabel(graph.status)) + '</span>' +
-    '<span>' + escapeHtml(completed + "/" + graph.nodes.length) + '</span>' +
-    '<span class="muted">' + escapeHtml(relativeTime(graph.completedAt || graph.startedAt || graph.createdAt, now)) + '</span>' +
+    '<span class="agent-graph-children" aria-label="' + escapeHtml(completed + " of " + graph.nodes.length + " children completed") + '">' + escapeHtml(completed + "/" + graph.nodes.length) + '</span>' +
+    '<span class="muted agent-graph-updated">' + escapeHtml(relativeTime(graph.completedAt || graph.startedAt || graph.createdAt, now)) + '</span>' +
   '</button>';
 }
 

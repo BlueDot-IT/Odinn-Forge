@@ -1712,6 +1712,13 @@
     .detail-card span { color: var(--muted); font-size: 11px; }
     .technical-token { font-family: inherit; overflow-wrap: anywhere; }
     .technical-details pre { max-height: 260px; overflow: auto; margin-top: 8px; }
+    @media (max-width: 980px) {
+      .agent-graph-layout { grid-template-columns: minmax(0, 1fr); }
+      .agent-graph-layout > .panel,
+      .agent-graph-list,
+      .agent-graph-head,
+      .agent-graph-row { min-width: 0; }
+    }
     @media (max-width: 900px) {
       .usage-grid, .agent-layout, .project-layout, .memory-management-layout, .workshop-grid, .experimental-workbench, .experimental-page-layout, .feature-hero { grid-template-columns: 1fr; }
       .feature-steps { grid-template-columns: 1fr; }
@@ -1733,6 +1740,34 @@
       .memory-card.selected p,
       .memory-card.selected .scope-label,
       .memory-card.selected .muted { display: none; }
+      .agent-graph-head { display: none; }
+      .agent-graph-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 7px 10px;
+        min-width: 0;
+        padding: 12px 10px;
+      }
+      .agent-graph-row > .data-primary {
+        grid-column: 1;
+        grid-row: 1;
+      }
+      .agent-graph-row > .chip {
+        grid-column: 2;
+        grid-row: 1;
+        justify-self: end;
+      }
+      .agent-graph-children {
+        grid-column: 1;
+        grid-row: 2;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .agent-graph-children::before { content: "Children "; }
+      .agent-graph-updated {
+        grid-column: 2;
+        grid-row: 2;
+        text-align: right;
+      }
       .task-table-panel {
         overflow-x: visible;
       }

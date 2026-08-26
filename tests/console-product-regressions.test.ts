@@ -2,7 +2,8 @@ process.env.ODINN_GATEWAY_AUTH = "off";
 process.env.ODINN_BROWSER_HEADLESS = "1";
 
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { access, mkdtemp } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +11,7 @@ import { Script } from "node:vm";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 
 const workspaceRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const { chromium } = createRequire(import.meta.url)("../packages/kernel/node_modules/playwright-core");
 
 function section(html: string, start: RegExp, end: RegExp) {
   const startMatch = start.exec(html);
@@ -351,6 +353,169 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     assert.doesNotMatch(html, /id="(?:health|copy-status|quick-smoke|chat-smoke)"/u);
     assertIds(html, ["task-page-size", "task-prev", "task-next", "task-select-page", "task-rerun-selected", "task-cancel-selected"]);
   } finally {
+    await new Promise<void>((resolve, reject) => server.close((error?: Error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("delegation remains operable at 375px and clears checkpoint tokens across every exit", async (t) => {
+  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
+  try {
+    await access(chromiumPath);
+  } catch {
+    t.skip(`Chromium not available at ${chromiumPath}`);
+    return;
+  }
+
+  const graph = {
+    graphRunId: "graph-mobile-completed",
+    parentRunId: "parent-mobile",
+    requestDigest: "a".repeat(64),
+    status: "completed",
+    maxConcurrency: 2,
+    maxRunMs: 120_000,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    completedAt: "2026-01-01T00:01:00.000Z",
+    nodes: [{
+      nodeId: "child-mobile",
+      manifestId: "research",
+      status: "completed",
+      resultRef: "result:child-mobile",
+      resultDigest: "b".repeat(64),
+    }],
+  };
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-console-delegation-browser-"));
+  const server = await createGatewayServer({ stateDir, workspaceRoot });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+
+  let browser: any;
+  let checkpointMode: "reject" | "pending" = "reject";
+  let releasePendingResponse = () => {};
+  const pendingResponse = new Promise<void>((resolve) => { releasePendingResponse = resolve; });
+  try {
+    browser = await chromium.launch({ executablePath: chromiumPath, headless: true });
+    const context = await browser.newContext({ viewport: { width: 375, height: 812 }, deviceScaleFactor: 1 });
+    const page = await context.newPage();
+    await page.route("**/agent-graphs**", async (route: any) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (request.method() === "POST" && url.pathname.endsWith("/checkpoint")) {
+        if (checkpointMode === "reject") {
+          await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "checkpoint rejected" }) });
+          return;
+        }
+        await pendingResponse;
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, applied: false }) });
+        return;
+      }
+      if (url.pathname === "/agent-graphs") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ graphs: [graph] }) });
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ graph }) });
+    });
+
+    await page.goto(`http://127.0.0.1:${address.port}/#view=delegation`, { waitUntil: "domcontentloaded" });
+    const graphRow = page.locator(".agent-graph-row");
+    await graphRow.waitFor({ state: "visible" });
+    await page.locator('.agent-graph-row[aria-current="true"]').waitFor({ state: "visible" });
+    assert.equal(await page.locator('.agent-graph-row[aria-current="true"]').count(), 1);
+
+    const mobileMetrics = await page.evaluate(() => {
+      const layout = document.querySelector<HTMLElement>(".agent-graph-layout")!;
+      const panels = [...layout.querySelectorAll<HTMLElement>(":scope > .panel")];
+      const listPanel = panels[0];
+      const row = document.querySelector<HTMLElement>(".agent-graph-row")!;
+      const listBounds = listPanel.getBoundingClientRect();
+      const rowBounds = row.getBoundingClientRect();
+      return {
+        viewportWidth: window.innerWidth,
+        columns: getComputedStyle(layout).gridTemplateColumns,
+        layoutClientWidth: layout.clientWidth,
+        layoutScrollWidth: layout.scrollWidth,
+        listClientWidth: listPanel.clientWidth,
+        listScrollWidth: listPanel.scrollWidth,
+        listRight: listBounds.right,
+        rowLeft: rowBounds.left,
+        rowRight: rowBounds.right,
+        listBottom: listBounds.bottom,
+        detailTop: panels[1].getBoundingClientRect().top,
+        graphHeadDisplay: getComputedStyle(document.querySelector<HTMLElement>(".agent-graph-head")!).display,
+      };
+    });
+    assert.equal(mobileMetrics.viewportWidth, 375);
+    assert.equal(mobileMetrics.columns.trim().split(/\s+/u).length, 1, "delegation panels must stack below 980px");
+    assert.ok(mobileMetrics.layoutScrollWidth <= mobileMetrics.layoutClientWidth, "delegation layout must not overflow horizontally");
+    assert.ok(mobileMetrics.listScrollWidth <= mobileMetrics.listClientWidth, "compact graph rows must fit their panel");
+    assert.ok(mobileMetrics.rowRight <= mobileMetrics.listRight + 0.5 && mobileMetrics.rowLeft >= 0, "graph row must stay inside the viewport");
+    assert.ok(mobileMetrics.detailTop >= mobileMetrics.listBottom, "graph detail must follow the graph list on narrow screens");
+    assert.equal(mobileMetrics.graphHeadDisplay, "none", "mobile graph rows replace the wide table header");
+
+    const dialog = page.locator("#agent-graph-checkpoint-dialog");
+    const token = page.locator("#agent-graph-checkpoint-token");
+    const runId = page.locator("#agent-graph-checkpoint-run");
+    const requestEditor = page.locator("#agent-graph-checkpoint-json");
+    const submit = page.locator('#agent-graph-checkpoint-form button[value="default"]');
+    const close = page.locator("#agent-graph-checkpoint-close");
+    const openCheckpoint = async () => {
+      await page.locator("#agent-graph-checkpoint").click();
+      await dialog.waitFor({ state: "visible" });
+    };
+
+    await openCheckpoint();
+    await runId.fill("");
+    await token.fill("close-lifecycle-value");
+    await close.click();
+    await dialog.waitFor({ state: "hidden" });
+    assert.equal(await token.inputValue(), "", "Close must bypass validation and clear the token");
+
+    await openCheckpoint();
+    await token.fill("cancel-lifecycle-value");
+    await page.evaluate(() => document.querySelector<HTMLDialogElement>("#agent-graph-checkpoint-dialog")!
+      .dispatchEvent(new Event("cancel", { cancelable: true })));
+    assert.equal(await token.inputValue(), "", "dialog cancellation must clear the token");
+    await token.fill("escape-lifecycle-value");
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "hidden" });
+    assert.equal(await token.inputValue(), "", "Escape must clear the token");
+
+    await openCheckpoint();
+    await requestEditor.fill("{");
+    await token.fill("serialization-failure-value");
+    await submit.click();
+    await page.waitForFunction(() => (document.querySelector<HTMLInputElement>("#agent-graph-checkpoint-token")?.value ?? "missing") === "");
+    assert.equal(await dialog.getAttribute("open"), "", "local serialization failures must leave the dialog available for correction");
+    await close.click();
+    await dialog.waitFor({ state: "hidden" });
+
+    await openCheckpoint();
+    await token.fill("request-failure-value");
+    const rejectedResponse = page.waitForResponse((response: any) => response.url().endsWith("/checkpoint") && response.status() === 500);
+    await submit.click();
+    await rejectedResponse;
+    assert.equal(await token.inputValue(), "", "request failure must clear the token");
+    assert.equal(await dialog.getAttribute("open"), "", "request failure must leave the dialog available for retry");
+    await close.click();
+    await dialog.waitFor({ state: "hidden" });
+
+    checkpointMode = "pending";
+    await openCheckpoint();
+    await token.fill("success-lifecycle-value");
+    const checkpointRequest = page.waitForRequest((request: any) => request.url().endsWith("/checkpoint") && request.method() === "POST");
+    await submit.click();
+    const serialized = await checkpointRequest;
+    assert.equal(serialized.postDataJSON().capabilityToken, "success-lifecycle-value");
+    assert.equal(await token.inputValue(), "", "the field must clear immediately after request serialization");
+    assert.equal(await dialog.getAttribute("open"), "", "the dialog must remain open while the request is pending");
+    const completedResponse = page.waitForResponse((response: any) => response.url().endsWith("/checkpoint") && response.status() === 200);
+    releasePendingResponse();
+    await completedResponse;
+    await dialog.waitFor({ state: "hidden" });
+    assert.equal(await token.inputValue(), "", "success must leave the token cleared");
+  } finally {
+    releasePendingResponse();
+    await browser?.close();
     await new Promise<void>((resolve, reject) => server.close((error?: Error) => error ? reject(error) : resolve()));
   }
 });

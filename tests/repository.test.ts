@@ -50,8 +50,25 @@ test("operator console keeps typed view and component boundaries", async () => {
   assert.match(sources.get("components/message-item.ts") ?? "", /renderMessageItem/u);
   assert.match(sources.get("components/tool-call.ts") ?? "", /terminalReason/u);
   assert.match(shell, /id="agent-graph-checkpoint-token" type="password" autocomplete="off" required/u);
+  assert.match(shell, /id="agent-graph-checkpoint-close" value="cancel" type="submit" formnovalidate/u);
+  assert.match(sources.get("views/agent-graphs.ts") ?? "", /aria-current=/u);
   assert.match(entry, /expectedResultDigest: node\.resultDigest, capabilityToken/u);
-  assert.match(entry, /agent-graph-checkpoint-token"\)\.value = ""/u);
+  assert.match(entry, /function clearAgentGraphCheckpointToken\(\)[\s\S]*agent-graph-checkpoint-token"\)\.value = ""/u);
+  assert.match(entry, /agent-graph-checkpoint-dialog"\)\.addEventListener\("cancel", clearAgentGraphCheckpointToken\)/u);
+  assert.match(entry, /agent-graph-checkpoint-dialog"\)\.addEventListener\("close", clearAgentGraphCheckpointToken\)/u);
+  const serialization = entry.indexOf("const serializedRequest = JSON.stringify(");
+  const immediateClear = entry.indexOf("clearAgentGraphCheckpointToken();", serialization);
+  const checkpointRequest = entry.indexOf('await api("/agent-graphs/"', serialization);
+  const serializedBody = entry.indexOf("body: serializedRequest", serialization);
+  assert.ok(serialization >= 0 && serialization < immediateClear && immediateClear < checkpointRequest && checkpointRequest < serializedBody,
+    "checkpoint tokens must clear after serialization and before starting the request");
+
+  const styles = await read(`${root}/styles.css`);
+  const graphBase = styles.indexOf(".agent-graph-layout { display: grid;");
+  const responsiveGraphLayout = styles.lastIndexOf("@media (max-width: 980px)");
+  assert.ok(graphBase >= 0 && responsiveGraphLayout > graphBase, "delegation responsive rules must follow the base graph layout");
+  assert.match(styles.slice(responsiveGraphLayout), /\.agent-graph-layout \{ grid-template-columns: minmax\(0, 1fr\); \}/u);
+  assert.match(styles, /@media \(max-width: 600px\)[\s\S]*\.agent-graph-row \{[\s\S]*grid-template-columns: minmax\(0, 1fr\) auto/u);
 });
 
 test("routine dependency groups exclude runtime and Node typing migrations", async () => {
