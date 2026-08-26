@@ -128,6 +128,7 @@ v1 compatibility policy before treating any interface as stable.
 - [Multi-user host](security/multi-user-host.md)
 - [Continuous security fuzzing](security/continuous-fuzzing.md)
 - [OpenSSF Scorecard triage](security/openssf-scorecard-triage.md)
+- [Odinn Maintainer remediation control-plane review](security/odinn-maintainer-control-plane-review.md)
 
 ## Planning and acceptance records
 
