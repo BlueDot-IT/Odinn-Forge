@@ -132,9 +132,8 @@ class BrowserNetworkProxy {
 
 type ChromiumCandidateSource = "configured" | "platform";
 
-function chromiumExecutableCandidates(): readonly Readonly<{ path: string; source: ChromiumCandidateSource }>[] {
-  const configured = process.env.ODINN_CHROMIUM_PATH;
-  const platformCandidates = [
+function platformChromiumExecutableCandidates(): readonly Readonly<{ path: string; source: "platform" }>[] {
+  return [
     process.platform === "win32" ? join(process.env.PROGRAMFILES ?? "C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe") : undefined,
     process.platform === "win32" ? join(process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)", "Microsoft", "Edge", "Application", "msedge.exe") : undefined,
     process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : undefined,
@@ -145,13 +144,13 @@ function chromiumExecutableCandidates(): readonly Readonly<{ path: string; sourc
     process.platform === "linux" ? join(homedir(), ".cache", "ms-playwright", "chromium", "chrome-linux", "chrome") : undefined
   ].filter((candidate): candidate is string => typeof candidate === "string")
     .map((path) => ({ path, source: "platform" as const }));
-  return configured
-    ? [{ path: configured, source: "configured" as const }, ...platformCandidates]
-    : platformCandidates;
 }
 
 async function resolveChromiumExecutableCandidate() {
-  const candidates = chromiumExecutableCandidates();
+  const configured = process.env.ODINN_CHROMIUM_PATH;
+  const candidates: readonly Readonly<{ path: string; source: ChromiumCandidateSource }>[] = configured
+    ? [{ path: configured, source: "configured" }]
+    : platformChromiumExecutableCandidates();
   for (const candidate of candidates) {
     try {
       const metadata = await stat(candidate.path);
@@ -172,14 +171,27 @@ async function resolveChromiumExecutable() {
 export async function probeChromiumEngine(): Promise<Readonly<{
   available: boolean;
   configured: boolean;
-  source: ChromiumCandidateSource | "unavailable";
+  source: "configured-unverified" | "platform" | "unavailable";
 }>> {
-  const configured = Boolean(process.env.ODINN_CHROMIUM_PATH);
+  if (process.env.ODINN_CHROMIUM_PATH) {
+    // Diagnostics must not dereference an arbitrary configured path. Browser
+    // execution performs the normal policy-bound validation when requested.
+    return Object.freeze({ available: false, configured: true, source: "configured-unverified" });
+  }
   try {
-    const candidate = await resolveChromiumExecutableCandidate();
-    return Object.freeze({ available: true, configured, source: candidate.source });
+    for (const candidate of platformChromiumExecutableCandidates()) {
+      try {
+        const metadata = await stat(candidate.path);
+        if (!metadata.isFile()) continue;
+        await access(candidate.path, constants.X_OK);
+        return Object.freeze({ available: true, configured: false, source: "platform" });
+      } catch {
+        // Try the next reviewed platform-native location.
+      }
+    }
+    return Object.freeze({ available: false, configured: false, source: "unavailable" });
   } catch {
-    return Object.freeze({ available: false, configured, source: "unavailable" });
+    return Object.freeze({ available: false, configured: false, source: "unavailable" });
   }
 }
 

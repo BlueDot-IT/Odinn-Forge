@@ -643,7 +643,8 @@ test("CLI doctor reports safe diagnostics without state paths or credentials", a
   assert.equal(init.status, 0, init.stderr || init.stdout);
   const chromiumFixture = await mkdtemp(join(tmpdir(), "odinn-cli-chromium-"));
   const chromiumProbe = join(chromiumFixture, "chromium-probe");
-  await writeFile(chromiumProbe, "#!/bin/sh\nexit 0\n");
+  const chromiumMarker = join(chromiumFixture, "launched");
+  await writeFile(chromiumProbe, `#!/bin/sh\nprintf launched > ${JSON.stringify(chromiumMarker)}\n`);
   await chmod(chromiumProbe, 0o700);
   const provider = spawnSync("node", ["apps/cli/src/cli.ts", "config", "provider", "add", "ci", "--base-url", "http://127.0.0.1:1/v1", "--model", "safe-model", "--api-key-env", "ODINN_DOCTOR_SECRET", "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(provider.status, 0, provider.stderr || provider.stdout);
@@ -655,13 +656,15 @@ test("CLI doctor reports safe diagnostics without state paths or credentials", a
   assert.equal(report.providerMode[0].configured, false);
   assert.equal(report.providerMode[0].supportTier, "custom");
   assert.equal(report.providerMode[0].genericCompatibilityMode, true);
-  assert.deepEqual(report.browserEngine, { available: true, configured: true, source: "configured" });
+  assert.deepEqual(report.browserEngine, { available: false, configured: true, source: "configured-unverified" });
+  await assert.rejects(() => access(chromiumMarker), { code: "ENOENT" });
   assert.equal(report.state.secretsExcludedFromDiagnostics, true);
   assert.equal("requestId" in report, false);
   assert.equal("correlationId" in report, false);
   assert.doesNotMatch(doctor.stdout, new RegExp(state.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(doctor.stdout, /chromium-probe/u);
   assert.doesNotMatch(doctor.stdout, /ODINN_DOCTOR_SECRET/);
+  await rm(chromiumFixture, { recursive: true, force: true });
 });
 
 test("CLI onboarding completes an OAuth PKCE callback locally", async () => {
