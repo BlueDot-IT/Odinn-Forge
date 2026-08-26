@@ -1,4 +1,4 @@
-import { accessSync, constants, lstatSync, realpathSync } from "node:fs";
+import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 export type TrustedToolName = "gpg" | "gpgv" | "gzip" | "sha256sum" | "shasum" | "tar" | "unzip" | "zip" | "zipinfo";
@@ -45,9 +45,10 @@ export function trustedTool(name: TrustedToolName): string {
     if (!isAbsolute(candidate)) continue;
     try {
       const metadata = lstatSync(candidate);
-      if (!metadata.isFile() || metadata.isSymbolicLink()) continue;
+      if (!metadata.isFile() && !metadata.isSymbolicLink()) continue;
       accessSync(candidate, constants.X_OK);
-      if (!isReviewedSystemToolPath(realpathSync(candidate))) continue;
+      const physicalCandidate = realpathSync(candidate);
+      if (!statSync(physicalCandidate).isFile() || !isReviewedSystemToolPath(physicalCandidate)) continue;
       const parent = dirname(candidate);
       if (!isReviewedSystemToolPath(`${realpathSync(parent)}/tool`)) continue;
       return candidate;
