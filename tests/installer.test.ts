@@ -265,6 +265,22 @@ test("installer refuses symlinked prefix ancestors and generated cache is ignore
   }
 });
 
+test("installer accepts platform-managed temporary-directory aliases", {
+  skip: process.platform !== "darwin" && process.platform !== "win32"
+}, async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-platform-alias-prefix-"));
+  try {
+    const prefix = join(temporary, "install");
+    const result = spawnSync(process.execPath, [
+      join(root, "scripts", "install.ts"), "status", "--prefix", prefix
+    ], { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { schemaVersion: 1, current: null, previous: null });
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("installer revalidates source and staging runtime identity after a copy race", {
   skip: process.platform === "win32"
 }, async () => {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, type Stats } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
@@ -290,12 +290,15 @@ async function requirePhysicalDirectory(path: string, label: string) {
 }
 
 async function requirePhysicalFile(path: string, label: string) {
-  await assertNoLinkedAncestors(dirname(path), `${label} parent`);
+  const reviewedDarwinAliasAncestor = await assertNoLinkedAncestors(dirname(path), `${label} parent`);
   const metadata = await lstat(path);
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
     throw new Error(`${label} must be a physical, uniquely linked file`);
   }
-  if (normalizePhysicalPath(await realpath(path)) !== normalizePhysicalPath(resolve(path))) {
+  const physicalPath = await realpath(path);
+  if (normalizePhysicalPath(physicalPath) !== normalizePhysicalPath(resolve(path))
+    && (!(process.platform === "win32" || reviewedDarwinAliasAncestor)
+      || !sameStableFilesystemIdentity(metadata, await lstat(physicalPath)))) {
     throw new Error(`${label} must not traverse a linked path`);
   }
   return metadata;
@@ -453,21 +456,55 @@ async function assertNoLinkedAncestors(path: string, label: string) {
   const absolute = resolve(path);
   const root = parse(absolute).root;
   let current = root;
+  let reviewedDarwinAliasAncestor = false;
   for (const component of absolute.slice(root.length).split(sep).filter(Boolean)) {
     current = join(current, component);
     let metadata;
     try {
       metadata = await lstat(current);
     } catch (error: any) {
-      if (error?.code === "ENOENT") return;
+      if (error?.code === "ENOENT") return reviewedDarwinAliasAncestor;
       throw error;
     }
-    if (metadata.isSymbolicLink()) throw new Error(`${label} must not traverse a symbolic link or reparse point`);
+    if (metadata.isSymbolicLink()) {
+      const physicalPath = await realpath(current);
+      const physical = await lstat(physicalPath);
+      if (!reviewedDarwinRootAlias(metadata, physical)) {
+        throw new Error(`${label} must not traverse a symbolic link or reparse point`);
+      }
+      reviewedDarwinAliasAncestor = true;
+      continue;
+    }
     if (!metadata.isDirectory() && current !== absolute) throw new Error(`${label} has a non-directory ancestor`);
-    if (normalizePhysicalPath(await realpath(current)) !== normalizePhysicalPath(current)) {
+    const physicalPath = await realpath(current);
+    if (normalizePhysicalPath(physicalPath) !== normalizePhysicalPath(current)
+      && (!(process.platform === "win32" || reviewedDarwinAliasAncestor)
+        || !sameStableFilesystemIdentity(metadata, await lstat(physicalPath)))) {
       throw new Error(`${label} must not traverse a linked ancestor`);
     }
   }
+  return reviewedDarwinAliasAncestor;
+}
+
+function reviewedDarwinRootAlias(link: Stats, physical: Stats) {
+  return process.platform === "darwin"
+    && link.uid === 0
+    && physical.isDirectory()
+    && !physical.isSymbolicLink()
+    && physical.uid === 0
+    && (physical.mode & 0o022) === 0;
+}
+
+function sameStableFilesystemIdentity(
+  lexical: Stats,
+  physical: Stats
+) {
+  return lexical.dev !== 0
+    && lexical.ino !== 0
+    && lexical.dev === physical.dev
+    && lexical.ino === physical.ino
+    && lexical.isDirectory() === physical.isDirectory()
+    && lexical.isFile() === physical.isFile();
 }
 
 async function acquireInstallLock(): Promise<() => Promise<void>> {
