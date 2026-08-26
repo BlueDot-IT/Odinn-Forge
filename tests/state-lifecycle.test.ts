@@ -31,6 +31,8 @@ async function preparedState() {
   await writeFile(join(state, "jobs.json"), `${JSON.stringify({ schemaVersion: 1, jobs: {} })}\n`);
   await writeFile(join(state, "approvals.json"), `${JSON.stringify({ schemaVersion: 1, approvals: [] })}\n`);
   await writeFile(join(state, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, status: "clear" })}\n`);
+  await writeFile(join(state, "channel-bindings.json"), `${JSON.stringify({ schemaVersion: 1, bindings: {} })}\n`);
+  await writeFile(join(state, "channel-dedupe.json"), `${JSON.stringify({ schemaVersion: 1, entries: {} })}\n`);
   await writeFile(join(state, "audit.jsonl"), "");
   await ensureStateCompatibility(state, { applicationVersion: "1.0.0", applicationCommit: "test-commit" });
   return { temporary, state };
@@ -71,6 +73,10 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     assert.equal(created.manifest.includesSensitiveState, false);
     assert.ok(created.manifest.files.some((file) => file.path === "records.jsonl"));
     assert.ok(created.manifest.files.some((file) => file.path === "audit.jsonl.keys.json"));
+    assert.ok(created.manifest.files.some((file) => file.path === "channel-bindings.json"));
+    assert.ok(created.manifest.files.some((file) => file.path === "channel-dedupe.json"));
+    assert.equal(created.manifest.stateSchemas.channelBindings, 1);
+    assert.equal(created.manifest.stateSchemas.channelDedupe, 1);
     for (const forbidden of ["oauth/openai.json", "credentials/custom-oauth.json", "browser-profile/Cookies", "gateway.token", "capability-signing.key", "approvals.json", "approvals.json.key", "bundles/sha256/bundle/workspace-secret.txt"]) {
       assert.equal(created.manifest.files.some((file) => file.path === forbidden), false);
     }
@@ -155,6 +161,40 @@ test("backup tampering and future schemas fail before restore", async () => {
     manifest.stateSchemas.config = 999;
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
     await assert.rejects(() => inspectStateBackup(backup), /future config schema/u);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("channel state schemas fail closed across status, backup, and restore", async () => {
+  const fixture = await preparedState();
+  const backup = join(fixture.temporary, "channel-backup");
+  try {
+    await createStateBackup(fixture.state, backup);
+    const bindingsPath = join(backup, "channel-bindings.json");
+    const futureBindings = `${JSON.stringify({ schemaVersion: 999, bindings: {} })}\n`;
+    await writeFile(bindingsPath, futureBindings);
+    const manifestPath = join(backup, "backup-manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const bindings = manifest.files.find((file: { path: string }) => file.path === "channel-bindings.json");
+    bindings.bytes = Buffer.byteLength(futureBindings);
+    bindings.sha256 = createHash("sha256").update(futureBindings).digest("hex");
+    delete manifest.stateSchemas.channelBindings;
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await assert.rejects(() => inspectStateBackup(backup), /future channelBindings schema/u);
+    await assert.rejects(
+      () => restoreStateBackup(backup, fixture.state, { skipCurrentBackup: true }),
+      /future channelBindings schema/u
+    );
+
+    await writeFile(join(fixture.state, "channel-dedupe.json"), `${JSON.stringify({ schemaVersion: 999, entries: {} })}\n`);
+    const status = await stateLifecycleStatus(fixture.state);
+    assert.equal(status.ok, false);
+    assert.equal(status.schemas.find((surface) => surface.surface === "channelDedupe")?.healthy, false);
+    await assert.rejects(
+      () => createStateBackup(fixture.state, join(fixture.temporary, "future-channel-backup")),
+      /active state is unhealthy/u
+    );
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
   }

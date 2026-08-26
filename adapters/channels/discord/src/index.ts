@@ -81,8 +81,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     edits: true,
     deletes: true,
     components: true,
-    nativeCommands: true,
-    streaming: true
+    nativeCommands: true
   };
   readonly #token: string;
   readonly #requireMention: boolean;
@@ -729,8 +728,7 @@ export const discordChannelPlugin: ChannelPlugin<DiscordChannelAccountConfig> = 
     edits: true,
     deletes: true,
     components: true,
-    nativeCommands: true,
-    streaming: true
+    nativeCommands: true
   },
   normalizeAccountConfig(_accountId, value) {
     const record = objectRecord(value);
@@ -840,13 +838,13 @@ function normalizeGuilds(value: unknown): Record<string, DiscordGuildPolicy> {
       const channel = objectRecord(rawChannel);
       return [[channelId, {
         enabled: channel.enabled !== false,
-        requireMention: channel.requireMention !== false,
+        ...(typeof channel.requireMention === "boolean" ? { requireMention: channel.requireMention } : {}),
         users: snowflakeArray(channel.users),
         roles: snowflakeArray(channel.roles)
       }]];
     }));
     return [[guildId, {
-      requireMention: guild.requireMention !== false,
+      ...(typeof guild.requireMention === "boolean" ? { requireMention: guild.requireMention } : {}),
       users: snowflakeArray(guild.users),
       roles: snowflakeArray(guild.roles),
       ...(Object.keys(channels).length ? { channels } : {})

@@ -18,6 +18,7 @@ import {
   FileSessionBindingStore,
   GatewayChannelHandler,
   createAllowlistPolicy,
+  projectChannelExecutionAudit,
   type ChannelExecutionStateEvent
 } from "@odinn/channels";
 import { authenticationMode, isMutatingMethod, permitsGatewayTokenBootstrap, validHostHeader, validMutationOrigin } from "./security.ts";
@@ -3560,23 +3561,26 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
   let started = false;
   return {
     status() {
-      return validateGatewayChannelDiagnosticsV1(configured.map((channel) => ({
-        name: channel.name,
-        type: channel.type,
-        enabled: channel.config.enabled,
-        running: channel.status.state === "connected" || channel.status.state === "starting" || channel.status.state === "degraded",
-        state: channel.status.state,
-        credentialConfigured: channelCredentialEnvironments(channel.config).every(Boolean),
-        credentialPresent: channelCredentialEnvironments(channel.config).every((name) => Boolean(process.env[name])),
-        allowlistEntries: channel.config.allowlist.length,
-        capabilities: channel.plugin.capabilities,
-        error: channel.publicError || (channel.status.error ? "channel adapter reported an error" : ""),
-        connectedAt: channel.status.connectedAt,
-        lastEventAt: channel.status.lastEventAt,
-        reconnectAttempts: channel.status.reconnectAttempts,
-        latencyMs: channel.status.latencyMs,
-        details: channel.status.details
-      })));
+      return validateGatewayChannelDiagnosticsV1(configured.map((channel) => {
+        const credentials = channelCredentialStatus(channel.config);
+        return {
+          name: channel.name,
+          type: channel.type,
+          enabled: channel.config.enabled,
+          running: channel.status.state === "connected" || channel.status.state === "starting" || channel.status.state === "degraded",
+          state: channel.status.state,
+          credentialConfigured: credentials.configured,
+          credentialPresent: credentials.present,
+          allowlistEntries: channel.config.allowlist.length,
+          capabilities: channel.plugin.capabilities,
+          error: channel.publicError || (channel.status.error ? "channel adapter reported an error" : ""),
+          connectedAt: channel.status.connectedAt,
+          lastEventAt: channel.status.lastEventAt,
+          reconnectAttempts: channel.status.reconnectAttempts,
+          latencyMs: channel.status.latencyMs,
+          details: channel.status.details
+        };
+      }));
     },
     async handleWebhook(request: any, response: any, url: URL) {
       const webhook = webhooks.get(url.pathname);
@@ -3634,6 +3638,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
             }
           });
           const recordChannelExecutionState = async (event: ChannelExecutionStateEvent) => {
+            const projection = projectChannelExecutionAudit(event);
             await auditStore.append({
               at: new Date().toISOString(),
               runId: event.executionKey,
@@ -3641,17 +3646,8 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
               actor: `channel:${channel.type}`,
               tool: "agent.run",
               decision: "allow",
-              message: event.error,
-              data: {
-                executionKey: event.executionKey,
-                state: event.state,
-                channel: event.message.address.channel,
-                accountId: event.message.address.accountId,
-                conversationId: event.message.address.conversationId,
-                conversationKind: event.message.address.conversationKind,
-                threadId: event.message.address.threadId,
-                inboundMessageId: event.message.id
-              }
+              ...projection.message ? { message: projection.message } : {},
+              data: projection.data
             });
           };
           const handler = new GatewayChannelHandler({
@@ -3726,9 +3722,18 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
 
 function channelCredentialEnvironments(config: any): string[] {
   return [
-    String(config.tokenEnv ?? ""),
-    ...Object.values(config.credentialEnvs ?? {}).map(String)
-  ].filter(Boolean);
+    config.tokenEnv,
+    ...Object.values(config.credentialEnvs ?? {})
+  ].map((value) => typeof value === "string" ? value.trim() : "");
+}
+
+function channelCredentialStatus(config: any): { configured: boolean; present: boolean } {
+  const environments = channelCredentialEnvironments(config);
+  const configured = environments.length > 0 && environments.every(Boolean);
+  return {
+    configured,
+    present: configured && environments.every((name) => typeof process.env[name] === "string" && process.env[name]!.length > 0)
+  };
 }
 
 async function diagnostics({ state, workspaceRoot, config, featureFlags, auditStore, approvalStore, supervisor, channelSupervisor, processRecoveryStartupError = false, sandboxRecoveryStartupError = false }: any): Promise<DiagnosticsReportV1> {

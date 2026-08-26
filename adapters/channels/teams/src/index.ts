@@ -40,8 +40,7 @@ export class TeamsChannelAdapter implements ChannelAdapter {
     media: true,
     edits: true,
     deletes: true,
-    components: true,
-    streaming: true
+    components: true
   };
   readonly #appId: string;
   readonly #adapter: CloudAdapter;
@@ -292,8 +291,7 @@ export const teamsChannelPlugin: ChannelPlugin<TeamsChannelAccountConfig> = {
     media: true,
     edits: true,
     deletes: true,
-    components: true,
-    streaming: true
+    components: true
   },
   normalizeAccountConfig(_accountId, value) {
     const record = objectRecord(value);

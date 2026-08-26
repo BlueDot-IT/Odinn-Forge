@@ -1138,7 +1138,8 @@ test("CLI configures Discord channels as mention-only by default", async () => {
     "apps/cli/src/cli.ts", "config", "channel", "add", "discord", "community",
     "--state", state,
     "--token-env", "ODINN_TEST_DISCORD_TOKEN",
-    "--allowlist", "discord:100,discord:800"
+    "--allowlist", "discord:100,discord:800",
+    "--allow-bots", "mentions"
   ], { cwd: root, encoding: "utf8" });
   assert.equal(add.status, 0, add.stderr || add.stdout);
   const channel = JSON.parse(add.stdout).channel;
@@ -1147,6 +1148,7 @@ test("CLI configures Discord channels as mention-only by default", async () => {
   const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
   assert.equal(config.channels.community.tokenEnv, "ODINN_TEST_DISCORD_TOKEN");
   assert.equal(config.channels.community.requireMention, true);
+  assert.equal(config.channels.community.allowBots, "mentions");
 
   await writeFile(join(state, ".env"), "ODINN_TEST_DISCORD_TOKEN=loaded-from-state\n", { mode: 0o600 });
   const listed = spawnSync("node", [
@@ -1158,5 +1160,17 @@ test("CLI configures Discord channels as mention-only by default", async () => {
   });
   assert.equal(listed.status, 0, listed.stderr || listed.stdout);
   assert.equal(JSON.parse(listed.stdout)[0].credentialPresent, true);
+  assert.equal(JSON.parse(listed.stdout)[0].allowBots, "mentions");
   assert.doesNotMatch(listed.stdout, /loaded-from-state/);
+
+  const doctor = spawnSync("node", [
+    "apps/cli/src/cli.ts", "doctor", "--state", state
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "ODINN_TEST_DISCORD_TOKEN"))
+  });
+  assert.equal(doctor.status, 0, doctor.stderr || doctor.stdout);
+  assert.equal(JSON.parse(doctor.stdout).channels[0].allowBots, "mentions");
+  assert.doesNotMatch(doctor.stdout, /loaded-from-state/);
 });

@@ -55,8 +55,7 @@ export class TelegramChannelAdapter implements ChannelAdapter {
     edits: true,
     deletes: true,
     components: true,
-    nativeCommands: true,
-    streaming: true
+    nativeCommands: true
   };
   readonly #token: string;
   readonly #pollTimeoutSeconds: number;
@@ -494,8 +493,7 @@ export const telegramChannelPlugin: ChannelPlugin<TelegramChannelAccountConfig> 
     edits: true,
     deletes: true,
     components: true,
-    nativeCommands: true,
-    streaming: true
+    nativeCommands: true
   },
   normalizeAccountConfig(_accountId, value) {
     const record = objectRecord(value);

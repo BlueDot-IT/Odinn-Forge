@@ -39,6 +39,45 @@ export interface ChannelExecutionStateEvent {
   message: InboundChannelMessage;
   error?: string;
 }
+export interface ChannelExecutionAuditProjection {
+  message?: string;
+  data: {
+    executionKey: string;
+    state: ChannelExecutionState;
+    channel: string;
+    accountId: string;
+    conversationId: string;
+    conversationKind: ChannelConversationKind;
+    threadId?: string;
+    inboundMessageId: string;
+  };
+}
+
+/**
+ * Project a channel lifecycle event into content-free durable audit evidence.
+ * Provider errors and untrusted message content stay out of the audit journal;
+ * operators still retain the stable identifiers needed to correlate the
+ * channel delivery with its durable job and session binding.
+ */
+export function projectChannelExecutionAudit(event: ChannelExecutionStateEvent): ChannelExecutionAuditProjection {
+  return {
+    ...(event.state === "uncertain"
+      ? { message: "channel run outcome requires operator review" }
+      : event.state === "delivery-failed"
+        ? { message: "channel reply delivery failed" }
+        : {}),
+    data: {
+      executionKey: event.executionKey,
+      state: event.state,
+      channel: event.message.address.channel,
+      accountId: event.message.address.accountId,
+      conversationId: event.message.address.conversationId,
+      conversationKind: event.message.address.conversationKind,
+      ...(event.message.address.threadId ? { threadId: event.message.address.threadId } : {}),
+      inboundMessageId: event.message.id
+    }
+  };
+}
 export interface OutboundChannelMessage {
   address: ChannelAddress;
   text?: string;
@@ -397,7 +436,7 @@ export class ChannelRouter {
   async #enqueue(adapter: ChannelAdapter, message: InboundChannelMessage): Promise<boolean> {
     validateInboundMessage(message);
     if (this.#options.access && !await this.#options.access.allows(message)) return false;
-    const deliveryKey = `${message.address.channel}:${message.address.accountId}:${message.id}`;
+    const deliveryKey = channelExecutionKey(message);
     if (!await this.#dedupe.claim(deliveryKey)) return false;
     const conversationKey = channelConversationKey(message.address);
     const conversationPending = this.#pendingByConversation.get(conversationKey) ?? 0;
@@ -848,62 +887,6 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
     return value;
   }
 
-  async #streamRequest(
-    path: string,
-    body: Record<string, unknown>,
-    signal: AbortSignal,
-    onDelta: (delta: string) => void | Promise<void>
-  ): Promise<Record<string, unknown>> {
-    let response: Response;
-    try {
-      response = await this.#fetch(`${this.#baseUrl}${path}`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${this.#token}`,
-          "content-type": "application/json",
-          accept: "text/event-stream"
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)])
-      });
-    } catch (error) {
-      throw new ChannelRetryableError(`gateway stream failed: ${error instanceof Error ? error.message : String(error)}`, {
-        cause: error
-      });
-    }
-    if (!response.ok || !response.body) {
-      const value = await response.json().catch(() => ({})) as Record<string, unknown>;
-      const message = typeof value.error === "string" ? value.error : `gateway stream failed with ${response.status}`;
-      if ([408, 425, 429].includes(response.status) || response.status >= 500) throw new ChannelRetryableError(message);
-      throw new Error(message);
-    }
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let result: Record<string, unknown> | undefined;
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const block = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const event = /^event:\s*(.+)$/mu.exec(block)?.[1] ?? "message";
-        const raw = /^data:\s*(.+)$/mu.exec(block)?.[1] ?? "{}";
-        const value = JSON.parse(raw) as Record<string, unknown>;
-        if (event === "delta" && typeof value.delta === "string") await onDelta(value.delta);
-        if (event === "result") result = value;
-        if (event === "error") {
-          const error = value.error;
-          throw new Error(typeof error === "string" ? error : "gateway stream failed");
-        }
-        boundary = buffer.indexOf("\n\n");
-      }
-    }
-    if (!result) throw new ChannelRetryableError("gateway stream ended without a result");
-    return result;
-  }
 }
 
 export function splitChannelText(text: string, maximumCodePoints: number): string[] {
@@ -955,9 +938,7 @@ function channelExternalMessageId(message: InboundChannelMessage, role: "user" |
   return [
     "channel",
     role,
-    message.address.channel,
-    message.address.accountId,
-    message.id
+    channelExecutionKey(message)
   ].map(encodeURIComponent).join(":");
 }
 function isChatMessage(value: unknown): value is { role: string; content: string } {
