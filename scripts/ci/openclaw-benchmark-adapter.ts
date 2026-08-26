@@ -46,14 +46,17 @@ function assertBenchmarkAuthStore(value: unknown): asserts value is Record<strin
   }
 }
 
-async function withConsoleDiagnosticsOnStderr<T>(operation: () => Promise<T>): Promise<T> {
+async function withRuntimeDiagnosticsOnStderr<T>(operation: () => Promise<T>): Promise<T> {
   const original = {
     debug: console.debug,
     info: console.info,
     log: console.log,
     warn: console.warn,
   };
+  const stdoutWrite = process.stdout.write;
+  const stderrWrite = process.stderr.write;
   const route = (...values: unknown[]) => console.error(...values);
+  (process.stdout as any).write = (...values: unknown[]) => Reflect.apply(stderrWrite, process.stderr, values);
   console.debug = route;
   console.info = route;
   console.log = route;
@@ -61,6 +64,7 @@ async function withConsoleDiagnosticsOnStderr<T>(operation: () => Promise<T>): P
   try {
     return await operation();
   } finally {
+    process.stdout.write = stdoutWrite;
     console.debug = original.debug;
     console.info = original.info;
     console.log = original.log;
@@ -91,7 +95,7 @@ export async function runOpenClawBenchmarkAdapter(args = process.argv.slice(2)):
     runtime.replaceRuntimeAuthProfileStoreSnapshots([{ agentDir, store: authStore }]);
     const prompt = await readFile(resolve(option(args, "--prompt-file")), "utf8");
     const trialId = option(args, "--trial-id");
-    const result = await withConsoleDiagnosticsOnStderr(() => runtime.agentCommand!({
+    const result = await withRuntimeDiagnosticsOnStderr(() => runtime.agentCommand!({
       message: prompt,
       agentId: "main",
       model: "openai/gpt-5.6-luna",
