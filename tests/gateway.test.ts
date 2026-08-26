@@ -387,6 +387,17 @@ test("gateway omits raw pending approval input before every read response", asyn
 
 test("gateway supervises configured channels without exposing credentials", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-channels-"));
+  const credentialNames = [
+    "ODINN_TEST_MISSING_TELEGRAM_TOKEN",
+    "ODINN_TEST_MISSING_DISCORD_TOKEN",
+    "ODINN_TEST_EMPTY_TELEGRAM_TOKEN",
+    "ODINN_TEST_PRESENT_SLACK_TOKEN"
+  ];
+  const previousCredentials = new Map(credentialNames.map((name) => [name, process.env[name]]));
+  delete process.env.ODINN_TEST_MISSING_TELEGRAM_TOKEN;
+  delete process.env.ODINN_TEST_MISSING_DISCORD_TOKEN;
+  process.env.ODINN_TEST_EMPTY_TELEGRAM_TOKEN = "";
+  process.env.ODINN_TEST_PRESENT_SLACK_TOKEN = "fixture-value";
   await writeFile(join(stateDir, "config.json"), JSON.stringify({
     version: 1,
     channels: {
@@ -402,6 +413,29 @@ test("gateway supervises configured channels without exposing credentials", asyn
         tokenEnv: "ODINN_TEST_MISSING_DISCORD_TOKEN",
         allowlist: ["discord:100"],
         requireMention: true
+      },
+      missingReference: {
+        type: "telegram",
+        enabled: true,
+        allowlist: ["telegram:100"]
+      },
+      emptyReference: {
+        type: "telegram",
+        enabled: true,
+        tokenEnv: "",
+        allowlist: ["telegram:100"]
+      },
+      emptyValue: {
+        type: "telegram",
+        enabled: true,
+        tokenEnv: "ODINN_TEST_EMPTY_TELEGRAM_TOKEN",
+        allowlist: ["telegram:100"]
+      },
+      missingRequiredReference: {
+        type: "slack",
+        enabled: true,
+        tokenEnv: "ODINN_TEST_PRESENT_SLACK_TOKEN",
+        allowlist: ["slack:100"]
       }
     }
   }));
@@ -410,21 +444,35 @@ test("gateway supervises configured channels without exposing credentials", asyn
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     await new Promise((resolveWait) => setImmediate(resolveWait));
-    const result = await getJson(`${base}/channels`);
-    assert.equal(result.ok, true);
-    assert.equal(result.channels[0].name, "personal");
-    assert.equal(result.channels[0].running, false);
-    assert.equal(result.channels[0].credentialConfigured, true);
-    assert.equal(result.channels[0].credentialPresent, false);
-    assert.match(result.channels[0].error, /credential is unavailable/);
-    const discord = result.channels.find((channel: any) => channel.name === "community");
-    assert.equal(discord.type, "discord");
-    assert.equal(discord.running, false);
-    assert.equal(discord.credentialPresent, false);
-    const diagnostics = await getJson(`${base}/diagnostics`);
-    assert.ok(diagnostics.channels.every((channel: any) => channel.credentialPresent === false));
+    for (const path of ["/channels", "/diagnostics"]) {
+      const result = await getJson(`${base}${path}`);
+      assert.equal(result.ok, true, path);
+      const byName = new Map(result.channels.map((channel: any) => [channel.name, channel]));
+      const personal = byName.get("personal") as any;
+      assert.equal(personal.running, false, path);
+      assert.equal(personal.credentialConfigured, true, path);
+      assert.equal(personal.credentialPresent, false, path);
+      assert.match(personal.error, /credential is unavailable/u, path);
+      const discord = byName.get("community") as any;
+      assert.equal(discord.type, "discord", path);
+      assert.equal(discord.running, false, path);
+      assert.equal(discord.credentialConfigured, true, path);
+      assert.equal(discord.credentialPresent, false, path);
+      for (const name of ["missingReference", "emptyReference", "missingRequiredReference"]) {
+        const channel = byName.get(name) as any;
+        assert.equal(channel.credentialConfigured, false, `${path}: ${name}`);
+        assert.equal(channel.credentialPresent, false, `${path}: ${name}`);
+      }
+      const emptyValue = byName.get("emptyValue") as any;
+      assert.equal(emptyValue.credentialConfigured, true, path);
+      assert.equal(emptyValue.credentialPresent, false, path);
+    }
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+    for (const [name, value] of previousCredentials) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 

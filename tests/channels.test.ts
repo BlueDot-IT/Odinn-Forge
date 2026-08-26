@@ -8,12 +8,12 @@ import test from "node:test";
 import { isOwnerOnlyPath } from "../packages/store-file/src/index.ts";
 import {
   ChannelAdmissionError, ChannelRetryableError, ChannelRouter, ChannelRunUncertainError, FileChannelDedupeStore, FileSessionBindingStore,
-  GatewayChannelHandler, channelConversationKey, channelExecutionKey, createAllowlistPolicy, splitChannelText,
+  GatewayChannelHandler, channelConversationKey, channelExecutionKey, createAllowlistPolicy, projectChannelExecutionAudit, splitChannelText,
   type ChannelAcknowledgement, type ChannelAdapter, type ChannelStartContext,
   type InboundChannelMessage, type OutboundChannelMessage
 } from "../packages/channels/src/index.ts";
 import {
-  TelegramChannelAdapter, normalizeTelegramCallbackQuery, normalizeTelegramUpdate
+  TelegramChannelAdapter, normalizeTelegramCallbackQuery, normalizeTelegramUpdate, telegramChannelPlugin
 } from "../adapters/channels/telegram/src/index.ts";
 import {
   DiscordChannelAdapter, createDiscordAccessPolicy, discordChannelPlugin,
@@ -77,6 +77,31 @@ test("channel router enforces allowlists, deduplicates deliveries, and returns r
     { id: "10", acknowledgement: "processing" },
     { id: "10", acknowledgement: "succeeded" }
   ]);
+});
+
+test("channel dedupe scopes provider message identifiers to the full conversation", async () => {
+  const adapter = new FixtureAdapter();
+  const handled: string[] = [];
+  const router = new ChannelRouter({
+    async handle(input) {
+      handled.push(`${input.address.conversationId}:${input.id}`);
+      return "accepted";
+    }
+  });
+  await router.attach(adapter);
+  const firstChat = message({
+    id: "1",
+    address: { channel: "telegram", accountId: "personal", conversationId: "200", conversationKind: "group" }
+  });
+  const secondChat = message({
+    id: "1",
+    address: { channel: "telegram", accountId: "personal", conversationId: "201", conversationKind: "group" }
+  });
+  assert.notEqual(channelExecutionKey(firstChat), channelExecutionKey(secondChat));
+  assert.equal(await adapter.deliver?.(firstChat), true);
+  assert.equal(await adapter.deliver?.(secondChat), true);
+  assert.equal(await adapter.deliver?.(firstChat), false);
+  assert.deepEqual(handled, ["200:1", "201:1"]);
 });
 
 test("channel acknowledgements report failures without changing delivery semantics", async () => {
@@ -324,11 +349,17 @@ test("gateway channel handler submits one durable run and reconciles its result"
     onExecutionState(event) { states.push(event.state); }
   });
 
-  const reply = await handler.handle(input, { signal: new AbortController().signal });
+  let deltas = 0;
+  const reply = await handler.handle(input, {
+    signal: new AbortController().signal,
+    onDelta() { deltas += 1; }
+  });
   assert.equal(reply, "durable answer");
+  assert.equal(deltas, 0);
   assert.deepEqual(states, ["accepted", "running", "completed"]);
   assert.equal(calls.filter((call) => call.method === "POST" && call.url.endsWith("/jobs")).length, 1);
   assert.equal(calls.find((call) => call.url.endsWith("/jobs"))?.headers.get("idempotency-key"), executionKey);
+  assert.equal(calls.some((call) => call.headers.get("accept") === "text/event-stream"), false);
 });
 
 test("gateway channel handler safely resubmits the same key after an accepted receipt is lost", async () => {
@@ -402,7 +433,46 @@ test("gateway channel handler treats a recovered uncertain job as non-replayable
   assert.deepEqual(states, ["accepted", "uncertain"]);
 });
 
-test("channel router streams drafts through one message and finalizes by editing", async () => {
+test("channel execution audit projection omits provider errors and untrusted content", () => {
+  const projection = projectChannelExecutionAudit({
+    executionKey: "telegram:personal:direct:200::10",
+    state: "uncertain",
+    error: "SENTINEL_PROVIDER_ERROR",
+    message: message({
+      text: "SENTINEL_MESSAGE_CONTENT",
+      sender: {
+        id: "100",
+        displayName: "SENTINEL_DISPLAY_NAME",
+        username: "SENTINEL_USERNAME"
+      },
+      attachments: [{ filename: "SENTINEL_ATTACHMENT", description: "SENTINEL_DESCRIPTION" }],
+      metadata: { providerPayload: "SENTINEL_METADATA" }
+    })
+  });
+
+  assert.equal(projection.message, "channel run outcome requires operator review");
+  assert.deepEqual(projection.data, {
+    executionKey: "telegram:personal:direct:200::10",
+    state: "uncertain",
+    channel: "telegram",
+    accountId: "personal",
+    conversationId: "200",
+    conversationKind: "direct",
+    inboundMessageId: "10"
+  });
+  const durable = JSON.stringify(projection);
+  for (const sentinel of [
+    "SENTINEL_PROVIDER_ERROR",
+    "SENTINEL_MESSAGE_CONTENT",
+    "SENTINEL_DISPLAY_NAME",
+    "SENTINEL_USERNAME",
+    "SENTINEL_ATTACHMENT",
+    "SENTINEL_DESCRIPTION",
+    "SENTINEL_METADATA"
+  ]) assert.equal(durable.includes(sentinel), false, sentinel);
+});
+
+test("a custom handler can opt into router draft edits", async () => {
   const adapter = new FixtureAdapter();
   const router = new ChannelRouter({
     async handle(_input, context) {
@@ -417,6 +487,11 @@ test("channel router streams drafts through one message and finalizes by editing
   assert.equal(adapter.sent[0].text, "partial ");
   assert.equal(adapter.sent[0].replyToId, "30");
   assert.equal(adapter.edits.at(-1)?.message.text, "partial reply");
+});
+
+test("production channel plugins advertise durable final replies rather than token streaming", () => {
+  assert.equal(telegramChannelPlugin.capabilities.streaming, undefined);
+  assert.equal(discordChannelPlugin.capabilities.streaming, undefined);
 });
 
 test("file channel dedupe survives restarts and permits released claims", async () => {
@@ -853,6 +928,64 @@ test("Telegram adapter supports rich delivery, reactions, typing, edits, and com
   await adapter.stop();
 });
 
+test("Telegram partial delivery is terminal and is not replayed", async () => {
+  const handlers = new Map<string, (context: any) => Promise<void> | void>();
+  let sendAttempts = 0;
+  const fakeBot = {
+    botInfo: { id: 600, username: "odinn_bot" },
+    api: new Proxy({}, {
+      get(_target, method: string) {
+        return async () => {
+          if (method !== "sendMessage") return true;
+          sendAttempts += 1;
+          if (sendAttempts === 1) return { message_id: 1 };
+          const error = new Error("provider rejected the second chunk") as Error & { error_code: number };
+          error.error_code = 400;
+          throw error;
+        };
+      }
+    }),
+    on(filter: string | string[], handler: (context: any) => Promise<void> | void) {
+      for (const entry of Array.isArray(filter) ? filter : [filter]) handlers.set(entry, handler);
+    },
+    catch() {},
+    async start(options: any) { await options.onStart(this.botInfo); },
+    async stop() {}
+  };
+  const adapter = new TelegramChannelAdapter({ token: "test-token", botFactory: () => fakeBot as any });
+  let modelRuns = 0;
+  const states: string[] = [];
+  const router = new ChannelRouter({
+    async handle() {
+      modelRuns += 1;
+      return "x".repeat(4_097);
+    }
+  }, {
+    maxAttempts: 3,
+    access: createAllowlistPolicy(["telegram:100"]),
+    onExecutionState(event) { states.push(event.state); }
+  });
+  await router.attach(adapter);
+  const context = {
+    update: {
+      update_id: 900,
+      message: {
+        message_id: 10,
+        date: 1_785_081_600,
+        text: "run",
+        chat: { id: 200, type: "private" },
+        from: { id: 100, first_name: "Operator" }
+      }
+    }
+  };
+  await handlers.get("message")?.(context);
+  await handlers.get("message")?.(context);
+  assert.equal(modelRuns, 1);
+  assert.equal(sendAttempts, 2);
+  assert.deepEqual(states, ["delivery-failed"]);
+  await router.stop([adapter]);
+});
+
 test("channel text splitting preserves Unicode and prefers word boundaries", () => {
   assert.deepEqual(splitChannelText("alpha beta gamma", 10), ["alpha", "beta gamma"]);
   assert.deepEqual(splitChannelText("🪁🪁🪁", 2), ["🪁🪁", "🪁"]);
@@ -925,6 +1058,40 @@ test("Discord plugin enforces DM, guild, channel, role, and mention policy", asy
   })), false);
 });
 
+test("Discord nested mention rules inherit from parents and explicit children take precedence", async () => {
+  const config = discordChannelPlugin.normalizeAccountConfig("home", {
+    enabled: true,
+    tokenEnv: "DISCORD_BOT_TOKEN",
+    groupPolicy: "allowlist",
+    requireMention: false,
+    guilds: {
+      "700": {
+        channels: {
+          "800": { enabled: true },
+          "801": { enabled: true, requireMention: true }
+        }
+      },
+      "701": {
+        requireMention: true,
+        channels: {
+          "802": { enabled: true, requireMention: false }
+        }
+      }
+    }
+  });
+  assert.equal(config.guilds["700"]?.requireMention, undefined);
+  assert.equal(config.guilds["700"]?.channels?.["800"]?.requireMention, undefined);
+  const policy = createDiscordAccessPolicy(config);
+  const guildMessage = (guildId: string, conversationId: string, mentionedBot = false) => message({
+    address: { channel: "discord", accountId: "home", conversationId, conversationKind: "channel" },
+    metadata: { guildId, ...(mentionedBot ? { mentionedBot: true } : {}) }
+  });
+  assert.equal(await policy.allows(guildMessage("700", "800")), true, "account false must flow through omitted guild and channel rules");
+  assert.equal(await policy.allows(guildMessage("700", "801")), false, "explicit channel true must override inherited account false");
+  assert.equal(await policy.allows(guildMessage("700", "801", true)), true);
+  assert.equal(await policy.allows(guildMessage("701", "802")), true, "explicit channel false must override guild true");
+});
+
 test("Discord replies disable mention parsing and respect the 2000-character limit", async () => {
   const sent: any[] = [];
   const client = fixtureDiscordClient({
@@ -956,6 +1123,66 @@ test("Discord replies disable mention parsing and respect the 2000-character lim
   } finally {
     await adapter.stop();
   }
+});
+
+test("Discord partial delivery is terminal and is not replayed", async () => {
+  let sendAttempts = 0;
+  const client = fixtureDiscordClient({
+    channel: {
+      isTextBased: () => true,
+      async send() {
+        sendAttempts += 1;
+        if (sendAttempts === 1) return { id: "1" };
+        throw new Error("provider rejected the second chunk");
+      }
+    }
+  });
+  const adapter = new DiscordChannelAdapter({
+    token: "test-token",
+    requireMention: false,
+    clientFactory: () => client
+  });
+  const config = discordChannelPlugin.normalizeAccountConfig("community", {
+    enabled: true,
+    tokenEnv: "ODINN_TEST_DISCORD_TOKEN",
+    allowlist: ["discord:500"],
+    requireMention: true
+  });
+  let modelRuns = 0;
+  const states: string[] = [];
+  let resolveDeliveryFailure: (() => void) | undefined;
+  const deliveryFailure = new Promise<void>((resolveFailure) => { resolveDeliveryFailure = resolveFailure; });
+  const router = new ChannelRouter({
+    async handle() {
+      modelRuns += 1;
+      return "x".repeat(2_001);
+    }
+  }, {
+    maxAttempts: 3,
+    access: createDiscordAccessPolicy(config),
+    onExecutionState(event) {
+      states.push(event.state);
+      if (event.state === "delivery-failed") resolveDeliveryFailure?.();
+    }
+  });
+  await router.attach(adapter);
+  const providerMessage = {
+    id: "900",
+    channelId: "800",
+    guildId: "700",
+    content: "<@600> run",
+    createdTimestamp: Date.parse("2026-07-26T12:00:00.000Z"),
+    author: { id: "500", username: "operator", bot: false },
+    mentions: [{ id: "600" }]
+  };
+  client.emit("messageCreate", providerMessage);
+  await deliveryFailure;
+  client.emit("messageCreate", providerMessage);
+  await new Promise((resolveWait) => setImmediate(resolveWait));
+  assert.equal(modelRuns, 1);
+  assert.equal(sendAttempts, 2);
+  assert.deepEqual(states, ["delivery-failed"]);
+  await router.stop([adapter]);
 });
 
 test("Discord acknowledgements replace the processing reaction with a terminal reaction", async () => {

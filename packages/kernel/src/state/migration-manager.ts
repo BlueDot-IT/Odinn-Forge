@@ -22,6 +22,8 @@ const RECOGNIZED_STATE_ENTRIES = new Set([
   "browser-recovery.json",
   "browser-tabs.json",
   "sandbox-recovery.json",
+  "channel-bindings.json",
+  "channel-dedupe.json",
   "cron-jobs.json",
   "extensions.json",
   "agents.json",
@@ -143,6 +145,8 @@ export async function inspectStateSchemas(stateDir: string): Promise<StateInspec
   put(statuses, "approvals", await inspectApprovals(join(stateRoot, "approvals.json")));
   put(statuses, "browserRecovery", await inspectBrowserRecovery(stateRoot));
   put(statuses, "sandboxRecovery", await inspectVersionedObject(join(stateRoot, "sandbox-recovery.json"), "pending", "array"));
+  put(statuses, "channelBindings", await inspectVersionedObject(join(stateRoot, "channel-bindings.json"), "bindings", "object"));
+  put(statuses, "channelDedupe", await inspectVersionedObject(join(stateRoot, "channel-dedupe.json"), "entries", "object"));
   put(statuses, "cron", await inspectVersionedObject(join(stateRoot, "cron-jobs.json"), "jobs", "array"));
   put(statuses, "extensions", await inspectVersionedObject(join(stateRoot, "extensions.json"), "extensions", "object"));
   put(statuses, "skills", await inspectVersionedObject(join(stateRoot, "skills", "registry.json"), "packages", "array"));
@@ -544,10 +548,11 @@ async function inspectHostMetadata(stateRoot: string, hasState: boolean): Promis
   const storeVersions = value.value.storeVersions;
   if (!storeVersions || typeof storeVersions !== "object" || Array.isArray(storeVersions)) throw new Error(`${MANIFEST_FILENAME} has no storeVersions object`);
   for (const surface of Object.keys(STATE_SCHEMA_TARGETS) as StateSurface[]) {
-    // sandboxRecovery was added as an independently initialized operational
-    // journal after the v1 compatibility manifest shipped. Its absence from an
-    // older manifest means the target v1 surface, not an unknown schema.
-    if (!(surface in storeVersions) && surface === "sandboxRecovery") continue;
+    // These independently initialized journals were registered after the v1
+    // compatibility manifest shipped. Their absence from an older manifest
+    // means the target v1 surface; their physical files are still inspected
+    // above and future versions fail closed.
+    if (!(surface in storeVersions) && ["sandboxRecovery", "channelBindings", "channelDedupe"].includes(surface)) continue;
     if (!(surface in storeVersions)) throw new Error(`${MANIFEST_FILENAME} is missing ${surface}`);
     const recordedVersion = schemaNumber((storeVersions as Record<string, unknown>)[surface], `${MANIFEST_FILENAME}.${surface}`);
     if (recordedVersion > STATE_SCHEMA_TARGETS[surface]) {
@@ -662,6 +667,8 @@ function schemaTargetForPath(path: string): number {
   if (normalized.endsWith("/skills/registry.json")) return STATE_SCHEMA_TARGETS.skills;
   if (normalized.endsWith("/agents.json")) return STATE_SCHEMA_TARGETS.agents;
   if (normalized.endsWith("/sandbox-recovery.json")) return STATE_SCHEMA_TARGETS.sandboxRecovery;
+  if (normalized.endsWith("/channel-bindings.json")) return STATE_SCHEMA_TARGETS.channelBindings;
+  if (normalized.endsWith("/channel-dedupe.json")) return STATE_SCHEMA_TARGETS.channelDedupe;
   throw new Error(`no schema target owns ${path}`);
 }
 

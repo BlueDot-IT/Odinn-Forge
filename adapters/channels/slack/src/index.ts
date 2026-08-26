@@ -48,8 +48,7 @@ export class SlackChannelAdapter implements ChannelAdapter {
     edits: true,
     deletes: true,
     components: true,
-    nativeCommands: true,
-    streaming: true
+    nativeCommands: true
   };
   readonly #token: string;
   readonly #appToken: string;
@@ -382,8 +381,7 @@ export const slackChannelPlugin: ChannelPlugin<SlackChannelAccountConfig> = {
     edits: true,
     deletes: true,
     components: true,
-    nativeCommands: true,
-    streaming: true
+    nativeCommands: true
   },
   normalizeAccountConfig(_accountId, value) {
     const record = objectRecord(value);

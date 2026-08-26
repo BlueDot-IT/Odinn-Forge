@@ -49,7 +49,8 @@ are not additional plugin switches:
 - [SQLite memory index](../sqlite-memory-index.md)
 - [Provider capability metadata](../provider-capability-metadata.md)
 - [Gateway Protocol v2](../gateway-protocol-v2.md)
-- [Messaging channels](../channels.md) (experimental)
+- [Messaging channels](../channels.md) (Discord and Telegram supported;
+  remaining adapters experimental)
 
 ## Related boundaries
 

@@ -1,12 +1,35 @@
 # Messaging channels
 
-Messaging channels are an experimental plugin interface. They connect external chat
-networks to the stable authenticated loopback gateway without giving transport
-adapters direct access to model providers, records, tools, or workspace files.
+Discord and Telegram are supported local single-user integration slices. Their
+configuration, permission inspection, authenticated gateway routing,
+credential-redacted diagnostics, durable session binding, audit projection,
+and no-replay recovery behavior are maintained interfaces. Live network,
+account, quota, permission, and provider behavior remains provider-dependent.
 
-Telegram and Discord are the first production adapters. Future adapters
-register a `ChannelPlugin` and implement the shared `ChannelAdapter` contract
-rather than duplicating account, conversation, lifecycle, or policy logic.
+The shared channel plugin interface and the Slack, Microsoft Teams, and
+WhatsApp adapters remain experimental. Future adapters register a
+`ChannelPlugin` and implement the shared `ChannelAdapter` contract rather than
+duplicating account, conversation, lifecycle, or policy logic.
+
+## Supported-slice contract
+
+| Requirement | Discord and Telegram control |
+| --- | --- |
+| Onboarding | `odinn config channel add`, `enable`, `disable`, `remove`, and `list` provide the documented local setup path. New accounts are disabled until explicitly enabled. |
+| Permission inspection | `odinn config channel list` shows the enabled state, credential presence, allowlist count, mention behavior, and Discord DM/group/bot policies. The authenticated console and `GET /config` expose the exact configured allowlist and Discord guild/channel rules without credential values. |
+| Secret handling | Configuration stores only credential-oriented environment-variable names. Parent-process and explicitly selected owner-only state `.env` values are inputs; token values are excluded from config, state projections, diagnostics, and command output. |
+| Approval behavior | Enabling an inbound account authorizes automatic replies to messages admitted by that account policy; those replies do not prompt per message. Discord agent read tools are read-only. Every Discord agent mutation consumes an exact, one-time approval before provider dispatch. Telegram currently exposes no separate agent-side mutation tool surface. Native command registration occurs only when the operator explicitly enables it. |
+| Diagnostics | `odinn status`, `odinn doctor`, and `GET /channels` report bounded lifecycle, capability, reconnect, timing, allowlist-count, and credential-presence fields. Provider errors, adapter detail bags, and credential values are not returned. |
+| Audit projection | `channel.execution` records lifecycle state and correlation identifiers only. Message text, attachment data, sender names/usernames, provider error bodies, and credentials are excluded; uncertain and delivery-failure messages are categorical. Accepted message and reply content still belongs to the local session transcript. |
+| Recovery | The channel/account/conversation/thread/message identity binds one durable job. Lost receipts reconcile the same job. Restart-uncertain model outcomes and partial provider deliveries fail closed and are never automatically replayed; a failed terminal delivery does not rerun the model. |
+| Integration tests | Repository tests drive both real adapter implementations through injected Discord and Telegram transports. They cover ingress, permission gates, delivery bounds, diagnostics, durable reconciliation, restart uncertainty, provider-partial delivery, and duplicate suppression without contacting either provider. |
+| Operator documentation | This page is the supported setup, security, diagnostics, recovery, and troubleshooting reference for both slices. |
+
+The deterministic repository acceptance harness is the release gate because it
+can reproduce failure boundaries without credentials or uncontrolled external
+messages. A live bot-account exercise is supplemental provider UAT, not proof
+of the local safety contract. The repository does not accept production bot
+credentials or send live Discord/Telegram messages from automated tests.
 
 ## Architecture
 
@@ -24,8 +47,9 @@ execution key is derived from the channel, account, conversation, thread, and
 inbound message ID. A dropped connection therefore reconciles the existing
 queued, running, completed, or restart-uncertain job instead of submitting a
 second run. Result delivery is a separate retry phase: a failed adapter send
-does not rerun the model. Binding and deduplication state are local,
-owner-only, and written atomically.
+does not rerun the model. The production handler delivers the one durable final
+result after job reconciliation; it does not advertise live token streaming.
+Binding and deduplication state are local, owner-only, and written atomically.
 
 Channel execution audit records use explicit states: `accepted`, `running`,
 `reconciled`, `completed`, `uncertain` after a restart-quarantined outcome, and
@@ -34,12 +58,14 @@ Channel execution audit records use explicit states: `accepted`, `running`,
 
 ### Channel state persistence and recovery
 
-Binding and deduplication files retain schema version `1` and use the shared
-secure JSON mutation primitive from `@odinn/store-file`. Each complete
-read/validate/mutate/replace operation is guarded by a token-owned lock at
-`<state-file>.lock`. Lock acquisition is bounded and fail-closed; a stale lock
-is not reclaimed automatically because an operator must first verify that no
-Odinn process still owns it.
+`channel-bindings.json` and `channel-dedupe.json` are stable schema-version `1`
+stores owned by `@odinn/channels`. State status, migration planning, backup, and
+restore inspect both files and fail closed on an unknown future version. They
+use the shared secure JSON mutation primitive from `@odinn/store-file`. Each
+complete read/validate/mutate/replace operation is guarded by a token-owned
+lock at `<state-file>.lock`. Lock acquisition is bounded and fail-closed; a
+stale lock is not reclaimed automatically because an operator must first
+verify that no Odinn process still owns it.
 
 State files and their immediate parent are validated as owner-only regular
 paths. Corrupt schemas, invalid entries, symbolic-link state files or parents,
@@ -98,7 +124,8 @@ Allowlist entries can identify a sender (`telegram:<user-id>`) or an entire
 conversation (`telegram:<chat-id>`). An empty allowlist denies everyone.
 Telegram supports text and attachment ingress, media egress, forum topics,
 typing indicators, reactions, reply markup buttons, message edits/deletion,
-streaming drafts, and callback-query routing. Native `/odinn` registration is
+and callback-query routing. Replies are sent after the durable model job reaches
+a terminal completed result. Native `/odinn` registration is
 opt-in with `--native-commands true`.
 
 Use `odinn config channel list`, `odinn status`, `odinn doctor`, or
@@ -107,8 +134,9 @@ displaying the credential. Channels can also be edited under Messaging
 channels in the local console configuration page. Configuration changes take
 effect after the gateway restarts.
 
-The operator workflow remains an experimental interface and is outside the v1
-compatibility promise.
+The local configuration, routing, diagnostics, and recovery workflow is a
+supported interface. Telegram service availability and bot-account behavior
+remain provider-dependent.
 
 ## Configure Discord
 
@@ -148,8 +176,9 @@ Accepted messages receive `👀` while processing, replaced by `✅` after a
 successful reply or `❌` when processing fails. Reaction failures never block
 message handling or replies.
 Outbound replies disable Discord mention parsing so model-generated text cannot
-unexpectedly ping users or roles. Replies can stream into a single edited
-message, carry attachments and buttons, and remain in the originating thread.
+unexpectedly ping users or roles. Replies carry attachments and buttons and
+remain in the originating thread; normal delivery waits for the durable final
+model result.
 
 Discord accounts support:
 
@@ -200,7 +229,9 @@ Advanced guild rules are edited in the local console or directly in
 }
 ```
 
-When a guild contains a `channels` map, unlisted channels are denied. Native
+When a guild contains a `channels` map, unlisted channels are denied. An omitted
+channel `requireMention` inherits the guild value, and an omitted guild value
+inherits the account value; an explicit child value takes precedence. Native
 command registration is disabled by default because it changes the bot
 application's command registry.
 
@@ -254,7 +285,7 @@ odinn config channel enable work
 
 Slack supports DMs, channels, threads, mentions, Socket Mode reconnects,
 reactions, files, Block Kit buttons, edits/deletion, slash-command ingress,
-streaming drafts, and credential-safe `auth.test` health probes. Bot and
+and credential-safe `auth.test` health probes. Bot and
 subtype events are rejected before routing.
 
 ## Configure Microsoft Teams
@@ -283,7 +314,7 @@ odinn config channel enable work
 ```
 
 Teams supports personal chats, channels, reply chains, attachments, typing,
-suggested-action buttons, edits/deletion, and streaming drafts. Conversation
+suggested-action buttons, and edits/deletion. Conversation
 references are learned only from authenticated inbound activities; proactive
 delivery cannot escape into an unknown conversation.
 

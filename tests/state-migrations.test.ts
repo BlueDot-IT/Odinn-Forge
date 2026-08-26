@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { createRunLedger, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, STATE_SCHEMA_TARGETS } from "../packages/kernel/src/index.ts";
+import { createRunLedger, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, STATE_SCHEMA_TARGETS, stateLifecycleStatus } from "../packages/kernel/src/index.ts";
 import { ArtifactStore, inspectExistingSqliteSchema, RunLedger, SqliteJobStore, SqliteStore } from "../packages/store-sqlite/src/index.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -76,6 +76,13 @@ test("release-candidate and empty state need no migration", async () => {
   const empty = await mkdtemp(join(tmpdir(), "odinn-state-empty-"));
   try {
     assert.deepEqual((await planStateMigration(candidate.state)).steps, []);
+    const legacyManifestPath = join(candidate.state, "state-schema.json");
+    const legacyManifest = JSON.parse(await readFile(legacyManifestPath, "utf8"));
+    delete legacyManifest.storeVersions.channelBindings;
+    delete legacyManifest.storeVersions.channelDedupe;
+    await writeFile(legacyManifestPath, `${JSON.stringify(legacyManifest, null, 2)}\n`);
+    assert.deepEqual((await planStateMigration(candidate.state)).steps, []);
+    assert.equal((await inspectStateSchemas(candidate.state)).healthy, true);
     assert.deepEqual((await planStateMigration(join(empty, "state"))).steps, []);
     assert.equal(await ensureStateCompatibility(join(empty, "state")), undefined);
   } finally {
@@ -352,6 +359,16 @@ test("corrupted and unknown future state fail closed without replacing working f
     const futureJobs = await readFile(join(future.state, "jobs.json"), "utf8");
     const plan = await planStateMigration(future.state);
     assert.match(plan.blockingIncompatibilities.join("\n"), /jobs schema 99 is newer/u);
+    assert.match(plan.blockingIncompatibilities.join("\n"), /channelBindings schema 99 is newer/u);
+    assert.match(plan.blockingIncompatibilities.join("\n"), /channelDedupe schema 99 is newer/u);
+    const inspection = await inspectStateSchemas(future.state);
+    assert.equal(inspection.healthy, false);
+    assert.equal(inspection.currentVersions.channelBindings, 99);
+    assert.equal(inspection.currentVersions.channelDedupe, 99);
+    const status = await stateLifecycleStatus(future.state);
+    assert.equal(status.ok, false);
+    assert.equal(status.schemas.find((surface) => surface.surface === "channelBindings")?.healthy, false);
+    assert.equal(status.schemas.find((surface) => surface.surface === "channelDedupe")?.healthy, false);
     await assert.rejects(() => ensureStateCompatibility(future.state), /jobs schema 99 is newer/u);
     assert.equal(await readFile(join(future.state, "jobs.json"), "utf8"), futureJobs);
   } finally {

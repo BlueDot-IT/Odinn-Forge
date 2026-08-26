@@ -184,6 +184,24 @@ test("kernel manifests and sources remain free of channel adapters", async () =>
   }
 });
 
+test("stable channel state is schema-owned and production capabilities remain truthful", async () => {
+  const registry = await read("packages/kernel/src/state/schema-registry.ts");
+  assert.match(registry, /channelBindings:\s*1/u);
+  assert.match(registry, /channelDedupe:\s*1/u);
+  assert.match(registry, /channelBindings:[^\n]+location: "channel-bindings\.json"[^\n]+support: "stable"/u);
+  assert.match(registry, /channelDedupe:[^\n]+location: "channel-dedupe\.json"[^\n]+support: "stable"/u);
+  const migration = await read("packages/kernel/src/state/migration-manager.ts");
+  for (const filename of ["channel-bindings.json", "channel-dedupe.json"]) {
+    assert.match(migration, new RegExp(filename.replace(".", "\\."), "u"));
+  }
+  for (const adapter of ["telegram", "discord", "slack", "teams"]) {
+    assert.doesNotMatch(await read(`adapters/channels/${adapter}/src/index.ts`), /streaming:\s*true/u, adapter);
+  }
+  const channels = await read("docs/channels.md");
+  assert.doesNotMatch(channels, /streaming drafts|replies can stream/iu);
+  assert.match(channels, /production handler delivers the one durable final\s+result/iu);
+});
+
 test("draft GitHub releases hand npm publication to the protected workflow", async () => {
   const release = await read(".github/workflows/release.yml");
   const preflight = await read("scripts/release/preflight.ts");
@@ -623,6 +641,22 @@ test("user documentation and reporting surfaces ship in the release tree", async
   assert.match(matrix, /forked workers are crash containment, not a security sandbox/i);
   assert.match(matrix, /remote hosting is application-level tenant isolation, not hostile-user OS isolation/i);
   assert.match(matrix, /external effects and nondeterministic provider behavior are outside full replay\/rollback guarantees/i);
+  assert.match(matrix, /Discord and Telegram local channel configuration[\s\S]*\*\*Stable v1 interface\*\*/u);
+  assert.match(matrix, /Live Discord and Telegram services[\s\S]*\*\*Provider-dependent behavior\*\*/u);
+  const channels = await read("docs/channels.md");
+  for (const requirement of [
+    "Onboarding",
+    "Permission inspection",
+    "Secret handling",
+    "Approval behavior",
+    "Diagnostics",
+    "Audit projection",
+    "Recovery",
+    "Integration tests",
+    "Operator documentation"
+  ]) assert.match(channels, new RegExp(`\\| ${requirement} \\|`, "u"));
+  assert.match(channels, /provider-partial delivery[\s\S]*duplicate suppression/u);
+  assert.match(channels, /does not accept production bot\s+credentials or send live Discord\/Telegram messages/u);
 });
 
 test("release packaging removes stale assets before creating a version", async () => {

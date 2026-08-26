@@ -51,9 +51,11 @@ have separate support boundaries.
 - Keep an activity trail so you can see what ran, when it ran, and whether it
   succeeded.
 
-Experimental messaging-channel foundations now include Telegram, Discord,
-Slack, Microsoft Teams, and WhatsApp Business adapters. They are not yet part
-of the supported v1 operator workflow; see
+Discord and Telegram are supported local single-user integration slices with
+environment-only credentials, explicit inbound policies, safe diagnostics,
+durable session binding, and no-replay recovery. Their live services remain
+provider-dependent. Slack, Microsoft Teams, WhatsApp Business, and the shared
+channel plugin interface remain experimental; see
 [`docs/channels.md`](docs/channels.md).
 
 Ódinn is not a finished industry-specific business suite. It is a general

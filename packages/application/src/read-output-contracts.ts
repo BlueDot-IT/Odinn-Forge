@@ -119,7 +119,7 @@ export interface CliChannelSummaryV1 {
   readonly historyLimit: number;
   readonly dmPolicy?: string;
   readonly groupPolicy?: string;
-  readonly allowBots?: boolean;
+  readonly allowBots?: boolean | "mentions";
   readonly nativeCommands: boolean;
   readonly nativeCommandName: string;
   readonly defaultModel: string;
@@ -710,7 +710,7 @@ function validatePolicy(input: unknown, path: string): void {
 
 function validateCliChannel(input: Record<string, unknown>, path: string): void {
   object(input, path, ["name", "type", "enabled", "credentialConfigured", "credentialPresent", "tokenEnv", "allowlistEntries", "requireMention", "historyLimit", "dmPolicy", "groupPolicy", "allowBots", "nativeCommands", "nativeCommandName", "defaultModel"], ["name", "type", "enabled", "credentialConfigured", "credentialPresent", "tokenEnv", "allowlistEntries", "requireMention", "historyLimit", "nativeCommands", "nativeCommandName", "defaultModel"]);
-  text(input.name, `${path}.name`); text(input.type, `${path}.type`); bool(input.enabled, `${path}.enabled`); bool(input.credentialConfigured, `${path}.credentialConfigured`); bool(input.credentialPresent, `${path}.credentialPresent`); environmentReference(input.tokenEnv, `${path}.tokenEnv`); count(input.allowlistEntries, `${path}.allowlistEntries`); bool(input.requireMention, `${path}.requireMention`); count(input.historyLimit, `${path}.historyLimit`); optionalText(input.dmPolicy, `${path}.dmPolicy`); optionalText(input.groupPolicy, `${path}.groupPolicy`); optionalBool(input.allowBots, `${path}.allowBots`); bool(input.nativeCommands, `${path}.nativeCommands`); text(input.nativeCommandName, `${path}.nativeCommandName`); text(input.defaultModel, `${path}.defaultModel`, true);
+  text(input.name, `${path}.name`); text(input.type, `${path}.type`); bool(input.enabled, `${path}.enabled`); bool(input.credentialConfigured, `${path}.credentialConfigured`); bool(input.credentialPresent, `${path}.credentialPresent`); environmentReference(input.tokenEnv, `${path}.tokenEnv`); count(input.allowlistEntries, `${path}.allowlistEntries`); bool(input.requireMention, `${path}.requireMention`); count(input.historyLimit, `${path}.historyLimit`); optionalText(input.dmPolicy, `${path}.dmPolicy`); optionalText(input.groupPolicy, `${path}.groupPolicy`); if (input.allowBots !== undefined && input.allowBots !== "mentions") bool(input.allowBots, `${path}.allowBots`); bool(input.nativeCommands, `${path}.nativeCommands`); text(input.nativeCommandName, `${path}.nativeCommandName`); text(input.defaultModel, `${path}.defaultModel`, true);
 }
 
 function validateRuntimeSurfaces(input: unknown, path: string): void {

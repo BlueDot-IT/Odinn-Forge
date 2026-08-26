@@ -38,6 +38,10 @@ const EPHEMERAL_STATE_FILES = Object.freeze([
   "db/audit.sqlite.notify"
 ]);
 const isEphemeralStateFile = (path: string) => EPHEMERAL_STATE_FILES.includes(path) || /^db\/.+\.sqlite-(?:shm|wal)$/u.test(path) || /^db\/.+\.sqlite\.notify$/u.test(path);
+const CHANNEL_BACKUP_SCHEMAS = Object.freeze([
+  { surface: "channelBindings", filename: "channel-bindings.json", collection: "bindings" },
+  { surface: "channelDedupe", filename: "channel-dedupe.json", collection: "entries" }
+] as const);
 
 export type BackupApplicationIdentity = {
   version: string;
@@ -198,6 +202,7 @@ export async function inspectStateBackup(inputDir: string): Promise<InspectedSta
       throw new Error(`backup contains future ${surface} schema ${version}; this Odinn supports ${STATE_SCHEMA_TARGETS[surface]}`);
     }
   }
+  await assertChannelBackupSchemas(root, manifest.stateSchemas);
   return { root, manifest, valid: true };
 }
 
@@ -439,7 +444,7 @@ function validateManifest(value: unknown): StateBackupManifest {
   const stateSchemas = manifest.stateSchemas;
   const schemaKeys = Object.keys(stateSchemas);
   const expectedKeys = (Object.keys(STATE_SCHEMA_TARGETS) as StateSurface[])
-    .filter((surface) => surface in stateSchemas || surface !== "sandboxRecovery");
+    .filter((surface) => surface in stateSchemas || !["sandboxRecovery", "channelBindings", "channelDedupe"].includes(surface));
   if (schemaKeys.length !== expectedKeys.length || expectedKeys.some((key) => !schemaKeys.includes(key))) {
     throw new Error("backup manifest must include every state schema");
   }
@@ -466,7 +471,7 @@ function assertRestorableSchemas(inspection: StateInspection, recorded: StateSch
   if (!inspection.healthy) throw new Error("restored state is unhealthy");
   const surfaceMap = new Map(inspection.surfaces.map((s) => [s.surface, s]));
   for (const surface of Object.keys(STATE_SCHEMA_TARGETS) as StateSurface[]) {
-    if (!(surface in recorded) && surface === "sandboxRecovery") continue;
+    if (!(surface in recorded) && ["sandboxRecovery", "channelBindings", "channelDedupe"].includes(surface)) continue;
     const status = surfaceMap.get(surface);
     if (!status || !status.present) continue;
     if (status.currentVersion > STATE_SCHEMA_TARGETS[surface]) {
@@ -475,6 +480,29 @@ function assertRestorableSchemas(inspection: StateInspection, recorded: StateSch
     const recordedVersion = recorded[surface];
     if (recordedVersion !== undefined && status.currentVersion > recordedVersion) {
       throw new Error(`restored ${surface} schema does not match the backup manifest`);
+    }
+  }
+}
+
+async function assertChannelBackupSchemas(root: string, recorded: StateSchemaVersions): Promise<void> {
+  for (const { surface, filename, collection } of CHANNEL_BACKUP_SCHEMAS) {
+    const path = join(root, filename);
+    if (!await exists(path)) continue;
+    const value = await readJsonIfPresent(path, {});
+    const version = value.schemaVersion;
+    if (!Number.isInteger(version) || Number(version) < 0) {
+      throw new Error(`backup ${filename} has an invalid schemaVersion`);
+    }
+    const entries = value[collection];
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+      throw new Error(`backup ${filename} has an invalid ${collection} collection`);
+    }
+    if (version > STATE_SCHEMA_TARGETS[surface]) {
+      throw new Error(`backup contains future ${surface} schema ${version}; this Odinn supports ${STATE_SCHEMA_TARGETS[surface]}`);
+    }
+    const recordedVersion = recorded[surface];
+    if (recordedVersion !== undefined && version !== recordedVersion) {
+      throw new Error(`backup ${surface} schema does not match the manifest`);
     }
   }
 }

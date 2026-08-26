@@ -52,6 +52,8 @@ The stable local, single-user product includes:
 - Installation, update, rollback, backup, restore, and uninstall
 - Persistent-state inspection and migration
 - Audit verification
+- Discord and Telegram local channel configuration, routing, diagnostics,
+  durable session binding, and uncertain-outcome recovery
 
 The [surface matrix](surface-matrix.md) maps individual product areas to these
 terms. Passing tests or having an implementation does not by itself make an
@@ -103,6 +105,7 @@ The canonical per-store registry is
 | Audit events and verification keyring | Protocol and file store | Stable |
 | Approvals | Kernel approval boundary | Stable |
 | Browser recovery and durable tab handles | Kernel browser boundary | Stable |
+| Channel session bindings and delivery deduplication | Shared channel boundary | Stable |
 | Cron definitions | Gateway cron boundary | Stable |
 | Runtime database | SQLite store | Stable |
 | Extension, Skill SDK, and Agent SDK registries | Their owning package boundary | Experimental |

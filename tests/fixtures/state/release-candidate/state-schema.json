@@ -11,6 +11,8 @@
     "audit": 1,
     "approvals": 1,
     "browserRecovery": 1,
+    "channelBindings": 1,
+    "channelDedupe": 1,
     "sessions": 1,
     "projects": 1,
     "goals": 1,
