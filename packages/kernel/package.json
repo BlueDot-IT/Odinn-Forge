@@ -7,6 +7,7 @@
     ".": "./src/index.ts",
     "./agent-run-graphs": "./src/agent-run-graphs.ts",
     "./async-telemetry": "./src/async-telemetry.ts",
+    "./otlp-http-exporter": "./src/otlp-http-exporter.ts",
     "./automation-primitives": "./src/automation-primitives.ts",
     "./mcp-host": "./src/mcp-host.ts",
     "./mcp-runtime": "./src/mcp-runtime.ts",

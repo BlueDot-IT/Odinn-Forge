@@ -510,22 +510,25 @@ test("constants and exporter batches are immutable", async () => {
   await telemetry.shutdown();
 });
 
-test("async telemetry is package-resolvable and absent from active imports", async () => {
+test("telemetry modules are package-resolvable and activation remains gateway-only", async () => {
   const root = join(import.meta.dirname, "..");
   const packageJson = JSON.parse(await readFile(join(root, "packages/kernel/package.json"), "utf8"));
   assert.equal(packageJson.exports["./async-telemetry"], "./src/async-telemetry.ts");
+  assert.equal(packageJson.exports["./otlp-http-exporter"], "./src/otlp-http-exporter.ts");
   for (const path of [
     "packages/kernel/src/index.ts",
     "packages/kernel/src/providers/runtime.ts",
-    "apps/cli/src/cli.ts",
-    "apps/gateway/src/server.ts"
+    "apps/cli/src/cli.ts"
   ]) {
     const source = await readFile(join(root, path), "utf8");
     assert.doesNotMatch(source, /async-telemetry/u, `${path} must not import the optional telemetry module`);
   }
+  const gatewaySource = await readFile(join(root, "apps/gateway/src/telemetry.ts"), "utf8");
+  assert.match(gatewaySource, /@odinn\/kernel\/async-telemetry/u);
+  assert.match(gatewaySource, /@odinn\/kernel\/otlp-http-exporter/u);
   const packageConsumer = spawnSync(
     process.execPath,
-    ["--input-type=module", "--eval", "import('@odinn/kernel/async-telemetry').then((value) => { if (value.TELEMETRY_SCHEMA_VERSION !== 1) process.exit(2); })"],
+    ["--input-type=module", "--eval", "Promise.all([import('@odinn/kernel/async-telemetry'), import('@odinn/kernel/otlp-http-exporter')]).then(([telemetry, otlp]) => { if (telemetry.TELEMETRY_SCHEMA_VERSION !== 1 || typeof otlp.createOtlpHttpExporter !== 'function') process.exit(2); })"],
     { cwd: join(root, "apps/cli"), encoding: "utf8" }
   );
   assert.equal(packageConsumer.status, 0, packageConsumer.stderr || packageConsumer.stdout);

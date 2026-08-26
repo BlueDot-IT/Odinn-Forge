@@ -54,7 +54,13 @@ export async function runGatewayEntrypoint({ createGatewayServer, compiledRuntim
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
   server.listen(port, host, () => {
-    console.log(JSON.stringify({ ok: true, host, port: server.address().port, stateDir }, null, 2));
+    console.log(JSON.stringify({
+      ok: true,
+      host,
+      port: server.address().port,
+      stateDir,
+      ...(typeof server.odinnTelemetryStatus === "function" ? { telemetry: server.odinnTelemetryStatus() } : {})
+    }, null, 2));
   });
   return true;
 }

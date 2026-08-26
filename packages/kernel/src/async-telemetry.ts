@@ -1,9 +1,14 @@
 export const TELEMETRY_SCHEMA_VERSION = 1 as const;
 export const TELEMETRY_NAMES = Object.freeze([
   "odinn.runtime.lifecycle",
+  "odinn.run.acceptance",
   "odinn.task",
   "odinn.model.request",
   "odinn.tool.execution",
+  "odinn.audit.append",
+  "odinn.memory.recall",
+  "odinn.recovery",
+  "odinn.shutdown",
   "odinn.policy.evaluation",
   "odinn.queue.depth",
   "odinn.export.dropped"

@@ -31,6 +31,8 @@ import { createGatewayOperatorSnapshotReadRequest, normalizeHostedUserId } from 
 import { assertTenantClaims, createGatewayTenantScope, createTenantScopedAuditStore, scopedJobPayload, type GatewayTenantScope } from "./http/tenant-scope.ts";
 import { AuthenticatedRouter } from "./http/router.ts";
 import { registerApplicationReadRoutes } from "./routes/application-reads.ts";
+import { createGatewayTelemetry, instrumentAuditStore, recordGatewayEvent, recordGatewaySpan, telemetryStatusProjection } from "./telemetry.ts";
+import type { TelemetryName } from "@odinn/kernel/async-telemetry";
 
 export { gatewayOperatorSnapshotFailure } from "./http/errors.ts";
 export {
@@ -787,6 +789,7 @@ export async function createGatewayServer(options: any = {}) {
   const requestedState = resolve(stateDir);
   const root = resolve(workspaceRoot);
   const version = await productVersion();
+  const telemetry = options.telemetry ?? createGatewayTelemetry({ serviceVersion: version });
   await ensureSecureStateDirectory(requestedState);
   await ensureStateCompatibility(requestedState, { applicationVersion: version, applicationCommit: await productCommit() });
   // macOS exposes standard temporary paths through system-owned aliases such
@@ -799,10 +802,24 @@ export async function createGatewayServer(options: any = {}) {
   let processRecoveryStartupError = false;
   let sandboxRecoveryStartupError = false;
   if (await access(join(state, "sandbox-recovery.json")).then(() => true).catch(() => false)) {
-    await reconcileSandboxRecovery(state, startupSandboxConfig.backend.enginePaths).catch(() => { sandboxRecoveryStartupError = true; });
+    const startedAt = Date.now();
+    try {
+      await reconcileSandboxRecovery(state, startupSandboxConfig.backend.enginePaths);
+      recordGatewaySpan(telemetry, { name: "odinn.recovery", startedAt, status: "ok", attributes: { component: "sandbox", operation: "reconcile", outcome: "completed" } });
+    } catch {
+      sandboxRecoveryStartupError = true;
+      recordGatewaySpan(telemetry, { name: "odinn.recovery", startedAt, status: "error", attributes: { component: "sandbox", operation: "reconcile", outcome: "quarantined" } });
+    }
   }
   if (await access(join(state, "process-recovery.json")).then(() => true).catch(() => false)) {
-    await reconcileProcessRecovery(state).catch(() => { processRecoveryStartupError = true; });
+    const startedAt = Date.now();
+    try {
+      await reconcileProcessRecovery(state);
+      recordGatewaySpan(telemetry, { name: "odinn.recovery", startedAt, status: "ok", attributes: { component: "process", operation: "reconcile", outcome: "completed" } });
+    } catch {
+      processRecoveryStartupError = true;
+      recordGatewaySpan(telemetry, { name: "odinn.recovery", startedAt, status: "error", attributes: { component: "process", operation: "reconcile", outcome: "quarantined" } });
+    }
   }
   await ensureMainAgent(state);
   const agentRegistryState = await new AgentRegistryStore(join(state, "agents.json")).read();
@@ -820,7 +837,7 @@ export async function createGatewayServer(options: any = {}) {
   };
   const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags, proofOptions });
   new CheckpointCoordinator({ runLedger: runtime.ledger }).recover();
-  const rawAuditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  const rawAuditStore = instrumentAuditStore(createAuditStore(join(state, config.auditLog ?? "audit.jsonl")), telemetry);
   const auditStore = createTenantScopedAuditStore(rawAuditStore, tenantScope);
   if (typeof auditStore.verifyIntegrity === "function") await auditStore.verifyIntegrity({ allowUnsigned: true }).catch(() => undefined);
   const policy = createDefaultPolicy(config.policy);
@@ -1590,9 +1607,33 @@ export async function createGatewayServer(options: any = {}) {
 
   const server: any = createServer(async (request: any, response: any) => {
     const requestId = String(request.headers["x-odinn-request-id"] || randomUUID());
+    const requestStartedAt = Date.now();
+    let requestTelemetryName: TelemetryName = "odinn.task";
+    let requestTelemetryOperation = "http.request";
+    let requestTelemetryTool: string | undefined;
+    response.once("finish", () => {
+      const statusCode = Number(response.statusCode || 500);
+      recordGatewaySpan(telemetry, {
+        name: requestTelemetryName,
+        startedAt: requestStartedAt,
+        status: statusCode < 400 ? "ok" : "error",
+        attributes: {
+          component: "gateway",
+          operation: requestTelemetryOperation,
+          outcome: statusCode < 400 ? "completed" : "failed",
+          transport: "http",
+          "http.response.status_code": statusCode,
+          ...(requestTelemetryTool ? { "tool.name": requestTelemetryTool } : {})
+        }
+      });
+    });
     response.setHeader("x-odinn-request-id", requestId);
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      if (request.method === "POST" && url.pathname === "/jobs") {
+        requestTelemetryName = "odinn.run.acceptance";
+        requestTelemetryOperation = "job.submit";
+      }
       if (!validHostHeader(request)) return json(response, 421, { ok: false, error: "invalid gateway Host header" });
       if (request.method === "GET" && url.pathname === "/odinn-logo.png") {
         return image(response, 200, await readFile(join(PUBLIC_DIR, "odinn-logo.png")), "image/png");
@@ -2885,6 +2926,9 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/run") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
+        requestTelemetryTool = typeof body.tool === "string" ? body.tool : undefined;
+        requestTelemetryName = requestTelemetryTool?.startsWith("memory.") ? "odinn.memory.recall" : "odinn.tool.execution";
+        requestTelemetryOperation = "tool.execute";
         quotaGate.checkTool(body.tool);
         const result = await runIsolatedTask({
           task: { id: body.id ?? request.headers["idempotency-key"], tool: body.tool, input: body.input, reason: body.reason, actor: "gateway" },
@@ -2910,12 +2954,25 @@ export async function createGatewayServer(options: any = {}) {
 
   const close = server.close.bind(server);
   server.close = (callback: any) => {
+    const shutdownStartedAt = Date.now();
+    recordGatewayEvent(telemetry, { name: "odinn.runtime.lifecycle", attributes: { component: "gateway", operation: "shutdown", outcome: "stopping" } });
     if (improvementStartupTimer) clearTimeout(improvementStartupTimer);
     if (improvementTimer) clearInterval(improvementTimer);
     clearInterval(cronTimer);
     if (eventHeartbeatTimer) clearInterval(eventHeartbeatTimer);
     Promise.allSettled([channelSupervisor.stop(), supervisor.shutdown(), workflowRuntime?.shutdown(), eventIngress?.shutdown(), isolatedTaskExecutor.shutdown?.(), mcpRuntime?.close()])
-      .then(() => {
+      .then(async (results) => {
+        recordGatewaySpan(telemetry, {
+          name: "odinn.shutdown",
+          startedAt: shutdownStartedAt,
+          status: results.some((result) => result.status === "rejected") ? "error" : "ok",
+          attributes: {
+            component: "gateway",
+            operation: "shutdown",
+            outcome: results.some((result) => result.status === "rejected") ? "partial" : "completed"
+          }
+        });
+        await telemetry.shutdown();
         let registryError: unknown;
         try { registry.close(); } catch (error) { registryError = error; }
         try { governedRegistry.close(); } catch (error) { registryError ??= error; }
@@ -2935,7 +2992,9 @@ export async function createGatewayServer(options: any = {}) {
     if (!address || typeof address === "string") return;
     channelSupervisor.start(`http://127.0.0.1:${address.port}`).catch(() => undefined);
   });
+  recordGatewayEvent(telemetry, { name: "odinn.runtime.lifecycle", attributes: { component: "gateway", operation: "startup", outcome: "ready" } });
   server.odinnAuthToken = gatewayToken;
+  server.odinnTelemetryStatus = () => telemetryStatusProjection(telemetry);
   return server;
 }
 

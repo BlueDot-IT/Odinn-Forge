@@ -1,15 +1,15 @@
 # Optional asynchronous telemetry foundation
 
 Ódinn includes a dependency-light, OpenTelemetry-compatible foundation at
-`@odinn/kernel/async-telemetry`. It is **disabled by default**, has no network
-exporter, and is not imported by the kernel root, provider runtime, CLI, or
-Gateway. Existing product behavior therefore remains unchanged: Ódinn Forge has
-no active built-in product telemetry.
+`@odinn/kernel/async-telemetry` and a wire-level OTLP/HTTP JSON exporter at
+`@odinn/kernel/otlp-http-exporter`. Product telemetry remains **disabled by
+default**. The Gateway activates it only when an operator explicitly sets
+`ODINN_OTLP_ENDPOINT`; the CLI, model-provider runtime, and kernel root do not
+activate telemetry.
 
-This module is an inert integration boundary for operators or future optional
-adapters. Creating an enabled instance requires an explicit exporter. Ódinn
-does not ship an exporter, endpoint, credential, background service, or hidden
-activation path. Supplying an exporter is an explicit data-egress decision.
+Creating an enabled buffer requires an explicit exporter. Ódinn ships no
+collector, credential, background service, or hidden activation path. Setting
+an OTLP endpoint is an explicit data-egress decision.
 Delivery is best-effort and non-durable; this buffer never replaces or weakens
 Ódinn's signed local audit journal.
 
@@ -85,10 +85,28 @@ instrument kind, unit, duration, and status fields. A future adapter can
 translate these bounded records to OpenTelemetry SDK data without placing that
 SDK or its initialization cost in Ódinn's active path.
 
-The interface does not claim wire-level OTLP compatibility and does not include
-a network implementation. Adding an OTLP exporter, runtime activation, remote
-endpoint, credentials, or configuration would require a separate security,
-privacy, lifecycle, and latency review.
+The OTLP adapter emits OTLP/HTTP JSON to the standard `v1/traces`, `v1/metrics`,
+and `v1/logs` paths. HTTPS is required except for loopback HTTP collectors.
+Endpoint URLs may not include credentials, queries, fragments, encoded path
+segments, or backslashes. Redirects are rejected, request credentials are
+omitted, response bodies are discarded, and exporter errors are reduced to
+categorical failures before they reach product status.
 
-No persistent state is added, so there is no migration. Removing the optional
-subpath and its explicit callers fully rolls back this foundation.
+The Gateway exports only the fixed schema above: lifecycle, run acceptance,
+tool or memory execution, audit append, recovery, shutdown, queue, and exporter
+health. It never exports request paths, request IDs, prompts, tool arguments,
+model output, audit payloads, filesystem paths, tenant identities, or endpoint
+details. Startup JSON reports only enabled/state/queue/drop categories.
+
+Example explicit local-collector activation:
+
+```bash
+ODINN_OTLP_ENDPOINT=http://127.0.0.1:4318/ pnpm gui:start
+```
+
+Use a trusted HTTPS collector for non-loopback export. Authentication headers
+are deliberately unsupported in this slice; place a trusted local collector
+or operator-managed authenticated proxy at the configured endpoint.
+
+No persistent state is added, so there is no migration. Removing the endpoint
+environment setting returns the Gateway to the inert disabled state.
