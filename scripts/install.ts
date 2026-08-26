@@ -183,7 +183,8 @@ async function writeCurrentPointer(versionId: string, distribution: string, runt
     throw new Error("unsafe current runtime digest pointer");
   }
   const temporary = `${currentPath}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temporary, `${versionId}\n${distribution}\n${runtimeSha256}\n`, { mode: 0o600, flag: "wx" });
+  const lineEnding = process.platform === "win32" ? "\r\n" : "\n";
+  await writeFile(temporary, `${versionId}${lineEnding}${distribution}${lineEnding}${runtimeSha256}${lineEnding}`, { mode: 0o600, flag: "wx" });
   await rename(temporary, currentPath);
   await chmod(currentPath, 0o600).catch(() => undefined);
 }

@@ -49,6 +49,7 @@ test("native installer upgrades by atomic pointer and rolls back to the previous
 test("standalone install uses only its bundled runtime and rolls back byte-equivalently across legacy packages", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-controlled-runtime-"));
   const prefix = join(temporary, "install");
+  const lineEnding = process.platform === "win32" ? "\r\n" : "\n";
   try {
     const standalone = await writeStandaloneFixture(temporary, "1.0.0", "a".repeat(40));
     runWithRuntime(standalone.runtime, [
@@ -68,7 +69,7 @@ test("standalone install uses only its bundled runtime and rolls back byte-equiv
     const firstRoot = join(prefix, "versions", first.current);
   const firstTree = await treeDigest(firstRoot);
     const firstRuntimeDigest = standalone.executableSha256;
-    assert.equal(await readFile(join(prefix, "current"), "utf8"), `${first.current}\nstandalone\n${firstRuntimeDigest}\n`);
+    assert.equal(await readFile(join(prefix, "current"), "utf8"), `${first.current}${lineEnding}standalone${lineEnding}${firstRuntimeDigest}${lineEnding}`);
 
     const fakeBin = join(temporary, "hostile-bin");
     await mkdir(fakeBin);
@@ -125,7 +126,7 @@ test("standalone install uses only its bundled runtime and rolls back byte-equiv
       "2".repeat(64)
     ]);
     const upgraded = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
-    assert.equal(await readFile(join(prefix, "current"), "utf8"), `${upgraded.current}\ncompiled\n\n`);
+    assert.equal(await readFile(join(prefix, "current"), "utf8"), `${upgraded.current}${lineEnding}compiled${lineEnding}${lineEnding}`);
     assert.equal(runInstalled(prefix, ["--version"]).trim(), "1.1.0");
     await assert.rejects(() => access(join(prefix, "versions", upgraded.current, ".cache")), { code: "ENOENT" });
 
@@ -140,7 +141,7 @@ test("standalone install uses only its bundled runtime and rolls back byte-equiv
     runWithRuntime(process.execPath, ["rollback", "--prefix", prefix]);
     const rolledBack = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
     assert.equal(rolledBack.current, first.current);
-    assert.equal(await readFile(join(prefix, "current"), "utf8"), `${first.current}\nstandalone\n${firstRuntimeDigest}\n`);
+    assert.equal(await readFile(join(prefix, "current"), "utf8"), `${first.current}${lineEnding}standalone${lineEnding}${firstRuntimeDigest}${lineEnding}`);
     assert.equal((await treeDigest(firstRoot)), firstTree);
     assert.equal(JSON.parse(runInstalled(prefix, ["probe"], hostileEnvironment)).version, "1.0.0");
 
@@ -151,7 +152,7 @@ test("standalone install uses only its bundled runtime and rolls back byte-equiv
     await writeFile(join(prefix, ".install-state-100-stale.tmp"), "stale");
     await writeFile(join(prefix, "current.100.stale.tmp"), "stale");
     await writeFile(join(prefix, "bin", "odinn.100.stale.tmp"), "stale");
-    await writeFile(join(prefix, "current"), `${first.current}\nstandalone\n${firstRuntimeDigest}\n`);
+    await writeFile(join(prefix, "current"), `${first.current}${lineEnding}standalone${lineEnding}${firstRuntimeDigest}${lineEnding}`);
     const recovered = JSON.parse(runWithRuntime(process.execPath, ["status", "--prefix", prefix]));
     assert.equal(recovered.current, first.current);
     assert.equal(recovered.previous, upgraded.current);
