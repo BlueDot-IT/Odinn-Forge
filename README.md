@@ -343,15 +343,14 @@ runtime-default sampling, and a bounded filesystem-and-shell tool policy. All
 | OpenClaw `2026.8.1` | 33/35 | 2 | 94.3% | 67.60s | 109.97s |
 | Hermes Agent `0.20.1` | 35/35 | 0 | 100% | 22.92s | 39.13s |
 
-The Odinn row is pinned to `v1.1.0-rc.2` at
-`9256e23c1f78b3ab14b51ee72c0d2a4d0fdd769c` and uses the benchmark adapter's
-local capability-fixture fix. Process-dependent cases used Odinn's explicit
-`--durable-process --confirm-process` authorization. The benchmark checkout was
-locally modified for that fixture, and `main` has since moved beyond RC2; rerun
-the external harness before treating these numbers as current-main performance.
-Without that fixture, the unmodified RC2 binary correctly refuses direct
-`process.exec`: the baseline matrix executes and verifies 20/35 trials, with 15
-cases reported unsupported.
+The historical Odinn row is pinned to `v1.1.0-rc.2` at
+`9256e23c1f78b3ab14b51ee72c0d2a4d0fdd769c`, but its locally modified adapter
+incorrectly advertised nested process execution that the candidate did not
+expose. Under the documented one-shot contract, Odinn covers **4/7 cases**:
+20 supported trials execute and verify, while 15 process-dependent trials are
+unsupported. `process.exec` remains separately approved, top-level durable
+`POST /jobs` work and is intentionally outside this adapter. Rerun the external
+harness before treating the historical table as current performance.
 See the
 [benchmark source revision](https://github.com/BlueDot-IT/agent-benchmarks/commit/e23ad096e0895fb0a6b0ef1f6faaf71d67b2ab35)
 for the harness revision and methodology.

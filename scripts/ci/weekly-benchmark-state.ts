@@ -217,10 +217,10 @@ async function prepare(args: string[]): Promise<void> {
       {
         id: "odinn-forge",
         metadata,
-        capabilities: ["text.generate", "workspace.read", "workspace.write", "process.exec"],
+        capabilities: ["text.generate", "workspace.read", "workspace.write"],
         preflight,
         command: odinn,
-        args: ["run", "--tool", "agent.run", "--input-file", "{inputFile}", "--durable-process", "--confirm-process", "--state", "{state}"],
+        args: ["run", "--tool", "agent.run", "--input-file", "{inputFile}", "--state", "{state}"],
         env: { HOME: "{state}", INIT_CWD: "{workspace}" },
         stateFixture: odinnState,
         output: {

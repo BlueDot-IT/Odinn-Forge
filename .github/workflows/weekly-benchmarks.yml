@@ -14,7 +14,7 @@ concurrency:
 env:
   NODE_VERSION: "24.15.0"
   PNPM_VERSION: "10.14.0"
-  BENCHMARK_COMMIT: b1213d03dcf17b6e6e0e02410f606a6dce73a815
+  BENCHMARK_COMMIT: 8ad91f0b9e396c88cf10e56687630539ce10bcd1
   ODINN_VERSION: "1.1.1"
   OPENCLAW_VERSION: "2026.7.1-2"
   HERMES_VERSION: "0.19.0"
@@ -67,7 +67,6 @@ jobs:
             --output "${RUNNER_TEMP}/odinn.tar.gz"
           echo "686bb66f2cd01c1467a120957032084932535cd753fd2267628e19a20e9faf55  ${RUNNER_TEMP}/odinn.tar.gz" | sha256sum --check --strict
           tar --extract --gzip --file "${RUNNER_TEMP}/odinn.tar.gz" --directory "${RUNNER_TEMP}"
-          docker pull "docker.io/library/node@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03"
           cp -a harness-base "${RUNNER_TEMP}/harness-odinn"
           cp -a harness-base "${RUNNER_TEMP}/harness-openclaw"
           cp -a harness-base "${RUNNER_TEMP}/harness-hermes"
@@ -186,11 +185,14 @@ jobs:
     permissions:
       actions: read
       contents: write
+      pull-requests: write
+    env:
+      PUBLISH_BRANCH: automation/weekly-benchmark-docs
     steps:
-      - name: Check out current main
+      - name: Check out the benchmarked main commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -214,17 +216,97 @@ jobs:
             --expected-commit "${BENCHMARK_COMMIT}"
           git diff --check
 
-      - name: Commit updated benchmark snapshot
+      - name: Publish updated benchmark snapshot branch with an exact lease
+        id: publish
         shell: bash
         run: |
           set -euo pipefail
           git add README.md docs/benchmarks.md
           if git diff --cached --quiet; then
             echo "Benchmark documentation is already current." >> "${GITHUB_STEP_SUMMARY}"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "docs(bench): update weekly comparison"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          remote_ref="refs/heads/${PUBLISH_BRANCH}"
+          remote_sha="$(git ls-remote --heads origin "${remote_ref}" | awk '{print $1}')"
+          if [[ -n "${remote_sha}" ]]; then
+            git push origin "HEAD:${remote_ref}" --force-with-lease="${remote_ref}:${remote_sha}"
+          else
+            git push origin "HEAD:${remote_ref}" --force-with-lease="${remote_ref}:"
+          fi
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Reuse or create the protected documentation pull request
+        if: steps.publish.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          existing_url="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base main \
+            --head "${PUBLISH_BRANCH}" \
+            --state open \
+            --json url \
+            --jq '.[0].url // empty')"
+          if [[ -n "${existing_url}" ]]; then
+            echo "Updated protected benchmark documentation PR: ${existing_url}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          body_file="${RUNNER_TEMP}/weekly-benchmark-pr.md"
+          cat > "${body_file}" <<EOF
+          ## Problem
+
+          Publish the complete, pinned three-runtime benchmark evidence from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} without writing directly to protected \`main\`.
+
+          ## Implementation
+
+          Update only the generated benchmark snapshot in \`README.md\` and \`docs/benchmarks.md\`.
+
+          ## Compatibility impact
+
+          Documentation-only; no runtime interface changes.
+
+          ## State migration impact
+
+          None.
+
+          ## Security impact
+
+          The source reports are bound to the pinned harness commit and validated before publication. This PR remains subject to normal branch protection.
+
+          ## Documentation impact
+
+          - [x] Documentation updated
+          - [ ] Documentation not required
+
+          Documentation details: generated \`README.md\` and \`docs/benchmarks.md\` benchmark evidence.
+
+          ## Validation
+
+          - [x] Complete three-runtime report matrix validated
+          - [x] Exact harness commit and clean source tree verified
+          - [x] Strict comparison and complete trial accounting verified
+          - [x] \`git diff --check\`
+
+          ## Rollback
+
+          Revert the generated documentation commit; no persistent state changes are involved.
+          EOF
+
+          if created_url="$(gh pr create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base main \
+            --head "${PUBLISH_BRANCH}" \
+            --title "docs(bench): update weekly comparison" \
+            --body-file "${body_file}" 2>"${RUNNER_TEMP}/weekly-benchmark-pr-error.log")"; then
+            echo "Created protected benchmark documentation PR: ${created_url}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "::warning::The benchmark branch was published, but repository policy did not permit this workflow token to create a pull request. A maintainer must open ${PUBLISH_BRANCH} against main."
+            echo "Benchmark branch published. Human gate: open \`${PUBLISH_BRANCH}\` against \`main\`; repository policy prevented workflow-created PRs." >> "${GITHUB_STEP_SUMMARY}"
+          fi
