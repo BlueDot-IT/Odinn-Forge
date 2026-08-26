@@ -10,3 +10,9 @@ matrix passes strict comparison and provenance validation, the dated historical
 snapshot in the root README remains the last available evidence. The workflow
 will replace this page atomically after a successful run; failed or incomplete
 runs do not overwrite it.
+
+The pinned Odinn Forge v1.1.1 one-shot adapter deliberately covers **4/7
+cases**. Its 20 supported trials exercise text generation and governed workspace
+reads and mutations. The 15 process-dependent trials are unsupported because
+`process.exec` requires a separately approved, top-level durable `POST /jobs`
+request; nested process calls are outside the one-shot adapter contract.

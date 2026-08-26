@@ -255,6 +255,13 @@ refresh, replace, or publish credentials and does not select another provider
 or model. Plaintext runtime state is removed before artifacts or repository
 writes. Publication occurs in a separate write-capable job only after the three
 reports pass strict metadata, provenance, and completeness validation.
+That job commits the generated files to the stable
+`automation/weekly-benchmark-docs` branch and updates it only with an exact
+remote-SHA lease. It reuses an existing protected pull request or attempts to
+create one; when repository policy denies workflow-created pull requests, the
+branch remains available for a maintainer to open against `main`. The workflow
+never pushes benchmark documentation directly to `main` or bypasses required
+reviews and checks.
 Failed matrices retain bounded adapter logs and per-trial progress journals for
 14 days. These diagnostics contain only disposable public benchmark fixtures
 and model results; runtime state and plaintext credentials are removed first.

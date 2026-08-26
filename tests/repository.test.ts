@@ -120,11 +120,18 @@ test("comparative harness remains external while Odinn publishes weekly results"
   assert.match(weekly, /workflow_dispatch:/u);
   assert.match(weekly, /runs-on: ubuntu-latest/u);
   assert.match(weekly, /BlueDot-IT\/agent-benchmarks/u);
-  assert.match(weekly, /BENCHMARK_COMMIT: [0-9a-f]{40}/u);
+  assert.match(weekly, /BENCHMARK_COMMIT: 8ad91f0b9e396c88cf10e56687630539ce10bcd1/u);
   assert.match(weekly, /ODINN_VERSION: "1\.1\.1"/u);
   assert.match(weekly, /686bb66f2cd01c1467a120957032084932535cd753fd2267628e19a20e9faf55/u);
   assert.match(weekly, /ODINN_OPENAI_OAUTH_JSON/u);
   assert.match(weekly, /docs\/benchmarks\.md/u);
+  assert.match(weekly, /PUBLISH_BRANCH: automation\/weekly-benchmark-docs/u);
+  assert.match(weekly, /--force-with-lease="\$\{remote_ref\}:\$\{remote_sha\}"/u);
+  assert.match(weekly, /gh pr list/u);
+  assert.match(weekly, /gh pr create/u);
+  assert.match(weekly, /pull-requests: write/u);
+  assert.doesNotMatch(weekly, /git push origin HEAD:main/u);
+  assert.doesNotMatch(weekly, /docker pull/u);
   assert.doesNotMatch(weekly, /openrouter|api[-_]?key|auth\.openai\.com/iu);
 });
 

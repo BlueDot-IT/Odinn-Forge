@@ -98,6 +98,15 @@ test("weekly benchmark preparation keeps credentials out of adapter configuratio
   assert.match(adapterConfig, /"model": "gpt-5\.6-luna"/u);
   assert.match(adapterConfig, /openclaw-benchmark-adapter\.ts/u);
   assert.doesNotMatch(adapterConfig, /"--local"/u);
+  assert.doesNotMatch(adapterConfig, /--durable-process|--confirm-process/u);
+  const adapters = JSON.parse(adapterConfig).adapters as Array<{
+    id: string;
+    capabilities: string[];
+    args: string[];
+  }>;
+  const odinn = adapters.find((adapter) => adapter.id === "odinn-forge");
+  assert.deepEqual(odinn?.capabilities, ["text.generate", "workspace.read", "workspace.write"]);
+  assert.deepEqual(odinn?.args, ["run", "--tool", "agent.run", "--input-file", "{inputFile}", "--state", "{state}"]);
   assert.equal((await stat(config)).mode & 0o777, 0o600);
   const openclawAuth = await readFile(join(state, "openclaw", "agents", "main", "agent", "auth-profiles.json"), "utf8");
   assert.match(openclawAuth, new RegExp(accessToken, "u"));
