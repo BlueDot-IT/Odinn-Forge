@@ -1,4 +1,4 @@
-import { createReadStream, closeSync, constants, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { chmodSync, createReadStream, closeSync, constants, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { createGunzip } from "node:zlib";
 import { dirname, join, parse, resolve, sep } from "node:path";
@@ -129,7 +129,17 @@ async function assertPhysicalAncestors(path: string, label: string): Promise<voi
     cursor = join(cursor, part);
     try {
       const metadata = await lstat(cursor);
-      if (metadata.isSymbolicLink()) throw new Error(`${label} must not traverse a symbolic link or reparse point`);
+      if (metadata.isSymbolicLink()) {
+        const physicalPath = await realpath(cursor);
+        const physical = await lstat(physicalPath);
+        const reviewedDarwinRootAlias = process.platform === "darwin"
+          && metadata.uid === 0
+          && physical.isDirectory()
+          && !physical.isSymbolicLink()
+          && physical.uid === 0
+          && (physical.mode & 0o022) === 0;
+        if (!reviewedDarwinRootAlias) throw new Error(`${label} must not traverse a symbolic link or reparse point`);
+      }
     } catch (error: any) {
       if (error?.code === "ENOENT") break;
       throw error;
@@ -411,9 +421,6 @@ async function prepareDestination(destination: string): Promise<void> {
   const metadata = await lstat(destination);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("release extraction destination must be a physical directory");
   if ((await readdir(destination)).length) throw new Error("release extraction destination must be empty");
-  if (process.platform !== "win32" && await realpath(destination) !== resolve(destination)) {
-    throw new Error("release extraction destination must not traverse a symbolic link");
-  }
 }
 
 function safeDestination(root: string, name: string): string {
@@ -482,6 +489,9 @@ async function extractZip(path: string, destination: string, entries: ZipEntry[]
           if (final) {
             if (descriptor !== null) { closeSync(descriptor); descriptor = null; }
             if (bytes !== entry.bytes) throw new Error(`release ZIP entry size does not match its central directory: ${entry.name}`);
+            if (entry.type === "file" && process.platform !== "win32") {
+              chmodSync(safeDestination(destination, entry.name), (entry.mode & 0o111) !== 0 ? 0o755 : 0o644);
+            }
             completed.add(identity);
           }
         } catch (failure) {

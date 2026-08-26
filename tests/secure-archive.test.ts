@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -30,7 +30,31 @@ test("secure extraction accepts bounded physical ZIP and tar archives", async ()
       });
       assert.equal(admitted.length, 2);
       assert.equal(await readFile(join(destination, "pkg", "package.json"), "utf8"), "{}\n");
+      if (process.platform !== "win32") {
+        assert.equal((await stat(join(destination, "pkg", "dist", "cli", "index.js"))).mode & 0o777, 0o755);
+      }
     }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("secure extraction rejects an untrusted symbolic-link destination ancestor", {
+  skip: process.platform === "win32"
+}, async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-destination-"));
+  try {
+    const physical = join(temporary, "physical");
+    const alias = join(temporary, "alias");
+    const archive = join(temporary, "package.tar.gz");
+    await mkdir(physical);
+    await symlink(physical, alias, "dir");
+    await writeFile(archive, tarGzip([{ name: "pkg/file", data: "x" }]));
+    await assert.rejects(
+      () => extractSecureArchive(archive, join(alias, "destination"), { expectedRoot: "pkg" }),
+      /must not traverse a symbolic link or reparse point/u
+    );
+    await assert.rejects(() => access(join(physical, "destination")), { code: "ENOENT" });
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

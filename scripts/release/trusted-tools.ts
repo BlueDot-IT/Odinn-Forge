@@ -31,6 +31,7 @@ const PROCESS_LOADER_ENVIRONMENT = [
 
 function isReviewedSystemToolPath(path: string): boolean {
   const normalized = resolve(path).replaceAll("\\", "/");
+  if (process.platform === "win32") return normalized.toLowerCase().startsWith("c:/windows/system32/");
   if (process.platform === "darwin") {
     return normalized.startsWith("/usr/bin/")
       || normalized.startsWith("/System/Volumes/Data/usr/bin/")
