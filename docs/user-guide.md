@@ -136,6 +136,12 @@ installs into an immutable version directory, checks migration compatibility,
 switches atomically, and runs a health check. A failed switch restores the
 previous application and any pre-update state snapshot.
 
+Windows upgrades defer only the final launcher replacement until the invoking
+batch process exits. The verified application/runtime pointer is activated
+first, and an installed finalizer replaces the launcher under the installer
+lock; a retained activation marker means finalization did not complete and the
+update must be reviewed before another lifecycle operation.
+
 After reviewing the check, install the latest verified release with:
 
 ```bash
