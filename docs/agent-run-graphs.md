@@ -105,10 +105,13 @@ the graph to `publishing`, then crosses the signed-audit and ledger boundaries;
 startup reconciles an interrupted `publishing` graph to `needs-review`.
 Volatile prompt content is never stored in the graph journal, job
 projection, ledger payload, or audit output; only digests and bounded byte
-metadata remain. Completed channel-bound `agent.run` jobs expose their live
-response only through the bounded ephemeral `/jobs/:id/result` route; the
-volatile result is cleared on supervisor shutdown and is never reconstructed
-from a redacted durable projection.
+metadata remain. Completed channel-bound `agent.run` jobs expose their response
+only through the bounded `/jobs/:id/result` route. The assistant result is
+committed to a job-, request-, session-, tenant-, and principal-bound protected
+record before the public job becomes terminal, so the exact bounded response
+survives a Gateway restart without reconstruction from the redacted job
+projection. Missing, substituted, or corrupted protected records quarantine
+the job as `needs-review`; process memory is never accepted as a fallback.
 
 The Gateway exposes an operator control plane for this durable state:
 

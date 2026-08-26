@@ -1056,6 +1056,35 @@ test("gateway persists a bound channel result before completion and serves it af
     assert.equal(resultBody.result.output.content, "PRIVATE_CHANNEL_OUTPUT");
     assert.doesNotMatch(JSON.stringify(resultBody), /PRIVATE_CHANNEL_PROMPT/u);
 
+    let liveRecords = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    const livePersisted = (await liveRecords.queryRecords({ types: ["channel.result.persisted"] }))[0] as any;
+    liveRecords.db.prepare("UPDATE record_events SET payload_json = ? WHERE id = ?")
+      .run(JSON.stringify({ ...livePersisted, sessionId: "live_session_substitution" }), livePersisted.id);
+    liveRecords.close();
+    const corruptedLiveResult = await fetch(`${base}/jobs/${executionKey}/result`);
+    assert.equal(corruptedLiveResult.status, 409, "volatile process memory must not mask protected result corruption");
+    assert.doesNotMatch(await corruptedLiveResult.text(), /PRIVATE_CHANNEL_OUTPUT/u);
+    let liveLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    liveLedger.database.db.prepare("UPDATE runtime_jobs SET status = 'completed', error = NULL WHERE id = ?").run(executionKey);
+    liveLedger.close();
+    liveRecords = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    liveRecords.db.prepare("UPDATE record_events SET payload_json = ? WHERE id = ?")
+      .run(JSON.stringify(livePersisted), livePersisted.id);
+    liveRecords.db.prepare("DELETE FROM record_events WHERE id = ?").run(livePersisted.id);
+    liveRecords.close();
+    const unavailableLiveResult = await fetch(`${base}/jobs/${executionKey}/result`);
+    assert.equal(unavailableLiveResult.status, 409, "volatile process memory must not mask protected result loss");
+    const unavailableLiveJob = await (await fetch(`${base}/jobs/${executionKey}`)).json();
+    assert.equal(unavailableLiveJob.status, "needs-review");
+    assert.match(unavailableLiveJob.error, /protected channel result is unavailable/u);
+    assert.equal(providerCalls, 3, "live missing-result quarantine must not replay the model");
+    const restoredLiveRecords = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    await restoredLiveRecords.append(livePersisted);
+    restoredLiveRecords.close();
+    liveLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    liveLedger.database.db.prepare("UPDATE runtime_jobs SET status = 'completed', error = NULL WHERE id = ?").run(executionKey);
+    liveLedger.close();
+
     await closeGateway();
     // Model execution returned and the protected result committed, but the
     // public runtime job did not reach its terminal update before the process

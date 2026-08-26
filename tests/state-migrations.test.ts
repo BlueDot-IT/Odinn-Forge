@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { createRunLedger, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, STATE_SCHEMA_TARGETS, stateLifecycleStatus } from "../packages/kernel/src/index.ts";
+import { createRunLedger, createStateBackup, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, STATE_SCHEMA_TARGETS, stateLifecycleStatus } from "../packages/kernel/src/index.ts";
 import { ArtifactStore, inspectExistingSqliteSchema, RunLedger, SqliteJobStore, SqliteStore } from "../packages/store-sqlite/src/index.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -426,7 +426,7 @@ test("unknown future SQLite schemas are rejected before migration", async () => 
   }
 });
 
-test("runtime schema v10 rejects missing owner columns and malformed owner indexes", async () => {
+test("runtime schema v10 rejects incomplete tables, constraints, foreign keys, migration ledgers, and indexes", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-state-malformed-v10-"));
   const state = join(temporary, "state");
   const databasePath = join(state, "db", "odinn.sqlite");
@@ -439,13 +439,124 @@ test("runtime schema v10 rejects missing owner columns and malformed owner index
     assert.throws(() => inspectExistingSqliteSchema(databasePath), /schema v10 execution_attempts shape is invalid/u);
     assert.throws(() => new SqliteStore(databasePath), /schema v10 execution_attempts shape is invalid/u);
     await assert.rejects(() => inspectStateSchemas(state), /schema v10 execution_attempts shape is invalid/u);
+    await assert.rejects(
+      () => createStateBackup(state, join(temporary, "rejected-incomplete-v10-backup")),
+      /schema v10 execution_attempts shape is invalid/u
+    );
 
     await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    const malformedStateIndex = new SqliteStore(databasePath);
+    malformedStateIndex.db.exec(`DROP INDEX idx_execution_attempts_state;
+      CREATE INDEX idx_execution_attempts_state
+      ON execution_attempts(created_at, state)`);
+    malformedStateIndex.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution state index/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution state index/u);
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
     const malformedIndex = new SqliteStore(databasePath);
-    malformedIndex.db.exec("DROP INDEX idx_execution_attempts_owner; CREATE INDEX idx_execution_attempts_owner ON execution_attempts(owner_pid, state)");
+    malformedIndex.db.exec(`DROP INDEX idx_execution_attempts_owner;
+      CREATE INDEX idx_execution_attempts_owner
+      ON execution_attempts(state DESC, owner_pid COLLATE NOCASE, owner_heartbeat_at)`);
     malformedIndex.close();
-    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution owner index columns are invalid/u);
-    assert.throws(() => new SqliteStore(databasePath), /execution owner index columns are invalid/u);
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution owner index/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution owner index/u);
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    const unexpectedIndex = new SqliteStore(databasePath);
+    unexpectedIndex.db.exec("CREATE INDEX idx_execution_attempts_unexpected ON execution_attempts(owner_token)");
+    unexpectedIndex.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution attempt index set is invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution attempt index set is invalid/u);
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath).close();
+    const unconstrained = new DatabaseSync(databasePath);
+    unconstrained.exec(`PRAGMA foreign_keys=OFF;
+      PRAGMA legacy_alter_table=ON;
+      DROP INDEX idx_execution_attempts_owner;
+      DROP INDEX idx_execution_attempts_state;
+      ALTER TABLE execution_attempts RENAME TO execution_attempts_old;
+      CREATE TABLE execution_attempts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES execution_envelopes(run_id),
+        attempt_number INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        settled_at TEXT,
+        outcome_digest TEXT,
+        error_code TEXT,
+        owner_token TEXT,
+        owner_pid INTEGER,
+        owner_heartbeat_at TEXT,
+        owner_released_at TEXT,
+        UNIQUE(run_id, attempt_number)
+      );
+      INSERT INTO execution_attempts SELECT * FROM execution_attempts_old;
+      DROP TABLE execution_attempts_old;
+      CREATE INDEX idx_execution_attempts_state ON execution_attempts(state, created_at);
+      CREATE INDEX idx_execution_attempts_owner ON execution_attempts(state, owner_pid, owner_heartbeat_at);
+      PRAGMA foreign_keys=ON;`);
+    unconstrained.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution_attempts constraints are invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution_attempts constraints are invalid/u);
+    await assert.rejects(() => inspectStateSchemas(state), /execution_attempts constraints are invalid/u);
+    await assert.rejects(
+      () => createStateBackup(state, join(temporary, "rejected-unconstrained-v10-backup")),
+      /execution_attempts constraints are invalid/u
+    );
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath).close();
+    const malformedForeignKey = new DatabaseSync(databasePath);
+    malformedForeignKey.exec(`PRAGMA foreign_keys=OFF;
+      PRAGMA legacy_alter_table=ON;
+      DROP INDEX idx_execution_attempts_owner;
+      DROP INDEX idx_execution_attempts_state;
+      ALTER TABLE execution_attempts RENAME TO execution_attempts_old;
+      CREATE TABLE execution_attempts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES execution_envelopes(run_id) ON DELETE CASCADE,
+        attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+        state TEXT NOT NULL CHECK(state IN ('proposed', 'admitted', 'queued', 'running', 'awaiting-approval', 'cancelling', 'completed', 'failed', 'cancelled', 'needs-review')),
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        settled_at TEXT,
+        outcome_digest TEXT,
+        error_code TEXT,
+        owner_token TEXT,
+        owner_pid INTEGER,
+        owner_heartbeat_at TEXT,
+        owner_released_at TEXT,
+        UNIQUE(run_id, attempt_number)
+      );
+      INSERT INTO execution_attempts SELECT * FROM execution_attempts_old;
+      DROP TABLE execution_attempts_old;
+      CREATE INDEX idx_execution_attempts_state ON execution_attempts(state, created_at);
+      CREATE INDEX idx_execution_attempts_owner ON execution_attempts(state, owner_pid, owner_heartbeat_at);
+      PRAGMA foreign_keys=ON;`);
+    malformedForeignKey.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution attempt foreign key is invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution attempt foreign key is invalid/u);
+    await assert.rejects(() => inspectStateSchemas(state), /execution attempt foreign key is invalid/u);
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath).close();
+    const malformedLedger = new DatabaseSync(databasePath);
+    malformedLedger.exec(`ALTER TABLE schema_migrations RENAME TO schema_migrations_old;
+      CREATE TABLE schema_migrations(version INTEGER, applied_at TEXT);
+      INSERT INTO schema_migrations SELECT * FROM schema_migrations_old;
+      DROP TABLE schema_migrations_old;`);
+    malformedLedger.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /schema_migrations shape is invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /schema_migrations shape is invalid/u);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

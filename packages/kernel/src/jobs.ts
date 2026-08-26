@@ -89,7 +89,6 @@ export class JobSupervisor {
   readonly defaultTimeoutMs: number;
   private readonly active: Map<string, ActiveJob>;
   private readonly volatilePayloads: Map<string, JsonObject>;
-  private readonly volatileResults: Map<string, { result: unknown; expiresAt: number }>;
   private readonly leaseOwner: string;
   private readonly leaseEpoch: string;
   private recoveryTimer?: NodeJS.Timeout;
@@ -110,7 +109,6 @@ export class JobSupervisor {
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.active = new Map();
     this.volatilePayloads = new Map();
-    this.volatileResults = new Map();
     this.leaseOwner = `supervisor:${process.pid}`;
     this.leaseEpoch = randomUUID();
     this.started = false;
@@ -231,15 +229,6 @@ export class JobSupervisor {
     if (typeof this.store.count === "function") return this.store.count();
     const jobs = await this.store.list({ limit: 500 });
     return { total: jobs.length, attention: jobs.filter((job) => ["failed", "needs-review"].includes(job.status)).length };
-  }
-
-  getVolatileResult(id: string): unknown | undefined {
-    const entry = this.volatileResults.get(id);
-    if (!entry || entry.expiresAt <= Date.now()) {
-      this.volatileResults.delete(id);
-      return undefined;
-    }
-    return entry.result;
   }
 
   async settleApproval(id: string, {
@@ -366,7 +355,6 @@ export class JobSupervisor {
     this.stopping = true;
     this.started = false;
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
-    this.volatileResults.clear();
     for (const active of this.active.values()) active.controller.abort(new Error("supervisor shutting down"));
     await Promise.allSettled(Array.from(this.active.values(), (active) => active.promise));
   }
@@ -405,16 +393,6 @@ export class JobSupervisor {
         // outcome. Approval requests are non-terminal control results and must
         // not be mistaken for an assistant reply.
         if (!awaitingApproval) await this.persistResult?.(job, result);
-        if (!awaitingApproval
-          && job.payload.executionKey === job.id
-          && (job.payload.task as JsonObject | undefined)?.tool === "agent.run") {
-          const now = Date.now();
-          for (const [id, entry] of this.volatileResults) {
-            if (entry.expiresAt <= now) this.volatileResults.delete(id);
-          }
-          this.volatileResults.set(job.id, { result, expiresAt: now + 5 * 60_000 });
-          while (this.volatileResults.size > 256) this.volatileResults.delete(this.volatileResults.keys().next().value as string);
-        }
         const terminalStatus = result && typeof result === "object"
           && ["completed", "failed", "cancelled", "needs-review"].includes(String((result as { terminalStatus?: unknown }).terminalStatus))
           ? String((result as { terminalStatus?: unknown }).terminalStatus)

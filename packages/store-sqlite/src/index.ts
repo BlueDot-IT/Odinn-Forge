@@ -43,6 +43,29 @@ const EXECUTION_ATTEMPT_V10_COLUMNS = Object.freeze([
   ["owner_heartbeat_at", "TEXT", 0, 0],
   ["owner_released_at", "TEXT", 0, 0]
 ] as const);
+const SCHEMA_MIGRATIONS_COLUMNS = Object.freeze([
+  ["version", "INTEGER", 0, 1],
+  ["applied_at", "TEXT", 1, 0]
+] as const);
+const SCHEMA_MIGRATIONS_DDL = "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)";
+const EXECUTION_ATTEMPTS_V10_DDL = `CREATE TABLE execution_attempts (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES execution_envelopes(run_id),
+  attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+  state TEXT NOT NULL CHECK(state IN ('proposed', 'admitted', 'queued', 'running', 'awaiting-approval', 'cancelling', 'completed', 'failed', 'cancelled', 'needs-review')),
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  settled_at TEXT,
+  outcome_digest TEXT,
+  error_code TEXT,
+  owner_token TEXT,
+  owner_pid INTEGER,
+  owner_heartbeat_at TEXT,
+  owner_released_at TEXT,
+  UNIQUE(run_id, attempt_number)
+)`;
+const EXECUTION_STATE_INDEX_DDL = "CREATE INDEX idx_execution_attempts_state ON execution_attempts(state, created_at)";
+const EXECUTION_OWNER_INDEX_DDL = "CREATE INDEX idx_execution_attempts_owner ON execution_attempts(state, owner_pid, owner_heartbeat_at)";
 const EXECUTION_ATTEMPT_TRANSITIONS: Readonly<Record<ExecutionAttemptState, ReadonlySet<ExecutionAttemptState>>> = Object.freeze({
   proposed: new Set<ExecutionAttemptState>(["admitted", "failed", "cancelled"]),
   admitted: new Set<ExecutionAttemptState>(["queued", "failed", "cancelled"]),
@@ -667,6 +690,18 @@ export class SqliteStore {
 }
 
 function assertSqliteSchemaIntegrity(database: DatabaseSync, version: number): void {
+  const schemaMigrationColumns = database.prepare("PRAGMA table_info(schema_migrations)").all() as SqlRow[];
+  const normalizedMigrationColumns = schemaMigrationColumns.map((column) => [
+    String(column.name),
+    String(column.type).toUpperCase(),
+    Number(column.notnull),
+    Number(column.pk)
+  ]);
+  if (normalizedMigrationColumns.length !== SCHEMA_MIGRATIONS_COLUMNS.length
+    || normalizedMigrationColumns.some((column, index) => column.some((value, field) => value !== SCHEMA_MIGRATIONS_COLUMNS[index]?.[field]))
+    || sqliteSchemaDdl(database, "table", "schema_migrations") !== normalizeSqliteDdl(SCHEMA_MIGRATIONS_DDL)) {
+    throw new Error("SQLite schema_migrations shape is invalid");
+  }
   const migrationVersions = (database.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as SqlRow[])
     .map((row) => Number(row.version));
   const expectedVersions = Array.from({ length: version }, (_unused, index) => index + 1);
@@ -686,17 +721,88 @@ function assertSqliteSchemaIntegrity(database: DatabaseSync, version: number): v
     || normalizedColumns.some((column, index) => column.some((value, field) => value !== EXECUTION_ATTEMPT_V10_COLUMNS[index]?.[field]))) {
     throw new Error("SQLite schema v10 execution_attempts shape is invalid");
   }
-  const ownerIndex = (database.prepare("PRAGMA index_list(execution_attempts)").all() as SqlRow[])
-    .find((index) => String(index.name) === "idx_execution_attempts_owner");
-  if (!ownerIndex || Number(ownerIndex.unique) !== 0 || Number(ownerIndex.partial) !== 0) {
+  const foreignKeys = database.prepare("PRAGMA foreign_key_list(execution_attempts)").all() as SqlRow[];
+  const foreignKey = foreignKeys[0];
+  if (foreignKeys.length !== 1 || !foreignKey
+    || String(foreignKey.table) !== "execution_envelopes"
+    || String(foreignKey.from) !== "run_id"
+    || String(foreignKey.to) !== "run_id"
+    || String(foreignKey.on_update) !== "NO ACTION"
+    || String(foreignKey.on_delete) !== "NO ACTION"
+    || String(foreignKey.match) !== "NONE") {
+    throw new Error("SQLite schema v10 execution attempt foreign key is invalid");
+  }
+  const indexes = database.prepare("PRAGMA index_list(execution_attempts)").all() as SqlRow[];
+  const primaryKeyIndex = indexes.find((index) => String(index.origin) === "pk");
+  const primaryKeyColumns = primaryKeyIndex
+    ? sqliteIndexKeyColumns(database, String(primaryKeyIndex.name))
+    : [];
+  if (!primaryKeyIndex || Number(primaryKeyIndex.unique) !== 1 || Number(primaryKeyIndex.partial) !== 0
+    || primaryKeyColumns.length !== 1
+    || primaryKeyColumns[0]?.name !== "id"
+    || primaryKeyColumns[0]?.desc !== 0
+    || primaryKeyColumns[0]?.collation !== "BINARY") {
+    throw new Error("SQLite schema v10 execution attempt primary key is invalid");
+  }
+  const attemptIdentityIndex = indexes.find((index) => String(index.origin) === "u");
+  const identityIndexColumns = attemptIdentityIndex
+    ? sqliteIndexKeyColumns(database, String(attemptIdentityIndex.name))
+    : [];
+  if (!attemptIdentityIndex || Number(attemptIdentityIndex.unique) !== 1 || Number(attemptIdentityIndex.partial) !== 0
+    || identityIndexColumns.length !== 2
+    || identityIndexColumns.some((column, index) => column.name !== ["run_id", "attempt_number"][index]
+      || column.desc !== 0 || column.collation !== "BINARY")) {
+    throw new Error("SQLite schema v10 execution attempt identity constraint is invalid");
+  }
+  const stateIndex = indexes.find((index) => String(index.name) === "idx_execution_attempts_state");
+  if (!stateIndex || Number(stateIndex.unique) !== 0 || Number(stateIndex.partial) !== 0
+    || String(stateIndex.origin) !== "c"
+    || sqliteSchemaDdl(database, "index", "idx_execution_attempts_state") !== normalizeSqliteDdl(EXECUTION_STATE_INDEX_DDL)) {
+    throw new Error("SQLite schema v10 execution state index is invalid");
+  }
+  const stateIndexColumns = sqliteIndexKeyColumns(database, "idx_execution_attempts_state");
+  if (stateIndexColumns.length !== 2
+    || stateIndexColumns.some((column, index) => column.name !== ["state", "created_at"][index]
+      || column.desc !== 0 || column.collation !== "BINARY")) {
+    throw new Error("SQLite schema v10 execution state index columns are invalid");
+  }
+  const ownerIndex = indexes.find((index) => String(index.name) === "idx_execution_attempts_owner");
+  if (!ownerIndex || Number(ownerIndex.unique) !== 0 || Number(ownerIndex.partial) !== 0
+    || String(ownerIndex.origin) !== "c"
+    || sqliteSchemaDdl(database, "index", "idx_execution_attempts_owner") !== normalizeSqliteDdl(EXECUTION_OWNER_INDEX_DDL)) {
     throw new Error("SQLite schema v10 execution owner index is invalid");
   }
-  const ownerIndexColumns = (database.prepare("PRAGMA index_info(idx_execution_attempts_owner)").all() as SqlRow[])
-    .map((column) => String(column.name));
+  const ownerIndexColumns = sqliteIndexKeyColumns(database, "idx_execution_attempts_owner");
   if (ownerIndexColumns.length !== 3
-    || ownerIndexColumns.some((column, index) => column !== ["state", "owner_pid", "owner_heartbeat_at"][index])) {
+    || ownerIndexColumns.some((column, index) => column.name !== ["state", "owner_pid", "owner_heartbeat_at"][index]
+      || column.desc !== 0 || column.collation !== "BINARY")) {
     throw new Error("SQLite schema v10 execution owner index columns are invalid");
   }
+  if (indexes.length !== 4) {
+    throw new Error("SQLite schema v10 execution attempt index set is invalid");
+  }
+  if (sqliteSchemaDdl(database, "table", "execution_attempts") !== normalizeSqliteDdl(EXECUTION_ATTEMPTS_V10_DDL)) {
+    throw new Error("SQLite schema v10 execution_attempts constraints are invalid");
+  }
+}
+
+function normalizeSqliteDdl(value: string): string {
+  return String(value).trim().replace(/\s+/gu, " ").replace(/\s*([(),])\s*/gu, "$1");
+}
+
+function sqliteSchemaDdl(database: DatabaseSync, type: "table" | "index", name: string): string {
+  const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = ? AND name = ?").get(type, name) as SqlRow | undefined;
+  return typeof row?.sql === "string" ? normalizeSqliteDdl(row.sql) : "";
+}
+
+function sqliteIndexKeyColumns(database: DatabaseSync, name: string): Array<{ name: string; desc: number; collation: string }> {
+  return (database.prepare("SELECT name, desc, coll, key FROM pragma_index_xinfo(?) ORDER BY seqno").all(name) as SqlRow[])
+    .filter((column) => Number(column.key) === 1)
+    .map((column) => ({
+      name: String(column.name),
+      desc: Number(column.desc),
+      collation: String(column.coll)
+    }));
 }
 
 export function inspectExistingSqliteSchema(path: string): number {

@@ -2392,12 +2392,24 @@ export async function createGatewayServer(options: any = {}) {
         try {
           durableResult = await readDurableChannelResult(channelResultRecords, job, tenantScope);
         } catch {
+          await jobStore.update(job.id, {
+            status: "needs-review",
+            completedAt: new Date().toISOString(),
+            error: "protected channel result failed integrity verification",
+            dispatchLease: undefined
+          });
           return json(response, 409, { ok: false, error: "durable channel result is unavailable" });
         }
-        const result = durableResult ?? supervisor.getVolatileResult(id);
-        return result === undefined
-          ? json(response, 409, { ok: false, error: "durable channel result is unavailable" })
-          : json(response, 200, { ok: true, result });
+        if (durableResult === undefined) {
+          await jobStore.update(job.id, {
+            status: "needs-review",
+            completedAt: new Date().toISOString(),
+            error: "protected channel result is unavailable after completed execution",
+            dispatchLease: undefined
+          });
+          return json(response, 409, { ok: false, error: "durable channel result is unavailable" });
+        }
+        return json(response, 200, { ok: true, result: durableResult });
       }
       if (request.method === "GET" && url.pathname.startsWith("/jobs/")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length));
