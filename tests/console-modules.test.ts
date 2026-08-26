@@ -25,9 +25,9 @@ test("session, settings, approval, audit, and tool modules expose deterministic 
   assert.equal(source.nested.enabled, true);
   assert.deepEqual(configLines(" one\n\n two "), ["one", "two"]);
   assert.equal(configNumber("12", 1), 12);
-  assert.match(renderOptions(["safe"], "safe"), /selected/u);
+  assert.equal(renderOptions(['safe"><script>'], 'safe"><script>'), '<option value="safe&quot;&gt;&lt;script&gt;" selected>safe&quot;&gt;&lt;script&gt;</option>');
   assert.match(renderApproval({ id: "approval-1", tool: "workspace.write", effect: { summary: "Write a file" } }, String), /Allow once/u);
-  assert.equal(auditFacetLabel("outcome", "failed"), "Needs attention");
+  assert.equal(auditFacetLabel("outcomes", "failed"), "Needs attention");
   assert.equal(toolCallStatus({ tool: "workspace.read" }), "Running workspace.read");
   assert.match(renderToolCall({ tool: "workspace.read", status: "running" }), /role="status"/u);
 });
