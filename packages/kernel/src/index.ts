@@ -1027,6 +1027,8 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   if (existingSystem) existingSystem.content = `${systemMessage}\n${existingSystem.content || ""}`.trim();
   else messages.unshift({ role: "system", content: systemMessage });
   if (recalled.memories.length) messages.splice(1, 0, { role: "system", content: formatMemoryContext(recalled.memories) });
+  const outputSchema = normalizeAssistantOutputSchema(input.outputSchema);
+  if (outputSchema) messages.splice(1, 0, { role: "system", content: assistantOutputSchemaInstruction(outputSchema) });
   const maxTurns = Math.min(Math.max(Number(input.maxTurns) || 6, 1), 8);
   const declaredTools = new Set(agent.manifest.tools);
   const availableTools = modelVisibleAgentToolSchemas(registry).filter((schema: any) => {
@@ -1034,18 +1036,22 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   });
   let aggregateUsage;
   let toolRepairUsed = false;
+  let structuredOutputRepairUsed = false;
+  const nestedToolCalls: any[] = [];
+  const childRuns: any[] = [];
   let budgetRecoveryUsed = false;
   let budgetRecovery;
   const tokenBudget = createAgentTokenBudget(input, maxTurns);
-  for (let turn = 0; turn < maxTurns; turn += 1) {
+  for (let turn = 0; turn < maxTurns + (structuredOutputRepairUsed ? 1 : 0); turn += 1) {
     throwIfAborted(signal);
     await onAgentProgress?.({ stage: "drafting-answer", message: "Drafting the answer.", turn: turn + 1 });
     const selectedModel = input.model || agent.manifest.model.default || undefined;
-    const turnBudget = tokenBudget.allocate(messages, availableTools, turn);
+    const turnTools = structuredOutputRepairUsed ? [] : availableTools;
+    const turnBudget = tokenBudget.allocate(messages, turnTools, turn);
     const modelRequest = {
       model: selectedModel,
       messages,
-      tools: availableTools,
+      tools: turnTools,
       stream: true,
       maxTokens: turnBudget.maxTokens
     };
@@ -1074,9 +1080,32 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
     }
     aggregateUsage = mergeUsage(aggregateUsage, result.usage);
     tokenBudget.record(result.usage);
+    if (structuredOutputRepairUsed && result.toolCalls?.length) {
+      const error = agentToolArgumentError(
+        "ASSISTANT_OUTPUT_SCHEMA_INVALID",
+        "Assistant structured-output repair attempted a tool call."
+      );
+      await recordAssistantOutputRejection(auditStore, runId ?? input?.sessionId, error, true);
+      throw error;
+    }
     if (!result.toolCalls?.length) {
+      let structuredOutput;
+      if (outputSchema) {
+        try {
+          structuredOutput = parseAssistantStructuredOutput(result.content, outputSchema);
+        } catch (error: any) {
+          await recordAssistantOutputRejection(auditStore, runId ?? input?.sessionId, error, structuredOutputRepairUsed);
+          if (structuredOutputRepairUsed) throw error;
+          structuredOutputRepairUsed = true;
+          messages.push({ role: "assistant", content: "[invalid structured output omitted]" });
+          messages.push({ role: "system", content: `The previous final answer was invalid (${cleanString(error?.code, "ASSISTANT_OUTPUT_SCHEMA_INVALID")}). Repair it once. Return only one JSON value matching the declared output schema; do not call tools.` });
+          continue;
+        }
+      }
       return {
         ...result,
+        ...(outputSchema ? { structuredOutput, structuredOutputRepair: { attempted: structuredOutputRepairUsed } } : {}),
+        nestedExecutionSummary: summarizeNestedExecutions(nestedToolCalls, childRuns),
         ...(aggregateUsage ? { usage: aggregateUsage } : {}),
         ...(budgetRecovery ? { modelRecovery: budgetRecovery } : {}),
         tokenBudget: tokenBudget.summary(),
@@ -1087,6 +1116,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
     messages.push({ role: "assistant", content: result.content || "", tool_calls: result.toolCalls });
     for (const [callIndex, call] of result.toolCalls.entries()) {
       let nested;
+      let nestedDispatchStarted = false;
       try {
         if (!allowNestedAgentExecution && ["agent.run", AGENT_GRAPH_TOOL].includes(call.name)) {
           const error = new Error("recursive agent execution is disabled for this child-agent profile") as NodeError;
@@ -1094,10 +1124,19 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
           throw error;
         }
         const args = parseAgentToolArguments(call.arguments, registry?.get?.(call.name)?.inputSchema);
+        nestedDispatchStarted = true;
         nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
+        const nestedSummary = summarizeNestedToolCall(call, nested);
+        nestedToolCalls.push(nestedSummary);
+        if (["agent.run", AGENT_GRAPH_TOOL].includes(call.name)) childRuns.push(summarizeChildRun(call, nested));
       } catch (error: any) {
         throwIfAborted(signal);
         const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError;
+        if (nestedDispatchStarted) {
+          const failed = { callId: cleanString(call?.id, "unknown"), tool: cleanString(call?.name, "unknown"), runId: "", status: "failed", code: cleanString(failure.code, "TOOL_ERROR") };
+          nestedToolCalls.push(failed);
+          if (["agent.run", AGENT_GRAPH_TOOL].includes(call.name)) childRuns.push(failed);
+        }
         const argumentCorrection = failure.code === "TOOL_ARGUMENTS_MALFORMED" || failure.code === "TOOL_ARGUMENTS_SCHEMA_INVALID";
         if (argumentCorrection) {
           await recordAgentToolRejection(auditStore, runId ?? input?.sessionId, call, failure);
@@ -1152,12 +1191,83 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
           pendingApproval: nested.output,
           ...(budgetRecovery ? { modelRecovery: budgetRecovery } : {}),
           tokenBudget: tokenBudget.summary(),
+          nestedExecutionSummary: summarizeNestedExecutions(nestedToolCalls, childRuns),
           memory: { recalled: recalled.memories.length, suggested: learned.suggested.length, learned: 0, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 }
         };
       }
     }
   }
   throw new Error(`agent reached its ${maxTurns}-turn tool limit`);
+}
+
+const MAX_ASSISTANT_OUTPUT_SCHEMA_BYTES = 65_536;
+const MAX_ASSISTANT_STRUCTURED_OUTPUT_BYTES = 262_144;
+
+function normalizeAssistantOutputSchema(value: any) {
+  if (value === undefined) return undefined;
+  let encoded: string;
+  try { encoded = JSON.stringify(value); } catch { throw agentToolArgumentError("ASSISTANT_OUTPUT_SCHEMA_INVALID", "Assistant output schema is not serializable."); }
+  if (Buffer.byteLength(encoded, "utf8") > MAX_ASSISTANT_OUTPUT_SCHEMA_BYTES) {
+    throw agentToolArgumentError("ASSISTANT_OUTPUT_SCHEMA_INVALID", "Assistant output schema exceeds the bounded size.");
+  }
+  try { validateAgentToolSchemaDefinition(value, "outputSchema"); }
+  catch { throw agentToolArgumentError("ASSISTANT_OUTPUT_SCHEMA_INVALID", "Assistant output schema is invalid or unsupported."); }
+  return value;
+}
+
+function assistantOutputSchemaInstruction(schema: any) {
+  return `The final assistant answer must contain only one JSON value matching this schema. Tool calls may occur before the final answer.\n${JSON.stringify(schema)}`;
+}
+
+function parseAssistantStructuredOutput(content: any, schema: any) {
+  const text = typeof content === "string" ? content.trim() : "";
+  if (!text || Buffer.byteLength(text, "utf8") > MAX_ASSISTANT_STRUCTURED_OUTPUT_BYTES) {
+    throw agentToolArgumentError("ASSISTANT_OUTPUT_SCHEMA_INVALID", "Assistant structured output is empty or exceeds the bounded size.");
+  }
+  let value;
+  try {
+    rejectDuplicateJsonKeys(text);
+    value = JSON.parse(text);
+    validateAgentToolSchema(value, schema, "assistant output");
+  } catch {
+    throw agentToolArgumentError("ASSISTANT_OUTPUT_SCHEMA_INVALID", "Assistant output is not valid JSON matching the declared schema.");
+  }
+  return value;
+}
+
+async function recordAssistantOutputRejection(auditStore: any, runId: any, error: NodeError, repairUsed: boolean) {
+  if (!auditStore?.append) return;
+  await auditStore.append({
+    at: new Date().toISOString(),
+    runId: cleanString(runId, "assistant-output"),
+    type: "assistant.output.rejected",
+    actor: "agent",
+    tool: "agent.run",
+    decision: "deny",
+    message: error.message,
+    data: { code: error.code ?? "ASSISTANT_OUTPUT_SCHEMA_INVALID", repairAttempt: repairUsed ? 2 : 1 }
+  });
+}
+
+function summarizeNestedToolCall(call: any, nested: any) {
+  const output = nested?.output;
+  const status = nested?.terminalStatus ?? (output?.type === "approval.required" ? "awaiting-approval" : nested?.ok === false ? "failed" : "completed");
+  return { callId: cleanString(call?.id, "unknown"), tool: cleanString(call?.name, "unknown"), runId: cleanString(nested?.id, ""), status };
+}
+
+function summarizeChildRun(call: any, nested: any) {
+  const output = nested?.output;
+  return {
+    callId: cleanString(call?.id, "unknown"),
+    tool: cleanString(call?.name, "unknown"),
+    runId: cleanString(nested?.id, ""),
+    ...(cleanString(output?.graphRunId, "") ? { graphRunId: cleanString(output.graphRunId, "") } : {}),
+    status: nested?.terminalStatus ?? (nested?.ok === false ? "failed" : "completed")
+  };
+}
+
+function summarizeNestedExecutions(toolCalls: any[], children: any[]) {
+  return { toolCalls: toolCalls.slice(0, 64), childRuns: children.slice(0, 16) };
 }
 
 function agentToolFailureMessage(error: any) {
@@ -1203,7 +1313,8 @@ function parseAgentToolArguments(raw: any, schema: any): any {
   return value;
 }
 
-function validateAgentToolSchema(value: any, schema: any, path = "arguments"): void {
+function validateAgentToolSchema(value: any, schema: any, path = "arguments", depth = 0): void {
+  if (depth > 32) throw new Error(`${path} exceeds the maximum schema depth`);
   if (!schema) return;
   validateAgentToolSchemaDefinition(schema, path);
   if (schema.type === "object") {
@@ -1212,7 +1323,7 @@ function validateAgentToolSchema(value: any, schema: any, path = "arguments"): v
     for (const key of Object.keys(value)) {
       if (FORBIDDEN_AGENT_ARGUMENT_KEYS.has(key)) throw new Error(`${path}.${key} is forbidden`);
       if (schema.additionalProperties === false && !Object.prototype.hasOwnProperty.call(properties, key)) throw new Error(`${path}.${key} is not allowed`);
-      if (Object.prototype.hasOwnProperty.call(properties, key)) validateAgentToolSchema(value[key], properties[key], `${path}.${key}`);
+      if (Object.prototype.hasOwnProperty.call(properties, key)) validateAgentToolSchema(value[key], properties[key], `${path}.${key}`, depth + 1);
     }
     for (const required of Array.isArray(schema.required) ? schema.required : []) {
       if (!Object.prototype.hasOwnProperty.call(value, required)) throw new Error(`${path}.${required} is required`);
@@ -1223,7 +1334,7 @@ function validateAgentToolSchema(value: any, schema: any, path = "arguments"): v
     if (!Array.isArray(value)) throw new Error(`${path} must be an array`);
     if (schema.minItems !== undefined && value.length < schema.minItems) throw new Error(`${path} has too few items`);
     if (schema.maxItems !== undefined && value.length > schema.maxItems) throw new Error(`${path} has too many items`);
-    if (schema.items) for (const [index, entry] of value.entries()) validateAgentToolSchema(entry, schema.items, `${path}[${index}]`);
+    if (schema.items) for (const [index, entry] of value.entries()) validateAgentToolSchema(entry, schema.items, `${path}[${index}]`, depth + 1);
     return;
   }
   if (schema.type === "string") {
@@ -1245,7 +1356,8 @@ function validateAgentToolSchema(value: any, schema: any, path = "arguments"): v
   if (Array.isArray(schema.enum) && !schema.enum.some((candidate: any) => Object.is(candidate, value))) throw new Error(`${path} is not an allowed value`);
 }
 
-function validateAgentToolSchemaDefinition(schema: any, path: string): void {
+function validateAgentToolSchemaDefinition(schema: any, path: string, depth = 0): void {
+  if (depth > 32) throw new Error(`${path} exceeds the maximum schema depth`);
   if (!schema || typeof schema !== "object" || Array.isArray(schema) || Object.getPrototypeOf(schema) !== Object.prototype) throw new Error(`${path} has an invalid schema`);
   for (const key of Object.keys(schema)) if (!SUPPORTED_AGENT_SCHEMA_KEYS.has(key)) throw new Error(`${path} uses an unsupported schema keyword`);
   if (schema.type !== undefined && (typeof schema.type !== "string" || !SUPPORTED_AGENT_SCHEMA_TYPES.has(schema.type))) throw new Error(`${path} has an unsupported schema type`);
@@ -1253,14 +1365,14 @@ function validateAgentToolSchemaDefinition(schema: any, path: string): void {
     if (!schema.properties || typeof schema.properties !== "object" || Array.isArray(schema.properties) || Object.getPrototypeOf(schema.properties) !== Object.prototype) throw new Error(`${path}.properties is invalid`);
     for (const [key, child] of Object.entries(schema.properties)) {
       if (FORBIDDEN_AGENT_ARGUMENT_KEYS.has(key)) throw new Error(`${path}.properties contains a forbidden key`);
-      validateAgentToolSchemaDefinition(child, `${path}.${key}`);
+      validateAgentToolSchemaDefinition(child, `${path}.${key}`, depth + 1);
     }
   }
   if (schema.required !== undefined) {
     if (!Array.isArray(schema.required) || schema.required.some((key: any) => typeof key !== "string") || new Set(schema.required).size !== schema.required.length) throw new Error(`${path}.required is invalid`);
   }
   if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== "boolean") throw new Error(`${path}.additionalProperties is unsupported`);
-  if (schema.items !== undefined) validateAgentToolSchemaDefinition(schema.items, `${path}.items`);
+  if (schema.items !== undefined) validateAgentToolSchemaDefinition(schema.items, `${path}.items`, depth + 1);
   if (schema.enum !== undefined && !Array.isArray(schema.enum)) throw new Error(`${path}.enum is invalid`);
   for (const key of ["minLength", "maxLength", "minItems", "maxItems"]) {
     if (schema[key] !== undefined && (!Number.isSafeInteger(schema[key]) || schema[key] < 0)) throw new Error(`${path}.${key} is invalid`);
