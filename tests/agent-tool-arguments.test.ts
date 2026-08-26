@@ -161,6 +161,7 @@ test("duplicate, prototype-shaped, trailing, and oversized arguments fail closed
       assert.ok(rejected, `missing rejection for case ${index}: ${JSON.stringify(fx.requests)}`);
       const payload = JSON.parse(rejected.content);
       assert.equal(payload?.error?.code, entry.code, JSON.stringify({ index, payload, badArguments: badArguments.slice(0, 80) }));
+      assert.equal(fx.requests[1].messages.find((message: any) => message.role === "assistant")?.tool_calls[0].function.arguments, "{}");
       assert.doesNotMatch(await auditText(fx), /polluted|duplicate|trailing|1,100,000/u);
     } finally {
       await fx.close();
