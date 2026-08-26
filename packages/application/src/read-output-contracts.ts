@@ -394,6 +394,16 @@ export interface DiagnosticStateSummaryV1 {
   readonly secretsExcludedFromDiagnostics: true;
 }
 
+export interface GitHubReadDiagnosticV1 {
+  readonly enabled: boolean;
+  readonly configured: boolean;
+  readonly repositoryCount: number;
+  readonly endpoint: "api.github.com";
+  readonly readOnly: true;
+  readonly mutationsAvailable: false;
+  readonly redirectsAllowed: false;
+}
+
 /** Versioned, explicitly redacted diagnostics read model. */
 export interface DiagnosticsReportV1 {
   readonly ok: boolean;
@@ -412,6 +422,7 @@ export interface DiagnosticsReportV1 {
   readonly jobs: JobTotalsV1;
   readonly sandbox: SandboxDiagnosticV1;
   readonly processRecovery: ProcessRecoveryDiagnosticV1;
+  readonly githubRead?: GitHubReadDiagnosticV1;
   readonly state: DiagnosticStateSummaryV1;
 }
 
@@ -581,7 +592,7 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
   object(
     input,
     "diagnostics report",
-    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "state"],
+    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "state"],
     ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserRecovery", "jobs", "sandbox", "processRecovery", "state"]
   );
   bool(input.ok, "diagnostics report.ok");
@@ -616,6 +627,11 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
   validateSandbox(input.sandbox, "diagnostics report.sandbox");
   const processRecovery = object(input.processRecovery, "diagnostics report.processRecovery", ["pending", "needsReview", "quarantined"]);
   nullableCount(processRecovery.pending, "diagnostics report.processRecovery.pending"); nullableCount(processRecovery.needsReview, "diagnostics report.processRecovery.needsReview"); bool(processRecovery.quarantined, "diagnostics report.processRecovery.quarantined");
+  if (input.githubRead !== undefined) {
+    const github = object(input.githubRead, "diagnostics report.githubRead", ["enabled", "configured", "repositoryCount", "endpoint", "readOnly", "mutationsAvailable", "redirectsAllowed"]);
+    bool(github.enabled, "diagnostics report.githubRead.enabled"); bool(github.configured, "diagnostics report.githubRead.configured"); count(github.repositoryCount, "diagnostics report.githubRead.repositoryCount");
+    literal(github.endpoint, "diagnostics report.githubRead.endpoint", "api.github.com"); literal(github.readOnly, "diagnostics report.githubRead.readOnly", true); literal(github.mutationsAvailable, "diagnostics report.githubRead.mutationsAvailable", false); literal(github.redirectsAllowed, "diagnostics report.githubRead.redirectsAllowed", false);
+  }
   const state = object(input.state, "diagnostics report.state", ["ownerOnly", "runtimeStateOutsideSourceCheckout", "secretsExcludedFromDiagnostics"]);
   bool(state.ownerOnly, "diagnostics report.state.ownerOnly"); bool(state.runtimeStateOutsideSourceCheckout, "diagnostics report.state.runtimeStateOutsideSourceCheckout"); literal(state.secretsExcludedFromDiagnostics, "diagnostics report.state.secretsExcludedFromDiagnostics", true);
   return input as unknown as DiagnosticsReportV1;

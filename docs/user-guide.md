@@ -185,7 +185,7 @@ and unexpected files in a custom installation prefix.
 
 ## Privacy and external services
 
-Ódinn Forge has no built-in product telemetry. Runtime state, browser profiles, audit records, memory, and credentials stay in the configured local state directory unless you deliberately use a remote host or external provider.
+Ódinn Forge has no built-in product telemetry. Runtime state, browser profiles, audit records, memory, and credentials stay in the configured local state directory unless you deliberately use a remote host or external provider. Optional bounded GitHub reads send authenticated requests only to the fixed GitHub API origin for repositories on the configured allowlist; see [Bounded GitHub reads](github-read.md).
 
 Model providers receive the prompts, recalled context, and tool results sent to their configured API. Websites receive normal browser or fetch traffic. Imported skills, MCP servers, extensions, and browser pages are untrusted input. Review them before enabling them and never post `.odinn`, OAuth files, gateway tokens, browser profiles, or raw diagnostic bundles publicly. External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
@@ -204,8 +204,9 @@ odinn runs
 The diagnostic report includes the Odinn version and commit, platform and Node
 version, provider mode without credentials, experimental flags, audit status,
 pending approvals, path-free Chromium candidate and configuration state,
-browser recovery, and job counts. A configured `ODINN_CHROMIUM_PATH` is reported
-as unverified without dereferencing or executing it; browser execution performs
+browser recovery, job counts, and optional path-free GitHub read health. A
+configured `ODINN_CHROMIUM_PATH` is reported as unverified without dereferencing
+or executing it; browser execution performs
 the normal policy-bound validation only when a browser tool is requested. If no
 reviewed platform candidate is available, install Chromium or configure a path
 before retrying browser tools. The report deliberately omits

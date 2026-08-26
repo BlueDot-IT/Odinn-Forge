@@ -5,14 +5,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
-import { createRunId, isEmailTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
+import { createRunId, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
 export { projectDurableJobPayload } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isAllowedCredentialEnvironmentKey, isCredentialEnvironmentName, isPhysicalPathInside, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile, ParsedEnvironmentFiles } from "./environment.ts";
-export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 export type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool, LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
@@ -25,8 +25,10 @@ import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryC
 import { approvalActionForExecution, createApprovalStore, isApprovalStoreContentionError, normalizeApprovalExecutionInput } from "./approvals.ts";
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
 import { closeBrowserManagers } from "./browser.ts";
-import { browserHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+import { browserHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 import type { EmailReadProvider } from "./email.ts";
+import { createGitHubReadClient, normalizeGitHubReadConfig } from "./github.ts";
+import type { GitHubReadClient } from "./github.ts";
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, ensureMainAgent, loadAgent, type AgentExecutionBinding } from "./agents.ts";
@@ -48,6 +50,8 @@ export type { OperatorActionDescriptor, OperatorActionName, OperatorHealth, Oper
 export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
 export { diagnoseGitWorkspace, gitDiff, gitLog, gitResourceBinding, gitStatus } from "./git.ts";
 export type { GitDiagnostic } from "./git.ts";
+export { createGitHubReadClient, diagnoseGitHubReadIntegration, normalizeGitHubReadConfig } from "./github.ts";
+export type { GitHubHttpRequest, GitHubHttpResponse, GitHubHttpTransport, GitHubReadClient, GitHubReadConfig, GitHubReadDiagnostic, GitHubReadTarget } from "./github.ts";
 import type { SandboxProcessInput } from "./sandbox-process.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
@@ -135,7 +139,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, githubReadClient }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -899,6 +903,30 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
     approvalStore,
     resolveNetworkAddresses
   });
+  let closeGitHubRead = () => {};
+  const githubConfig = normalizeGitHubReadConfig(config?.integrations?.github ?? {});
+  if (githubConfig.enabled) {
+    const configuredClient: GitHubReadClient = githubReadClient ?? createGitHubReadClient(githubConfig, { resolveNetworkAddresses });
+    let active = true;
+    const ensureActive = () => {
+      if (!active) throw new Error("GitHub read client is closed");
+    };
+    const guardedGitHubReadClient: GitHubReadClient = {
+      get target() { ensureActive(); return configuredClient.target; },
+      get diagnostic() { ensureActive(); return configuredClient.diagnostic; },
+      resourceFor(kind, input) { ensureActive(); return configuredClient.resourceFor(kind, input); },
+      repository(input, signal) { ensureActive(); return configuredClient.repository(input, signal); },
+      issue(input, signal) { ensureActive(); return configuredClient.issue(input, signal); },
+      pullRequest(input, signal) { ensureActive(); return configuredClient.pullRequest(input, signal); },
+      checks(input, signal) { ensureActive(); return configuredClient.checks(input, signal); }
+    };
+    registerHostCapabilityPlugin(registry, githubReadHostCapabilityPlugin, {
+      stateDir,
+      approvalStore,
+      githubReadClient: guardedGitHubReadClient
+    });
+    closeGitHubRead = () => { active = false; };
+  }
   let closeComputerScreen = () => {};
   if (enableComputerScreen === true && computerScreenProvider) {
     let active = true;
@@ -987,6 +1015,7 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
     value: () => {
       if (closed) return;
       closed = true;
+      closeGitHubRead();
       closeComputerScreen();
       closeEmailRead();
       void ownedMcpRuntime?.close();
@@ -1694,10 +1723,10 @@ async function consumeClaimedApprovalContinuation({
 
 function taskRequestDigest(request: any, tool?: AnyRecord): string {
   const requestInput = canonicalTaskInput(request.tool, request.input, tool);
-  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke" || isEmailTool(request.tool)
+  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke" || isEmailTool(request.tool) || isGitHubTool(request.tool)
     ? projectDurableToolInput(request.tool, requestInput)
     : requestInput;
-  const resource = request.tool === "computer.screen" || isEmailTool(request.tool) ? executionResourceForRequest(request.tool, requestInput, tool) : undefined;
+  const resource = request.tool === "computer.screen" || isEmailTool(request.tool) || isGitHubTool(request.tool) ? executionResourceForRequest(request.tool, requestInput, tool) : undefined;
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown", ...(resource ? { resource } : {}) })).digest("hex");
 }
 

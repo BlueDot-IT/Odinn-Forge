@@ -103,6 +103,7 @@ export type {
   ExperimentalFlagsV1,
   GatewayChannelDiagnosticV1,
   GatewayStatusSnapshotV1,
+  GitHubReadDiagnosticV1,
   JobTotalsV1,
   PendingApprovalSummaryV1,
   PlatformSummaryV1,

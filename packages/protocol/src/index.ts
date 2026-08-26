@@ -90,7 +90,8 @@ const SKILL_LIFECYCLE_TOOLS = new Set(["skill.install", "skill.lifecycle"]);
 const MCP_DISCOVER_TOOLS = new Set(["mcp.discover"]);
 const MCP_INVOKE_TOOLS = new Set(["mcp.invoke"]);
 const EMAIL_TOOLS = new Set(["email.accounts", "email.search", "email.read", "email.thread"]);
-const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", ...EMAIL_TOOLS]);
+const GITHUB_TOOLS = new Set(["github.repository", "github.issue", "github.pull-request", "github.checks"]);
+const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", ...EMAIL_TOOLS, ...GITHUB_TOOLS]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -98,6 +99,10 @@ export function isWorkspaceContentTool(toolName: unknown): boolean {
 
 export function isEmailTool(toolName: unknown): boolean {
   return typeof toolName === "string" && EMAIL_TOOLS.has(toolName);
+}
+
+export function isGitHubTool(toolName: unknown): boolean {
+  return typeof toolName === "string" && GITHUB_TOOLS.has(toolName);
 }
 
 export function isReplayUnavailableTool(toolName: unknown): boolean {
@@ -118,6 +123,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleInput(input);
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverInput(input);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeInput(input);
+  if (GITHUB_TOOLS.has(toolName)) return projectGitHubInput(toolName, input);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailInput(input);
   if (toolName.startsWith("git.")) return projectGitInput(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
@@ -170,6 +176,7 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleOutput(output);
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverOutput(output);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeOutput(output);
+  if (GITHUB_TOOLS.has(toolName)) return projectGitHubOutput(toolName, output);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailOutput(toolName, output);
   if (toolName.startsWith("git.")) return projectGitOutput(toolName, output);
   if (REPLAY_UNAVAILABLE_TOOLS.has(toolName)) return projectComputerScreenOutput(output);
@@ -217,6 +224,41 @@ function projectGitInput(input: unknown): JsonObject {
     if (typeof source[key] === "number" || typeof source[key] === "boolean") projected[key] = source[key];
   }
   return projected;
+}
+
+function projectGitHubInput(toolName: string, input: unknown): JsonObject {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const source = input as JsonObject;
+  const target = [
+    toolName,
+    typeof source.repository === "string" ? source.repository.toLowerCase() : null,
+    Number.isSafeInteger(source.issueNumber) ? source.issueNumber : null,
+    Number.isSafeInteger(source.pullNumber) ? source.pullNumber : null,
+    typeof source.ref === "string" ? source.ref.toLowerCase() : null
+  ];
+  const projected: JsonObject = { targetDigest: sha256Reference(JSON.stringify(target)) };
+  if (Number.isSafeInteger(source.limit)) projected.limit = source.limit;
+  return projected;
+}
+
+function projectGitHubOutput(toolName: string, output: unknown): JsonObject {
+  const base: JsonObject = { type: toolName, contentUnavailableOnReplay: true };
+  if (!output || typeof output !== "object" || Array.isArray(output)) return base;
+  const record = output as JsonObject;
+  const target = [
+    toolName,
+    typeof record.repository === "string" ? record.repository.toLowerCase() : null,
+    Number.isSafeInteger(record.issueNumber) ? record.issueNumber : null,
+    Number.isSafeInteger(record.pullNumber) ? record.pullNumber : null,
+    typeof record.ref === "string" ? record.ref.toLowerCase() : null
+  ];
+  const encoded = JSON.stringify(output) ?? "null";
+  base.targetDigest = sha256Reference(JSON.stringify(target));
+  base.payloadDigest = sha256Reference(encoded);
+  base.payloadBytes = Buffer.byteLength(encoded, "utf8");
+  if (Array.isArray(record.checks)) base.itemCount = record.checks.length;
+  if (Array.isArray(record.labels)) base.itemCount = record.labels.length;
+  return base;
 }
 
 function projectGitOutput(toolName: string, output: unknown): JsonObject {

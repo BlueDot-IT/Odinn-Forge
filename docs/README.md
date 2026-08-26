@@ -86,6 +86,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
 - [Bounded workspace inspection](workspace-inspection.md) — read-only listing,
   metadata, literal search, bounded reads and diffs, sensitive-file policy,
   cursors, and platform limits.
+- [Bounded GitHub reads](github-read.md) — fixed-origin, repository-allowlisted
+  live reads with credential references and digest-only durable evidence.
 
 ## Advanced capability notes
 
