@@ -491,7 +491,7 @@ export function matchAutomationEvent(
   });
 }
 
-function validateCandidate(input: unknown): AutomationCandidate {
+export function validateAutomationCandidate(input: unknown): AutomationCandidate {
   const value = object(input, "automation candidate");
   exact(value, new Set([
     "schemaVersion", "candidateId", "declarationId", "declarationRevision", "declarationDigest",
@@ -547,7 +547,7 @@ export function validateOdinnAgentControlEnvelope(input: unknown): OdinnAgentCon
     agentId: token(value.agentId, "control agentId"),
     issuedAtUnixMs: unixMs(value.issuedAtUnixMs, "control issuedAtUnixMs")
   };
-  if (value.kind === "dispatch") return freeze({ ...base, kind: "dispatch", candidate: validateCandidate(value.candidate) });
+  if (value.kind === "dispatch") return freeze({ ...base, kind: "dispatch", candidate: validateAutomationCandidate(value.candidate) });
   const dispatchId = token(value.dispatchId, "control dispatchId");
   if (value.kind === "cancel") {
     const reasons = new Set(["operator-request", "superseded", "shutdown", "policy"]);

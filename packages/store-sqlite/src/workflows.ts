@@ -5,6 +5,7 @@ import {
   projectWorkflowInput,
   projectWorkflowOutput,
   validateWorkflowDefinition,
+  validateWorkflowErrorCode,
   validateWorkflowRunRequest,
   validateWorkflowTransition,
   type WorkflowDefinition,
@@ -299,6 +300,7 @@ export class SqliteWorkflowStore {
   }
 
   failStep(runId: string, stepId: string, leaseToken: string, errorCode: string, { uncertain = false, stopDeadlineAt = new Date(Date.now() + DEFAULT_FAILURE_STOP_GRACE_MS).toISOString() }: { uncertain?: boolean; stopDeadlineAt?: string } = {}): WorkflowRunRecord {
+    const code = validateWorkflowErrorCode(errorCode);
     return this.database.transaction((db) => {
       const row = db.prepare(`SELECT s.status, s.attempt, s.max_attempts, s.retry_safety FROM workflow_steps s JOIN workflow_runs r ON r.run_id=s.run_id
         WHERE s.run_id=? AND s.step_id=? AND s.lease_token=? AND s.lease_expires_at > ?
@@ -309,9 +311,9 @@ export class SqliteWorkflowStore {
       const status: WorkflowStepStatus = uncertain ? "needs-review" : retry ? "queued" : "failed";
       validateWorkflowTransition(String(row.status) as WorkflowStepStatus, status);
       db.prepare("UPDATE workflow_steps SET status=?, error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND step_id=? AND lease_token=?")
-        .run(status, errorCode.slice(0, 256), timestamp, runId, stepId, leaseToken);
-      appendEventUnsafe(db, runId, `workflow.step.${status}`, { stepId, errorCode: errorCode.slice(0, 256) });
-      if (status !== "queued") beginFailureStopUnsafe(db, runId, timestamp, stopDeadlineAt, errorCode.slice(0, 256));
+        .run(status, code, timestamp, runId, stepId, leaseToken);
+      appendEventUnsafe(db, runId, `workflow.step.${status}`, { stepId, errorCode: code });
+      if (status !== "queued") beginFailureStopUnsafe(db, runId, timestamp, stopDeadlineAt, code);
       return this.get(runId)!;
     });
   }
@@ -380,7 +382,7 @@ export class SqliteWorkflowStore {
       const status: WorkflowStepStatus = uncertain ? "needs-review" : "cancelled";
       validateWorkflowTransition(String(row.status) as WorkflowStepStatus, status);
       const timestamp = now();
-      const code = (errorCode ?? (uncertain ? "WORKFLOW_CANCELLATION_OUTCOME_UNCERTAIN" : "WORKFLOW_CANCELLED")).slice(0, 256);
+      const code = validateWorkflowErrorCode(errorCode ?? (uncertain ? "WORKFLOW_CANCELLATION_OUTCOME_UNCERTAIN" : "WORKFLOW_CANCELLED"));
       db.prepare("UPDATE workflow_steps SET status=?, error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND step_id=? AND lease_token=?")
         .run(status, code, timestamp, runId, stepId, leaseToken);
       appendEventUnsafe(db, runId, `workflow.step.${status}`, { stepId, errorCode: code });
@@ -398,7 +400,7 @@ export class SqliteWorkflowStore {
       const status: WorkflowStepStatus = uncertain ? "needs-review" : "cancelled";
       validateWorkflowTransition(String(row.status) as WorkflowStepStatus, status);
       const timestamp = now();
-      const code = (errorCode ?? (uncertain ? "WORKFLOW_STOP_OUTCOME_UNCERTAIN" : "WORKFLOW_STOPPED_AFTER_FAILURE")).slice(0, 256);
+      const code = validateWorkflowErrorCode(errorCode ?? (uncertain ? "WORKFLOW_STOP_OUTCOME_UNCERTAIN" : "WORKFLOW_STOPPED_AFTER_FAILURE"));
       db.prepare("UPDATE workflow_steps SET status=?, error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE run_id=? AND step_id=? AND lease_token=?")
         .run(status, code, timestamp, runId, stepId, leaseToken);
       appendEventUnsafe(db, runId, `workflow.step.${status}`, { stepId, errorCode: code });
@@ -418,12 +420,12 @@ export class SqliteWorkflowStore {
   }
 
   quarantineStep(runId: string, stepId: string, leaseToken: string, errorCode = "WORKFLOW_OUTCOME_UNCERTAIN", stopDeadlineAt = new Date(Date.now() + DEFAULT_FAILURE_STOP_GRACE_MS).toISOString()): WorkflowRunRecord {
+    const code = validateWorkflowErrorCode(errorCode);
     return this.database.transaction((db) => {
       const row = db.prepare("SELECT status FROM workflow_steps WHERE run_id=? AND step_id=? AND lease_token=?").get(runId, stepId, leaseToken) as Row | undefined;
       if (!row) throw new Error("workflow step quarantine lease is missing or stale");
       validateWorkflowTransition(String(row.status) as WorkflowStepStatus, "needs-review");
       const timestamp = now();
-      const code = errorCode.slice(0, 256);
       db.prepare(`UPDATE workflow_steps SET status='needs-review', error_code=?, lease_token=NULL, lease_expires_at=NULL, updated_at=?
         WHERE run_id=? AND step_id=? AND lease_token=?`).run(code, timestamp, runId, stepId, leaseToken);
       appendEventUnsafe(db, runId, "workflow.step.needs-review", { stepId, errorCode: code });

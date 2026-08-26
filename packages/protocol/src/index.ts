@@ -135,6 +135,31 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   return projected;
 }
 
+/**
+ * Canonical persistence projection for a durable runtime-job payload.
+ *
+ * Callers must compute authorization and idempotency digests from the live
+ * request before using this projection. The projection is shared by stores
+ * and binding checks so content-removing tool projections cannot make a
+ * legitimate persisted job look like an unrelated request.
+ */
+export function projectDurableJobPayload(payload: JsonObject): JsonObject {
+  const task = payload.task;
+  const projected = !task || typeof task !== "object" || Array.isArray(task)
+    ? payload
+    : {
+        ...payload,
+        task: {
+          ...task,
+          input: projectDurableToolInput(
+            typeof (task as JsonObject).tool === "string" ? String((task as JsonObject).tool) : "",
+            (task as JsonObject).input
+          )
+        }
+      };
+  return redactDurableValue(projected, { input: true }) as JsonObject;
+}
+
 /** Project workspace results to bounded metadata before durable persistence. */
 export function projectDurableToolOutput(toolName: string, output: unknown): unknown {
   if (WORKSPACE_MUTATION_TOOLS.has(toolName)) return projectMutationPayload(output);

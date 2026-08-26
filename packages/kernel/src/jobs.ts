@@ -168,7 +168,9 @@ export class JobSupervisor {
     } catch (error) {
       if (!idempotent) throw error;
       const existing = await this.store.get(id);
-      if (!existing || existing.occurrenceKey !== occurrenceKey) throw error;
+      if (!existing
+        || existing.occurrenceKey !== occurrenceKey
+        || (requestHash !== undefined && existing.requestHash !== requestHash)) throw error;
       return existing;
     }
     await this.drain();
