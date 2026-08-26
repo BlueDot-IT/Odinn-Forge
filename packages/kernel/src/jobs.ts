@@ -29,8 +29,18 @@ export interface JobRecord {
   dispatchLease?: JsonObject;
 }
 
+export interface JobCreationControl extends JsonObject {
+  agentGraphReassignment?: {
+    graphRunId: string;
+    replacementJobId: string;
+    replacementRequestHash: string;
+    replacementIdentityDigest: string;
+    trustedPrincipalId: string;
+  };
+}
+
 export interface JobStore {
-  create(job: JsonObject & { id: string }): Promise<JobRecord>;
+  create(job: JsonObject & { id: string }, control?: JobCreationControl): Promise<JobRecord>;
   claimNextQueued?(patch: JsonObject): Promise<JobRecord | undefined>;
   claim(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
   claimApproval?(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
@@ -124,7 +134,8 @@ export class JobSupervisor {
       occurrenceKey,
       scheduledFor,
       nextRunAt,
-      idempotent = false
+      idempotent = false,
+      creationControl
     }: {
       id?: string;
       timeoutMs?: number;
@@ -134,6 +145,7 @@ export class JobSupervisor {
       scheduledFor?: string;
       nextRunAt?: string | null;
       idempotent?: boolean;
+      creationControl?: JobCreationControl;
     } = {}
   ): Promise<JobRecord> {
     const normalizedPayload = payload.task && typeof payload.task === "object" && !Array.isArray(payload.task)
@@ -151,7 +163,7 @@ export class JobSupervisor {
         ...(occurrenceKey ? { occurrenceKey } : {}),
         ...(scheduledFor ? { scheduledFor } : {}),
         ...(nextRunAt !== undefined ? { nextRunAt } : {})
-      });
+      }, creationControl);
       this.volatilePayloads.set(id, normalizedPayload);
     } catch (error) {
       if (!idempotent) throw error;

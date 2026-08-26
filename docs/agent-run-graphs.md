@@ -92,7 +92,8 @@ process execution, approvals, effectful tools, and retries are refused.
 
 Before dispatch, the kernel persists only graph/manifest digests, a principal
 digest marker, and bounded byte metadata, plus one queued node, in runtime
-SQLite graph state, extended by schema v8 for bounded concurrency. The child is dispatched through
+SQLite graph state, extended by schema v9 for bounded concurrency and durable
+single-successor reassignment reservations. The child is dispatched through
 the existing admission, isolated-worker, ledger, and signed audit paths. A
 receipt is accepted only when the child audit run contains a terminal task
 event; missing or unreadable audit evidence becomes `needs-review`. Graph and
@@ -108,6 +109,46 @@ metadata remain. Completed channel-bound `agent.run` jobs expose their live
 response only through the bounded ephemeral `/jobs/:id/result` route; the
 volatile result is cleared on supervisor shutdown and is never reconstructed
 from a redacted durable projection.
+
+The Gateway exposes an operator control plane for this durable state:
+
+- `GET /agent-graphs` lists bounded, newest-first projections with optional
+  `status`, `parentRunId`, and `limit` filters; `GET /agent-graphs/:id` returns
+  one projection. Neither route reconstructs prompts or provider output.
+- `POST /agent-graphs/:id/cancel` fences the owning durable job. Graph work is
+  conservatively quarantined as `needs-review` because a durable cancellation
+  request cannot prove that every physical child effect was absent. A live
+  graph whose parent job has disappeared is quarantined instead of being
+  treated as successfully cancelled. A signed, pre-effect cancellation intent
+  must be recorded before the durable fence is changed, and a signed outcome
+  records the resulting job state.
+- `POST /agent-graphs/:id/reassign` accepts only a new `kind=agent-graph`
+  durable job for a terminal incomplete graph. The caller must bind the exact
+  prior request digest, use a new idempotency key, preserve the original
+  trusted tenant and execution principal as well as the principal namespace,
+  and request a subset of the prior parent capabilities. The parent must be
+  terminal and have no unexpired durable lease. Runtime schema v9 atomically
+  reserves one successor per source graph: an exact same-successor replay is
+  idempotent, while a different successor conflicts. Existing replacement jobs
+  must retain the exact request hash, tool, delegation source/digest, scope,
+  principal, and capabilities; hashless legacy jobs conflict. A signed
+  pre-effect intent must exist before submission, and the old/new identities
+  are then linked by a signed outcome and ledger relation. Immutable graph
+  history is never rewritten.
+- `POST /agent-graphs/:id/checkpoint` admits an operator-authored
+  `workspace.mutate` or `workspace.patch` request only after the graph and
+  selected node complete. Admission binds the exact child result digest,
+  requires the original parent job to have that mutation capability, and then
+  crosses the existing policy, capability-token, preview/apply, audit, and
+  recovery boundary. A signed pre-effect checkpoint intent is required before
+  governed mutation admission, followed by a signed outcome. Child output
+  never becomes executable authority and a child cannot call this route
+  directly.
+
+When experimental capability tokens are enabled, the trusted graph runner
+mints a one-use, child-run-bound `agent.run` token only after parent authority,
+manifest, and capability intersection succeed. Parent tokens are never copied
+into child input, and model content cannot request or widen the internal grant.
 
 The runner itself still performs no registry loading, filesystem, network,
 environment, provider, credential, or tool access. Its dispatch callback is

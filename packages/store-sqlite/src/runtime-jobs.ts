@@ -11,6 +11,24 @@ const MAX_LEGACY_JOB_STORE_BYTES = 64 * 1024 * 1024;
 
 type SqlRow = { [key: string]: any };
 
+type AgentGraphReassignmentCreationControl = {
+  graphRunId: string;
+  replacementJobId: string;
+  replacementRequestHash: string;
+  replacementIdentityDigest: string;
+  trustedPrincipalId: string;
+};
+
+type JobCreationControl = {
+  agentGraphReassignment?: AgentGraphReassignmentCreationControl;
+};
+
+function jobCreationConflict(message: string, code: string): never {
+  const error = new Error(message) as Error & { code?: string };
+  error.code = code;
+  throw error;
+}
+
 export interface RuntimeJobRecord {
   schemaVersion: 1;
   id: string;
@@ -357,11 +375,57 @@ export class SqliteJobStore {
     return row ? hydrate(row) : undefined;
   }
 
-  async create(job: JsonObject & { id: string }): Promise<RuntimeJobRecord> {
+  async create(job: JsonObject & { id: string }, control?: JobCreationControl): Promise<RuntimeJobRecord> {
     return this.ledger.database.transaction((db) => {
       if (db.prepare("SELECT 1 FROM runtime_jobs WHERE id = ?").get(job.id)) throw new Error(`job already exists: ${job.id}`);
       const normalized = normalizeJob(job);
+      const supportsReassignments = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_graph_reassignments'").get());
+      const reservation = supportsReassignments
+        ? db.prepare("SELECT * FROM agent_graph_reassignments WHERE replacement_job_id = ?").get(normalized.id) as SqlRow | undefined
+        : undefined;
+      const reassignment = control?.agentGraphReassignment;
+      if (reservation) {
+        if (!reassignment
+          || reassignment.graphRunId !== String(reservation.graph_run_id)
+          || reassignment.replacementJobId !== normalized.id
+          || reassignment.replacementRequestHash !== String(reservation.replacement_request_hash)
+          || reassignment.replacementRequestHash !== normalized.requestHash
+          || reassignment.replacementIdentityDigest !== String(reservation.replacement_identity_digest)
+          || reassignment.trustedPrincipalId !== String(reservation.trusted_principal_id)
+          || String(reservation.status) !== "reserved") {
+          jobCreationConflict(
+            "job id is reserved for an exact agent graph reassignment",
+            "AGENT_GRAPH_REASSIGNMENT_TARGET_RESERVED"
+          );
+        }
+      } else if (reassignment) {
+        jobCreationConflict(
+          "agent graph reassignment reservation is unavailable during job creation",
+          "AGENT_GRAPH_REASSIGNMENT_RESERVATION_LOST"
+        );
+      }
       writeJob(db, normalized);
+      if (reservation && reassignment) {
+        const now = new Date().toISOString();
+        const submitted = db.prepare(`UPDATE agent_graph_reassignments
+          SET status='submitted', submitted_at=COALESCE(submitted_at, ?)
+          WHERE graph_run_id=? AND replacement_job_id=? AND replacement_request_hash=?
+            AND replacement_identity_digest=? AND trusted_principal_id=? AND status='reserved'`)
+          .run(
+            now,
+            reassignment.graphRunId,
+            reassignment.replacementJobId,
+            reassignment.replacementRequestHash,
+            reassignment.replacementIdentityDigest,
+            reassignment.trustedPrincipalId
+          );
+        if (Number(submitted.changes) !== 1) {
+          jobCreationConflict(
+            "agent graph reassignment reservation changed during atomic job creation",
+            "AGENT_GRAPH_REASSIGNMENT_RESERVATION_LOST"
+          );
+        }
+      }
       return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(normalized.id) as SqlRow);
     });
   }

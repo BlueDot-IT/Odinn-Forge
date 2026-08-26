@@ -373,7 +373,37 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
             recordNode: (value) => context.runLedger.recordAgentGraphNodeResult(value),
             complete: (value) => context.runLedger.completeAgentGraphRun(value)
           },
-          runChild: (childTask) => context.runTool(childTask)
+          runChild: (childTask) => {
+            if (context.runLedger.featureFlags?.capabilities !== true) return context.runTool(childTask);
+            if (childTask.tool !== "agent.run" || typeof childTask.id !== "string" || !childTask.id) {
+              throw new Error("agent graph child capability admission requires a bounded agent.run task identity");
+            }
+            // The graph runner, not child/model content, mints this one-use
+            // token after parent authority and manifest intersection succeed.
+            // Enforcement is the broker's exact run/tool binding, expiry, and
+            // atomic use count; do not attach advisory scope labels that the
+            // broker does not enforce.
+            context.runLedger.ensureRun({ runId: childTask.id, objective: "governed agent graph child execution" });
+            const capabilityToken = new CapabilityBroker({
+              ledger: context.runLedger,
+              stateDir: context.runLedger.stateDir,
+              featureFlags: context.runLedger.featureFlags
+            }).issue({
+              runId: childTask.id,
+              stepId: `${childTask.id}:agent-run`,
+              toolName: "agent.run",
+              scopes: [],
+              expiresInMs: 60_000,
+              maxUses: 1
+            }).token;
+            const childInput = childTask.input && typeof childTask.input === "object" && !Array.isArray(childTask.input)
+              ? childTask.input
+              : {};
+            return context.runTool({
+              ...childTask,
+              input: { ...childInput, capabilityToken }
+            });
+          }
         });
       }
     }],

@@ -226,6 +226,11 @@ this surface and host execution remains unavailable.
 | `POST /jobs` | A task or `{ task, id?, timeoutMs? }` | `202 { ok, job }`; a repeated matching idempotency key returns the existing job |
 | `GET /jobs/:id` | Job identifier in the path | The job record |
 | `POST /jobs/:id/cancel` | No body | `{ ok, job }` with the cancellation state |
+| `GET /agent-graphs` | Optional `status`, `parentRunId`, and bounded `limit` | `{ graphs }` with durable digest-only graph/node projections |
+| `GET /agent-graphs/:id` | Graph run identifier in the path | `{ graph }`; unknown identifiers return 404 |
+| `POST /agent-graphs/:id/cancel` | No body | Records a signed intent, fences the owning durable job, then records the signed outcome; a missing live parent is quarantined for review |
+| `POST /agent-graphs/:id/reassign` | `{ expectedRequestDigest, replacement }`; replacement is a new `kind=agent-graph` job with a new idempotency key | Atomically reserves one capability-subset successor for a terminal, lease-free incomplete graph under the original trusted tenant/principal, with signed intent/outcome evidence; exact replay is idempotent and a different successor conflicts |
+| `POST /agent-graphs/:id/checkpoint` | `{ runId, nodeId, expectedResultDigest, tool, ...governedMutation, capabilityToken? }` | Records a signed intent, then admits a digest-bound `workspace.mutate` or `workspace.patch` preview/apply through the original parent authority and normal governed-mutation boundary, followed by a signed outcome |
 | `GET /cron` | No body | `{ enabled, jobs, nextWake }` |
 | `POST /cron` | `{ name?, schedule, timezone?, tool, input?, enabled? }` | `{ ok, job }` for the created schedule |
 | `PATCH /cron/:id` | Any mutable schedule fields | `{ ok, job }` for the updated schedule |
