@@ -46,6 +46,28 @@ function assertBenchmarkAuthStore(value: unknown): asserts value is Record<strin
   }
 }
 
+async function withConsoleDiagnosticsOnStderr<T>(operation: () => Promise<T>): Promise<T> {
+  const original = {
+    debug: console.debug,
+    info: console.info,
+    log: console.log,
+    warn: console.warn,
+  };
+  const route = (...values: unknown[]) => console.error(...values);
+  console.debug = route;
+  console.info = route;
+  console.log = route;
+  console.warn = route;
+  try {
+    return await operation();
+  } finally {
+    console.debug = original.debug;
+    console.info = original.info;
+    console.log = original.log;
+    console.warn = original.warn;
+  }
+}
+
 export async function runOpenClawBenchmarkAdapter(args = process.argv.slice(2)): Promise<unknown> {
   const executable = await realpath(resolve(option(args, "--openclaw")));
   const packageRoot = dirname(executable);
@@ -69,7 +91,7 @@ export async function runOpenClawBenchmarkAdapter(args = process.argv.slice(2)):
     runtime.replaceRuntimeAuthProfileStoreSnapshots([{ agentDir, store: authStore }]);
     const prompt = await readFile(resolve(option(args, "--prompt-file")), "utf8");
     const trialId = option(args, "--trial-id");
-    const result = await runtime.agentCommand({
+    const result = await withConsoleDiagnosticsOnStderr(() => runtime.agentCommand!({
       message: prompt,
       agentId: "main",
       model: "openai/gpt-5.6-luna",
@@ -80,7 +102,7 @@ export async function runOpenClawBenchmarkAdapter(args = process.argv.slice(2)):
       cleanupBundleMcpOnRunEnd: true,
       cleanupCliLiveSessionOnRunEnd: true,
       oneShotCliRun: true,
-    });
+    }));
     if (result === undefined) {
       throw new Error("pinned OpenClaw agentCommand returned no benchmark result");
     }
