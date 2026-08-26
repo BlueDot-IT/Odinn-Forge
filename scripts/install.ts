@@ -112,11 +112,14 @@ async function install(operation: any) {
 
 function deferredLauncherParentPid(operation: string): number | null {
   const value = option("--defer-launchers-until-pid");
-  if (!value) return null;
   if (process.platform !== "win32" || operation !== "upgrade") {
+    if (!value) return null;
     throw new Error("deferred launcher activation is supported only for Windows upgrades");
   }
-  const pid = Number(value);
+  // Older installed CLIs do not know the defer flag. The candidate installer
+  // still owns launcher safety, so every Windows upgrade defaults to waiting
+  // for its invoking CLI parent before replacing the active batch file.
+  const pid = Number(value || process.ppid);
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("deferred launcher activation requires a valid parent process ID");
   if (!processIsAlive(pid)) throw new Error("deferred launcher activation parent process is not running");
   return pid;

@@ -278,9 +278,6 @@ export async function validatePriorRollback(options: {
       recordOutcome(6, "Candidate update output", false, `Update output mismatch: ${JSON.stringify(updateData)}`);
     }
     if (process.platform === "win32") {
-      if (updateData.launcherActivation !== "deferred") {
-        recordOutcome(6, "Candidate launcher handoff", false, "Windows update did not defer active batch launcher replacement");
-      }
       await waitForLauncherActivation(prefix);
     }
     recordOutcome(6, "Execute candidate update from v1.0.0 binary", true);
@@ -434,16 +431,24 @@ export async function validatePriorRollback(options: {
 async function waitForLauncherActivation(prefix: string) {
   const marker = join(prefix, ".launcher-activation.json");
   const deadline = Date.now() + 30_000;
+  let observed = false;
   while (Date.now() < deadline) {
     try {
       await readFile(marker);
+      observed = true;
     } catch (error: any) {
-      if (error?.code === "ENOENT") return;
+      if (error?.code === "ENOENT" && observed) return;
+      if (error?.code === "ENOENT") {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        continue;
+      }
       throw error;
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
   }
-  throw new Error("timed out waiting for deferred Windows launcher activation");
+  throw new Error(observed
+    ? "timed out waiting for deferred Windows launcher activation"
+    : "Windows update did not create a deferred launcher activation marker");
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
