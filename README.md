@@ -332,28 +332,17 @@ final message as proof. The dated snapshot below is informational: it is not a
 CI gate, a release guarantee, or a model-only score.
 
 <!-- weekly-benchmark:start -->
-**2026-08-14 — 1.1.0-rc.2 candidate comparison.** Seven cases ran five times
-per runtime with OpenAI OAuth, `gpt-5.6-luna`, cloud-only deployment,
-runtime-default sampling, and a bounded filesystem-and-shell tool policy. All
-35 trials executed for each runtime.
+**2026-08-26 — weekly GitHub Actions comparison.** Seven deterministic cases ran five times per runtime with openai-oauth, `gpt-5.6-luna`, cloud deployment, runtime-default sampling, and the same bounded-filesystem-and-process policy.
 
 | Runtime | Verified | Failed | Verified rate | p50 | p95 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Ódinn Forge `1.1.0-rc.2` | 35/35 | 0 | 100% | 20.27s | 35.42s |
-| OpenClaw `2026.8.1` | 33/35 | 2 | 94.3% | 67.60s | 109.97s |
-| Hermes Agent `0.20.1` | 35/35 | 0 | 100% | 22.92s | 39.13s |
+| Ódinn Forge `1.1.1` | 20/35 | 0 | 57.1% | 3.80s | 19.07s |
+| OpenClaw `OpenClaw 2026.7.1-2 (0790d9f)` | 23/35 | 12 | 65.7% | 26.75s | 45.01s |
+| Hermes Agent `Hermes Agent v0.19.0 (2026.7.20)` | 35/35 | 0 | 100% | 15.98s | 23.98s |
 
-The historical Odinn row is pinned to `v1.1.0-rc.2` at
-`9256e23c1f78b3ab14b51ee72c0d2a4d0fdd769c`, but its locally modified adapter
-incorrectly advertised nested process execution that the candidate did not
-expose. Under the documented one-shot contract, Odinn covers **4/7 cases**:
-20 supported trials execute and verify, while 15 process-dependent trials are
-unsupported. `process.exec` remains separately approved, top-level durable
-`POST /jobs` work and is intentionally outside this adapter. Rerun the external
-harness before treating the historical table as current performance.
-See the
-[benchmark source revision](https://github.com/BlueDot-IT/agent-benchmarks/commit/e23ad096e0895fb0a6b0ef1f6faaf71d67b2ab35)
-for the harness revision and methodology.
+Ódinn Forge's one-shot agent adapter covers **4/7 cases**: 20 supported trials execute and verify, while 15 process-dependent trials are unsupported. Its documented `process.exec` surface is separately approved, top-level durable `/jobs` work and is intentionally outside this adapter. Unsupported trials are not failures and remain in the denominator.
+
+Harness: [`8ad91f0b9e39`](https://github.com/BlueDot-IT/agent-benchmarks/commit/8ad91f0b9e396c88cf10e56687630539ce10bcd1). [GitHub Actions run](https://github.com/BlueDot-IT/Odinn-Forge/actions/runs/33011203479). Raw reports are retained as workflow artifacts.
 <!-- weekly-benchmark:end -->
 
 The [current benchmark page](docs/benchmarks.md) contains the complete generated
