@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: "24"
+  NODE_VERSION: "24.19.0"
   PNPM_VERSION: "10.14.0"
   RELEASE_TAG: ${{ inputs.tag }}
   RELEASE_ID: ${{ inputs.release_id }}
@@ -130,6 +130,7 @@ jobs:
       - run: pnpm release:package
         env:
           GITHUB_SHA: ${{ env.ODINN_RELEASE_COMMIT }}
+      - run: pnpm release:package-standalone
       - run: pnpm release:soak
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
@@ -266,6 +267,8 @@ jobs:
         run: node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
       - name: Run install and recovery smoke against downloaded archives
         run: node scripts/release/install-smoke.ts downloaded-release-assets
+      - name: Run controlled-runtime standalone smoke without ambient Node use
+        run: node scripts/release/standalone-smoke.ts downloaded-release-assets
       - name: Run prior baseline rollback validation against downloaded candidate
         run: node scripts/release/validate-prior-rollback.ts --candidate-release downloaded-release-assets
 

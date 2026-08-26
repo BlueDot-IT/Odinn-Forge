@@ -11,7 +11,8 @@ const files = (await readdir(directory))
 
 const manifestPath = join(directory, "release-manifest.json");
 const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-manifest.archiveSha256 = Object.fromEntries(await Promise.all((manifest.artifacts ?? []).map(async (name: string) => [
+const archiveNames = [...(manifest.artifacts ?? []), ...(manifest.standaloneArtifacts ?? []).map((entry: any) => entry.name)];
+manifest.archiveSha256 = Object.fromEntries(await Promise.all(archiveNames.map(async (name: string) => [
   name,
   createHash("sha256").update(await readFile(join(directory, name))).digest("hex")
 ])));

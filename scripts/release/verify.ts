@@ -29,6 +29,10 @@ if (!Array.isArray(manifest.artifacts)
   || !manifest.artifacts.includes(`${expectedRoot}.tar.gz`)) {
   throw new Error("release manifest must name both production archives");
 }
+const standaloneArtifacts = Array.isArray(manifest.standaloneArtifacts) ? manifest.standaloneArtifacts : [];
+if (standaloneArtifacts.length !== 3 || !standaloneArtifacts.every((entry: any) => typeof entry.name === "string" && entry.embeddedRuntime?.version === "24.19.0")) {
+  throw new Error("release manifest must name the controlled standalone runtime matrix");
+}
 if ((manifest.stateSchemas !== undefined && JSON.stringify(manifest.stateSchemas) !== JSON.stringify(targetStateSchemaVersions()))
   || manifest.minimumApplicationVersionForTargetState !== STATE_SCHEMA_MINIMUM_APPLICATION_VERSION) {
   throw new Error("release manifest state compatibility metadata is missing or inconsistent");
@@ -53,7 +57,7 @@ const checksumFiles = new Set(sums.map(({ name }) => name));
 if (releaseFiles.size !== checksumFiles.size || [...releaseFiles].some((name) => !checksumFiles.has(name))) {
   throw new Error("checksum file does not cover exactly the release assets");
 }
-for (const archiveName of manifest.artifacts) {
+for (const archiveName of [...manifest.artifacts, ...standaloneArtifacts.map((entry: any) => entry.name)]) {
   const digest = createHash("sha256").update(await readFile(join(releaseDir, archiveName))).digest("hex");
   if (manifest.archiveSha256?.[archiveName] !== digest) {
     throw new Error(`release manifest archive digest mismatch for ${archiveName}`);

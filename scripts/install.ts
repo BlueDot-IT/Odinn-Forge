@@ -10,6 +10,7 @@ import { spawnPnpmSync } from "./lib/package-manager.ts";
 const [command = "status", ...args] = process.argv.slice(2);
 const prefix = resolve(option("--prefix", process.env.ODINN_INSTALL_PREFIX || join(homedir(), ".local", "share", "odinn")));
 const statePath = join(prefix, "install-state.json");
+const currentPath = join(prefix, "current");
 await validatePrefix(prefix);
 
 if (command === "install" || command === "upgrade") await install(command);
@@ -25,7 +26,8 @@ async function install(operation: any) {
     throw new Error("install source is not an Odinn Forge package");
   }
   const releaseInfo = await readReleaseInfo(source);
-  const compiled = releaseInfo.distribution === "compiled" && existsSync(join(source, "dist", "cli", "index.js"));
+  const compiled = (releaseInfo.distribution === "compiled" || releaseInfo.distribution === "standalone") && existsSync(join(source, "dist", "cli", "index.js"));
+  const bundledRuntime = compiled && (existsSync(join(source, "runtime", "node")) || existsSync(join(source, "runtime", "node.exe")));
   const version = option("--version", pkg.version);
   if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error("invalid Odinn Forge version");
   const lockfileSha256 = await digestIfPresent(join(source, "pnpm-lock.yaml"));
@@ -36,8 +38,18 @@ async function install(operation: any) {
   const artifactSha256 = option("--artifact-sha256", process.env.ODINN_ARTIFACT_SHA256 || "unknown");
   if (!/^(?:[a-f0-9]{40}|unknown)$/u.test(commit)) throw new Error("invalid Odinn Forge commit identity");
   if (!/^(?:[a-f0-9]{64}|unknown)$/u.test(artifactSha256)) throw new Error("invalid Odinn Forge artifact digest");
+  if (bundledRuntime && (!releaseInfo.embeddedRuntime || releaseInfo.embeddedRuntime.version !== process.version.slice(1))) {
+    throw new Error("standalone installer is not executing its declared embedded runtime");
+  }
+  if (bundledRuntime) {
+    const runtimeExecutable = existsSync(join(source, "runtime", "node.exe")) ? join(source, "runtime", "node.exe") : join(source, "runtime", "node");
+    const runtimeExecutableSha256 = await digestIfPresent(runtimeExecutable);
+    if (!/^[a-f0-9]{64}$/u.test(releaseInfo.embeddedRuntime?.executableSha256 ?? "") || runtimeExecutableSha256 !== releaseInfo.embeddedRuntime.executableSha256) {
+      throw new Error("embedded runtime executable digest does not match signed release metadata");
+    }
+  }
   const toolchain = compiled
-    ? { node: process.version, distribution: "compiled" }
+    ? { node: process.version, distribution: bundledRuntime ? "standalone" : "compiled", embeddedRuntime: bundledRuntime ? releaseInfo.embeddedRuntime : undefined }
     : { node: process.version, distribution: "source", packageManager: pkg.packageManager || "unknown" };
   const toolchainSha256 = createHash("sha256").update(JSON.stringify(toolchain)).digest("hex");
   const identity = `${runtimeSha256.slice(0, 12)}-${String(commit).slice(0, 12)}-${toolchainSha256.slice(0, 12)}`;
@@ -67,7 +79,8 @@ async function install(operation: any) {
   const previous = await readState();
   const next = { schemaVersion: 1, current: versionId, currentVersion: version, currentCommit: commit, previous: previous.current && previous.current !== versionId ? previous.current : previous.previous ?? null, installedAt: new Date().toISOString(), operation };
   await writeState(next);
-  await writeLaunchers(compiled);
+  await writeCurrentPointer(versionId);
+  await writeLaunchers(compiled, bundledRuntime);
   console.log(JSON.stringify({ ok: true, prefix, version, versionId, commit, previous: next.previous }, null, 2));
 }
 
@@ -77,6 +90,7 @@ async function rollback() {
   const priorMetadata = await readInstalledMetadata(current.previous);
   const next = { ...current, current: current.previous, currentVersion: priorMetadata.version, currentCommit: priorMetadata.commit, previous: current.current, rolledBackAt: new Date().toISOString(), operation: "rollback" };
   await writeState(next);
+  await writeCurrentPointer(next.current);
   console.log(JSON.stringify({ ok: true, prefix, current: next.current, previous: next.previous }, null, 2));
 }
 
@@ -104,6 +118,14 @@ async function writeState(value: any) {
   await chmod(statePath, 0o600).catch(() => undefined);
 }
 
+async function writeCurrentPointer(versionId: string) {
+  if (!safeVersionId(versionId)) throw new Error("unsafe current version pointer");
+  const temporary = `${currentPath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporary, `${versionId}\n`, { mode: 0o600, flag: "wx" });
+  await rename(temporary, currentPath);
+  await chmod(currentPath, 0o600).catch(() => undefined);
+}
+
 async function readReleaseInfo(source: string) {
   try {
     const value = JSON.parse(await readFile(join(source, "release-info.json"), "utf8"));
@@ -128,19 +150,26 @@ async function digestIfPresent(path: string): Promise<string> {
   }
 }
 
-async function writeLaunchers(compiled: boolean) {
+async function writeLaunchers(compiled: boolean, bundledRuntime = false) {
   const bin = join(prefix, "bin");
   await ensurePhysicalDirectory(bin, "launcher root");
   const cliEntry = compiled ? "dist/cli/index.js" : "apps/cli/src/cli.ts";
   const gatewayEntry = compiled ? "dist/gateway/server.js" : "apps/gateway/src/server.ts";
-  const unix = `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\nCURRENT=$(node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).current)' "$PREFIX/install-state.json")\nexec node "$PREFIX/versions/$CURRENT/${cliEntry}" "$@"\n`;
-  const gateway = `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\nCURRENT=$(node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).current)' "$PREFIX/install-state.json")\nexec node "$PREFIX/versions/$CURRENT/${gatewayEntry}" "$@"\n`;
+  const unixNode = bundledRuntime ? '"$PREFIX/versions/$CURRENT/runtime/node"' : "node";
+  const unixPrelude = bundledRuntime
+    ? `unset NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE NODE_EXTRA_CA_CERTS\nCURRENT=$(sed -n '1p' "$PREFIX/current")\n`
+    : `CURRENT=$(node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).current)' "$PREFIX/install-state.json")\n`;
+  const unix = `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\n${unixPrelude}exec ${unixNode} "$PREFIX/versions/$CURRENT/${cliEntry}" "$@"\n`;
+  const gateway = `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\n${unixPrelude}exec ${unixNode} "$PREFIX/versions/$CURRENT/${gatewayEntry}" "$@"\n`;
   await atomicLauncher(join(bin, "odinn"), unix, 0o755);
   await atomicLauncher(join(bin, "odinn-gateway"), gateway, 0o755);
   const cmdEntry = cliEntry.replaceAll("/", "\\");
   const gatewayCmdEntry = gatewayEntry.replaceAll("/", "\\");
-  const cmd = `@echo off\r\nfor /f "usebackq delims=" %%i in (\`node -e "const fs=require('fs');process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],'utf8')).current)" "${statePath}"\`) do set ODINN_CURRENT=%%i\r\nnode "${prefix}\\versions\\%ODINN_CURRENT%\\${cmdEntry}" %*\r\n`;
-  const gatewayCmd = `@echo off\r\nfor /f "usebackq delims=" %%i in (\`node -e "const fs=require('fs');process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],'utf8')).current)" "${statePath}"\`) do set ODINN_CURRENT=%%i\r\nnode "${prefix}\\versions\\%ODINN_CURRENT%\\${gatewayCmdEntry}" %*\r\n`;
+  const cmdPrelude = bundledRuntime
+    ? `set "NODE_OPTIONS="\r\nset "NODE_PATH="\r\nset /p ODINN_CURRENT=<"${currentPath}"\r\nset "ODINN_NODE=${prefix}\\versions\\%ODINN_CURRENT%\\runtime\\node.exe"`
+    : `for /f "usebackq delims=" %%i in (\`node -e "const fs=require('fs');process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],'utf8')).current)" "${statePath}"\`) do set ODINN_CURRENT=%%i\r\nset "ODINN_NODE=node"`;
+  const cmd = `@echo off\r\nsetlocal\r\n${cmdPrelude}\r\n"%ODINN_NODE%" "${prefix}\\versions\\%ODINN_CURRENT%\\${cmdEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
+  const gatewayCmd = `@echo off\r\nsetlocal\r\n${cmdPrelude}\r\n"%ODINN_NODE%" "${prefix}\\versions\\%ODINN_CURRENT%\\${gatewayCmdEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
   await atomicLauncher(join(bin, "odinn.cmd"), cmd, 0o600);
   await atomicLauncher(join(bin, "odinn-gateway.cmd"), gatewayCmd, 0o600);
 }

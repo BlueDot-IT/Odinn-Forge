@@ -1,5 +1,19 @@
 # User guide
 
+## Choose a download
+
+Normal users on Linux x64, macOS x64, or Windows x64 should choose the release
+asset named `odinn-v<VERSION>-standalone-<PLATFORM>-x64`. These archives carry
+a checksum- and signature-verified Node 24 runtime and do not use ambient
+`node`, `NODE_OPTIONS`, preload hooks, or loader paths. The generic archives
+and npm package intentionally remain Node-dependent for advanced installation
+and unsupported platforms.
+
+The standalone installer stages the complete application/runtime pair under
+an immutable version identity before switching the current pointer. Upgrade
+and rollback never mix application and runtime versions; user state and
+credentials remain outside the version tree.
+
 Ódinn Forge is a local-first personal agent for a machine you control. This
 guide covers the supported local workflow, installation, privacy boundary,
 diagnostics, and bug reporting. Do not use it as a safety-critical service or

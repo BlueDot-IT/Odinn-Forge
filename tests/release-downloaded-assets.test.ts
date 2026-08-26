@@ -12,7 +12,13 @@ const commit = "a".repeat(40);
 
 async function fixture(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "odinn-downloaded-release-"));
-  const archives = [`odinn-v${pkg.version}.zip`, `odinn-v${pkg.version}.tar.gz`];
+  const policy = JSON.parse(await readFile(join(root, "release/node-runtime-policy.json"), "utf8"));
+  const standaloneArtifacts = Object.entries(policy.targets).map(([target, entry]: [string, any]) => ({
+    name: `odinn-v${pkg.version}-standalone-${target}.${target === "win32-x64" ? "zip" : "tar.gz"}`,
+    target,
+    embeddedRuntime: { version: policy.version, sourceUrl: `${policy.origin}/dist/v${policy.version}/${entry.archive}`, archiveSha256: entry.sha256 }
+  }));
+  const archives = [`odinn-v${pkg.version}.zip`, `odinn-v${pkg.version}.tar.gz`, ...standaloneArtifacts.map((entry) => entry.name)];
   for (const name of archives) await writeFile(join(directory, name), `archive:${name}`);
   const archiveSha256 = Object.fromEntries(await Promise.all(archives.map(async (name) => [
     name,
@@ -26,6 +32,7 @@ async function fixture(): Promise<string> {
     files: [{ fileName: "bin/odinn", checksums: [{ algorithm: "SHA256", checksumValue: "b".repeat(64) }] }]
   }));
   await writeFile(join(directory, "odinn-anchore.spdx.json"), JSON.stringify({ spdxVersion: "SPDX-2.3" }));
+  await writeFile(join(directory, "odinn-standalone.spdx.json"), JSON.stringify({ spdxVersion: "SPDX-2.3", packages: [{ name: "Node.js", versionInfo: policy.version }] }));
   await writeFile(join(directory, "release-manifest.json"), JSON.stringify({
     name: pkg.name,
     distributionName: "@bluedot-it/odinn",
@@ -33,7 +40,9 @@ async function fixture(): Promise<string> {
     commit,
     distribution: "compiled",
     runtimeSha256: "c".repeat(64),
-    artifacts: archives,
+    artifacts: archives.slice(0, 2),
+    standaloneArtifacts,
+    standaloneSbom: "odinn-standalone.spdx.json",
     archiveSha256,
     sbom: "odinn.spdx.json",
     provenance: "release-provenance.json"
@@ -51,6 +60,7 @@ async function fixture(): Promise<string> {
     ...archives,
     "odinn.spdx.json",
     "odinn-anchore.spdx.json",
+    "odinn-standalone.spdx.json",
     "release-manifest.json",
     "release-provenance.json"
   ].sort();
@@ -73,7 +83,7 @@ test("downloaded release verification binds checksums, SBOM, provenance, and tag
   try {
     const result = verify(directory);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /verified 6 downloaded assets/);
+    assert.match(result.stdout, /verified 10 downloaded assets/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

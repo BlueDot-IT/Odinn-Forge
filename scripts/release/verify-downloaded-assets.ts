@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readRuntimePolicy } from "./node-runtime.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const releaseDirectory = resolve(process.argv[2] ?? "");
@@ -54,10 +55,15 @@ if (manifest.name !== pkg.name
   throw new Error("downloaded release manifest identity does not match the tagged checkout");
 }
 
-const archiveNames = [`odinn-v${pkg.version}.zip`, `odinn-v${pkg.version}.tar.gz`];
+const runtimePolicy = await readRuntimePolicy(root);
+const standaloneNames = Object.keys(runtimePolicy.targets).map((target) => `odinn-v${pkg.version}-standalone-${target}.${target === "win32-x64" ? "zip" : "tar.gz"}`);
+const archiveNames = [`odinn-v${pkg.version}.zip`, `odinn-v${pkg.version}.tar.gz`, ...standaloneNames];
 if (!Array.isArray(manifest.artifacts)
-  || manifest.artifacts.length !== archiveNames.length
-  || archiveNames.some((name) => !manifest.artifacts.includes(name))) {
+  || manifest.artifacts.length !== 2
+  || archiveNames.slice(0, 2).some((name) => !manifest.artifacts.includes(name))
+  || !Array.isArray(manifest.standaloneArtifacts)
+  || manifest.standaloneArtifacts.length !== standaloneNames.length
+  || standaloneNames.some((name) => !manifest.standaloneArtifacts.some((entry: any) => entry.name === name))) {
   throw new Error("downloaded release manifest does not name the exact production archives");
 }
 for (const name of archiveNames) {
@@ -71,6 +77,19 @@ const provenanceName = manifest.provenance;
 for (const [kind, name] of [["SBOM", sbomName], ["provenance", provenanceName]] as const) {
   if (typeof name !== "string" || basename(name) !== name || !checksums.has(name)) {
     throw new Error(`downloaded release ${kind} is missing from the checksum manifest`);
+  }
+}
+if (manifest.standaloneSbom !== "odinn-standalone.spdx.json" || !checksums.has(manifest.standaloneSbom)) {
+  throw new Error("downloaded standalone SBOM is missing");
+}
+const standaloneSbom = JSON.parse(await readFile(join(releaseDirectory, manifest.standaloneSbom), "utf8"));
+if (standaloneSbom.spdxVersion !== "SPDX-2.3" || !standaloneSbom.packages?.some((entry: any) => entry.name === "Node.js" && entry.versionInfo === runtimePolicy.version)) {
+  throw new Error("downloaded standalone SBOM does not inventory the embedded Node runtime");
+}
+for (const entry of manifest.standaloneArtifacts) {
+  const policy = runtimePolicy.targets[entry.target as keyof typeof runtimePolicy.targets];
+  if (!policy || entry.embeddedRuntime?.version !== runtimePolicy.version || entry.embeddedRuntime?.archiveSha256 !== policy.sha256 || entry.embeddedRuntime?.sourceUrl !== `${runtimePolicy.origin}/dist/v${runtimePolicy.version}/${policy.archive}`) {
+    throw new Error(`standalone runtime evidence mismatch: ${String(entry.target)}`);
   }
 }
 
