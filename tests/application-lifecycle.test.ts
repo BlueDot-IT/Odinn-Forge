@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { STATE_SCHEMA_TARGETS } from "../packages/kernel/src/state/schema-registry.ts";
 import {
@@ -99,6 +99,40 @@ async function lifecycleFixture() {
   return { temporary, prefix, state, priorId };
 }
 
+async function makePackageStandalone(packageRoot: string) {
+  const installedReleaseInfoPath = join(packageRoot, "release-info.json");
+  const installedReleaseInfo = JSON.parse(await readFile(installedReleaseInfoPath, "utf8"));
+  const runtimeBytes = await readFile(process.execPath);
+  const executableSha256 = createHash("sha256").update(runtimeBytes).digest("hex");
+  const policyBytes = Buffer.from("test runtime policy\n");
+  const runtimePolicySha256 = createHash("sha256").update(policyBytes).digest("hex");
+  const target = `${process.platform}-${process.arch}`;
+  const runtimeName = process.platform === "win32" ? "node.exe" : "node";
+  await mkdir(join(packageRoot, "runtime"), { recursive: true });
+  await writeFile(join(packageRoot, "runtime", runtimeName), runtimeBytes, { mode: 0o755 });
+  await mkdir(join(packageRoot, "THIRD_PARTY_NOTICES"), { recursive: true });
+  await writeFile(join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json"), policyBytes);
+  installedReleaseInfo.distribution = "standalone";
+  installedReleaseInfo.embeddedRuntime = {
+    version: process.version.slice(1),
+    target,
+    executableBytes: runtimeBytes.byteLength,
+    executableSha256,
+    runtimePolicySha256
+  };
+  await writeFile(installedReleaseInfoPath, `${JSON.stringify(installedReleaseInfo, null, 2)}\n`);
+  const installedPackagePath = join(packageRoot, "package.json");
+  const installedPackage = JSON.parse(await readFile(installedPackagePath, "utf8"));
+  installedPackage.odinnStandalone = {
+    runtime: "node",
+    version: process.version.slice(1),
+    target,
+    executableSha256,
+    runtimePolicySha256
+  };
+  await writeFile(installedPackagePath, `${JSON.stringify(installedPackage, null, 2)}\n`);
+}
+
 test("verified local update installs immutably, reports identity, and remains rollbackable", async () => {
   const fixture = await lifecycleFixture();
   try {
@@ -141,41 +175,15 @@ test("verified local update installs immutably, reports identity, and remains ro
   }
 });
 
-test("standalone update checks select the controlled platform artifact without falling back to a legacy archive", async () => {
+test("standalone update checks accept the trusted macOS /var alias and select the controlled platform artifact", async () => {
   const fixture = await lifecycleFixture();
   try {
     const packageRoot = join(fixture.prefix, "versions", fixture.priorId);
-    const installedReleaseInfoPath = join(packageRoot, "release-info.json");
-    const installedReleaseInfo = JSON.parse(await readFile(installedReleaseInfoPath, "utf8"));
-    const runtimeBytes = await readFile(process.execPath);
-    const runtimeSha256 = createHash("sha256").update(runtimeBytes).digest("hex");
-    const policyBytes = Buffer.from("test runtime policy\n");
-    const runtimePolicySha256 = createHash("sha256").update(policyBytes).digest("hex");
-    const target = `${process.platform}-${process.arch}`;
-    const runtimeName = process.platform === "win32" ? "node.exe" : "node";
-    await mkdir(join(packageRoot, "runtime"), { recursive: true });
-    await writeFile(join(packageRoot, "runtime", runtimeName), runtimeBytes, { mode: 0o755 });
-    await mkdir(join(packageRoot, "THIRD_PARTY_NOTICES"), { recursive: true });
-    await writeFile(join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json"), policyBytes);
-    installedReleaseInfo.distribution = "standalone";
-    installedReleaseInfo.embeddedRuntime = {
-      version: process.version.slice(1),
-      target,
-      executableBytes: runtimeBytes.byteLength,
-      executableSha256: runtimeSha256,
-      runtimePolicySha256
-    };
-    await writeFile(installedReleaseInfoPath, `${JSON.stringify(installedReleaseInfo, null, 2)}\n`);
-    const installedPackagePath = join(packageRoot, "package.json");
-    const installedPackage = JSON.parse(await readFile(installedPackagePath, "utf8"));
-    installedPackage.odinnStandalone = {
-      runtime: "node",
-      version: process.version.slice(1),
-      target,
-      executableSha256: runtimeSha256,
-      runtimePolicySha256
-    };
-    await writeFile(installedPackagePath, `${JSON.stringify(installedPackage, null, 2)}\n`);
+    await makePackageStandalone(packageRoot);
+    if (process.platform === "darwin") {
+      assert.equal((await lstat("/var")).isSymbolicLink(), true);
+      assert.notEqual(resolve(await realpath(fixture.temporary)), resolve(fixture.temporary));
+    }
 
     const release = await createRelease(fixture.temporary, "1.0.0", NEXT_COMMIT, { health: true });
     const manifest = JSON.parse(await readFile(release.manifest, "utf8"));
@@ -227,6 +235,31 @@ test("standalone update checks select the controlled platform artifact without f
         artifact: release.artifact
       }),
       /does not match the required standalone artifact/u
+    );
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("standalone runtime validation rejects a user-created symlink or reparse-point ancestor", async () => {
+  const fixture = await lifecycleFixture();
+  try {
+    const packageRoot = join(fixture.prefix, "versions", fixture.priorId);
+    await makePackageStandalone(packageRoot);
+    const release = await createRelease(fixture.temporary, "1.0.0", NEXT_COMMIT, { health: true });
+    const linkedVersions = join(fixture.temporary, "linked-versions");
+    await symlink(dirname(packageRoot), linkedVersions, process.platform === "win32" ? "junction" : "dir");
+    await assert.rejects(
+      () => checkForUpdate({
+        identity: { applicationVersion: "0.9.0", applicationCommit: PRIOR_COMMIT },
+        stateDir: fixture.state,
+        packageRoot: join(linkedVersions, basename(packageRoot)),
+        prefix: fixture.prefix,
+        manifest: release.manifest,
+        checksums: release.checksums,
+        artifact: release.artifact
+      }),
+      /symbolic link|reparse point|linked ancestor/u
     );
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });

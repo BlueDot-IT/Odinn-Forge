@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { createWriteStream, existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { createWriteStream, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, type Stats } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
@@ -846,7 +846,7 @@ function validatedPackageRuntime(packageRoot: string): {
     throw new Error("standalone package runtime metadata is invalid for this platform");
   }
   assertNoLinkedAncestorsSync(packageRoot, "standalone package root");
-  assertNoLinkedAncestorsSync(runtimeDirectory, "standalone runtime directory");
+  const reviewedRuntimeAliasAncestor = assertNoLinkedAncestorsSync(runtimeDirectory, "standalone runtime directory");
   const packageRootMetadata = lstatSync(packageRoot);
   const runtimeDirectoryMetadata = lstatSync(runtimeDirectory);
   const runtimeMetadata = lstatSync(runtime);
@@ -855,36 +855,76 @@ function validatedPackageRuntime(packageRoot: string): {
     || !runtimeMetadata.isFile() || runtimeMetadata.isSymbolicLink() || runtimeMetadata.nlink !== 1
     || runtimeMetadata.size !== releaseInfo.embeddedRuntime.executableBytes
     || readdirSync(runtimeDirectory).length !== 1 || readdirSync(runtimeDirectory)[0] !== runtimeName
-    || !samePhysicalPath(realpathSync(runtimeDirectory), runtimeDirectory)
-    || !samePhysicalPath(realpathSync(runtime), runtime)) {
+    || !hasStablePhysicalPathSync(runtimeDirectory, runtimeDirectoryMetadata, reviewedRuntimeAliasAncestor)
+    || !hasStablePhysicalPathSync(runtime, runtimeMetadata, reviewedRuntimeAliasAncestor)) {
     throw new Error("standalone embedded runtime must be a physical regular file without linked ancestors");
   }
   if (createHash("sha256").update(readFileSync(runtime)).digest("hex") !== expectedDigest) {
     throw new Error("standalone embedded runtime digest mismatch");
   }
   const policy = join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json");
-  assertNoLinkedAncestorsSync(dirname(policy), "standalone runtime policy directory");
+  const reviewedPolicyAliasAncestor = assertNoLinkedAncestorsSync(dirname(policy), "standalone runtime policy directory");
   const policyMetadata = lstatSync(policy);
   if (!policyMetadata.isFile() || policyMetadata.isSymbolicLink() || policyMetadata.nlink !== 1
-    || !samePhysicalPath(realpathSync(policy), policy)
+    || !hasStablePhysicalPathSync(policy, policyMetadata, reviewedPolicyAliasAncestor)
     || createHash("sha256").update(readFileSync(policy)).digest("hex") !== expectedPolicyDigest) {
     throw new Error("standalone embedded runtime policy digest mismatch");
   }
   return { distribution, runtime };
 }
 
-function assertNoLinkedAncestorsSync(path: string, label: string): void {
+function assertNoLinkedAncestorsSync(path: string, label: string): boolean {
   const absolute = resolve(path);
   const root = parse(absolute).root;
   let current = root;
+  let reviewedDarwinAliasAncestor = false;
   for (const component of absolute.slice(root.length).split(sep).filter(Boolean)) {
     current = join(current, component);
-    if (!existsSync(current)) return;
+    if (!existsSync(current)) return reviewedDarwinAliasAncestor;
     const metadata = lstatSync(current);
-    if (metadata.isSymbolicLink()) throw new Error(`${label} must not traverse a symbolic link or reparse point`);
+    if (metadata.isSymbolicLink()) {
+      const physicalPath = realpathSync(current);
+      const physical = lstatSync(physicalPath);
+      if (!reviewedDarwinRootAlias(metadata, physical)) {
+        throw new Error(`${label} must not traverse a symbolic link or reparse point`);
+      }
+      reviewedDarwinAliasAncestor = true;
+      continue;
+    }
     if (!metadata.isDirectory() && current !== absolute) throw new Error(`${label} has a non-directory ancestor`);
-    if (!samePhysicalPath(realpathSync(current), current)) throw new Error(`${label} must not traverse a linked ancestor`);
+    const physicalPath = realpathSync(current);
+    if (!samePhysicalPath(physicalPath, current)
+      && (!(process.platform === "win32" || reviewedDarwinAliasAncestor)
+        || !sameStableFilesystemIdentity(metadata, lstatSync(physicalPath)))) {
+      throw new Error(`${label} must not traverse a linked ancestor`);
+    }
   }
+  return reviewedDarwinAliasAncestor;
+}
+
+function reviewedDarwinRootAlias(link: Stats, physical: Stats): boolean {
+  return process.platform === "darwin"
+    && link.uid === 0
+    && physical.isDirectory()
+    && !physical.isSymbolicLink()
+    && physical.uid === 0
+    && (physical.mode & 0o022) === 0;
+}
+
+function hasStablePhysicalPathSync(path: string, metadata: Stats, reviewedDarwinAliasAncestor: boolean): boolean {
+  const physicalPath = realpathSync(path);
+  return samePhysicalPath(physicalPath, path)
+    || ((process.platform === "win32" || reviewedDarwinAliasAncestor)
+      && sameStableFilesystemIdentity(metadata, lstatSync(physicalPath)));
+}
+
+function sameStableFilesystemIdentity(left: Stats, right: Stats): boolean {
+  return left.dev !== 0
+    && left.ino !== 0
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.isDirectory() === right.isDirectory()
+    && left.isFile() === right.isFile();
 }
 
 function samePhysicalPath(left: string, right: string): boolean {
