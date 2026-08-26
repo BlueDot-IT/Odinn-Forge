@@ -155,21 +155,21 @@ async function writeLaunchers(compiled: boolean, bundledRuntime = false) {
   await ensurePhysicalDirectory(bin, "launcher root");
   const cliEntry = compiled ? "dist/cli/index.js" : "apps/cli/src/cli.ts";
   const gatewayEntry = compiled ? "dist/gateway/server.js" : "apps/gateway/src/server.ts";
-  const unixNode = bundledRuntime ? '"$PREFIX/versions/$CURRENT/runtime/node"' : "node";
   const unixPrelude = bundledRuntime
     ? `unset NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE NODE_EXTRA_CA_CERTS\nCURRENT=$(sed -n '1p' "$PREFIX/current")\n`
     : `CURRENT=$(node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).current)' "$PREFIX/install-state.json")\n`;
-  const unix = `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\n${unixPrelude}exec ${unixNode} "$PREFIX/versions/$CURRENT/${cliEntry}" "$@"\n`;
-  const gateway = `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\n${unixPrelude}exec ${unixNode} "$PREFIX/versions/$CURRENT/${gatewayEntry}" "$@"\n`;
+  const unix = `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\n${unixPrelude}exec ${bundledRuntime ? '"$PREFIX/versions/$CURRENT/runtime/node"' : "node"} "$PREFIX/versions/$CURRENT/${cliEntry}" "$@"\n`;
+  const gateway = `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\n${unixPrelude}exec ${bundledRuntime ? '"$PREFIX/versions/$CURRENT/runtime/node"' : "node"} "$PREFIX/versions/$CURRENT/${gatewayEntry}" "$@"\n`;
   await atomicLauncher(join(bin, "odinn"), unix, 0o755);
   await atomicLauncher(join(bin, "odinn-gateway"), gateway, 0o755);
   const cmdEntry = cliEntry.replaceAll("/", "\\");
   const gatewayCmdEntry = gatewayEntry.replaceAll("/", "\\");
-  const cmdPrelude = bundledRuntime
-    ? `set "NODE_OPTIONS="\r\nset "NODE_PATH="\r\nset /p ODINN_CURRENT=<"${currentPath}"\r\nset "ODINN_NODE=${prefix}\\versions\\%ODINN_CURRENT%\\runtime\\node.exe"`
-    : `for /f "usebackq delims=" %%i in (\`node -e "const fs=require('fs');process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],'utf8')).current)" "${statePath}"\`) do set ODINN_CURRENT=%%i\r\nset "ODINN_NODE=node"`;
-  const cmd = `@echo off\r\nsetlocal\r\n${cmdPrelude}\r\n"%ODINN_NODE%" "${prefix}\\versions\\%ODINN_CURRENT%\\${cmdEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
-  const gatewayCmd = `@echo off\r\nsetlocal\r\n${cmdPrelude}\r\n"%ODINN_NODE%" "${prefix}\\versions\\%ODINN_CURRENT%\\${gatewayCmdEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
+  const cmd = bundledRuntime
+    ? `@echo off\r\nsetlocal\r\nset "NODE_OPTIONS="\r\nset "NODE_PATH="\r\nset /p ODINN_CURRENT=<"${currentPath}"\r\nset "ODINN_NODE=${prefix}\\versions\\%ODINN_CURRENT%\\runtime\\node.exe"\r\n"%ODINN_NODE%" "${prefix}\\versions\\%ODINN_CURRENT%\\${cmdEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n`
+    : `@echo off\r\nfor /f "usebackq delims=" %%i in (\`node -e "const fs=require('fs');process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],'utf8')).current)" "${statePath}"\`) do set ODINN_CURRENT=%%i\r\nnode "${prefix}\\versions\\%ODINN_CURRENT%\\${cmdEntry}" %*\r\n`;
+  const gatewayCmd = bundledRuntime
+    ? `@echo off\r\nsetlocal\r\nset "NODE_OPTIONS="\r\nset "NODE_PATH="\r\nset /p ODINN_CURRENT=<"${currentPath}"\r\nset "ODINN_NODE=${prefix}\\versions\\%ODINN_CURRENT%\\runtime\\node.exe"\r\n"%ODINN_NODE%" "${prefix}\\versions\\%ODINN_CURRENT%\\${gatewayCmdEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n`
+    : `@echo off\r\nfor /f "usebackq delims=" %%i in (\`node -e "const fs=require('fs');process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],'utf8')).current)" "${statePath}"\`) do set ODINN_CURRENT=%%i\r\nnode "${prefix}\\versions\\%ODINN_CURRENT%\\${gatewayCmdEntry}" %*\r\n`;
   await atomicLauncher(join(bin, "odinn.cmd"), cmd, 0o600);
   await atomicLauncher(join(bin, "odinn-gateway.cmd"), gatewayCmd, 0o600);
 }
