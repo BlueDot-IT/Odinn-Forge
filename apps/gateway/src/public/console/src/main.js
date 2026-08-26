@@ -9,6 +9,41 @@ import { escapeHtml, renderMarkdown, safeHref } from "./components/message-item.
 import { relativeTime as sessionRelativeTime } from "./views/sessions.ts";
 import { cloneConfig as cloneStructuredConfig, configLines as structuredConfigLines, configNumber as structuredConfigNumber } from "./views/settings.ts";
 import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
+import { composeMessageWithLocalAttachments, readLocalTextAttachmentBatch, renderLocalAttachmentList } from "./components/local-attachments.ts";
+
+    let chatAttachments = [];
+
+    function renderChatAttachments() {
+      const list = $("chat-file-list");
+      list.hidden = chatAttachments.length === 0;
+      list.innerHTML = renderLocalAttachmentList(chatAttachments);
+      $("attach-chat-file").setAttribute("aria-label", chatAttachments.length
+        ? `Attach local text files. ${chatAttachments.length} currently attached.`
+        : "Attach local text files");
+    }
+
+    function clearChatAttachments() {
+      chatAttachments = [];
+      $("chat-file-input").value = "";
+      renderChatAttachments();
+    }
+
+    async function addChatFiles(files) {
+      const selected = Array.from(files || []);
+      if (!selected.length) return;
+      const button = $("attach-chat-file");
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      try {
+        const prepared = await readLocalTextAttachmentBatch(selected, chatAttachments);
+        chatAttachments = prepared;
+        renderChatAttachments();
+      } finally {
+        $("chat-file-input").value = "";
+        button.removeAttribute("aria-busy");
+        button.disabled = !providerReady(state.status);
+      }
+    }
 
     const advancedFeatureBrands = {"proof":{"name":"Runemark","descriptor":"Run verification","legacyName":"Proof"},"sentinel":{"name":"Gatewatch","descriptor":"Policy safety","legacyName":"Sentinel"},"rewind":{"name":"Norn Restore","descriptor":"Restore points","legacyName":"Rewind"},"darwin":{"name":"Raven Route","descriptor":"Model routing","legacyName":"Darwin"},"capabilities":{"name":"Rune Key","descriptor":"Scoped temporary access","legacyName":"Capability Tokens"},"capsules":{"name":"Saga Archive","descriptor":"Portable run bundles","legacyName":"Capsules"},"counterfactual":{"name":"Worldtree Paths","descriptor":"Scenario comparison","legacyName":"Counterfactual"}};
     const experimentalFeatures = {
@@ -924,7 +959,9 @@ import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
     }
 
     async function sendChatMessage(text, options = {}) {
-      const content = String(text || "").trim();
+      const plainText = String(text || "").trim();
+      const attachments = options.tool === "job.healthcheck" ? [] : chatAttachments;
+      const content = composeMessageWithLocalAttachments(plainText, attachments);
       if (!content) return;
       if (options.tool !== "job.healthcheck" && !providerReady(state.status)) {
         showOutput("Connect a model provider with odinn onboard, then refresh before sending a message.");
@@ -934,7 +971,7 @@ import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
       const sessionId = await ensureChat();
       const currentTitle = $("chat-title").textContent.trim();
       if (!state.messages.length && ["Gateway chat", "Chat", "New chat"].includes(currentTitle)) {
-        const title = suggestedChatTitle(content);
+        const title = suggestedChatTitle(plainText || attachments.map((attachment) => attachment.name).join(", "));
         if (title) {
           await api("/sessions/" + encodeURIComponent(sessionId), {
             method: "PATCH",
@@ -996,6 +1033,7 @@ import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
         })
       });
       $("chat-input").value = "";
+      clearChatAttachments();
       $("chat-status").textContent = "Ready";
       await loadChat(sessionId);
       await refreshSessions();
@@ -1477,6 +1515,7 @@ import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
         $("model-select").disabled = !ready;
         $("chat-input").disabled = !ready;
         $("send-chat").disabled = !ready;
+        $("attach-chat-file").disabled = !ready;
         $("provider-cta").hidden = ready;
         $("chat-input").placeholder = ready ? "Message Ódinn Forge..." : "Connect a provider to start chatting";
         $("chat-status").textContent = ready ? "Ready" : "Provider required";
@@ -2420,6 +2459,7 @@ import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
       const button = event.currentTarget;
       try {
         setBusy(button, true);
+        clearChatAttachments();
         await createChat("New chat");
       } catch (error) {
         showOutput(error.message);
@@ -2436,7 +2476,10 @@ import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
         return;
       }
       const item = event.target.closest("[data-chat-session-id]");
-      if (item) loadChat(item.dataset.chatSessionId).catch((error) => showOutput(error.message));
+      if (item) {
+        clearChatAttachments();
+        loadChat(item.dataset.chatSessionId).catch((error) => showOutput(error.message));
+      }
     }
     $("chat-session-list").addEventListener("click", handleChatRailClick);
     $("pinned-chat-list").addEventListener("click", handleChatRailClick);
@@ -2457,6 +2500,18 @@ import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
       } finally {
         setBusy(button, false);
       }
+    });
+    $("attach-chat-file").addEventListener("click", () => $("chat-file-input").click());
+    $("chat-file-input").addEventListener("change", (event) => {
+      addChatFiles(event.target.files).catch((error) => showOutput(error.message));
+    });
+    $("chat-file-list").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-local-attachment-remove]");
+      if (!button) return;
+      const index = Number(button.dataset.localAttachmentRemove);
+      if (!Number.isInteger(index) || index < 0 || index >= chatAttachments.length) return;
+      chatAttachments = chatAttachments.filter((_, attachmentIndex) => attachmentIndex !== index);
+      renderChatAttachments();
     });
     $("chat-input").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {

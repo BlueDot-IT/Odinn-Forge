@@ -798,6 +798,48 @@
     .composer textarea:focus {
       outline: 0;
     }
+    .local-attachment-list {
+      display: grid;
+      gap: 6px;
+      padding: 0 8px 6px;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .local-attachment-list[hidden] {
+      display: none;
+    }
+    .local-attachment {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+      padding: 6px 8px;
+      border: 1px solid var(--line-soft);
+      border-radius: 9px;
+      background: var(--surface-2);
+      font-size: 12px;
+    }
+    .local-attachment > span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .local-attachment-remove {
+      min-height: 26px;
+      padding: 3px 7px;
+      font-size: 11px;
+    }
     .composer-footer {
       display: flex;
       align-items: center;

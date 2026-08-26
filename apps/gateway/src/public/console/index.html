@@ -141,9 +141,13 @@
                 <div class="row"><button class="secondary" data-view-jump="usage" type="button">View provider status</button><button class="secondary" id="copy-onboard-command" type="button">Copy command</button></div>
               </div>
               <textarea id="chat-input" aria-label="Message Ódinn Forge" placeholder="Connect a provider to start chatting" disabled></textarea>
+              <input id="chat-file-input" type="file" multiple accept=".txt,.md,.markdown,.json,.yaml,.yml,.csv,.ts,.tsx,.js,.jsx,.mjs,.cjs,.css,.html,.xml,.py,.rs,.go,.java,.sh,.toml,.ini,.conf,.log,.sql,text/*,application/json,application/xml,application/yaml" aria-describedby="chat-file-help" hidden>
+              <span id="chat-file-help" class="sr-only">Attach up to four UTF-8 text files, 128 KiB each and 256 KiB total. Attachments are retained if sending fails and cleared when you change chats.</span>
+              <div id="chat-file-list" class="local-attachment-list" role="status" aria-live="polite" aria-atomic="true" hidden></div>
               <div class="composer-footer">
                 <div class="row composer-tools">
                   <button class="secondary" data-view-jump="tasks" title="Open tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span></button>
+                  <button class="secondary" id="attach-chat-file" title="Attach local text files" type="button" aria-controls="chat-file-input chat-file-list" aria-label="Attach local text files" disabled>Attach files</button>
                   <select id="model-select" aria-label="Model" disabled>
                     <option value="">Configure a provider first</option>
                   </select>
