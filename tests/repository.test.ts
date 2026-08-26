@@ -41,6 +41,7 @@ test("operator console keeps typed view and component boundaries", async () => {
   ];
   const sources = new Map(await Promise.all(required.map(async (path) => [path, await read(`${root}/${path}`)] as const)));
   const entry = await read(`${root}/main.js`);
+  const shell = await read("apps/gateway/src/public/console/index.html");
   for (const path of required) assert.ok(sources.get(path)?.trim(), `${path} must remain a non-empty source boundary`);
   for (const path of ["chat", "sessions", "settings", "approvals", "audit", "agent-graphs"]) assert.match(entry, new RegExp(`from ["']\\./views/${path}\\.ts["']`));
   for (const path of ["dialog", "tool-call", "local-attachments"]) assert.match(entry, new RegExp(`from ["']\\./components/${path}\\.ts["']`));
@@ -48,6 +49,9 @@ test("operator console keeps typed view and component boundaries", async () => {
   assert.match(await read(`${root}/api.ts`), /Promise<T>/u);
   assert.match(sources.get("components/message-item.ts") ?? "", /renderMessageItem/u);
   assert.match(sources.get("components/tool-call.ts") ?? "", /terminalReason/u);
+  assert.match(shell, /id="agent-graph-checkpoint-token" type="password" autocomplete="off" required/u);
+  assert.match(entry, /expectedResultDigest: node\.resultDigest, capabilityToken/u);
+  assert.match(entry, /agent-graph-checkpoint-token"\)\.value = ""/u);
 });
 
 test("routine dependency groups exclude runtime and Node typing migrations", async () => {

@@ -2796,15 +2796,17 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
       try {
         const payload = JSON.parse($("agent-graph-checkpoint-json").value);
         const runId = $("agent-graph-checkpoint-run").value.trim();
+        const capabilityToken = $("agent-graph-checkpoint-token").value;
         const result = await api("/agent-graphs/" + encodeURIComponent(graph.graphRunId) + "/checkpoint", {
           method: "POST",
           headers: { "content-type": "application/json", "idempotency-key": runId },
-          body: JSON.stringify({ ...payload, runId, nodeId: node.nodeId, expectedResultDigest: node.resultDigest })
+          body: JSON.stringify({ ...payload, runId, nodeId: node.nodeId, expectedResultDigest: node.resultDigest, capabilityToken })
         });
         closeDialog($("agent-graph-checkpoint-dialog"));
         showOutput(result);
         await selectAgentGraph(graph.graphRunId);
       } catch (error) { showOutput(error.message); }
+      finally { $("agent-graph-checkpoint-token").value = ""; }
     });
     $("refresh-goals").addEventListener("click", () => refreshGoals().catch((error) => showOutput(error.message)));
     $("goal-query").addEventListener("input", () => refreshGoals().catch((error) => showOutput(error.message)));

@@ -93,7 +93,7 @@ test("console presents the human-first product surfaces and dedicated Advanced p
     const navigationMatches = [...navigation.matchAll(/\bdata-view=["']([^"']+)["']/giu)].map((match) => match[1]);
     const views = [...new Set(viewMatches)];
     const navigationTargets = [...new Set(navigationMatches)];
-    assert.equal(views.length, 22, "the console must expose the product surface, operator controls, and eight dedicated Advanced pages");
+    assert.equal(views.length, 23, "the console must expose the product surface, operator controls, delegation, and eight dedicated Advanced pages");
     assert.equal(viewMatches.length, views.length, "console view ids must be unique");
     assert.equal(navigationMatches.length, navigationTargets.length, "console navigation targets must be unique");
     assert.deepEqual(
