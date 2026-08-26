@@ -80,7 +80,7 @@ export function redactDurableValue(value: unknown, context: DurableRedactionCont
   });
 }
 
-const WORKSPACE_CONTENT_TOOLS = new Set(["workspace.readText", "workspace.read", "workspace.search", "workspace.diff"]);
+const WORKSPACE_CONTENT_TOOLS = new Set(["workspace.readText", "workspace.read", "workspace.search", "workspace.diff", "git.status", "git.diff", "git.log"]);
 const WORKSPACE_MUTATION_TOOLS = new Set(["workspace.mutate", "workspace.patch"]);
 const PROCESS_TOOLS = new Set(["process.exec"]);
 const AGENT_TOOLS = new Set(["agent.run", "agent.delegate"]);
@@ -119,6 +119,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverInput(input);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeInput(input);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailInput(input);
+  if (toolName.startsWith("git.")) return projectGitInput(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
   if (typeof projected.before === "string") {
@@ -145,6 +146,7 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverOutput(output);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeOutput(output);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailOutput(toolName, output);
+  if (toolName.startsWith("git.")) return projectGitOutput(toolName, output);
   if (REPLAY_UNAVAILABLE_TOOLS.has(toolName)) return projectComputerScreenOutput(output);
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
   const record = output as JsonObject;
@@ -174,6 +176,35 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
     return pickWorkspaceMetadata(record, ["path", "resolvedPath", "type", "binary", "bytes", "modifiedAt", "mode", "digest", "digestComplete"]);
   }
   return output;
+}
+
+function projectGitInput(input: unknown): JsonObject {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const source = input as JsonObject;
+  const projected: JsonObject = {};
+  for (const key of ["path", "ref"] as const) {
+    if (typeof source[key] === "string") {
+      projected[`${key}Digest`] = sha256Reference(source[key]);
+      projected[`${key}Bytes`] = Buffer.byteLength(source[key], "utf8");
+    }
+  }
+  for (const key of ["limit", "maxBytes", "staged"] as const) {
+    if (typeof source[key] === "number" || typeof source[key] === "boolean") projected[key] = source[key];
+  }
+  return projected;
+}
+
+function projectGitOutput(toolName: string, output: unknown): JsonObject {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return {};
+  const record = output as JsonObject;
+  const common = pickWorkspaceMetadata(record, ["type", "repositoryId", "worktreeId", "headState", "headOid", "truncated"]);
+  if (toolName === "git.status") {
+    return { ...common, entryCount: Array.isArray(record.entries) ? record.entries.length : 0 };
+  }
+  if (toolName === "git.diff") {
+    return { ...common, ...pickWorkspaceMetadata(record, ["patchBytes", "patchDigest", "digestComplete", "staged"]) };
+  }
+  return { ...common, commitCount: Array.isArray(record.commits) ? record.commits.length : 0 };
 }
 
 function projectComputerScreenOutput(value: unknown): unknown {

@@ -31,6 +31,7 @@ import { decideImprovement, learnImprovements, listImprovements, normalizeSelfIm
 import { DEFAULT_AGENT_ID, ensureMainAgent, loadAgent, type AgentExecutionBinding } from "./agents.ts";
 import { registerChannelAgentTools } from "./channel-agent-tools.ts";
 import { readWorkspaceText, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
+import { diagnoseGitWorkspace, gitDiff, gitLog, gitResourceBinding, gitStatus } from "./git.ts";
 import { AGENT_GRAPH_TOOL, executeAgentGraph, type AgentGraphTaskInput } from "./agent-graph-runtime.ts";
 import { ProgressiveSkillDisclosure } from "./skill-disclosure.ts";
 import { createGovernedMcpRuntime, GovernedMcpRuntime } from "./mcp-runtime.ts";
@@ -44,6 +45,8 @@ export type { ProjectContextMemory, ProjectContextOptions, ProjectContextPacket,
 export { OPERATOR_CONTRACT_VERSION, OPERATOR_DEFAULT_PAGE_SIZE, OPERATOR_MAX_PAGE_SIZE, buildOperatorSnapshot, defaultOperatorActions, operatorActionNames, paginateOperatorItems, redactOperatorValue } from "./operator-control.ts";
 export type { OperatorActionDescriptor, OperatorActionName, OperatorHealth, OperatorItem, OperatorPage, OperatorSection, OperatorSectionInput, OperatorSnapshot, OperatorSnapshotInput, OperatorSurface } from "./operator-control.ts";
 export { readWorkspaceText, resolveWorkspacePath, workspaceDiff, workspaceList, workspaceRead, workspaceSearch, workspaceStat } from "./workspace-tools.ts";
+export { diagnoseGitWorkspace, gitDiff, gitLog, gitResourceBinding, gitStatus } from "./git.ts";
+export type { GitDiagnostic } from "./git.ts";
 import type { SandboxProcessInput } from "./sandbox-process.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
@@ -208,6 +211,27 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
       description: "Render a bounded deterministic text diff against another confined workspace file or provided bounded baseline.",
       inputSchema: { type: "object", properties: { path: { type: "string" }, basePath: { type: "string" }, before: { type: "string" }, beforePath: { type: "string", minLength: 1, maxLength: 256 }, maxBytes: boundedWorkspaceBytesSchema() }, required: ["path"], additionalProperties: false },
       execute: async (input: any, context: any) => workspaceDiff(root, input, { signal: context.signal, security: context.policy?.security?.workspace })
+    }],
+    ["git.status", {
+      capability: "git.read",
+      description: "Inspect a bounded local Git worktree status without network access, credential helpers, or remote metadata.",
+      inputSchema: { type: "object", properties: { path: { type: "string", minLength: 1, maxLength: 1_024 }, limit: { type: "integer", minimum: 1, maximum: 500 } }, additionalProperties: false },
+      resourceForInput: (input: Record<string, unknown>) => gitResourceBinding(root, input),
+      execute: async (input: Record<string, unknown>, context: any) => gitStatus(root, input, context.signal)
+    }],
+    ["git.diff", {
+      capability: "git.read",
+      description: "Render a bounded local Git patch against HEAD or one explicit local branch, tag, or object ID.",
+      inputSchema: { type: "object", properties: { path: { type: "string", minLength: 1, maxLength: 1_024 }, ref: { type: "string", minLength: 1, maxLength: 256 }, staged: { type: "boolean" }, maxBytes: { type: "integer", minimum: 1, maximum: 262_144 } }, additionalProperties: false },
+      resourceForInput: (input: Record<string, unknown>) => gitResourceBinding(root, input),
+      execute: async (input: Record<string, unknown>, context: any) => gitDiff(root, input, context.signal)
+    }],
+    ["git.log", {
+      capability: "git.read",
+      description: "Read bounded local commit metadata from HEAD or one explicit local branch, tag, or object ID.",
+      inputSchema: { type: "object", properties: { path: { type: "string", minLength: 1, maxLength: 1_024 }, ref: { type: "string", minLength: 1, maxLength: 256 }, limit: { type: "integer", minimum: 1, maximum: 100 } }, additionalProperties: false },
+      resourceForInput: (input: Record<string, unknown>) => gitResourceBinding(root, input),
+      execute: async (input: Record<string, unknown>, context: any) => gitLog(root, input, context.signal)
     }],
     ["process.exec", {
       capability: "process.exec",

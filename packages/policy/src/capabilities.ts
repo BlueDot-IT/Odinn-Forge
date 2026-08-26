@@ -6,6 +6,7 @@ export const CAPABILITY_REGISTRY = Object.freeze([
   capability("workspace.inspect", "Inspect bounded workspace and local runtime state."),
   capability("workspace.mutate", "Create, update, or remove workspace and local runtime state."),
   capability("workspace.patch", "Apply a bounded, reviewable workspace patch."),
+  capability("git.read", "Inspect bounded status, diffs, and history from the assigned local Git worktree."),
   capability("process.execute", "Execute a bounded process without an implicit shell."),
   capability("process.interactive", "Control an interactive process or terminal session."),
   capability("process.shell", "Interpret shell syntax; separate from argument-array process execution."),
@@ -157,6 +158,16 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
   // Keeping their alias lists empty preserves versionless capability policies.
   tool("workspace.mutate", ["workspace.mutate"], []),
   tool("workspace.patch", ["workspace.patch"], []),
+  ...["git.status", "git.diff", "git.log"].map((name) => tool(name, ["git.read"], [], {
+    approval: "not-required",
+    safety: Object.freeze({
+      effects: Object.freeze(["read"] as const),
+      reversibility: "pure",
+      requiresCapability: true,
+      requiresApproval: false,
+      retrySafe: true
+    })
+  })),
   tool("restore.create", ["restore.create"], []),
   tool("restore.apply", ["restore.apply"], []),
   tool("snapshot.create", ["restore.create"], []),
