@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { JobSupervisor } from "../packages/kernel/src/jobs.ts";
+import { createIsolatedTaskExecutor, JobSupervisor } from "../packages/kernel/src/jobs.ts";
 import { ensureSecureStateDirectory, FileAuditStore, FileJobStore, isOwnerOnlyPath } from "../packages/store-file/src/index.ts";
 
 const execFile = promisify(execFileCallback);
@@ -84,6 +84,99 @@ test("job supervisor projects a graph needs-review receipt instead of completed"
   assert.equal(review.result.terminalStatus, "needs-review");
   assert.equal(review.attempts, 1);
   await supervisor.shutdown();
+});
+
+test("job supervisor does not persist an approval request as a terminal channel result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-channel-approval-"));
+  const store = new FileJobStore(join(root, "jobs.json"));
+  let persistedResults = 0;
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async () => ({
+      ok: true,
+      output: {
+        type: "approval.required",
+        approvalId: "approval_fixture",
+        summary: "Approve fixture",
+        expiresInSeconds: 300
+      }
+    }),
+    persistResult: async () => { persistedResults += 1; }
+  });
+  await supervisor.start();
+  const id = "job_channel_approval";
+  await supervisor.submit({
+    executionKey: id,
+    task: { tool: "agent.run", input: { sessionId: "session_fixture" } }
+  }, { id });
+  const awaiting = await waitFor(async () => (await supervisor.get(id))?.status === "awaiting-approval"
+    ? supervisor.get(id)
+    : undefined);
+  assert.equal(awaiting.result.output.type, "approval.required");
+  assert.equal(persistedResults, 0);
+  await supervisor.shutdown();
+});
+
+test("isolated approval continuations defer execution settlement only for their exact linked runtime job", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-deferred-approval-worker-"));
+  const workerPath = join(root, "capture-worker.mjs");
+  await writeFile(workerPath, `process.on("message", (message) => {
+    process.send({ id: message.id, ok: true, result: { deferExecutionSettlement: message.deferExecutionSettlement === true } });
+  });\n`);
+  const executor = createIsolatedTaskExecutor({
+    stateDir: root,
+    workspaceRoot: root,
+    taskWorkerPath: workerPath,
+    browserWorkerPath: workerPath
+  });
+  try {
+    const id = "linked-agent-approval";
+    const linked = await executor({ task: { id, tool: "agent.run", input: {} } } as any, {
+      job: {
+        id,
+        status: "running",
+        payload: { executionKey: id, task: { id, tool: "agent.run", input: {} } },
+        attempts: 1,
+        timeoutMs: 30_000
+      }
+    });
+    assert.deepEqual(linked, { deferExecutionSettlement: true });
+
+    const unrelated = await executor({ task: { id: "other", tool: "agent.run", input: {} } } as any, {
+      job: {
+        id,
+        status: "running",
+        payload: { executionKey: "different-job", task: { id, tool: "agent.run", input: {} } },
+        attempts: 1,
+        timeoutMs: 30_000
+      }
+    });
+    assert.deepEqual(unrelated, { deferExecutionSettlement: false });
+
+    const browserLinked = await executor({
+      approvalId: "approval_fixture",
+      approvalRunId: id,
+      task: { id, tool: "browser.click", input: {} }
+    } as any, {
+      job: {
+        id,
+        status: "running",
+        payload: { task: { id, tool: "browser.click", input: {} } },
+        attempts: 1,
+        timeoutMs: 30_000
+      }
+    });
+    assert.deepEqual(browserLinked, { deferExecutionSettlement: true });
+
+    const browserUnlinked = await executor({
+      approvalId: "approval_fixture",
+      approvalRunId: id,
+      task: { id, tool: "browser.click", input: {} }
+    } as any);
+    assert.deepEqual(browserUnlinked, { deferExecutionSettlement: false });
+  } finally {
+    await executor.shutdown?.();
+  }
 });
 
 test("job supervisor quarantines uncertain cancellation and supports retry-safe timeout recovery", async () => {

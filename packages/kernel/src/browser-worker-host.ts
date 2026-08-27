@@ -23,6 +23,7 @@ interface BrowserWorkerMessage {
   config?: { auditLog?: string; experimental?: unknown };
   policy?: RuntimePolicy;
   trustedRecovery?: boolean;
+  deferExecutionSettlement?: boolean;
 }
 
 const messageError = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -53,7 +54,7 @@ export function installBrowserWorker(createRegistry: WorkerRegistryFactory): voi
           registry = createRegistry({ workspaceRoot, stateDir, config, approvalStore, auditStore });
           runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
         });
-        const result = await runTask({ task: payload.task, auditStore, approvalStore, policy, registry, runLedger, signal: undefined, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: message.trustedRecovery === true });
+        const result = await runTask({ task: payload.task, auditStore, approvalStore, policy, registry, runLedger, signal: undefined, trustedApprovalId: payload.approvalId, trustedApprovalRunId: payload.approvalRunId, trustedRecovery: message.trustedRecovery === true, deferExecutionSettlement: message.deferExecutionSettlement === true });
         process.send?.({ id: message.id, ok: true, result });
       } catch (error) {
         process.send?.({ id: message.id, ok: false, error: messageError(error) });

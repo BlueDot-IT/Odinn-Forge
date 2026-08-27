@@ -26,5 +26,6 @@ export const STATE_MIGRATIONS: readonly StateMigrationDefinition[] = Object.free
   runtimeDatabaseMigration(6, 7),
   runtimeDatabaseMigration(7, 8),
   runtimeDatabaseMigration(8, 9),
+  runtimeDatabaseMigration(9, 10),
   hostMetadataV0ToV1
 ]);

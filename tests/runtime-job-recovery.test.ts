@@ -266,6 +266,98 @@ test("SQLite runtime jobs atomically claim leases and bind terminal execution id
   assert.equal(leaseRow.release_reason, "completed");
 });
 
+test("protected result recovery atomically fences cancellation, lease drift, and incompatible attempts", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-protected-result-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+
+  const seed = async (id: string) => {
+    ledger.ensureRun({ runId: id, objective: "protected result recovery" });
+    const admitted = ledger.admitExecution(executionEnvelope(root, id, false));
+    ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+    await createRunningJob(store, id, false, true);
+    const job = await store.update(id, { requestHash: "b".repeat(64) });
+    assert.ok(job?.dispatchLease?.token);
+    return { admitted, job };
+  };
+  const recover = async (job: NonNullable<Awaited<ReturnType<typeof store.get>>>) => {
+    const snapshot = await store.getProtectedResultSnapshot(job.id);
+    assert.ok(snapshot);
+    return store.adoptProtectedResult(job.id, {
+      result: { output: { text: `protected:${job.id}` } },
+      expected: snapshot
+    });
+  };
+
+  const safe = await seed("protected-safe");
+  const adopted = await recover(safe.job);
+  assert.equal(adopted.status, "completed");
+  assert.equal(ledger.getExecutionAttempt(safe.admitted.attempt.id)?.state, "completed");
+
+  const attemptDrift = await seed("protected-attempt-drift");
+  const staleAttemptSnapshot = await store.getProtectedResultSnapshot(attemptDrift.job.id);
+  assert.ok(staleAttemptSnapshot);
+  assert.equal(staleAttemptSnapshot.executionAttemptId, attemptDrift.admitted.attempt.id);
+  ledger.transitionExecutionAttempt({
+    attemptId: attemptDrift.admitted.attempt.id,
+    from: "running",
+    to: "failed",
+    errorCode: "ATTEMPT_REPLACED_BEFORE_RESULT_SETTLEMENT"
+  });
+  const replacementAttempt = ledger.createExecutionAttempt({
+    runId: attemptDrift.job.id,
+    attemptId: "attempt-protected-result-replacement"
+  });
+  ledger.transitionExecutionAttempt({ attemptId: replacementAttempt.id, from: "queued", to: "running" });
+  const quarantinedAttemptDrift = await store.adoptProtectedResult(attemptDrift.job.id, {
+    result: { output: { text: "protected:stale-attempt" } },
+    expected: staleAttemptSnapshot
+  });
+  assert.equal(quarantinedAttemptDrift.status, "needs-review");
+  assert.equal(quarantinedAttemptDrift.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(replacementAttempt.id)?.state, "needs-review");
+
+  const cancelled = await seed("protected-cancelled");
+  const cancelling = await store.cancel(cancelled.job.id, { requestedBy: "test", reason: "cancel protected result" });
+  const quarantinedCancellation = await recover(cancelling);
+  assert.equal(quarantinedCancellation.status, "needs-review");
+  assert.equal(quarantinedCancellation.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(cancelled.admitted.attempt.id)?.state, "needs-review");
+
+  const cancellationControlOnly = await seed("protected-control-only");
+  const cancellationAt = new Date().toISOString();
+  ledger.database.db.prepare(`UPDATE cancellation_controls
+    SET requested_at = ?, requested_by = 'test', reason = 'control-only cancellation', acknowledged_at = ?
+    WHERE run_id = ?`).run(cancellationAt, cancellationAt, cancellationControlOnly.job.id);
+  const quarantinedControl = await recover(cancellationControlOnly.job);
+  assert.equal(quarantinedControl.status, "needs-review");
+  assert.equal(quarantinedControl.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(cancellationControlOnly.admitted.attempt.id)?.errorCode, "PROTECTED_RESULT_CANCELLATION_OUTCOME_UNCERTAIN");
+
+  const leaseDrift = await seed("protected-lease-drift");
+  ledger.database.db.prepare("UPDATE runtime_job_leases SET epoch = 'different-epoch' WHERE token = ?")
+    .run(String(leaseDrift.job.dispatchLease?.token));
+  const quarantinedLease = await recover(leaseDrift.job);
+  assert.equal(quarantinedLease.status, "needs-review");
+  assert.equal(quarantinedLease.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(leaseDrift.admitted.attempt.id)?.errorCode, "PROTECTED_RESULT_RECOVERY_STATE_UNCERTAIN");
+
+  const incompatible = await seed("protected-incompatible-attempt");
+  ledger.transitionExecutionAttempt({
+    attemptId: incompatible.admitted.attempt.id,
+    from: "running",
+    to: "failed",
+    errorCode: "EXECUTION_FAILED_BEFORE_ADOPTION"
+  });
+  const quarantinedAttempt = await recover(incompatible.job);
+  assert.equal(quarantinedAttempt.status, "needs-review");
+  assert.equal(quarantinedAttempt.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(incompatible.admitted.attempt.id)?.state, "failed");
+});
+
 test("restart recovery classifies every crash boundary without replaying unsafe work", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-recovery-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -389,6 +481,90 @@ test("unexpired owner leases prevent recovery and stale workers cannot settle a 
     () => owner.update(runId, { status: "completed", expectedLeaseToken: lease.token, result: { stale: true } }),
     (error: unknown) => (error as { code?: string }).code === "STALE_DISPATCH_LEASE"
   );
+});
+
+test("direct execution attempts bind a live owner and reconcile dead, stale, and closed owners without stealing runtime jobs", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-direct-attempt-owner-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const owner = createRunLedger({ stateDir, workspaceRoot: root });
+  owner.ensureRun({ runId: "direct-dead", objective: "direct owner" });
+  const dead = owner.admitExecution(executionEnvelope(root, "direct-dead", false));
+  owner.transitionExecutionAttempt({ attemptId: dead.attempt.id, from: "queued", to: "running" });
+  const ownership = owner.database.db.prepare(`SELECT owner_token, owner_pid, owner_heartbeat_at, owner_released_at
+    FROM execution_attempts WHERE id = ?`).get(dead.attempt.id) as any;
+  assert.equal(ownership.owner_token, owner.executionOwnerToken);
+  assert.equal(Number(ownership.owner_pid), process.pid);
+  assert.ok(Date.parse(String(ownership.owner_heartbeat_at)) > 0);
+  assert.equal(ownership.owner_released_at, null);
+
+  const recovery = createRunLedger({ stateDir, workspaceRoot: root });
+  assert.equal(recovery.getExecutionAttempt(dead.attempt.id)?.state, "running", "a second ledger must not steal a live process owner");
+  const reconciledDead = recovery.reconcileExecutionAttemptOwnership({ isProcessAlive: () => false });
+  assert.deepEqual(reconciledDead.map((entry) => entry.errorCode), ["EXECUTION_OWNER_DEAD"]);
+  assert.equal(recovery.getExecutionAttempt(dead.attempt.id)?.state, "needs-review");
+
+  owner.ensureRun({ runId: "direct-stale", objective: "stale owner" });
+  const stale = owner.admitExecution(executionEnvelope(root, "direct-stale", false));
+  owner.transitionExecutionAttempt({ attemptId: stale.attempt.id, from: "queued", to: "running" });
+  owner.database.db.prepare("UPDATE execution_attempts SET owner_heartbeat_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 60_000).toISOString(), stale.attempt.id);
+  const reconciledStale = recovery.reconcileExecutionAttemptOwnership({ isProcessAlive: () => true });
+  assert.deepEqual(reconciledStale.map((entry) => entry.errorCode), ["EXECUTION_OWNER_STALE"]);
+
+  owner.ensureRun({ runId: "linked-runtime", objective: "durable job owns recovery" });
+  const linked = owner.admitExecution(executionEnvelope(root, "linked-runtime", false));
+  owner.transitionExecutionAttempt({ attemptId: linked.attempt.id, from: "queued", to: "running" });
+  const jobs = new SqliteJobStore(owner);
+  await jobs.create({ id: "linked-runtime", status: "running", payload: { task: { id: "linked-runtime", tool: "text.echo", input: {} } }, retrySafe: false });
+  assert.equal(owner.reconcileExecutionAttemptOwnership({ isProcessAlive: () => false }).length, 0);
+  assert.equal(owner.getExecutionAttempt(linked.attempt.id)?.state, "running");
+
+  owner.ensureRun({ runId: "direct-close", objective: "close owner" });
+  const closing = owner.admitExecution(executionEnvelope(root, "direct-close", false));
+  owner.transitionExecutionAttempt({ attemptId: closing.attempt.id, from: "queued", to: "running" });
+  owner.close();
+  assert.equal(recovery.getExecutionAttempt(closing.attempt.id)?.state, "needs-review");
+  assert.equal(recovery.getExecutionAttempt(closing.attempt.id)?.errorCode, "EXECUTION_OWNER_CLOSED");
+  recovery.close();
+});
+
+test("direct execution attempt settlement is fenced to its exact live owner generation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-direct-attempt-owner-fence-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const owner = createRunLedger({ stateDir, workspaceRoot: root });
+  const interloper = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => { owner.close(); interloper.close(); });
+  owner.ensureRun({ runId: "owner-fence", objective: "owner fence" });
+  const admitted = owner.admitExecution(executionEnvelope(root, "owner-fence", false));
+  owner.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+
+  assert.throws(
+    () => interloper.transitionExecutionAttempt({
+      attemptId: admitted.attempt.id,
+      from: "running",
+      to: "completed",
+      outcomeDigest: "b".repeat(64)
+    }),
+    (error: unknown) => (error as { code?: string }).code === "EXECUTION_ATTEMPT_OWNER_CONFLICT"
+  );
+  assert.equal(owner.getExecutionAttempt(admitted.attempt.id)?.state, "running");
+  const before = owner.database.db.prepare("SELECT owner_token, owner_released_at FROM execution_attempts WHERE id = ?")
+    .get(admitted.attempt.id) as { owner_token: string; owner_released_at: string | null };
+  assert.equal(before.owner_token, owner.executionOwnerToken);
+  assert.equal(before.owner_released_at, null);
+
+  owner.transitionExecutionAttempt({
+    attemptId: admitted.attempt.id,
+    from: "running",
+    to: "completed",
+    outcomeDigest: "b".repeat(64)
+  });
+  const after = owner.database.db.prepare("SELECT owner_token, owner_released_at FROM execution_attempts WHERE id = ?")
+    .get(admitted.attempt.id) as { owner_token: string; owner_released_at: string | null };
+  assert.equal(after.owner_token, owner.executionOwnerToken);
+  assert.ok(after.owner_released_at);
 });
 
 test("retry-safe shutdown and failed-attempt crash windows remain dispatchable", async (t) => {
@@ -539,8 +715,13 @@ test("claimed approvals have one durable owner and only its lease can settle", a
   t.after(() => { leftLedger.close(); rightLedger.close(); });
   const leftStore = new SqliteJobStore(leftLedger);
   const rightStore = new SqliteJobStore(rightLedger);
-  const leftSupervisor = new JobSupervisor({ store: leftStore, execute: async () => ({ ok: true }) });
-  const rightSupervisor = new JobSupervisor({ store: rightStore, execute: async () => ({ ok: true }) });
+  let protectedPersistCalls = 0;
+  const persistResult = async () => {
+    protectedPersistCalls += 1;
+    assert.equal((await leftStore.get("approval-cancel-race"))?.status, "running");
+  };
+  const leftSupervisor = new JobSupervisor({ store: leftStore, execute: async () => ({ ok: true }), persistResult });
+  const rightSupervisor = new JobSupervisor({ store: rightStore, execute: async () => ({ ok: true }), persistResult });
   const runId = "approval-cancel-race";
   leftLedger.ensureRun({ runId, objective: "approval cancellation race" });
   const admitted = leftLedger.admitExecution(executionEnvelope(root, runId, false));
@@ -575,9 +756,202 @@ test("claimed approvals have one durable owner and only its lease can settle", a
 
   const winner = claims[0].status === "fulfilled" ? leftSupervisor : rightSupervisor;
   const settled = await winner.settleApproval(runId, { result: { applied: true }, expectedLeaseToken });
+  assert.equal(protectedPersistCalls, 1);
   assert.equal(settled.status, "completed");
   assert.equal(settled.dispatchLease, undefined);
   assert.equal(leftLedger.getExecutionAttempt(admitted.attempt.id)?.state, "completed");
+});
+
+test("approval result persistence failure quarantines before any terminal completion", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-approval-persist-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async () => ({ ok: true }),
+    persistResult: async () => { throw new Error("protected record unavailable"); }
+  });
+  const runId = "approval-persist-failure";
+  ledger.ensureRun({ runId, objective: "approval protected-result failure" });
+  const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, runId, false);
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
+  await store.update(runId, { status: "awaiting-approval", dispatchLease: undefined });
+
+  const claimed = await supervisor.beginApproval(runId);
+  const expectedLeaseToken = String(claimed.dispatchLease?.token ?? "");
+  await assert.rejects(
+    () => supervisor.settleApproval(runId, { result: { applied: true }, expectedLeaseToken }),
+    /protected record unavailable/u
+  );
+  const quarantined = await store.get(runId);
+  assert.equal(quarantined?.status, "needs-review");
+  assert.equal(quarantined?.result, undefined);
+  assert.equal(quarantined?.dispatchLease, undefined);
+  assert.match(quarantined?.error ?? "", /approval result persistence failed/u);
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "needs-review");
+});
+
+test("approved execution is supervisor-owned and cancellation cannot be overwritten by completion", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-approval-cancel-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  let persistedResults = 0;
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async () => ({ ok: true }),
+    persistResult: async () => { persistedResults += 1; }
+  });
+  const runId = "approval-active-cancel";
+  ledger.ensureRun({ runId, objective: "approval active cancellation" });
+  const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, runId, false);
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
+  await store.update(runId, { status: "awaiting-approval", dispatchLease: undefined });
+
+  let signalDispatched!: () => void;
+  const dispatched = new Promise<void>((resolve) => { signalDispatched = resolve; });
+  let observedSignal: AbortSignal | undefined;
+  const execution = supervisor.runApproval(runId, async ({ signal, markDispatched }) => {
+    observedSignal = signal;
+    markDispatched();
+    ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "awaiting-approval", to: "running" });
+    signalDispatched();
+    await new Promise<never>((_resolve, reject) => {
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  });
+  await dispatched;
+  const cancelling = await supervisor.cancel(runId);
+  assert.equal(cancelling.status, "cancelling");
+  assert.equal(observedSignal?.aborted, true);
+  await assert.rejects(execution, /cancelled by user/u);
+
+  const settled = await store.get(runId);
+  assert.equal(settled?.status, "needs-review");
+  assert.equal(settled?.result, undefined);
+  assert.equal(settled?.dispatchLease, undefined);
+  assert.match(settled?.error ?? "", /interrupted after dispatch/u);
+  assert.equal(persistedResults, 0);
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "needs-review");
+  const cancellation = ledger.database.db.prepare(`SELECT requested_at, acknowledged_at, settled_at
+    FROM cancellation_controls WHERE run_id = ?`).get(runId) as Record<string, unknown>;
+  assert.ok(cancellation.requested_at);
+  assert.ok(cancellation.acknowledged_at);
+  assert.ok(cancellation.settled_at);
+});
+
+test("SQLite settlement linearizes cancellation that arrives during protected-result persistence", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-approval-persist-cancel-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  let signalPersistenceStarted!: () => void;
+  const persistenceStarted = new Promise<void>((resolve) => { signalPersistenceStarted = resolve; });
+  let releasePersistence!: () => void;
+  const persistenceCanFinish = new Promise<void>((resolve) => { releasePersistence = resolve; });
+  let persistedResults = 0;
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async () => ({ ok: true }),
+    persistResult: async () => {
+      persistedResults += 1;
+      signalPersistenceStarted();
+      await persistenceCanFinish;
+    }
+  });
+  const runId = "approval-persist-cancel";
+  ledger.ensureRun({ runId, objective: "approval persistence cancellation race" });
+  const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, runId, false);
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
+  await store.update(runId, { status: "awaiting-approval", dispatchLease: undefined });
+
+  const execution = supervisor.runApproval(runId, async ({ markDispatched }) => {
+    markDispatched();
+    return { applied: true };
+  });
+  await persistenceStarted;
+  const cancelling = await supervisor.cancel(runId);
+  assert.equal(cancelling.status, "cancelling");
+  releasePersistence();
+  await assert.rejects(execution, /durable settlement is needs-review/u);
+
+  const settled = await store.get(runId);
+  assert.equal(settled?.status, "needs-review");
+  assert.equal(settled?.result, undefined);
+  assert.equal(settled?.dispatchLease, undefined);
+  assert.match(settled?.error ?? "", /interrupted after dispatch/u);
+  assert.equal(persistedResults, 1);
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "needs-review");
+});
+
+test("restart recovery fences a non-cooperative approved effect after cancellation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-approval-cancel-restart-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const ownerLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  const recoveryLedger = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => { ownerLedger.close(); recoveryLedger.close(); });
+  const ownerStore = new SqliteJobStore(ownerLedger);
+  const recoveryStore = new SqliteJobStore(recoveryLedger);
+  let persistedResults = 0;
+  const owner = new JobSupervisor({
+    store: ownerStore,
+    execute: async () => ({ ok: true }),
+    persistResult: async () => { persistedResults += 1; }
+  });
+  const runId = "approval-cancel-restart";
+  ownerLedger.ensureRun({ runId, objective: "approval cancellation restart fence" });
+  const admitted = ownerLedger.admitExecution(executionEnvelope(root, runId, false));
+  ownerLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(ownerStore, runId, false);
+  ownerLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
+  await ownerStore.update(runId, { status: "awaiting-approval", dispatchLease: undefined });
+
+  let signalDispatched!: () => void;
+  const dispatched = new Promise<void>((resolve) => { signalDispatched = resolve; });
+  let releaseEffect!: () => void;
+  const effectCanReturn = new Promise<void>((resolve) => { releaseEffect = resolve; });
+  let executions = 0;
+  const execution = owner.runApproval(runId, async ({ markDispatched }) => {
+    executions += 1;
+    markDispatched();
+    ownerLedger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "awaiting-approval", to: "running" });
+    signalDispatched();
+    await effectCanReturn;
+    return { applied: true };
+  });
+  await dispatched;
+  const cancelling = await owner.cancel(runId);
+  assert.equal(cancelling.status, "cancelling");
+  const leaseToken = String(cancelling.dispatchLease?.token ?? "");
+  assert.ok(leaseToken);
+
+  const expiredAt = new Date(Date.now() - 1_000).toISOString();
+  recoveryLedger.database.db.prepare("UPDATE runtime_jobs SET lease_expires_at = ? WHERE id = ?").run(expiredAt, runId);
+  recoveryLedger.database.db.prepare("UPDATE runtime_job_leases SET expires_at = ? WHERE token = ?").run(expiredAt, leaseToken);
+  const recovery = await recoveryStore.recover({ maxAttempts: 3 });
+  const recovered = await recoveryStore.get(runId);
+  assert.equal(recovered?.status, "needs-review");
+  assert.equal(recovered?.dispatchLease, undefined);
+  assert.equal((recovery as { needsReview: number }).needsReview, 1);
+  assert.equal(recoveryLedger.getExecutionAttempt(admitted.attempt.id)?.state, "needs-review");
+
+  releaseEffect();
+  await assert.rejects(execution, /no claimed approval execution|claim lease is no longer owned/u);
+  assert.equal((await recoveryStore.get(runId))?.status, "needs-review");
+  assert.equal(executions, 1, "restart recovery must not replay the approved effect");
+  assert.equal(persistedResults, 0, "a stale owner must not persist a late result");
 });
 
 test("expired approval continuation leases require review without replay", async (t) => {

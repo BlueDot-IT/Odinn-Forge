@@ -58,6 +58,19 @@ export interface RuntimeJobRecord {
   dispatchLease?: JsonObject;
 }
 
+type ProtectedResultRecoveryExpectation = {
+  status: string;
+  updatedAt?: string;
+  requestHash?: string;
+  occurrenceKey?: string;
+  executionRunId?: string;
+  executionAttemptId?: string;
+  envelopeDigest?: string;
+  auditCorrelationId?: string;
+  cancellationControlReference?: string;
+  dispatchLease?: JsonObject;
+};
+
 type NormalizedRuntimeJob = RuntimeJobRecord & {
   resultJson: string | null;
   payloadJson: string;
@@ -260,25 +273,35 @@ function correlation(ledger: RunLedger, runId: string | undefined) {
   };
 }
 
-function transitionAttempt(db: any, attemptId: string | undefined, from: ExecutionAttemptState | undefined, to: ExecutionAttemptState, errorCode?: string) {
+function transitionAttempt(db: any, attemptId: string | undefined, from: ExecutionAttemptState | undefined, to: ExecutionAttemptState, errorCode?: string, executionOwnershipEnabled = false) {
   if (!attemptId || !from || TERMINAL_ATTEMPT_STATES.has(from) || from === to) return;
   const now = new Date().toISOString();
   const settledAt = TERMINAL_ATTEMPT_STATES.has(to) ? now : null;
+  const ownerRelease = executionOwnershipEnabled && TERMINAL_ATTEMPT_STATES.has(to)
+    ? ", owner_released_at = COALESCE(owner_released_at, ?)"
+    : "";
   const result = db.prepare(`UPDATE execution_attempts
     SET state = ?, started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
-      settled_at = ?, error_code = ?
-    WHERE id = ? AND state = ?`).run(to, to, now, settledAt, errorCode ?? null, attemptId, from);
+      settled_at = ?, error_code = ?${ownerRelease}
+    WHERE id = ? AND state = ?`).run(
+      to, to, now, settledAt, errorCode ?? null,
+      ...(ownerRelease ? [now] : []),
+      attemptId, from
+    );
   if (Number(result.changes) !== 1) throw new Error(`execution attempt ${attemptId} changed concurrently during job recovery`);
 }
 
 export class SqliteJobStore {
   readonly ledger: RunLedger;
   readonly legacyPath?: string;
+  private readonly executionOwnershipEnabled: boolean;
 
   constructor(ledger: RunLedger, { legacyPath }: { legacyPath?: string } = {}) {
     if (!ledger?.database?.db) throw new Error("SqliteJobStore requires a run ledger");
     this.ledger = ledger;
     this.legacyPath = legacyPath ? resolve(legacyPath) : undefined;
+    this.executionOwnershipEnabled = (ledger.database.db.prepare("PRAGMA table_info(execution_attempts)").all() as SqlRow[])
+      .some((column) => String(column.name) === "owner_token");
   }
 
   async list({ limit = 500, offset = 0 }: { limit?: number; offset?: number } = {}): Promise<RuntimeJobRecord[]> {
@@ -461,6 +484,245 @@ export class SqliteJobStore {
     });
   }
 
+  async settleApproval(id: string, {
+    expectedLeaseToken,
+    result,
+    error,
+    dispatched,
+    interrupted
+  }: {
+    expectedLeaseToken: string;
+    result?: unknown;
+    error?: string;
+    dispatched: boolean;
+    interrupted?: string;
+  }): Promise<RuntimeJobRecord> {
+    return this.ledger.database.transaction((db) => {
+      const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;
+      if (!row) throw new Error(`job not found: ${id}`);
+      const current = hydrate(row);
+      if (!expectedLeaseToken || current.dispatchLease?.token !== expectedLeaseToken) {
+        const staleLease = new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`) as Error & { code?: string };
+        staleLease.code = "STALE_APPROVAL_LEASE";
+        throw staleLease;
+      }
+      if (!["running", "cancelling"].includes(current.status)) {
+        const staleState = new Error(`runtime job ${id} has no claimed approval execution`) as Error & { code?: string };
+        staleState.code = "STALE_APPROVAL_STATE";
+        throw staleState;
+      }
+      const linked = correlation(this.ledger, current.executionRunId);
+      if (!linked?.attemptId || !["awaiting-approval", "running", "cancelling"].includes(String(linked.attemptState))) {
+        const staleAttempt = new Error(`runtime job ${id} approval execution attempt is no longer active for settlement`) as Error & { code?: string };
+        staleAttempt.code = "STALE_APPROVAL_ATTEMPT";
+        throw staleAttempt;
+      }
+      const interruption = optionalString(interrupted)
+        ?? (current.status === "cancelling" ? "job cancellation was requested" : undefined);
+      const targetStatus = interruption
+        ? dispatched ? "needs-review" : "cancelled"
+        : error !== undefined ? "needs-review" : "completed";
+      const settlementError = targetStatus === "completed"
+        ? undefined
+        : interruption
+          ? dispatched
+            ? `approval continuation was interrupted after dispatch; external outcome requires review: ${interruption}`
+            : `approval continuation was cancelled before dispatch: ${interruption}`
+          : optionalString(error) ?? "approval continuation failed without a bounded error";
+      const now = new Date().toISOString();
+      db.prepare(`UPDATE runtime_job_leases
+        SET released_at = COALESCE(released_at, ?), release_reason = COALESCE(release_reason, ?)
+        WHERE token = ? AND job_id = ? AND released_at IS NULL`)
+        .run(now, targetStatus, expectedLeaseToken, id);
+      transitionAttempt(
+        db,
+        linked.attemptId,
+        linked.attemptState,
+        targetStatus as ExecutionAttemptState,
+        targetStatus === "needs-review"
+          ? interruption ? "APPROVAL_CONTINUATION_OUTCOME_UNCERTAIN" : "EXECUTION_OUTCOME_UNCERTAIN"
+          : targetStatus === "cancelled" ? "EXECUTION_CANCELLED" : undefined,
+        this.executionOwnershipEnabled
+      );
+      if (current.executionRunId) {
+        db.prepare("UPDATE cancellation_controls SET settled_at = COALESCE(settled_at, ?) WHERE run_id = ?")
+          .run(now, current.executionRunId);
+      }
+      const normalized = normalizeJob({
+        ...current,
+        status: targetStatus,
+        completedAt: now,
+        result: targetStatus === "completed" ? result : undefined,
+        error: settlementError,
+        dispatchLease: undefined,
+        executionAttemptId: linked.attemptId,
+        envelopeDigest: linked.envelopeDigest,
+        auditCorrelationId: linked.auditCorrelationId,
+        cancellationControlReference: linked.cancellationControlReference
+      }, current);
+      writeJob(db, normalized);
+      return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow);
+    });
+  }
+
+  async adoptProtectedResult(id: string, {
+    result,
+    expected,
+    interrupted,
+    source = "recovery"
+  }: {
+    result: unknown;
+    expected: ProtectedResultRecoveryExpectation;
+    interrupted?: string;
+    source?: "live" | "recovery";
+  }): Promise<RuntimeJobRecord> {
+    return this.ledger.database.transaction((db) => {
+      const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;
+      if (!row) throw new Error(`job not found: ${id}`);
+      const current = hydrate(row);
+
+      const linked = correlation(this.ledger, current.executionRunId);
+      const cancellation = current.executionRunId
+        ? db.prepare(`SELECT id, requested_at, acknowledged_at, settled_at
+          FROM cancellation_controls WHERE run_id = ?`).get(current.executionRunId) as SqlRow | undefined
+        : undefined;
+      const lease = current.dispatchLease?.token
+        ? db.prepare("SELECT * FROM runtime_job_leases WHERE token = ? AND job_id = ?")
+            .get(String(current.dispatchLease.token), current.id) as SqlRow | undefined
+        : undefined;
+
+      // The protected record lives in a separate access-controlled store, so
+      // bind the already-verified record to the exact runtime-job snapshot
+      // that was used to verify it. The remaining job, attempt, lease, and
+      // cancellation checks and all state changes share this transaction.
+      const expectedLeaseToken = optionalString(expected.dispatchLease?.token);
+      const snapshotMatches = current.status === expected.status
+        && current.updatedAt === expected.updatedAt
+        && current.requestHash === expected.requestHash
+        && current.occurrenceKey === expected.occurrenceKey
+        && current.executionRunId === expected.executionRunId
+        && current.dispatchLease?.token === expectedLeaseToken
+        && current.dispatchLease?.owner === optionalString(expected.dispatchLease?.owner)
+        && current.dispatchLease?.epoch === optionalString(expected.dispatchLease?.epoch)
+        && current.dispatchLease?.acquiredAt === optionalString(expected.dispatchLease?.acquiredAt)
+        && current.dispatchLease?.expiresAt === optionalString(expected.dispatchLease?.expiresAt)
+        && current.dispatchLease?.occurrenceKey === optionalString(expected.dispatchLease?.occurrenceKey);
+      const executionIdentityMatches = Boolean(
+        current.executionRunId
+        && current.executionRunId === expected.executionRunId
+        && linked?.attemptId
+        && expected.executionAttemptId === linked.attemptId
+        && expected.envelopeDigest === linked.envelopeDigest
+        && expected.auditCorrelationId === linked.auditCorrelationId
+        && expected.cancellationControlReference === linked.cancellationControlReference
+        && (!current.executionAttemptId || current.executionAttemptId === expected.executionAttemptId)
+        && (!current.envelopeDigest || current.envelopeDigest === expected.envelopeDigest)
+        && (!current.auditCorrelationId || current.auditCorrelationId === expected.auditCorrelationId)
+        && (!current.cancellationControlReference
+          || current.cancellationControlReference === expected.cancellationControlReference)
+      );
+      const cancellationControlMatches = Boolean(
+        cancellation
+        && linked
+        && String(cancellation.id) === linked.cancellationControlReference
+      );
+      const cancellationObserved = Boolean(cancellation?.requested_at || cancellation?.acknowledged_at);
+      const settlementInterrupted = optionalString(interrupted);
+      const leaseMatches = Boolean(
+        expectedLeaseToken
+        && current.dispatchLease
+        && lease
+        && lease.released_at === null
+        && String(lease.owner) === current.dispatchLease.owner
+        && String(lease.epoch) === current.dispatchLease.epoch
+        && String(lease.acquired_at) === current.dispatchLease.acquiredAt
+        && String(lease.expires_at) === current.dispatchLease.expiresAt
+        && (lease.occurrence_key === null ? current.occurrenceKey === undefined : String(lease.occurrence_key) === current.occurrenceKey)
+      );
+      const compatibleAttempt = linked?.attemptState === "running" || linked?.attemptState === "completed";
+      const canAdopt = current.status === "running"
+        && snapshotMatches
+        && executionIdentityMatches
+        && cancellationControlMatches
+        && !cancellationObserved
+        && !settlementInterrupted
+        && leaseMatches
+        && compatibleAttempt;
+      const now = new Date().toISOString();
+      const targetStatus = canAdopt ? "completed" : "needs-review";
+      const recoveryError = canAdopt
+        ? undefined
+        : current.status === "cancelling" || cancellationObserved || linked?.attemptState === "cancelling"
+          ? "protected channel result cannot override a cancellation; external outcome requires operator review"
+          : settlementInterrupted
+            ? "protected channel result settlement was interrupted; external outcome requires operator review"
+            : "protected channel result could not be atomically bound to its execution state; external outcome requires operator review";
+
+      if (current.dispatchLease?.token) {
+        db.prepare(`UPDATE runtime_job_leases
+          SET released_at = COALESCE(released_at, ?), release_reason = COALESCE(release_reason, ?)
+          WHERE token = ? AND job_id = ?`)
+          .run(now, targetStatus, String(current.dispatchLease.token), current.id);
+      }
+      if (canAdopt && linked?.attemptState === "running") {
+        transitionAttempt(db, linked.attemptId, "running", "completed", undefined, this.executionOwnershipEnabled);
+      } else if (!canAdopt && linked?.attemptState
+        && !TERMINAL_ATTEMPT_STATES.has(linked.attemptState)) {
+        transitionAttempt(
+          db,
+          linked.attemptId,
+          linked.attemptState,
+          "needs-review",
+          cancellationObserved || current.status === "cancelling" || linked.attemptState === "cancelling"
+            ? "PROTECTED_RESULT_CANCELLATION_OUTCOME_UNCERTAIN"
+            : "PROTECTED_RESULT_RECOVERY_STATE_UNCERTAIN",
+          this.executionOwnershipEnabled
+        );
+      }
+      if (current.executionRunId && cancellationControlMatches) {
+        db.prepare("UPDATE cancellation_controls SET settled_at = COALESCE(settled_at, ?) WHERE run_id = ?")
+          .run(now, current.executionRunId);
+      }
+      const normalized = normalizeJob({
+        ...current,
+        status: targetStatus,
+        completedAt: now,
+        result: canAdopt ? result : undefined,
+        error: recoveryError,
+        ...(source === "recovery" ? { recoveredAt: now } : {}),
+        dispatchLease: undefined,
+        ...(linked ? {
+          executionAttemptId: linked.attemptId,
+          envelopeDigest: linked.envelopeDigest,
+          auditCorrelationId: linked.auditCorrelationId,
+          cancellationControlReference: linked.cancellationControlReference
+        } : {})
+      }, current);
+      if (!canAdopt) {
+        normalized.result = undefined;
+        normalized.resultJson = null;
+      }
+      writeJob(db, normalized);
+      return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow);
+    });
+  }
+
+  async getProtectedResultSnapshot(id: string): Promise<RuntimeJobRecord | undefined> {
+    return this.ledger.database.transaction((db) => {
+      const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;
+      if (!row) return undefined;
+      const current = hydrate(row);
+      const linked = correlation(this.ledger, current.executionRunId);
+      return linked ? {
+        ...current,
+        executionAttemptId: linked.attemptId,
+        envelopeDigest: linked.envelopeDigest,
+        auditCorrelationId: linked.auditCorrelationId,
+        cancellationControlReference: linked.cancellationControlReference
+      } : current;
+    });
+  }
+
   async update(id: string, patch: JsonObject): Promise<RuntimeJobRecord> {
     return this.ledger.database.transaction((db) => {
       const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;
@@ -477,7 +739,12 @@ export class SqliteJobStore {
       const linkedTerminalState = linked?.attemptState && TERMINAL_ATTEMPT_STATES.has(linked.attemptState)
         ? linked.attemptState
         : undefined;
-      const targetStatus = linkedTerminalState && TERMINAL_JOB_STATES.has(requestedStatus)
+      // A later integrity failure is allowed to quarantine an apparently
+      // completed attempt. Completion is not truthful when its protected
+      // result is missing or failed verification.
+      const targetStatus = requestedStatus === "needs-review"
+        ? requestedStatus
+        : linkedTerminalState && TERMINAL_JOB_STATES.has(requestedStatus)
         ? linkedTerminalState
         : requestedStatus;
       const effectivePatch = targetStatus === requestedStatus ? patch : {
@@ -495,7 +762,8 @@ export class SqliteJobStore {
           linked.attemptId,
           linked.attemptState,
           targetStatus as ExecutionAttemptState,
-          targetStatus === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : targetStatus === "cancelled" ? "EXECUTION_CANCELLED" : undefined
+          targetStatus === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : targetStatus === "cancelled" ? "EXECUTION_CANCELLED" : undefined,
+          this.executionOwnershipEnabled
         );
         db.prepare("UPDATE cancellation_controls SET settled_at = COALESCE(settled_at, ?) WHERE run_id = ?")
           .run(new Date().toISOString(), current.executionRunId ?? "");
@@ -567,9 +835,9 @@ export class SqliteJobStore {
           acknowledged_at = COALESCE(acknowledged_at, ?), settled_at = CASE WHEN ? = 'cancelled' THEN COALESCE(settled_at, ?) ELSE settled_at END
           WHERE run_id = ?`).run(now, requestedBy, reason, now, status, now, current.executionRunId);
       }
-      if (linked?.attemptState === "running") transitionAttempt(db, linked.attemptId, "running", "cancelling", "EXECUTION_CANCELLATION_REQUESTED");
+      if (linked?.attemptState === "running") transitionAttempt(db, linked.attemptId, "running", "cancelling", "EXECUTION_CANCELLATION_REQUESTED", this.executionOwnershipEnabled);
       else if (status === "cancelled" && linked?.attemptState && !TERMINAL_ATTEMPT_STATES.has(linked.attemptState)) {
-        transitionAttempt(db, linked.attemptId, linked.attemptState, "cancelled", "EXECUTION_CANCELLED");
+        transitionAttempt(db, linked.attemptId, linked.attemptState, "cancelled", "EXECUTION_CANCELLED", this.executionOwnershipEnabled);
       }
       const normalized = normalizeJob({
         ...current,
@@ -631,7 +899,7 @@ export class SqliteJobStore {
               ? current.error ?? linked?.attemptErrorCode ?? "execution failed while cancellation was pending"
               : "execution was interrupted while cancellation was pending; outcome requires operator review";
           completedAt = now;
-          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "CANCELLATION_OUTCOME_UNCERTAIN" : "EXECUTION_CANCELLED");
+          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "CANCELLATION_OUTCOME_UNCERTAIN" : "EXECUTION_CANCELLED", this.executionOwnershipEnabled);
         } else if (linked?.attemptState && TERMINAL_ATTEMPT_STATES.has(linked.attemptState)) {
           status = linked.attemptState;
           error = current.error ?? linked.attemptErrorCode ?? "execution attempt settled before runtime job projection";
@@ -642,7 +910,7 @@ export class SqliteJobStore {
           status = "needs-review";
           error = "an approval continuation lease expired before a terminal result was persisted; outcome requires operator review";
           completedAt = now;
-          transitionAttempt(db, linked.attemptId, linked.attemptState, "needs-review", "APPROVAL_CONTINUATION_OUTCOME_UNCERTAIN");
+          transitionAttempt(db, linked.attemptId, linked.attemptState, "needs-review", "APPROVAL_CONTINUATION_OUTCOME_UNCERTAIN", this.executionOwnershipEnabled);
         } else if (current.recoveryInputAvailable !== true) {
           const crossedDispatch = linked?.attemptState === "running";
           status = crossedDispatch && !retrySafe ? "needs-review" : "failed";
@@ -650,7 +918,7 @@ export class SqliteJobStore {
             ? "execution crossed the dispatch boundary before volatile input was lost; outcome requires operator review"
             : "volatile execution input is unavailable after restart; resubmit the job with fresh input";
           completedAt = now;
-          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : "RECOVERY_INPUT_UNAVAILABLE");
+          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : "RECOVERY_INPUT_UNAVAILABLE", this.executionOwnershipEnabled);
         } else if (!linked && current.importedFromLegacy && (!retrySafe || current.attempts >= maxAttempts)) {
           status = retrySafe ? "failed" : "needs-review";
           error = retrySafe
@@ -665,14 +933,14 @@ export class SqliteJobStore {
           status = "queued";
           error = "retry-safe execution was interrupted and is eligible for a new attempt";
           completedAt = undefined;
-          transitionAttempt(db, linked?.attemptId, linked?.attemptState, "failed", "EXECUTION_INTERRUPTED_RETRY_SAFE");
+          transitionAttempt(db, linked?.attemptId, linked?.attemptState, "failed", "EXECUTION_INTERRUPTED_RETRY_SAFE", this.executionOwnershipEnabled);
         } else {
           status = retrySafe ? "failed" : "needs-review";
           error = retrySafe
             ? "retry-safe execution exhausted its attempt limit during restart recovery"
             : "execution was interrupted after dispatch; outcome requires operator review";
           completedAt = now;
-          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : "EXECUTION_RETRY_EXHAUSTED");
+          transitionAttempt(db, linked?.attemptId, linked?.attemptState, status as ExecutionAttemptState, status === "needs-review" ? "EXECUTION_OUTCOME_UNCERTAIN" : "EXECUTION_RETRY_EXHAUSTED", this.executionOwnershipEnabled);
         }
         const normalized = normalizeJob({
           ...current,

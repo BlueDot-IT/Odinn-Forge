@@ -26,7 +26,16 @@ export interface JobRecord {
   occurrenceKey?: string;
   scheduledFor?: string;
   nextRunAt?: string | null;
+  executionRunId?: string;
+  executionAttemptId?: string;
+  envelopeDigest?: string;
+  auditCorrelationId?: string;
+  cancellationControlReference?: string;
   dispatchLease?: JsonObject;
+}
+
+export interface JobResultPersistence {
+  settlement: "protected";
 }
 
 export interface JobCreationControl extends JsonObject {
@@ -44,6 +53,20 @@ export interface JobStore {
   claimNextQueued?(patch: JsonObject): Promise<JobRecord | undefined>;
   claim(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
   claimApproval?(id: string, patch: JsonObject): Promise<JobRecord | undefined>;
+  settleApproval?(id: string, settlement: {
+    expectedLeaseToken: string;
+    result?: unknown;
+    error?: string;
+    dispatched: boolean;
+    interrupted?: string;
+  }): Promise<JobRecord>;
+  adoptProtectedResult?(id: string, settlement: {
+    result: unknown;
+    expected: JobRecord;
+    interrupted?: string;
+    source?: "live" | "recovery";
+  }): Promise<JobRecord>;
+  getProtectedResultSnapshot?(id: string): Promise<JobRecord | undefined>;
   update(id: string, patch: JsonObject): Promise<JobRecord>;
   get(id: string): Promise<JobRecord | undefined>;
   list(options?: { limit?: number; offset?: number }): Promise<JobRecord[]>;
@@ -59,11 +82,16 @@ export interface JobExecutionContext {
   job: JobRecord;
 }
 
+export interface ApprovalExecutionContext extends JobExecutionContext {
+  markDispatched(): void;
+}
+
 export type JobExecute = (payload: JsonObject, context: JobExecutionContext) => Promise<unknown>;
 
 export interface JobSupervisorOptions {
   store: JobStore;
   execute: JobExecute;
+  persistResult?: (job: JobRecord, result: unknown) => Promise<JobResultPersistence | void> | JobResultPersistence | void;
   onCancel?: (job: JobRecord) => Promise<void> | void;
   concurrency?: number;
   maxAttempts?: number;
@@ -73,6 +101,13 @@ export interface JobSupervisorOptions {
 interface ActiveJob {
   controller: AbortController;
   promise: Promise<void>;
+  approval?: {
+    dispatched: boolean;
+    finish(): void;
+    heartbeat?: NodeJS.Timeout;
+    leaseToken?: string;
+    timeout?: NodeJS.Timeout;
+  };
 }
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -81,13 +116,13 @@ const PROCESS_WORKER_ABORT_GRACE_MS = 30_000;
 export class JobSupervisor {
   readonly store: JobStore;
   readonly execute: JobExecute;
+  readonly persistResult?: (job: JobRecord, result: unknown) => Promise<JobResultPersistence | void> | JobResultPersistence | void;
   readonly onCancel?: (job: JobRecord) => Promise<void> | void;
   readonly concurrency: number;
   readonly maxAttempts: number;
   readonly defaultTimeoutMs: number;
   private readonly active: Map<string, ActiveJob>;
   private readonly volatilePayloads: Map<string, JsonObject>;
-  private readonly volatileResults: Map<string, { result: unknown; expiresAt: number }>;
   private readonly leaseOwner: string;
   private readonly leaseEpoch: string;
   private recoveryTimer?: NodeJS.Timeout;
@@ -96,18 +131,18 @@ export class JobSupervisor {
   private stopping: boolean;
 
   constructor(options: Partial<JobSupervisorOptions> = {}) {
-    const { store, execute, onCancel, concurrency = 1, maxAttempts = 3, defaultTimeoutMs = 120_000 } = options;
+    const { store, execute, persistResult, onCancel, concurrency = 1, maxAttempts = 3, defaultTimeoutMs = 120_000 } = options;
     if (!store || typeof store.create !== "function") throw new Error("JobSupervisor requires a durable store");
     if (typeof execute !== "function") throw new Error("JobSupervisor requires an execute function");
     this.store = store;
     this.execute = execute;
+    this.persistResult = persistResult;
     this.onCancel = onCancel;
     this.concurrency = Math.max(1, Number(concurrency) || 1);
     this.maxAttempts = Math.max(1, Number(maxAttempts) || 1);
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.active = new Map();
     this.volatilePayloads = new Map();
-    this.volatileResults = new Map();
     this.leaseOwner = `supervisor:${process.pid}`;
     this.leaseEpoch = randomUUID();
     this.started = false;
@@ -230,15 +265,6 @@ export class JobSupervisor {
     return { total: jobs.length, attention: jobs.filter((job) => ["failed", "needs-review"].includes(job.status)).length };
   }
 
-  getVolatileResult(id: string): unknown | undefined {
-    const entry = this.volatileResults.get(id);
-    if (!entry || entry.expiresAt <= Date.now()) {
-      this.volatileResults.delete(id);
-      return undefined;
-    }
-    return entry.result;
-  }
-
   async settleApproval(id: string, {
     result,
     error,
@@ -249,44 +275,182 @@ export class JobSupervisor {
     expectedLeaseToken: string;
   }): Promise<JobRecord> {
     if (!expectedLeaseToken) throw new Error(`runtime job ${id} approval settlement requires its claim lease`);
-    const current = await this.store.get(id);
-    if (!current || !["running", "cancelling"].includes(current.status)) {
-      throw new Error(`runtime job ${id} has no claimed approval execution`);
-    }
-    if (current.dispatchLease?.token !== expectedLeaseToken) {
+    const active = this.active.get(id);
+    if (!active?.approval || active.approval.leaseToken !== expectedLeaseToken) {
       throw new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`);
     }
-    return this.store.update(id, error === undefined ? {
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      result,
-      expectedLeaseToken,
-      dispatchLease: undefined
-    } : {
-      status: "needs-review",
-      completedAt: new Date().toISOString(),
-      error: errorMessage(error),
-      expectedLeaseToken,
-      dispatchLease: undefined
-    });
+    try {
+      const current = await this.store.get(id);
+      if (!current || !["running", "cancelling"].includes(current.status)) {
+        throw new Error(`runtime job ${id} has no claimed approval execution`);
+      }
+      if (current.dispatchLease?.token !== expectedLeaseToken) {
+        throw new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`);
+      }
+      const interruptedBeforePersistence = active.controller.signal.aborted
+        ? errorMessage(active.controller.signal.reason)
+        : current.status === "cancelling"
+          ? "job cancellation was requested"
+          : undefined;
+      if (!interruptedBeforePersistence && error === undefined) {
+        await this.persistResult?.(current, result);
+      }
+      const interrupted = active.controller.signal.aborted
+        ? errorMessage(active.controller.signal.reason)
+        : interruptedBeforePersistence;
+      const settlement = {
+        expectedLeaseToken,
+        ...(error === undefined ? { result } : {}),
+        ...(error === undefined ? {} : { error: errorMessage(error) }),
+        dispatched: active.approval.dispatched,
+        ...(interrupted ? { interrupted } : {})
+      };
+      if (this.store.settleApproval) return this.store.settleApproval(id, settlement);
+
+      // Compatibility stores cannot provide the SQLite transaction boundary,
+      // so retain the same fail-closed checks immediately before their write.
+      const latest = await this.store.get(id);
+      if (!latest || !["running", "cancelling"].includes(latest.status)
+        || latest.dispatchLease?.token !== expectedLeaseToken) {
+        throw new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`);
+      }
+      const interruptedLatest = settlement.interrupted
+        ?? (latest.status === "cancelling" ? "job cancellation was requested" : undefined);
+      const status = interruptedLatest
+        ? settlement.dispatched ? "needs-review" : "cancelled"
+        : settlement.error !== undefined ? "needs-review" : "completed";
+      return this.store.update(id, {
+        status,
+        completedAt: new Date().toISOString(),
+        result: status === "completed" ? result : undefined,
+        error: status === "completed"
+          ? undefined
+          : interruptedLatest
+            ? settlement.dispatched
+              ? `approval continuation was interrupted after dispatch; external outcome requires review: ${interruptedLatest}`
+              : `approval continuation was cancelled before dispatch: ${interruptedLatest}`
+            : settlement.error,
+        expectedLeaseToken,
+        dispatchLease: undefined
+      });
+    } catch (settlementError) {
+      if (error === undefined && !active.controller.signal.aborted) {
+        if (this.store.settleApproval) {
+          await this.store.settleApproval(id, {
+            expectedLeaseToken,
+            error: `approval result persistence failed: ${errorMessage(settlementError)}`,
+            dispatched: active.approval.dispatched
+          }).catch(() => undefined);
+        } else {
+          await this.store.update(id, {
+            status: "needs-review",
+            completedAt: new Date().toISOString(),
+            result: undefined,
+            error: `approval result persistence failed: ${errorMessage(settlementError)}`,
+            expectedLeaseToken,
+            dispatchLease: undefined
+          }).catch(() => undefined);
+        }
+      }
+      throw settlementError;
+    } finally {
+      this.finishApproval(id, active);
+    }
   }
 
   async beginApproval(id: string): Promise<JobRecord> {
     if (!this.store.claimApproval) throw new Error("runtime job store does not support approval claims");
+    if (this.active.has(id)) throw new Error(`runtime job ${id} already has an active execution`);
+    const controller = new AbortController();
+    let finish!: () => void;
+    const promise = new Promise<void>((resolve) => { finish = resolve; });
+    const active: ActiveJob = {
+      controller,
+      promise,
+      approval: { dispatched: false, finish }
+    };
+    // Register before the durable claim so a concurrent cancellation either
+    // aborts this owner or wins the atomic awaiting-approval claim.
+    this.active.set(id, active);
     const acquiredAt = new Date().toISOString();
-    const claimed = await this.store.claimApproval(id, {
-      status: "running",
-      error: undefined,
-      dispatchLease: {
-        token: randomUUID(),
-        owner: this.leaseOwner,
-        epoch: this.leaseEpoch,
-        acquiredAt,
-        expiresAt: new Date(Date.now() + Math.max(this.defaultTimeoutMs + 30_000, 120_000)).toISOString()
+    try {
+      const claimed = await this.store.claimApproval(id, {
+        status: "running",
+        error: undefined,
+        dispatchLease: {
+          token: randomUUID(),
+          owner: this.leaseOwner,
+          epoch: this.leaseEpoch,
+          acquiredAt,
+          expiresAt: new Date(Date.now() + Math.max(this.defaultTimeoutMs + 30_000, 120_000)).toISOString()
+        }
+      });
+      if (!claimed) throw new Error(`runtime job ${id} is no longer awaiting approval`);
+      const leaseToken = typeof claimed.dispatchLease?.token === "string" ? claimed.dispatchLease.token : undefined;
+      if (!leaseToken) throw new Error(`runtime job ${id} approval claim did not return its dispatch lease`);
+      active.approval!.leaseToken = leaseToken;
+      const timeoutMs = claimed.timeoutMs || this.defaultTimeoutMs;
+      const leaseWindowMs = Math.max(timeoutMs + 30_000, 120_000);
+      active.approval!.timeout = setTimeout(
+        () => controller.abort(new Error("approval continuation timed out")),
+        timeoutMs
+      );
+      active.approval!.timeout.unref?.();
+      if (leaseToken && this.store.renewLease) {
+        active.approval!.heartbeat = setInterval(() => {
+          void this.store.renewLease!(id, {
+            token: leaseToken,
+            owner: String(claimed.dispatchLease?.owner),
+            epoch: String(claimed.dispatchLease?.epoch),
+            expiresAt: new Date(Date.now() + leaseWindowMs).toISOString()
+          }).then((renewed) => {
+            if (!renewed) controller.abort(new Error("approval continuation lease was lost"));
+          }).catch(() => controller.abort(new Error("approval continuation lease renewal failed")));
+        }, Math.min(30_000, Math.max(1_000, Math.floor(leaseWindowMs / 3))));
+        active.approval!.heartbeat.unref?.();
       }
-    });
-    if (!claimed) throw new Error(`runtime job ${id} is no longer awaiting approval`);
-    return claimed;
+      return claimed;
+    } catch (error) {
+      this.finishApproval(id, active);
+      throw error;
+    }
+  }
+
+  async runApproval<T>(id: string, continuation: (context: ApprovalExecutionContext) => Promise<T>): Promise<T> {
+    const job = await this.beginApproval(id);
+    const active = this.active.get(id);
+    const expectedLeaseToken = typeof job.dispatchLease?.token === "string" ? job.dispatchLease.token : "";
+    if (!active?.approval || active.approval.leaseToken !== expectedLeaseToken) {
+      throw new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`);
+    }
+    const markDispatched = () => {
+      if (active.controller.signal.aborted) {
+        throw active.controller.signal.reason ?? new Error("approval continuation aborted before dispatch");
+      }
+      active.approval!.dispatched = true;
+    };
+    let result: T;
+    try {
+      if (active.controller.signal.aborted) {
+        throw active.controller.signal.reason ?? new Error("approval continuation aborted before dispatch");
+      }
+      result = await continuation({ signal: active.controller.signal, job, markDispatched });
+    } catch (error) {
+      await this.settleApproval(id, { error, expectedLeaseToken });
+      throw error;
+    }
+    if (active.controller.signal.aborted) {
+      const error = active.controller.signal.reason ?? new Error("approval continuation aborted after dispatch");
+      await this.settleApproval(id, { error, expectedLeaseToken });
+      throw error;
+    }
+    const settled = await this.settleApproval(id, { result, expectedLeaseToken });
+    if (settled.status !== "completed") {
+      const settlementError = new Error(`approval continuation did not complete because its durable settlement is ${settled.status}`) as Error & { code?: string };
+      settlementError.code = "APPROVAL_CONTINUATION_INTERRUPTED";
+      throw settlementError;
+    }
+    return result;
   }
 
   async drain(): Promise<void> {
@@ -363,7 +527,6 @@ export class JobSupervisor {
     this.stopping = true;
     this.started = false;
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
-    this.volatileResults.clear();
     for (const active of this.active.values()) active.controller.abort(new Error("supervisor shutting down"));
     await Promise.allSettled(Array.from(this.active.values(), (active) => active.promise));
   }
@@ -393,14 +556,6 @@ export class JobSupervisor {
         const result = await this.execute(job.payload, { signal: controller.signal, job });
         backendReturned = true;
         if (controller.signal.aborted) throw controller.signal.reason ?? new Error("job aborted");
-        if (job.payload.executionKey === job.id && (job.payload.task as JsonObject | undefined)?.tool === "agent.run") {
-          const now = Date.now();
-          for (const [id, entry] of this.volatileResults) {
-            if (entry.expiresAt <= now) this.volatileResults.delete(id);
-          }
-          this.volatileResults.set(job.id, { result, expiresAt: now + 5 * 60_000 });
-          while (this.volatileResults.size > 256) this.volatileResults.delete(this.volatileResults.keys().next().value as string);
-        }
         const awaitingApproval = Boolean(result && typeof result === "object"
           && (result as { output?: { type?: unknown } }).output?.type === "approval.required");
         const terminalStatus = result && typeof result === "object"
@@ -410,6 +565,34 @@ export class JobSupervisor {
             && ["completed", "failed", "cancelled", "needs-review"].includes(String((result as { output?: { status?: unknown } }).output?.status))
             ? String((result as { output?: { status?: unknown } }).output?.status)
             : undefined;
+        // Content-bearing results that must survive restart are committed to
+        // their protected store before the public job is allowed to become
+        // terminal. A persistence failure therefore quarantines non-retry-safe
+        // work instead of publishing a completed receipt with no retrievable
+        // outcome. Approval requests are non-terminal control results and must
+        // not be mistaken for an assistant reply.
+        const persistence = !awaitingApproval
+          ? await this.persistResult?.(job, result)
+          : undefined;
+        if (persistence?.settlement === "protected") {
+          if (!this.store.getProtectedResultSnapshot) throw new Error("protected result snapshot fencing is unavailable");
+          const snapshot = await this.store.getProtectedResultSnapshot(job.id);
+          if (!snapshot) throw new Error(`protected result job disappeared before settlement: ${job.id}`);
+          if (!this.store.adoptProtectedResult) throw new Error("protected result settlement is unavailable");
+          const protectedResultInterruption = controller.signal.aborted
+            ? errorMessage(controller.signal.reason ?? new Error("job aborted"))
+            : terminalStatus && terminalStatus !== "completed"
+              ? `protected result requested ${terminalStatus} settlement`
+              : undefined;
+          await this.store.adoptProtectedResult(job.id, {
+            result,
+            expected: snapshot,
+            ...(protectedResultInterruption ? { interrupted: protectedResultInterruption } : {}),
+            source: "live"
+          });
+          return;
+        }
+        if (controller.signal.aborted) throw controller.signal.reason ?? new Error("job aborted");
         await this.store.update(job.id, {
           status: awaitingApproval ? "awaiting-approval" : terminalStatus ?? "completed",
           ...(awaitingApproval ? {} : { completedAt: new Date().toISOString() }),
@@ -470,6 +653,14 @@ export class JobSupervisor {
     }, delay);
     this.recoveryTimer.unref?.();
   }
+
+  private finishApproval(id: string, active: ActiveJob): void {
+    if (active.approval?.timeout) clearTimeout(active.approval.timeout);
+    if (active.approval?.heartbeat) clearInterval(active.approval.heartbeat);
+    if (this.active.get(id) === active) this.active.delete(id);
+    active.approval?.finish();
+    if (!this.stopping) void this.drain().catch(() => undefined);
+  }
 }
 
 interface WorkerPayload extends JsonObject {
@@ -516,6 +707,14 @@ function isWorkerResponse(message: unknown): message is WorkerResponse {
   return Boolean(message && typeof message === "object" && "ok" in message && typeof (message as { ok?: unknown }).ok === "boolean");
 }
 
+function shouldDeferExecutionSettlement(payload: WorkerPayload, job?: JobRecord): boolean {
+  if (!job) return false;
+  if (typeof payload.approvalId === "string"
+    && typeof payload.approvalRunId === "string"
+    && payload.approvalRunId === job.id) return true;
+  return job.payload.executionKey === job.id && payload.task?.tool === "agent.run";
+}
+
 export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): TaskExecutor {
   const { stateDir, workspaceRoot, config, policy } = options;
   const authoritativeRoot = resolve(workspaceRoot ?? currentWorkingDirectory());
@@ -531,6 +730,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
   const children = new Set<ChildProcess>();
   const execute = ((payload: WorkerPayload, { signal, job }: ExecutorOptions = {}) => {
     const trustedRecovery = Number(job?.attempts ?? 0) > 1;
+    const deferExecutionSettlement = shouldDeferExecutionSettlement(payload, job);
     const taskWorkspaceRoot = resolve(payload.workspaceRoot || authoritativeRoot);
     if (taskWorkspaceRoot !== authoritativeRoot && !taskWorkspaceRoot.startsWith(`${authoritativeRoot}${sep}`)) {
       return Promise.reject(new Error("task workspaceRoot must remain inside the gateway workspace"));
@@ -584,7 +784,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
         if (!settled) finish(new Error(`forked task worker exited unexpectedly: ${code ?? exitSignal}`));
       });
       signal?.addEventListener("abort", abort, { once: true });
-      child.send({ type: "task", payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy, trustedRecovery });
+      child.send({ type: "task", payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy, trustedRecovery, deferExecutionSettlement });
     });
   }) as TaskExecutor;
   execute.shutdown = async () => {
@@ -648,7 +848,17 @@ function createPersistentWorkerExecutor(options: WorkerConfiguration & { workerP
     pending.set(id, { finish });
     signal?.addEventListener("abort", abort, { once: true });
     try {
-      ensureChild().send({ type: "task", id, payload, stateDir, workspaceRoot, config, policy, trustedRecovery: Number(job?.attempts ?? 0) > 1 }, (error) => {
+      ensureChild().send({
+        type: "task",
+        id,
+        payload,
+        stateDir,
+        workspaceRoot,
+        config,
+        policy,
+        trustedRecovery: Number(job?.attempts ?? 0) > 1,
+        deferExecutionSettlement: shouldDeferExecutionSettlement(payload, job)
+      }, (error) => {
         if (error) {
           pending.delete(id);
           finish(error);

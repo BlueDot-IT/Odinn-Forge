@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { cp, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { createRunLedger, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, STATE_SCHEMA_TARGETS, stateLifecycleStatus } from "../packages/kernel/src/index.ts";
+import { createRunLedger, createStateBackup, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, restoreStateBackup, STATE_SCHEMA_TARGETS, stateLifecycleStatus } from "../packages/kernel/src/index.ts";
 import { ArtifactStore, inspectExistingSqliteSchema, RunLedger, SqliteJobStore, SqliteStore } from "../packages/store-sqlite/src/index.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -17,6 +18,17 @@ async function fixture(name: string): Promise<{ temporary: string; state: string
   const state = join(temporary, "state");
   await cp(join(fixtures, name), state, { recursive: true });
   return { temporary, state };
+}
+
+async function refreshBackupManifestFile(backup: string, relativePath: string): Promise<void> {
+  const manifestPath = join(backup, "backup-manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const bytes = await readFile(join(backup, relativePath));
+  const entry = manifest.files.find((candidate: { path?: unknown }) => candidate.path === relativePath);
+  assert.ok(entry, `backup manifest is missing ${relativePath}`);
+  entry.bytes = bytes.length;
+  entry.sha256 = createHash("sha256").update(bytes).digest("hex");
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 test("latest pre-v1 state plans, backs up, migrates atomically, and preserves stable data", async () => {
@@ -103,11 +115,11 @@ test("release-candidate SQLite state migrates transactionally and preserves its 
     } }, null, 2)}\n`;
     await writeFile(join(candidate.state, "jobs.json"), legacyJobs);
     const plan = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4", "runtime-database-v4-to-v5", "runtime-database-v5-to-v6", "runtime-database-v6-to-v7", "runtime-database-v7-to-v8", "runtime-database-v8-to-v9"]);
+    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v2-to-v3", "runtime-database-v3-to-v4", "runtime-database-v4-to-v5", "runtime-database-v5-to-v6", "runtime-database-v6-to-v7", "runtime-database-v7-to-v8", "runtime-database-v8-to-v9", "runtime-database-v9-to-v10"]);
     assert.equal(plan.rollbackCompatible, false);
     const report = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(report?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 9);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 10);
     assert.equal(inspectExistingSqliteSchema(join(report.backupLocation!, "db", "odinn.sqlite")), 2);
     const migratedDatabase = new DatabaseSync(databasePath, { readOnly: true });
     assert.equal((migratedDatabase.prepare("SELECT status FROM runtime_jobs WHERE id = 'migrated_job'").get() as { status: string }).status, "queued");
@@ -116,7 +128,7 @@ test("release-candidate SQLite state migrates transactionally and preserves its 
     const manifest = JSON.parse(await readFile(join(candidate.state, "state-schema.json"), "utf8"));
     assert.equal(manifest.minimumApplicationVersion, "1.0.0");
     assert.equal(manifest.applicationVersion, "1.0.0");
-    assert.equal(manifest.storeVersions.runtimeDatabase, 9);
+    assert.equal(manifest.storeVersions.runtimeDatabase, 10);
   } finally {
     await rm(candidate.temporary, { recursive: true, force: true });
   }
@@ -130,10 +142,10 @@ test("release-candidate migration from runtime schema 5 persists checkpoint jour
     const database = new SqliteStore(databasePath, { targetVersion: 5 });
     database.close();
     const report = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(report.steps.map((step) => step.id), ["runtime-database-v5-to-v6", "runtime-database-v6-to-v7", "runtime-database-v7-to-v8", "runtime-database-v8-to-v9"]);
+    assert.deepEqual(report.steps.map((step) => step.id), ["runtime-database-v5-to-v6", "runtime-database-v6-to-v7", "runtime-database-v7-to-v8", "runtime-database-v8-to-v9", "runtime-database-v9-to-v10"]);
     const migration = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(migration?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 9);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 10);
     const sqlite = new DatabaseSync(databasePath);
     try {
       const tables = (sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('mutation_groups','mutation_checkpoints','mutation_journal_entries','checkpoint_manifest_artifacts','agent_graph_runs','agent_graph_nodes','agent_graph_edges','agent_graph_reassignments')").all() as Array<{ name: string }>).map((row) => row.name).sort();
@@ -170,10 +182,10 @@ test("a true runtime schema 6 fixture preserves jobs and supports graph read/wri
     ledger.close();
 
     const plan = await planStateMigration(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
-    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v6-to-v7", "runtime-database-v7-to-v8", "runtime-database-v8-to-v9"]);
+    assert.deepEqual(plan.steps.map((step) => step.id), ["runtime-database-v6-to-v7", "runtime-database-v7-to-v8", "runtime-database-v8-to-v9", "runtime-database-v9-to-v10"]);
     const report = await ensureStateCompatibility(candidate.state, { applicationVersion: "1.0.0", applicationCommit: "fixture-v1" });
     assert.ok(report?.backupLocation);
-    assert.equal(inspectExistingSqliteSchema(databasePath), 9);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 10);
 
     const sqlite = new DatabaseSync(databasePath, { readOnly: true });
     try {
@@ -221,7 +233,7 @@ test("a true runtime schema 6 fixture preserves jobs and supports graph read/wri
   }
 });
 
-test("runtime schema 9 preserves schema 7 graph state and admits bounded concurrency", async () => {
+test("runtime schema 10 preserves schema 7 graph state and admits bounded concurrency", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-schema8-"));
   const databasePath = join(state, "db", "odinn.sqlite");
   const digest = "d".repeat(64);
@@ -234,7 +246,7 @@ test("runtime schema 9 preserves schema 7 graph state and admits bounded concurr
     ledger.close();
 
     const migrated = createRunLedger({ stateDir: state, workspaceRoot: state });
-    assert.equal(inspectExistingSqliteSchema(databasePath), 9);
+    assert.equal(inspectExistingSqliteSchema(databasePath), 10);
     assert.equal(migrated.getAgentGraphRun("schema7-graph")?.maxConcurrency, 1);
     migrated.ensureRun({ runId: "schema8-parent", objective: "parallel graph" });
     migrated.createAgentGraphRun({ graphRunId: "schema8-graph", parentRunId: "schema8-parent", graphDigest: digest, manifestsDigest: digest, graphBytes: 12, manifestsBytes: 12, principalNamespace: "operator", requestDigest: digest, maxConcurrency: 4, maxRunMs: 1_000, nodes: [node] });
@@ -421,6 +433,254 @@ test("unknown future SQLite schemas are rejected before migration", async () => 
     await assert.rejects(() => ensureStateCompatibility(state), /runtimeDatabase schema 99 is newer/u);
     assert.throws(() => new SqliteStore(databasePath), /newer than this Odinn version supports/u);
     assert.deepEqual(await readFile(databasePath), before);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("runtime schema v10 rejects incomplete tables, constraints, foreign keys, migration ledgers, and indexes", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-state-malformed-v10-"));
+  const state = join(temporary, "state");
+  const databasePath = join(state, "db", "odinn.sqlite");
+  try {
+    await mkdir(dirname(databasePath), { recursive: true });
+    const incomplete = new SqliteStore(databasePath, { targetVersion: 9 });
+    incomplete.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+      .run(10, new Date().toISOString());
+    incomplete.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /schema v10 execution_attempts shape is invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /schema v10 execution_attempts shape is invalid/u);
+    await assert.rejects(() => inspectStateSchemas(state), /schema v10 execution_attempts shape is invalid/u);
+    await assert.rejects(
+      () => createStateBackup(state, join(temporary, "rejected-incomplete-v10-backup")),
+      /schema v10 execution_attempts shape is invalid/u
+    );
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    const malformedStateIndex = new SqliteStore(databasePath);
+    malformedStateIndex.db.exec(`DROP INDEX idx_execution_attempts_state;
+      CREATE INDEX idx_execution_attempts_state
+      ON execution_attempts(created_at, state)`);
+    malformedStateIndex.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution state index/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution state index/u);
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    const malformedIndex = new SqliteStore(databasePath);
+    malformedIndex.db.exec(`DROP INDEX idx_execution_attempts_owner;
+      CREATE INDEX idx_execution_attempts_owner
+      ON execution_attempts(state DESC, owner_pid COLLATE NOCASE, owner_heartbeat_at)`);
+    malformedIndex.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution owner index/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution owner index/u);
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    const unexpectedIndex = new SqliteStore(databasePath);
+    unexpectedIndex.db.exec("CREATE INDEX idx_execution_attempts_unexpected ON execution_attempts(owner_token)");
+    unexpectedIndex.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution attempt index set is invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution attempt index set is invalid/u);
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath).close();
+    const unconstrained = new DatabaseSync(databasePath);
+    unconstrained.exec(`PRAGMA foreign_keys=OFF;
+      PRAGMA legacy_alter_table=ON;
+      DROP INDEX idx_execution_attempts_owner;
+      DROP INDEX idx_execution_attempts_state;
+      ALTER TABLE execution_attempts RENAME TO execution_attempts_old;
+      CREATE TABLE execution_attempts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES execution_envelopes(run_id),
+        attempt_number INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        settled_at TEXT,
+        outcome_digest TEXT,
+        error_code TEXT,
+        owner_token TEXT,
+        owner_pid INTEGER,
+        owner_heartbeat_at TEXT,
+        owner_released_at TEXT,
+        UNIQUE(run_id, attempt_number)
+      );
+      INSERT INTO execution_attempts SELECT * FROM execution_attempts_old;
+      DROP TABLE execution_attempts_old;
+      CREATE INDEX idx_execution_attempts_state ON execution_attempts(state, created_at);
+      CREATE INDEX idx_execution_attempts_owner ON execution_attempts(state, owner_pid, owner_heartbeat_at);
+      PRAGMA foreign_keys=ON;`);
+    unconstrained.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution_attempts constraints are invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution_attempts constraints are invalid/u);
+    await assert.rejects(() => inspectStateSchemas(state), /execution_attempts constraints are invalid/u);
+    await assert.rejects(
+      () => createStateBackup(state, join(temporary, "rejected-unconstrained-v10-backup")),
+      /execution_attempts constraints are invalid/u
+    );
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath).close();
+    const malformedForeignKey = new DatabaseSync(databasePath);
+    malformedForeignKey.exec(`PRAGMA foreign_keys=OFF;
+      PRAGMA legacy_alter_table=ON;
+      DROP INDEX idx_execution_attempts_owner;
+      DROP INDEX idx_execution_attempts_state;
+      ALTER TABLE execution_attempts RENAME TO execution_attempts_old;
+      CREATE TABLE execution_attempts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES execution_envelopes(run_id) ON DELETE CASCADE,
+        attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+        state TEXT NOT NULL CHECK(state IN ('proposed', 'admitted', 'queued', 'running', 'awaiting-approval', 'cancelling', 'completed', 'failed', 'cancelled', 'needs-review')),
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        settled_at TEXT,
+        outcome_digest TEXT,
+        error_code TEXT,
+        owner_token TEXT,
+        owner_pid INTEGER,
+        owner_heartbeat_at TEXT,
+        owner_released_at TEXT,
+        UNIQUE(run_id, attempt_number)
+      );
+      INSERT INTO execution_attempts SELECT * FROM execution_attempts_old;
+      DROP TABLE execution_attempts_old;
+      CREATE INDEX idx_execution_attempts_state ON execution_attempts(state, created_at);
+      CREATE INDEX idx_execution_attempts_owner ON execution_attempts(state, owner_pid, owner_heartbeat_at);
+      PRAGMA foreign_keys=ON;`);
+    malformedForeignKey.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /execution attempt foreign key is invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /execution attempt foreign key is invalid/u);
+    await assert.rejects(() => inspectStateSchemas(state), /execution attempt foreign key is invalid/u);
+
+    await rm(state, { recursive: true, force: true });
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath).close();
+    const malformedLedger = new DatabaseSync(databasePath);
+    malformedLedger.exec(`ALTER TABLE schema_migrations RENAME TO schema_migrations_old;
+      CREATE TABLE schema_migrations(version INTEGER, applied_at TEXT);
+      INSERT INTO schema_migrations SELECT * FROM schema_migrations_old;
+      DROP TABLE schema_migrations_old;`);
+    malformedLedger.close();
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /schema_migrations shape is invalid/u);
+    assert.throws(() => new SqliteStore(databasePath), /schema_migrations shape is invalid/u);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("runtime schema validation rejects persisted foreign-key and CHECK corruption across open, inspection, backup, and restore", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-state-corrupt-v10-data-"));
+  const state = join(temporary, "state");
+  const databasePath = join(state, "db", "odinn.sqlite");
+  const backup = join(temporary, "valid-backup");
+  const restoredState = join(temporary, "restored-state");
+  const checkState = join(temporary, "check-state");
+  const checkDatabasePath = join(checkState, "db", "odinn.sqlite");
+  const checkBackup = join(temporary, "valid-check-backup");
+  const restoredCheckState = join(temporary, "restored-check-state");
+  const corrupt = (path: string) => {
+    const database = new DatabaseSync(path);
+    database.exec("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON");
+    database.prepare(`INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at)
+      VALUES (?, ?, ?, ?, ?)`).run("corrupt-attempt", "missing-run", 0, "invalid-state", new Date().toISOString());
+    database.close();
+  };
+  try {
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath).close();
+    await createStateBackup(state, backup);
+
+    corrupt(databasePath);
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /foreign key violations|integrity check failed/u);
+    assert.throws(() => new SqliteStore(databasePath), /foreign key violations|integrity check failed/u);
+    await assert.rejects(() => inspectStateSchemas(state), /foreign key violations|integrity check failed/u);
+    await assert.rejects(
+      () => createStateBackup(state, join(temporary, "rejected-corrupt-data-backup")),
+      /foreign key violations|integrity check failed/u
+    );
+
+    const backupDatabasePath = join(backup, "db", "odinn.sqlite");
+    corrupt(backupDatabasePath);
+    await refreshBackupManifestFile(backup, "db/odinn.sqlite");
+    await assert.rejects(
+      () => restoreStateBackup(backup, restoredState, { skipCurrentBackup: true }),
+      /foreign key violations|integrity check failed/u
+    );
+
+    const corruptCheck = (path: string) => {
+      const database = new DatabaseSync(path);
+      database.exec(`PRAGMA foreign_keys = OFF;
+        PRAGMA ignore_check_constraints = ON;
+        INSERT INTO runs(id, status, objective, workspace_root, feature_flags_json, created_at)
+          VALUES ('check-run', 'created', '', '/tmp', '{}', '2026-01-01T00:00:00.000Z');
+        INSERT INTO execution_envelopes(run_id, schema_version, principal_id, idempotency_key, envelope_digest, envelope_json, admitted_at)
+          VALUES ('check-run', 1, 'check-principal', 'check-key', 'check-digest', '{}', '2026-01-01T00:00:00.000Z');
+        INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at)
+          VALUES ('check-attempt', 'check-run', 0, 'queued', '2026-01-01T00:00:00.000Z');
+        PRAGMA ignore_check_constraints = OFF;`);
+      database.close();
+    };
+    await mkdir(dirname(checkDatabasePath), { recursive: true });
+    new SqliteStore(checkDatabasePath).close();
+    await createStateBackup(checkState, checkBackup);
+    corruptCheck(checkDatabasePath);
+    assert.throws(() => inspectExistingSqliteSchema(checkDatabasePath), /integrity check failed/u);
+    assert.throws(() => new SqliteStore(checkDatabasePath), /integrity check failed/u);
+    await assert.rejects(() => inspectStateSchemas(checkState), /integrity check failed/u);
+    await assert.rejects(
+      () => createStateBackup(checkState, join(temporary, "rejected-check-backup")),
+      /integrity check failed/u
+    );
+    const checkBackupDatabasePath = join(checkBackup, "db", "odinn.sqlite");
+    corruptCheck(checkBackupDatabasePath);
+    await refreshBackupManifestFile(checkBackup, "db/odinn.sqlite");
+    await assert.rejects(
+      () => restoreStateBackup(checkBackup, restoredCheckState, { skipCurrentBackup: true }),
+      /integrity check failed/u
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("a populated SQLite state without its migration ledger fails closed across open, inspection, backup, and restore", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-state-missing-ledger-"));
+  const state = join(temporary, "state");
+  const databasePath = join(state, "db", "odinn.sqlite");
+  const backup = join(temporary, "valid-backup");
+  const restoredState = join(temporary, "restored-state");
+  const removeLedger = (path: string) => {
+    const database = new DatabaseSync(path);
+    database.exec("DROP TABLE schema_migrations");
+    database.close();
+  };
+  try {
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath, { targetVersion: 9 }).close();
+    await createStateBackup(state, backup);
+
+    removeLedger(databasePath);
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /migration ledger is missing/u);
+    assert.throws(() => new SqliteStore(databasePath), /migration ledger is missing/u);
+    await assert.rejects(() => inspectStateSchemas(state), /migration ledger is missing/u);
+    await assert.rejects(
+      () => createStateBackup(state, join(temporary, "rejected-missing-ledger-backup")),
+      /migration ledger is missing/u
+    );
+
+    const backupDatabasePath = join(backup, "db", "odinn.sqlite");
+    removeLedger(backupDatabasePath);
+    await refreshBackupManifestFile(backup, "db/odinn.sqlite");
+    await assert.rejects(
+      () => restoreStateBackup(backup, restoredState, { skipCurrentBackup: true }),
+      /migration ledger is missing/u
+    );
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

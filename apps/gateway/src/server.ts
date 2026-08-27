@@ -796,12 +796,23 @@ export async function createGatewayServer(options: any = {}) {
   const governedRegistry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: { ...runtimeConfig, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const gatewayToken = await loadGatewayToken(state);
   const rawIsolatedTaskExecutor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
-  const isolatedTaskExecutor: any = (request: any, options?: { signal?: AbortSignal }) => rawIsolatedTaskExecutor(scopeTaskRequest(request, tenantScope), options);
+  const isolatedTaskExecutor: any = (request: any, options?: { signal?: AbortSignal; job?: any }) => rawIsolatedTaskExecutor(scopeTaskRequest(request, tenantScope), options);
   isolatedTaskExecutor.shutdown = rawIsolatedTaskExecutor.shutdown?.bind(rawIsolatedTaskExecutor);
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
+  const channelResultRecords = new SqliteRecordStore(join(state, "db", "records.sqlite"));
+  const jobStore = new SqliteJobStore(runtime.ledger, { legacyPath: join(state, "jobs.json") });
+  await recoverPersistedChannelResults(jobStore, channelResultRecords, tenantScope);
   const supervisor = new JobSupervisor({
-    store: new SqliteJobStore(runtime.ledger, { legacyPath: join(state, "jobs.json") }),
+    store: jobStore,
     execute: isolatedTaskExecutor,
+    persistResult: async (job, result) => {
+      const protectedResult = Boolean(durableChannelResultBinding(job, tenantScope));
+      if (protectedResult) {
+        await testHooks?.beforeChannelResultPersist?.({ jobId: job.id });
+      }
+      await persistDurableChannelResult(channelResultRecords, job, result, tenantScope);
+      return protectedResult ? { settlement: "protected" as const } : undefined;
+    },
     onCancel: (job) => {
       const task = job.payload?.task;
       const taskTool = task && typeof task === "object" && !Array.isArray(task)
@@ -981,14 +992,6 @@ export async function createGatewayServer(options: any = {}) {
     registry
   }));
 
-  const settleClaimedGatewayApproval = async (linkedJob: any, outcome: { result?: unknown; error?: unknown }) => {
-    const expectedLeaseToken = typeof linkedJob?.dispatchLease?.token === "string"
-      ? linkedJob.dispatchLease.token
-      : "";
-    if (!expectedLeaseToken) throw new Error("claimed approval job is missing its dispatch lease");
-    return supervisor.settleApproval(linkedJob.id, { ...outcome, expectedLeaseToken });
-  };
-
   const approvalSettlementError = (error: unknown): unknown => {
     const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
     const message = error instanceof Error ? error.message : String(error ?? "");
@@ -1052,38 +1055,66 @@ export async function createGatewayServer(options: any = {}) {
     let claimedLinkedJob: any;
     try {
       const preview = (await listGatewayApprovals()).find((approval: any) => approval.id === id);
-      let linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
+      const linkedJob = preview?.runId ? await supervisor.get(String(preview.runId)) : undefined;
       if (linkedJob && linkedJob.status !== "awaiting-approval") {
         if (linkedJob.status !== "running") await revokeGatewayApproval(id);
         throw new GatewayError(409, "the originating job is no longer awaiting approval");
       }
       if (linkedJob) {
+        let result: unknown;
         try {
-          linkedJob = await supervisor.beginApproval(linkedJob.id);
-          claimedLinkedJob = linkedJob;
-        } catch {
-          const current = await supervisor.get(linkedJob.id);
-          if (current?.status !== "running") await revokeGatewayApproval(id);
-          throw new GatewayError(409, "the originating job approval was already claimed or cancelled");
-        }
-        await testHooks?.afterApprovalJobClaimed?.({ approvalId: id, jobId: linkedJob.id });
-      }
-      const pending = await claimGatewayApproval(id);
-      if (!pending) {
-        throw new GatewayError(404, "approval not found or expired");
-      }
-      if (pending.type === "skill-lifecycle") {
-        const result = await skillLifecycle.applyApproved(id, pending);
-        if (linkedJob) {
-          await settleClaimedGatewayApproval(linkedJob, { result });
-          claimedLinkedJob = undefined;
+          result = await supervisor.runApproval(linkedJob.id, async ({ signal, job, markDispatched }) => {
+            claimedLinkedJob = job;
+            await testHooks?.afterApprovalJobClaimed?.({ approvalId: id, jobId: job.id });
+            let pending: any;
+            try {
+              pending = await claimGatewayApproval(id);
+            } catch (error) {
+              throw approvalSettlementError(error);
+            }
+            if (!pending) throw new GatewayError(404, "approval not found or expired");
+            if (pending.type === "skill-lifecycle") {
+              markDispatched();
+              await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
+              if (signal.aborted) throw signal.reason ?? new Error("approval continuation aborted before skill activation");
+              return skillLifecycle.applyApproved(id, pending);
+            }
+            const linkedTask = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task)
+              ? job.payload.task as Record<string, unknown>
+              : undefined;
+            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask);
+            markDispatched();
+            await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
+            if (signal.aborted) throw signal.reason ?? new Error("approval continuation aborted before executor dispatch");
+            return isolatedTaskExecutor({
+              approvalId: id,
+              approvalRunId: continuation.runId,
+              durableExecution: continuation.tool === "process.exec" || continuation.tool === "mcp.invoke",
+              task: {
+                id: continuation.runId,
+                tool: continuation.tool,
+                input: continuation.input,
+                actor: continuation.actor,
+                reason: "explicit user approval"
+              }
+            }, { signal, job });
+          });
+        } catch (error) {
+          if (!claimedLinkedJob) {
+            const current = await supervisor.get(linkedJob.id);
+            if (current?.status !== "running") await revokeGatewayApproval(id);
+            throw new GatewayError(409, "the originating job approval was already claimed or cancelled");
+          }
+          throw error;
         }
         return { approvalId: id, result };
       }
-      const linkedTask = linkedJob?.payload?.task && typeof linkedJob.payload.task === "object" && !Array.isArray(linkedJob.payload.task)
-        ? linkedJob.payload.task as Record<string, unknown>
-        : undefined;
-      const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask);
+      const pending = await claimGatewayApproval(id);
+      if (!pending) throw new GatewayError(404, "approval not found or expired");
+      if (pending.type === "skill-lifecycle") {
+        return { approvalId: id, result: await skillLifecycle.applyApproved(id, pending) };
+      }
+      const continuation = await recoverGatewayApprovalContinuation(id, pending, undefined);
       const result = await isolatedTaskExecutor({
         approvalId: id,
         approvalRunId: continuation.runId,
@@ -1096,15 +1127,10 @@ export async function createGatewayServer(options: any = {}) {
           reason: "explicit user approval"
         }
       });
-      if (linkedJob) {
-        await settleClaimedGatewayApproval(linkedJob, { result });
-        claimedLinkedJob = undefined;
-      }
       return { approvalId: id, result };
     } catch (error) {
       if (claimedLinkedJob) {
         const settlementError = approvalSettlementError(error);
-        await settleClaimedGatewayApproval(claimedLinkedJob, { error: settlementError }).catch(() => undefined);
         if ((settlementError as { code?: unknown } | undefined)?.code === "APPROVAL_CONTINUATION_DENIED") {
           await auditStore.append({
             at: new Date().toISOString(),
@@ -1382,6 +1408,38 @@ export async function createGatewayServer(options: any = {}) {
     if (task.tool === AGENT_GRAPH_TOOL && config?.runtime?.enableAgentGraphs !== true) {
       throw new GatewayError(403, "agent graph execution is disabled; enable config.runtime.enableAgentGraphs explicitly");
     }
+    const channelExecutionRequested = task.tool === "agent.run"
+      && Object.prototype.hasOwnProperty.call(body, "executionKey");
+    let channelExecutionKey: string | undefined;
+    if (channelExecutionRequested) {
+      if (typeof body.executionKey !== "string" || !body.executionKey
+        || Buffer.byteLength(body.executionKey, "utf8") > 512) {
+        throw new GatewayError(400, "channel executionKey must contain 1 through 512 bytes");
+      }
+      channelExecutionKey = body.executionKey;
+      if ((body.id !== undefined && String(body.id) !== channelExecutionKey)
+        || (idempotencyKey !== undefined && idempotencyKey !== channelExecutionKey)) {
+        throw new GatewayError(409, "channel execution identity does not match its idempotency key");
+      }
+      const input = task.input && typeof task.input === "object" && !Array.isArray(task.input)
+        ? task.input
+        : undefined;
+      const sessionId = typeof input?.sessionId === "string" ? input.sessionId : "";
+      if (!sessionId || Buffer.byteLength(sessionId, "utf8") > 256) {
+        throw new GatewayError(400, "channel execution requires a bounded sessionId");
+      }
+      const session = await channelResultRecords.getCurrentSession(sessionId);
+      if (!session || session.status !== "open") {
+        throw new GatewayError(409, "channel session is unavailable or closed");
+      }
+      const sessionActor = typeof session.actor === "string" ? session.actor : "";
+      const acceptedActors = tenantScope.hosted
+        ? [tenantScope.principalId]
+        : [tenantScope.principalId, "local"];
+      if (!acceptedActors.includes(sessionActor)) {
+        throw new GatewayError(403, "channel session is not owned by the authenticated principal");
+      }
+    }
     const parentCapabilities = task.tool === AGENT_GRAPH_TOOL
       ? (() => {
         try {
@@ -1395,7 +1453,7 @@ export async function createGatewayServer(options: any = {}) {
       : undefined;
     const activeJobs = (await supervisor.list()).filter((job: any) => ["queued", "running"].includes(job.status)).length;
     if (activeJobs >= quotaGate.maximumActiveJobs) throw new GatewayError(429, "tenant active-job quota exceeded");
-    const id = body.id || idempotencyKey || undefined;
+    const id = channelExecutionKey ?? (body.id || idempotencyKey || undefined);
     const requestHash = hashRequest(delegation ? { ...body, delegation } : body);
     const scopedPayloadBase = scopedJobPayload({
       durableExecution: task.tool === "process.exec" || task.tool === "agent.delegate" || task.tool === "mcp.invoke",
@@ -2345,12 +2403,30 @@ export async function createGatewayServer(options: any = {}) {
         const task = job.payload?.task;
         const taskTool = task && typeof task === "object" && !Array.isArray(task) ? (task as Record<string, unknown>).tool : undefined;
         if (job.status !== "completed" || job.payload?.executionKey !== id || taskTool !== "agent.run") {
-          return json(response, 409, { ok: false, error: "ephemeral channel result is unavailable" });
+          return json(response, 409, { ok: false, error: "durable channel result is unavailable" });
         }
-        const result = supervisor.getVolatileResult(id);
-        return result === undefined
-          ? json(response, 409, { ok: false, error: "ephemeral channel result is unavailable" })
-          : json(response, 200, { ok: true, result });
+        let durableResult: unknown;
+        try {
+          durableResult = await readDurableChannelResult(channelResultRecords, job, tenantScope);
+        } catch {
+          await jobStore.update(job.id, {
+            status: "needs-review",
+            completedAt: new Date().toISOString(),
+            error: "protected channel result failed integrity verification",
+            dispatchLease: undefined
+          });
+          return json(response, 409, { ok: false, error: "durable channel result is unavailable" });
+        }
+        if (durableResult === undefined) {
+          await jobStore.update(job.id, {
+            status: "needs-review",
+            completedAt: new Date().toISOString(),
+            error: "protected channel result is unavailable after completed execution",
+            dispatchLease: undefined
+          });
+          return json(response, 409, { ok: false, error: "durable channel result is unavailable" });
+        }
+        return json(response, 200, { ok: true, result: durableResult });
       }
       if (request.method === "GET" && url.pathname.startsWith("/jobs/")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length));
@@ -2611,8 +2687,13 @@ export async function createGatewayServer(options: any = {}) {
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/sessions") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
         return json(response, 200, (await runIsolatedTask({
-          task: { tool: "session.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
+          task: {
+            tool: "session.create",
+            input: { ...body, actor: tenantScope.principalId },
+            actor: "gateway"
+          },
           auditStore,
           policy,
           registry
@@ -2792,6 +2873,7 @@ export async function createGatewayServer(options: any = {}) {
         try { governedRegistry.close(); } catch (error) { registryError ??= error; }
         try { auditStore.close?.(); } catch (error) { registryError ??= error; }
         try { contextRecords?.close?.(); } catch (error) { registryError ??= error; }
+        try { channelResultRecords.close(); } catch (error) { registryError ??= error; }
         try { operatorReadStore.close(); } catch (error) { registryError ??= error; }
         close((serverError: unknown) => callback?.(serverError ?? registryError));
       })
@@ -2838,6 +2920,187 @@ async function loadGatewayToken(state: any) {
 
 function hashRequest(value: any) {
   return createHash("sha256").update(stableJson(value)).digest("hex");
+}
+
+const CHANNEL_RESULT_MAX_BYTES = 1_000_000;
+
+function durableChannelResultBinding(job: any, scope: GatewayTenantScope) {
+  const payload = job?.payload;
+  const task = payload?.task;
+  const input = task?.input;
+  const persistedScope = payload?.scope;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)
+    || payload.executionKey !== job.id
+    || !task || typeof task !== "object" || Array.isArray(task)
+    || task.tool !== "agent.run"
+    || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const sessionId = typeof input.sessionId === "string" ? input.sessionId : "";
+  const requestHash = typeof job.requestHash === "string" ? job.requestHash : "";
+  const tenantId = typeof persistedScope?.tenantId === "string" ? persistedScope.tenantId : "";
+  const principalId = typeof persistedScope?.principalId === "string" ? persistedScope.principalId : "";
+  if (!sessionId || Buffer.byteLength(sessionId, "utf8") > 256
+    || typeof job.id !== "string" || !job.id || Buffer.byteLength(job.id, "utf8") > 512
+    || !/^[a-f0-9]{64}$/u.test(requestHash)
+    || tenantId !== scope.tenantId || principalId !== scope.principalId) {
+    throw new Error("durable channel result binding is invalid");
+  }
+  return {
+    recordId: `channel_result_${hashRequest({ jobId: job.id, requestHash })}`,
+    jobId: job.id,
+    idempotencyKey: job.id,
+    conversationId: job.id,
+    sessionId,
+    requestHash,
+    tenantId,
+    principalId
+  };
+}
+
+function boundedDurableChannelResult(result: unknown) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("channel result must be an object");
+  const output = (result as Record<string, unknown>).output;
+  if (!output || typeof output !== "object" || Array.isArray(output)) throw new Error("channel result output must be an object");
+  const source = output as Record<string, unknown>;
+  const content = typeof source.content === "string" ? source.content : "";
+  if (!content || Buffer.byteLength(content, "utf8") > CHANNEL_RESULT_MAX_BYTES) throw new Error("channel result content is invalid or exceeds its durable limit");
+  const projectedOutput: Record<string, unknown> = { content };
+  for (const key of ["provider", "model"] as const) {
+    const value = source[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > 256) throw new Error(`channel result ${key} is invalid`);
+    projectedOutput[key] = value;
+  }
+  const projected = { output: projectedOutput };
+  const encoded = stableJson(projected);
+  const bytes = Buffer.byteLength(encoded, "utf8");
+  if (bytes > CHANNEL_RESULT_MAX_BYTES) throw new Error("channel result exceeds its durable limit");
+  return {
+    projected,
+    digest: hashRequest(projected),
+    bytes,
+    contentDigest: `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`,
+    contentBytes: Buffer.byteLength(content, "utf8")
+  };
+}
+
+function assertDurableChannelResultRecord(record: any, binding: ReturnType<typeof durableChannelResultBinding>, job: any) {
+  if (!binding || !record || typeof record !== "object" || Array.isArray(record)
+    || record.type !== "channel.result.persisted"
+    || record.id !== binding.recordId
+    || record.jobId !== binding.jobId
+    || record.idempotencyKey !== binding.idempotencyKey
+    || record.conversationId !== binding.conversationId
+    || record.sessionId !== binding.sessionId
+    || record.requestHash !== binding.requestHash
+    || record.tenantId !== binding.tenantId
+    || record.principalId !== binding.principalId) {
+    throw new Error("durable channel result record binding does not match its job");
+  }
+  const normalized = boundedDurableChannelResult(record.result);
+  if (record.resultDigest !== normalized.digest || record.resultBytes !== normalized.bytes) {
+    throw new Error("durable channel result record failed integrity verification");
+  }
+  const projectedOutput = job?.result?.output;
+  const projectedOutputIsObject = Boolean(projectedOutput
+    && typeof projectedOutput === "object"
+    && !Array.isArray(projectedOutput));
+  const projectedRecord = projectedOutputIsObject
+    ? projectedOutput as Record<string, unknown>
+    : undefined;
+  const hasContentDigest = projectedRecord
+    ? Object.prototype.hasOwnProperty.call(projectedRecord, "contentDigest")
+    : false;
+  const hasContentBytes = projectedRecord
+    ? Object.prototype.hasOwnProperty.call(projectedRecord, "contentBytes")
+    : false;
+  // A running approval continuation can legitimately retain the earlier
+  // non-terminal approval projection (`output: {}`). Once a job is public and
+  // terminal, or either terminal binding field is present, the projection must
+  // contain the complete exact digest/length pair for this protected record.
+  if (job?.status === "completed" || hasContentDigest || hasContentBytes) {
+    if (!projectedRecord
+      || !hasContentDigest
+      || !hasContentBytes
+      || projectedRecord.contentDigest !== normalized.contentDigest
+      || projectedRecord.contentBytes !== normalized.contentBytes) {
+      throw new Error("durable channel result does not match the terminal job projection");
+    }
+  }
+  return normalized.projected;
+}
+
+async function persistDurableChannelResult(store: SqliteRecordStore, job: any, result: unknown, scope: GatewayTenantScope) {
+  const binding = durableChannelResultBinding(job, scope);
+  if (!binding) return;
+  const normalized = boundedDurableChannelResult(result);
+  const existing = await store.findById(binding.recordId);
+  if (existing) {
+    const persisted = assertDurableChannelResultRecord(existing, binding, job);
+    if (hashRequest(persisted) !== normalized.digest) throw new Error("durable channel result changed for the same execution");
+    return;
+  }
+  await store.append({
+    id: binding.recordId,
+    type: "channel.result.persisted",
+    status: "completed",
+    ...binding,
+    resultDigest: normalized.digest,
+    resultBytes: normalized.bytes,
+    result: normalized.projected
+  });
+}
+
+async function readDurableChannelResult(store: SqliteRecordStore, job: any, scope: GatewayTenantScope) {
+  const binding = durableChannelResultBinding(job, scope);
+  if (!binding) return undefined;
+  const record = await store.findById(binding.recordId);
+  return record ? assertDurableChannelResultRecord(record, binding, job) : undefined;
+}
+
+async function recoverPersistedChannelResults(store: SqliteJobStore, records: SqliteRecordStore, scope: GatewayTenantScope) {
+  for (const status of ["running", "cancelling", "completed"] as const) {
+    const page = await store.queryJobs({ status, limit: 100_000 });
+    for (const job of page.items) {
+      const listedTask = job.payload?.task;
+      const listedChannelShaped = job.payload?.executionKey === job.id
+        && listedTask && typeof listedTask === "object" && !Array.isArray(listedTask)
+        && (listedTask as Record<string, unknown>).tool === "agent.run";
+      if (!listedChannelShaped) continue;
+      const snapshot = await store.getProtectedResultSnapshot(job.id);
+      if (!snapshot) continue;
+      const task = snapshot.payload?.task;
+      const channelShaped = snapshot.payload?.executionKey === snapshot.id
+        && task && typeof task === "object" && !Array.isArray(task)
+        && (task as Record<string, unknown>).tool === "agent.run";
+      if (!channelShaped) continue;
+      let result: unknown;
+      let integrityError: unknown;
+      try { result = await readDurableChannelResult(records, snapshot, scope); }
+      catch (error) { integrityError = error; }
+      const attempt = snapshot.executionAttemptId
+        ? store.ledger.getExecutionAttempt(snapshot.executionAttemptId)
+        : undefined;
+      if (integrityError || (result === undefined && attempt?.state === "completed")) {
+        await store.update(snapshot.id, {
+          status: "needs-review",
+          completedAt: new Date().toISOString(),
+          error: integrityError
+            ? "protected channel result failed integrity verification"
+            : "protected channel result is unavailable after completed execution",
+          expectedLeaseToken: snapshot.dispatchLease?.token,
+          dispatchLease: undefined
+        });
+        continue;
+      }
+      if (result === undefined) continue;
+      if (snapshot.status === "completed") continue;
+      await store.adoptProtectedResult(snapshot.id, {
+        result,
+        expected: snapshot,
+        source: "recovery"
+      });
+    }
+  }
 }
 
 function scopeTask(task: any, scope: GatewayTenantScope): any {
