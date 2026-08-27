@@ -3,7 +3,7 @@ import { api, streamApi } from "./api.ts";
 import { state } from "./state.ts";
 import { renderChatMessages as renderChatMessagesView, suggestedChatTitle as suggestedChatTitleView } from "./views/chat.ts";
 import { renderApproval as renderApprovalView } from "./views/approvals.ts";
-import { toolCallStatus } from "./components/tool-call.ts";
+import { renderToolCall, toolCallStatus } from "./components/tool-call.ts";
 import { closeDialog, openDialog } from "./components/dialog.ts";
 import { escapeHtml, renderMarkdown, safeHref } from "./components/message-item.ts";
 import { relativeTime as sessionRelativeTime } from "./views/sessions.ts";
@@ -456,8 +456,10 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
       risk.className = "chip " + (action.dangerous ? "danger" : action.method === "GET" ? "ok" : "warn");
       const targetField = page.querySelector('[data-role="target-field"]');
       targetField.hidden = !action.target;
-      page.querySelector('[data-role="target-label"]').textContent = friendlyTargetLabel(action.target);
+      const targetLabel = friendlyTargetLabel(action.target);
+      page.querySelector('[data-role="target-label"]').textContent = targetLabel;
       const target = page.querySelector('[data-role="target"]');
+      target.setAttribute("aria-label", targetLabel);
       if (target.dataset.action !== action.id) {
         target.dataset.action = action.id;
         target.value = action.defaultTarget || "";
@@ -742,6 +744,7 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
         taskClass: "Kind of work",
         maxUses: "Maximum uses",
         remainingUses: "Uses remaining",
+        applied: "Files changed",
         durationMs: "Duration",
         selected: "Selected option",
         assertions: "Checks",
@@ -970,6 +973,8 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
         return;
       }
       $("chat-status").textContent = "Thinking";
+      $("chat-tool-progress").hidden = true;
+      $("chat-tool-progress").replaceChildren();
       const sessionId = await ensureChat();
       const currentTitle = $("chat-title").textContent.trim();
       if (!state.messages.length && ["Gateway chat", "Chat", "New chat"].includes(currentTitle)) {
@@ -1016,6 +1021,13 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
             },
             (progress) => {
               $("chat-status").textContent = toolCallStatus(progress);
+              if (progress.tool || progress.stage === "page-opened") {
+                $("chat-tool-progress").hidden = false;
+                $("chat-tool-progress").innerHTML = renderToolCall({
+                  ...progress,
+                  tool: progress.tool || "browser.open"
+                });
+              }
             }
           );
       const reply = options.tool === "job.healthcheck"
@@ -2400,9 +2412,7 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
     });
     $("mobile-scrim").addEventListener("click", closeMobileNavigation);
     window.addEventListener("hashchange", () => switchView(viewFromHash(), { updateHash: false }));
-    window.addEventListener("resize", () => {
-      if (!matchMedia("(max-width: 980px)").matches) closeMobileNavigation();
-    });
+    window.addEventListener("resize", closeMobileNavigation);
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") closeMobileNavigation();
       const target = event.target.closest?.('[role="button"][tabindex="0"]');

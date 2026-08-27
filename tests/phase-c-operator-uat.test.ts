@@ -2,257 +2,268 @@ process.env.ODINN_GATEWAY_AUTH = "off";
 process.env.ODINN_BROWSER_HEADLESS = "1";
 
 import assert from "node:assert/strict";
-import { access, mkdtemp } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { createGatewayServer } from "../apps/gateway/src/server.ts";
+import {
+  createPhaseCHarness,
+  jsonRequest,
+  launchPinnedChromium,
+  seedPhaseCRecovery,
+  setPhaseCCapabilityAdmission,
+  type PhaseCHarness,
+  type PinnedBrowser,
+} from "../scripts/uat/phase-c-harness.ts";
 
-const workspaceRoot = new URL("..", import.meta.url).pathname.replace(/\/$/u, "");
-const { chromium } = createRequire(import.meta.url)("../packages/kernel/node_modules/playwright-core");
-
-function json(route: any, body: unknown, status = 200) {
-  return route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
-function operatorSection(items: any[], counts: Record<string, number> = {}) {
-  return {
-    items,
-    counts: { total: items.length, ...counts },
-    pagination: { page: 1, pageSize: 25, pages: 1, total: items.length, from: items.length ? 1 : 0, to: items.length },
-  };
-}
-
-test("a source-blind operator can complete the Phase C daily-driver and recovery walkthrough", { timeout: 60_000 }, async () => {
-  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || chromium.executablePath();
-  await access(chromiumPath).catch((error) => assert.fail(`Pinned Chromium is required for Phase C UAT (${chromiumPath}): ${String(error)}`));
-
-  const stateDir = await mkdtemp(join(tmpdir(), "odinn-phase-c-uat-"));
-  const server = await createGatewayServer({ stateDir, workspaceRoot });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-
-  const now = new Date().toISOString();
-  const approvals = [{
-    id: "approval-uat-1",
-    tool: "browser.click",
-    effect: { summary: "Submit the reviewed recovery form", capability: "browser.mutate", reversible: "reversible", idempotency: "idempotent" },
-  }];
-  const schedules: any[] = [];
-  const captured: { streamBody?: any; operatorActions: string[]; approved: string[] } = { operatorActions: [], approved: [] };
-  let recovered = false;
-  let browser: any;
-
-  const recoveryItem = () => ({
-    id: "workflow-uat-recovery",
-    kind: "workflow",
-    label: "Interrupted scheduled report",
-    status: recovered ? "running" : "needs-review",
-    summary: recovered ? "Resumed from the durable checkpoint" : "Restart interrupted one step; review before resuming",
-    attention: !recovered,
-    controls: recovered ? [] : ["resume-workflow"],
-    updatedAt: now,
-    details: {},
+function attachBrowserEvidence(page: any, pageErrors: string[], expectedDialogs: string[], unexpectedDialogs: string[]) {
+  page.on("pageerror", (error: Error) => pageErrors.push(error.message));
+  page.on("dialog", async (dialog: any) => {
+    const evidence = `${dialog.type()}: ${dialog.message()}`;
+    if (dialog.type() === "confirm" && dialog.message().includes("Restore files")) {
+      expectedDialogs.push(evidence);
+      await dialog.accept();
+      return;
+    }
+    unexpectedDialogs.push(evidence);
+    await dialog.dismiss();
   });
+}
 
+async function openConsole(pinned: PinnedBrowser, base: string, viewport = { width: 1280, height: 900 }) {
+  const context = await pinned.browser.newContext({ viewport });
+  const page = await context.newPage();
+  await page.goto(base, { waitUntil: "domcontentloaded" });
+  await page.getByLabel("Message Ódinn Forge").waitFor({ state: "visible" });
+  await page.waitForFunction(() => !(document.querySelector<HTMLTextAreaElement>('[aria-label="Message Ódinn Forge"]')?.disabled ?? true));
+  return { context, page };
+}
+
+async function navigateWithKeyboard(page: any, name: string | RegExp) {
+  const button = page.getByRole("button", { name }).first();
+  await button.focus();
+  assert.equal(await button.evaluate((element: Element) => element === document.activeElement), true);
+  await page.keyboard.press("Enter");
+}
+
+async function openAdvancedNavigation(page: any) {
+  const advanced = page.locator("details.nav-labs");
+  if (!await advanced.evaluate((element: HTMLDetailsElement) => element.open)) {
+    const summary = advanced.locator("summary");
+    await summary.focus();
+    assert.equal(await summary.evaluate((element: Element) => element === document.activeElement), true);
+    await page.keyboard.press("Enter");
+  }
+  assert.equal(await advanced.evaluate((element: HTMLDetailsElement) => element.open), true);
+}
+
+test("a source-blind operator completes Phase C against durable state across a real Gateway restart", { timeout: 180_000 }, async () => {
+  let harness: PhaseCHarness | undefined;
+  let firstBrowser: PinnedBrowser | undefined;
+  let secondBrowser: PinnedBrowser | undefined;
+  let requiredBrowserVersion = "";
+  const pageErrors: string[] = [];
+  const expectedDialogs: string[] = [];
+  const unexpectedDialogs: string[] = [];
   try {
-    browser = await chromium.launch({ executablePath: chromiumPath, headless: true });
-    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-    const page = await context.newPage();
-    const pageErrors: string[] = [];
-    page.on("pageerror", (error: Error) => pageErrors.push(error.message));
-    page.on("dialog", (dialog: any) => dialog.accept());
+    harness = await createPhaseCHarness();
+    const seed = await seedPhaseCRecovery(harness);
+    await setPhaseCCapabilityAdmission(harness, false);
+    firstBrowser = await launchPinnedChromium({ headless: true });
+    requiredBrowserVersion = firstBrowser.browserVersion;
+    assert.equal(firstBrowser.playwrightVersion, "1.62.1");
+    const first = await openConsole(firstBrowser, harness.base);
+    attachBrowserEvidence(first.page, pageErrors, expectedDialogs, unexpectedDialogs);
 
-    await page.route("**/*", async (route: any) => {
-      const request = route.request();
-      const url = new URL(request.url());
-      const method = request.method();
-
-      if (url.pathname === "/status") {
-        const response = await route.fetch();
-        const status = await response.json();
-        const tools = new Set([...(status.tools || []), "agent.run", "session.list", "goal.list", "memory.browse", "browser.tabs"]);
-        const allowedTools = new Set([...(status.allowedTools || []), ...tools]);
-        await json(route, {
-          ...status,
-          defaultModel: "uat:daily-driver",
-          providers: [{ name: "uat", displayName: "UAT provider", configured: true, models: ["daily-driver"], supportTier: "test", authMode: "none" }],
-          models: [{ id: "uat:daily-driver", provider: "uat", model: "daily-driver" }],
-          tools: [...tools],
-          allowedTools: [...allowedTools],
-        });
-        return;
-      }
-
-      if (url.pathname === "/run/stream" && method === "POST") {
-        captured.streamBody = request.postDataJSON();
-        await route.fulfill({
-          status: 200,
-          contentType: "text/event-stream",
-          body: [
-            'event: progress\ndata: {"tool":"workspace.read","status":"running","message":"Reading attached recovery notes"}\n\n',
-            'event: delta\ndata: {"delta":"Recovery notes verified. "}\n\n',
-            'event: delta\ndata: {"delta":"No source inspection required."}\n\n',
-            'event: result\ndata: {"output":{"content":"Recovery notes verified. No source inspection required.","model":"daily-driver","provider":"uat"}}\n\n',
-          ].join(""),
-        });
-        return;
-      }
-
-      if (url.pathname === "/approvals" && method === "GET") {
-        await json(route, approvals);
-        return;
-      }
-      if (/^\/approvals\/[^/]+\/approve$/u.test(url.pathname) && method === "POST") {
-        const id = decodeURIComponent(url.pathname.split("/")[2] || "");
-        captured.approved.push(id);
-        approvals.splice(0, approvals.length);
-        await json(route, { ok: true, approvalId: id, result: { status: "completed" } });
-        return;
-      }
-      if (url.pathname === "/run" && method === "POST") {
-        const body = request.postDataJSON();
-        if (body.tool === "browser.tabs") await json(route, { output: { tabs: [] } });
-        else await json(route, { output: {} });
-        return;
-      }
-
-      if (url.pathname === "/operator/snapshot" && method === "GET") {
-        const item = recoveryItem();
-        await json(route, {
-          ok: true,
-          schemaVersion: 1,
-          generatedAt: now,
-          surface: "console",
-          identity: { principalId: "operator:uat" },
-          health: { status: recovered ? "healthy" : "needs-attention", attention: recovered ? 0 : 1 },
-          actions: ["resume-workflow"],
-          sections: {
-            runtime: operatorSection([{ id: "gateway", kind: "runtime", label: "Local gateway", status: "running", summary: "Ready", details: {} }]),
-            work: operatorSection([]),
-            approvals: operatorSection([], { pending: 0 }),
-            automation: operatorSection([]),
-            context: operatorSection([]),
-            recovery: operatorSection(recovered ? [] : [item]),
-            audit: operatorSection([{ id: "audit", kind: "audit", label: "Signed history", status: "verified", summary: "Integrity verified", details: {} }]),
-            surfaces: operatorSection([]),
-          },
-        });
-        return;
-      }
-      if (url.pathname === "/operator/actions" && method === "POST") {
-        const body = request.postDataJSON();
-        captured.operatorActions.push(body.action);
-        recovered = body.action === "resume-workflow";
-        await json(route, { ok: true, action: body.action, targetId: body.targetId });
-        return;
-      }
-
-      if (url.pathname === "/cron" && method === "GET") {
-        await json(route, { enabled: true, jobs: schedules, nextWake: schedules.length ? now : null });
-        return;
-      }
-      if (url.pathname === "/cron" && method === "POST") {
-        const body = request.postDataJSON();
-        schedules.push({ id: "cron-uat-1", enabled: true, lastStatus: "active", lastRunAt: now, ...body });
-        await json(route, { ok: true, job: schedules[0] }, 201);
-        return;
-      }
-
-      if (url.pathname === "/memory/status") {
-        await json(route, { records: 1, latestAt: now, integration: { readAllowed: true, writeAllowed: true, autoRecall: true, autoLearn: true } });
-        return;
-      }
-      if (url.pathname === "/memory" && method === "GET") {
-        await json(route, { memories: [{ id: "memory-uat-1", kind: "procedure", subject: "Recovery preference", summary: "Use the operator page first", text: "Use the operator page before raw logs.", scopeType: "global", at: now, authority: "user", source: "console" }] });
-        return;
-      }
-      if (url.pathname === "/memory/browse") {
-        await json(route, { namespaces: [{ namespace: "procedures/recovery", count: 1, tiers: { l1: 1 } }] });
-        return;
-      }
-      if (url.pathname === "/memory/candidates") {
-        await json(route, { candidates: [] });
-        return;
-      }
-
-      if (url.pathname === "/usage") {
-        await json(route, { summary: { totalTokens: 42, modelRuns: 1, runs: 1, errors: 0 }, days: [{ day: "2026-08-26", events: 1, tokens: 42 }], runs: [{ id: "run-uat-1", status: "completed", tool: "agent.run", createdAt: now }] });
-        return;
-      }
-      if (url.pathname === "/audit/query") {
-        await json(route, {
-          events: [{ id: "event-uat-1", at: now, type: "agent.progress", runId: "run-uat-1", actor: "operator", tool: "agent.run", decision: "allow", message: "Recovery completed" }],
-          pagination: { page: 1, pages: 1, total: 1, from: 1, to: 1 },
-          summary: { events: 1, runs: 1, modelRuns: 1, errors: 0 },
-          facets: { types: [], tools: [], actors: [], outcomes: [] },
-        });
-        return;
-      }
-
-      if (url.pathname === "/agent-graphs" && method === "GET") {
-        await json(route, { graphs: [{ graphRunId: "graph-uat-1", parentRunId: "run-uat-1", requestDigest: "a".repeat(64), status: "needs-review", errorCode: "CHILD_OUTCOME_UNCERTAIN", maxConcurrency: 2, maxRunMs: 60_000, createdAt: now, nodes: [{ nodeId: "child-uat-1", manifestId: "research", status: "needs-review", errorCode: "CHILD_OUTCOME_UNCERTAIN" }] }] });
-        return;
-      }
-      if (url.pathname === "/agent-graphs/graph-uat-1" && method === "GET") {
-        await json(route, { graph: { graphRunId: "graph-uat-1", parentRunId: "run-uat-1", requestDigest: "a".repeat(64), status: "needs-review", errorCode: "CHILD_OUTCOME_UNCERTAIN", maxConcurrency: 2, maxRunMs: 60_000, createdAt: now, nodes: [{ nodeId: "child-uat-1", manifestId: "research", status: "needs-review", errorCode: "CHILD_OUTCOME_UNCERTAIN" }] } });
-        return;
-      }
-
-      await route.continue();
+    await first.page.getByLabel("Model", { exact: true }).selectOption("uat:daily-driver-b");
+    assert.equal(await first.page.getByLabel("Model", { exact: true }).inputValue(), "uat:daily-driver-b");
+    await first.page.evaluate(() => {
+      const status = document.querySelector('[role="status"].chat-status');
+      const values: string[] = [];
+      const record = () => {
+        const value = status?.textContent?.trim();
+        if (value && values.at(-1) !== value) values.push(value);
+      };
+      record();
+      new MutationObserver(record).observe(status!, { childList: true, subtree: true, characterData: true });
+      (window as any).__phaseCProgress = values;
     });
+    await first.page.locator('input[type="file"][accept*="text"]').setInputFiles({
+      name: "recovery-notes.md",
+      mimeType: "text/markdown",
+      buffer: Buffer.from("Use the retained checkpoint and require an explicit operator restore."),
+    });
+    const composer = first.page.getByLabel("Message Ódinn Forge");
+    await composer.fill("Confirm the Phase C recovery steps");
+    await composer.press("Enter");
+    await first.page.getByText("Recovery notes verified. The durable checkpoint remains operator-controlled.").waitFor({ timeout: 15_000 }).catch(async (error: unknown) => {
+      const audit = await jsonRequest(harness!.base, "/audit/query?pageSize=100").catch((auditError: unknown) => ({ error: String(auditError) }));
+      assert.fail(JSON.stringify({
+        error: String(error),
+        status: await first.page.locator('[role="status"].chat-status').textContent(),
+        toast: await first.page.locator("#toast-region").textContent(),
+        output: await first.page.locator("#output").textContent(),
+        pageErrors,
+        providerRequests: harness?.providerRequests.map((request) => ({
+          model: request.model,
+          roles: request.messages?.map((message: any) => message.role),
+          tools: request.tools?.map((tool: any) => tool.function?.name),
+        })),
+        failures: audit.events?.filter((event: any) => event.type === "task.failed").map((event: any) => ({
+          runId: event.runId,
+          tool: event.tool,
+          message: event.message,
+        })),
+      }));
+    });
+    await first.page.getByText("recovery-notes.md", { exact: true }).waitFor({ state: "hidden" });
+    const progress = await first.page.evaluate(() => (window as any).__phaseCProgress as string[]);
+    assert.ok(progress.some((value) => /Drafting the answer/u.test(value)), JSON.stringify(progress));
+    const toolPresentation = first.page.locator("#chat-tool-progress");
+    await toolPresentation.getByText("browser.open", { exact: true }).waitFor();
+    assert.match(await toolPresentation.innerText(), /Page opened and snapshot captured/u);
+    const selectedModelRequest = harness.providerRequests.find((request) => request.model === "daily-driver-b" && JSON.stringify(request.messages).includes("BEGIN UNTRUSTED LOCAL FILE"));
+    assert.ok(selectedModelRequest, "the selected model and bounded attachment reached the real local provider adapter");
+    assert.ok(selectedModelRequest.tools?.some((tool: any) => tool.function?.name === "browser_x2e_open"), "the real agent loop offered the bounded browser tool");
+    assert.ok(harness.providerRequests.some((request) => request.model === "daily-driver-b" && request.messages?.some((message: any) => message.role === "tool")), "the real browser result returned to the selected model");
+    const chatAudit = await jsonRequest(harness.base, "/audit/query?pageSize=100");
+    assert.ok(chatAudit.events.some((event: any) => event.type === "task.completed" && event.tool === "browser.open"), "browser.open completed through the governed task boundary");
 
-    await page.goto(`http://127.0.0.1:${address.port}/`, { waitUntil: "domcontentloaded" });
-    await page.locator("#chat-input").waitFor({ state: "visible" });
-    await page.waitForFunction(() => !(document.querySelector<HTMLTextAreaElement>("#chat-input")?.disabled ?? true));
+    await navigateWithKeyboard(first.page, /^Schedules$/u);
+    await first.page.getByRole("heading", { name: "Schedules", exact: true }).waitFor();
+    await first.page.getByRole("button", { name: "New schedule" }).click();
+    await first.page.getByLabel("Name", { exact: true }).fill("Daily recovery check");
+    await first.page.getByLabel("Action", { exact: true }).selectOption("text.echo");
+    await first.page.getByText("Advanced action input").click();
+    await first.page.getByLabel("Structured input").fill('{"text":"scheduled recovery evidence"}');
+    await first.page.getByRole("button", { name: "Save schedule" }).click();
+    await first.page.getByText("Daily recovery check").waitFor();
+    const firstCron = await jsonRequest(harness.base, "/cron");
+    assert.equal(firstCron.jobs.length, 1);
+    assert.equal(firstCron.jobs[0].name, "Daily recovery check");
 
-    await page.setInputFiles("#chat-file-input", { name: "recovery-notes.md", mimeType: "text/markdown", buffer: Buffer.from("Use the Operator page and resume from the durable checkpoint.") });
-    await page.locator("#chat-file-list").getByText("recovery-notes.md").waitFor();
-    await page.locator("#chat-input").fill("Confirm the recovery steps");
-    await page.locator("#send-chat").click();
-    await page.getByText("Recovery notes verified. No source inspection required.").waitFor();
-    await page.locator("#chat-file-list").waitFor({ state: "hidden" });
-    assert.equal(await page.locator("#chat-file-list").isHidden(), true, "successful sends clear local attachments");
-    assert.match(JSON.stringify(captured.streamBody), /BEGIN UNTRUSTED LOCAL FILE/u);
-    assert.equal(captured.streamBody?.tool, "agent.run");
+    await navigateWithKeyboard(first.page, /^Memory$/u);
+    await first.page.getByRole("button", { name: "Add memory" }).click();
+    await first.page.getByLabel("Short title").fill("Recovery preference");
+    await first.page.getByLabel("What should Ódinn remember?").fill("Use the Operator and Activity pages before raw logs.");
+    await first.page.getByRole("button", { name: "Save memory" }).click();
+    await first.page.getByText("Recovery preference").first().waitFor();
 
-    await page.locator('[data-view="capabilities"]').click();
-    await page.getByText("Submit the reviewed recovery form").waitFor();
-    await page.locator('[data-approval-action="approve"]').click();
-    await page.getByText("Nothing is waiting").waitFor();
-    assert.deepEqual(captured.approved, ["approval-uat-1"]);
+    await navigateWithKeyboard(first.page, /^Web tools$/u);
+    await first.page.getByRole("button", { name: "Deny" }).waitFor();
+    assert.match(await first.page.getByText(/Click/u).first().innerText(), /Click/u);
 
-    await page.locator('[data-view="cron"]').click();
-    await page.locator("#new-cron").click();
-    await page.locator("#cron-name").fill("Daily recovery check");
-    await page.locator("#save-cron").click();
-    await page.getByText("Daily recovery check").waitFor();
-    assert.equal(schedules.length, 1);
+    await navigateWithKeyboard(first.page, /^Activity$/u);
+    await first.page.getByRole("tab", { name: "History" }).click();
+    const unfilteredEvents = await first.page.locator(".activity-event").count();
+    assert.ok(unfilteredEvents > 1);
+    await first.page.getByLabel("Search activity").fill("text.echo");
+    await first.page.waitForResponse((response: any) => response.url().includes("/audit/query?") && response.url().includes("q=text.echo"));
+    await first.page.waitForFunction(() => document.querySelector("#audit-showing")?.textContent?.includes("matching"));
+    const filteredEvents = first.page.locator(".activity-event");
+    assert.ok(await filteredEvents.count() > 0);
+    for (const text of await filteredEvents.allInnerTexts()) assert.match(text, /text echo/iu);
 
-    await page.locator('[data-view="memory"]').click();
-    await page.locator("#memory-tab-saved").click();
-    await page.getByText("Recovery preference").first().waitFor();
+    await navigateWithKeyboard(first.page, /^Delegation\b/u);
+    const graphRow = first.page.getByRole("button", { name: new RegExp(escapeRegExp(seed.graphRunId), "u") });
+    await graphRow.waitFor();
+    await graphRow.focus();
+    await first.page.keyboard.press("Enter");
+    await first.page.getByText("Terminal reason").waitFor();
+    assert.match(await first.page.locator("#agent-graph-detail").innerText(), /Terminal reason\s+Completed/u);
+    assert.match(await first.page.locator("#agent-graph-detail").innerText(), /checkpoint-reader/u);
 
-    await page.locator('[data-view="usage"]').click();
-    await page.locator("#activity-tab-history").click();
-    await page.waitForFunction(() => document.querySelector("#audit-count")?.textContent === "1");
-    assert.match(await page.locator("#audit-events").innerText(), /Recovery completed|Agent progress/u);
+    await first.page.setViewportSize({ width: 375, height: 812 });
+    const responsive = await first.page.evaluate(() => ({ viewport: innerWidth, document: document.documentElement.scrollWidth }));
+    assert.ok(responsive.document <= responsive.viewport, JSON.stringify(responsive));
+    const navigationToggle = first.page.getByRole("button", { name: /Open navigation/u });
+    await navigationToggle.focus();
+    await first.page.keyboard.press("Enter");
+    assert.equal(await first.page.locator("#sidebar-toggle").getAttribute("aria-expanded"), "true");
+    await navigateWithKeyboard(first.page, /^Operator/u);
+    await first.page.getByRole("heading", { name: "Operator", exact: true }).waitFor();
+    await first.context.close();
+    await firstBrowser.browser.close();
+    firstBrowser = undefined;
 
-    await page.locator('[data-view="delegation"]').click();
-    await page.getByText("CHILD_OUTCOME_UNCERTAIN").first().waitFor();
+    const originalPort = harness.port;
+    await harness.stopGateway();
+    await harness.startGateway(originalPort);
+    assert.equal(await readFile(join(harness.workspaceRoot, "recovery-state.txt"), "utf8"), "interrupted-after-checkpoint\n", "startup must not replay a retained checkpoint");
 
-    await page.locator('[data-view="operator"]').click();
-    await page.getByText("Restart interrupted one step; review before resuming").first().waitFor();
-    await page.locator('[data-operator-action="resume-workflow"]').first().click();
-    await page.waitForFunction(() => document.querySelector("#operator-attention")?.textContent === "0");
-    assert.deepEqual(captured.operatorActions, ["resume-workflow"]);
+    secondBrowser = await launchPinnedChromium({ headless: true });
+    assert.equal(secondBrowser.browserVersion, requiredBrowserVersion);
+    const second = await openConsole(secondBrowser, harness.base);
+    attachBrowserEvidence(second.page, pageErrors, expectedDialogs, unexpectedDialogs);
+    await second.page.getByText("Recovery notes verified. The durable checkpoint remains operator-controlled.").waitFor();
 
-    assert.equal(await page.locator("#model-select").inputValue(), "uat:daily-driver");
+    await navigateWithKeyboard(second.page, /^Schedules$/u);
+    await second.page.getByText("Daily recovery check").waitFor();
+    const restartedCron = await jsonRequest(harness.base, "/cron");
+    assert.equal(restartedCron.jobs.length, 1);
+
+    await navigateWithKeyboard(second.page, /^Memory$/u);
+    await second.page.getByRole("tab", { name: /Saved memories/u }).click();
+    await second.page.getByText("Recovery preference").first().waitFor();
+
+    await navigateWithKeyboard(second.page, /^Web tools$/u);
+    const deny = second.page.getByRole("button", { name: "Deny" });
+    await deny.focus();
+    assert.equal(await deny.evaluate((element: Element) => element === document.activeElement), true);
+    await second.page.keyboard.press("Enter");
+    await second.page.locator('[role="status"]').filter({ hasText: "Action completed." }).waitFor();
+    await second.page.getByText("Nothing is waiting").waitFor();
+    assert.deepEqual(await jsonRequest(harness.base, "/approvals"), []);
+    await jsonRequest(harness.base, `/approvals/${encodeURIComponent(seed.approvalId)}/approve`, { method: "POST" }, 404);
+
+    const recoveredJob = await jsonRequest(harness.base, `/jobs/${encodeURIComponent(seed.durableJobId)}`);
+    assert.equal(recoveredJob.status, "completed");
+    assert.equal(recoveredJob.result.output.text, "PHASE_C_DURABLE_JOB_RESULT");
+    const replay = await jsonRequest(harness.base, "/jobs", {
+      method: "POST",
+      headers: { "idempotency-key": seed.durableJobId },
+      body: JSON.stringify({ task: { tool: "text.echo", input: { text: "PHASE_C_DURABLE_JOB_RESULT", capabilityToken: seed.durableJobCapabilityToken } } }),
+    });
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.job.attempts, recoveredJob.attempts);
+
+    const beforeRestore = await readFile(join(harness.workspaceRoot, "recovery-state.txt"), "utf8");
+    await openAdvancedNavigation(second.page);
+    await navigateWithKeyboard(second.page, /^Restore Points$/u);
+    const restoreView = second.page.locator("#view-lab-restore-points");
+    await restoreView.getByRole("heading", { name: "Restore Points", exact: true }).waitFor();
+    await restoreView.getByRole("button", { name: /Preview a restore/u }).click();
+    await restoreView.getByRole("textbox", { name: "Restore point reference" }).fill(seed.checkpointId);
+    await restoreView.getByRole("button", { name: "Preview a restore", exact: true }).last().click();
+    const previewResult = restoreView.locator('[data-role="result"]');
+    await previewResult.getByText("Preview a restore complete", { exact: true }).waitFor();
+    assert.match(await previewResult.innerText(), /Files changed\s+No/iu);
+    assert.equal(await readFile(join(harness.workspaceRoot, "recovery-state.txt"), "utf8"), beforeRestore, "preview must not mutate recovery state");
+    await restoreView.getByRole("button", { name: /Restore files/u }).first().click();
+    await restoreView.getByRole("textbox", { name: "Restore point reference" }).fill(seed.checkpointId);
+    await restoreView.getByRole("button", { name: "Restore files", exact: true }).last().click();
+    const appliedResult = restoreView.locator('[data-role="result"]');
+    await appliedResult.getByText("Restore files complete", { exact: true }).waitFor();
+    assert.match(await appliedResult.innerText(), /Files changed\s+Yes/iu);
+    assert.equal(await readFile(join(harness.workspaceRoot, "recovery-state.txt"), "utf8"), "checkpoint-before-interruption\n");
+    assert.equal(expectedDialogs.length, 1, JSON.stringify(expectedDialogs));
+
+    await navigateWithKeyboard(second.page, /^Delegation\b/u);
+    await second.page.getByRole("button", { name: new RegExp(escapeRegExp(seed.graphRunId), "u") }).waitFor();
+    assert.match(await second.page.locator("#agent-graph-detail").innerText(), /Terminal reason\s+Completed/u);
+    const auditIntegrity = await jsonRequest(harness.base, "/audit/verify");
+    assert.equal(auditIntegrity.valid, true);
+    assert.ok(Number.isSafeInteger(auditIntegrity.events) && auditIntegrity.events > 0);
+    assert.equal(auditIntegrity.unsigned, 0);
+    assert.deepEqual(auditIntegrity.failures, []);
     assert.deepEqual(pageErrors, []);
+    assert.deepEqual(unexpectedDialogs, []);
   } finally {
-    await browser?.close();
-    await new Promise<void>((resolve, reject) => server.close((error?: Error) => error ? reject(error) : resolve()));
+    await firstBrowser?.browser.close().catch(() => undefined);
+    await secondBrowser?.browser.close().catch(() => undefined);
+    await harness?.close();
   }
 });

@@ -34,6 +34,7 @@
     "test:lifecycle": "node --test --test-concurrency=1 --test-reporter=spec tests/application-lifecycle.test.ts tests/state-lifecycle.test.ts",
     "test:browser-lifecycle": "node --test --test-concurrency=1 --test-reporter=spec tests/browser-state-lifecycle.integration.test.ts",
     "uat:phase-c": "pnpm build:console && node --test --test-concurrency=1 --test-reporter=spec tests/phase-c-operator-uat.test.ts",
+    "uat:phase-c:human": "pnpm build:console && node scripts/uat/phase-c-harness.ts",
     "test:portable": "node scripts/ci/portable.ts",
     "test:update": "node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern=update tests/application-lifecycle.test.ts",
     "test:rollback": "node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern=rollback tests/application-lifecycle.test.ts",
