@@ -255,29 +255,39 @@ export function createOtlpHttpExporter(options: OtlpHttpExporterOptions): Teleme
   };
 
   return Object.freeze({
-    export: async (batch: readonly TelemetryEnvelope[], signal: AbortSignal): Promise<TelemetryExportResult> => {
+    export: async (
+      batch: readonly TelemetryEnvelope[],
+      signal: AbortSignal,
+      reportSettlement?: (
+        kind: TelemetryEnvelope["kind"],
+        settlement: TelemetryExportResult
+      ) => void
+    ): Promise<TelemetryExportResult> => {
       const spans = batch.filter((item): item is TelemetrySpan => item.kind === "span");
       const metrics = batch.filter((item): item is TelemetryMetric => item.kind === "metric");
       const events = batch.filter((item): item is TelemetryEvent => item.kind === "event");
       const groups = [
-        { path: "v1/traces" as const, items: spans, payload: () => tracePayload(spans, serviceName, serviceVersion) },
-        { path: "v1/metrics" as const, items: metrics, payload: () => metricPayload(metrics, serviceName, serviceVersion) },
-        { path: "v1/logs" as const, items: events, payload: () => logPayload(events, serviceName, serviceVersion) }
+        { kind: "span" as const, path: "v1/traces" as const, items: spans, payload: () => tracePayload(spans, serviceName, serviceVersion) },
+        { kind: "metric" as const, path: "v1/metrics" as const, items: metrics, payload: () => metricPayload(metrics, serviceName, serviceVersion) },
+        { kind: "event" as const, path: "v1/logs" as const, items: events, payload: () => logPayload(events, serviceName, serviceVersion) }
       ];
       let exported = 0;
       let rejected = 0;
       for (let index = 0; index < groups.length; index += 1) {
         const group = groups[index];
         if (!group.items.length) continue;
+        let groupRejected: number;
         try {
-          const groupRejected = await post(group.path, group.payload(), group.items.length, signal);
-          rejected += groupRejected;
-          exported += group.items.length - groupRejected;
+          groupRejected = await post(group.path, group.payload(), group.items.length, signal);
         } catch (error) {
           if (signal.aborted) throw error;
           rejected += groups.slice(index).reduce((count, remaining) => count + remaining.items.length, 0);
           return Object.freeze({ exported, rejected });
         }
+        const groupExported = group.items.length - groupRejected;
+        rejected += groupRejected;
+        exported += groupExported;
+        reportSettlement?.(group.kind, Object.freeze({ exported: groupExported, rejected: groupRejected }));
       }
       return Object.freeze({ exported, rejected });
     }

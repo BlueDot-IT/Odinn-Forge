@@ -16,7 +16,7 @@ const DIRECT_TOOL_CATEGORIES = new Set([
   "agent", "browser", "computer", "email", "git", "github", "goal", "job", "mcp", "memory",
   "model", "process", "project", "sandbox", "session", "skill", "text", "web", "workflow", "workspace"
 ]);
-const REPORTED_DROPPED = new WeakMap<object, number>();
+const REPORTED_DROPPED = new WeakMap<object, { confirmed: number; pending?: number }>();
 
 export function gatewayToolTelemetryCategory(registeredToolName: string): string {
   const prefix = registeredToolName.split(".", 1)[0]?.toLowerCase() ?? "";
@@ -85,24 +85,31 @@ export function recordGatewayTelemetryHealth(telemetry: GatewayTelemetry): void 
       instrument: "gauge",
       value: queued,
       unit: "1",
-      attributes: { component: "gateway", operation: "telemetry.observe", "queue.depth": queued }
+      attributes: { component: "gateway", operation: "telemetry.observe" }
     });
     const currentStatus = telemetry.status();
     const dropped = currentStatus.droppedOverflow
       + currentStatus.droppedExportFailure
       + currentStatus.rejectedInvalid
       + currentStatus.rejectedAfterShutdown;
-    const previousDropped = REPORTED_DROPPED.get(telemetry as object) ?? 0;
-    const newlyDropped = Math.max(0, dropped - previousDropped);
-    if (newlyDropped > 0) {
+    const watermark = REPORTED_DROPPED.get(telemetry as object) ?? { confirmed: 0 };
+    const newlyDropped = Math.max(0, dropped - watermark.confirmed);
+    if (newlyDropped > 0 && watermark.pending === undefined) {
+      const target = dropped;
       const admitted = telemetry.recordMetric({
         name: "odinn.export.dropped",
         instrument: "counter",
         value: newlyDropped,
         unit: "1",
-        attributes: { component: "gateway", operation: "telemetry.observe", "item.count": newlyDropped }
+        attributes: { component: "gateway", operation: "telemetry.observe" }
+      }, (settlement) => {
+        const current = REPORTED_DROPPED.get(telemetry as object) ?? { confirmed: 0 };
+        if (current.pending !== target) return;
+        REPORTED_DROPPED.set(telemetry as object, {
+          confirmed: settlement === "exported" ? Math.max(current.confirmed, target) : current.confirmed
+        });
       });
-      if (admitted) REPORTED_DROPPED.set(telemetry as object, dropped);
+      if (admitted) REPORTED_DROPPED.set(telemetry as object, { ...watermark, pending: target });
     }
   } catch {
     // Invalid or post-shutdown telemetry is locally accounted by the buffer.

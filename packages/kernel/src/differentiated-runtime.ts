@@ -1385,6 +1385,11 @@ async function syncWorkspace(source: string, destination: string, {
       const destinationPath = join(destinationDirectory, entry.name);
       if (!filter(sourcePath, destinationPath)) continue;
       const destinationEntry = destinationEntries.get(entry.name);
+      // Candidate and rollback copies deliberately omit symbolic links. If a
+      // live workspace path becomes a link after either snapshot, leave that
+      // path untouched rather than replacing it with unauthenticated copied
+      // content or deleting it during rollback.
+      if (destinationEntry?.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
         if (destinationEntry && !destinationEntry.isDirectory()) {
           beforeMutation();

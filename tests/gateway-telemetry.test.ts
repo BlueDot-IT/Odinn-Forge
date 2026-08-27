@@ -61,7 +61,7 @@ test("gateway telemetry activates only through a policy-valid explicit endpoint"
   );
 });
 
-test("Gateway telemetry health reports drop counters as deltas", () => {
+test("Gateway telemetry health reports successfully exported drop counters as deltas", async () => {
   const metrics: any[] = [];
   let dropped = 3;
   const telemetry: any = {
@@ -82,12 +82,19 @@ test("Gateway telemetry health reports drop counters as deltas", () => {
       queuedBytes: 0,
       inFlightBytes: 0
     }),
-    recordMetric: (input: any) => { metrics.push(input); return true; }
+    recordMetric: (input: any, onSettlement?: (settlement: "exported" | "rejected") => void) => {
+      metrics.push(input);
+      if (onSettlement) queueMicrotask(() => onSettlement("exported"));
+      return true;
+    }
   };
   recordGatewayTelemetryHealth(telemetry);
+  await Promise.resolve();
   recordGatewayTelemetryHealth(telemetry);
+  await Promise.resolve();
   dropped = 4;
   recordGatewayTelemetryHealth(telemetry);
+  await Promise.resolve();
   assert.deepEqual(
     metrics.filter((metric) => metric.name === "odinn.export.dropped").map((metric) => metric.value),
     [3, 1]
@@ -96,6 +103,49 @@ test("Gateway telemetry health reports drop counters as deltas", () => {
     metrics.filter((metric) => metric.name === "odinn.queue.depth").map((metric) => metric.value),
     [3, 3, 3]
   );
+  for (const metric of metrics) {
+    assert.deepEqual(metric.attributes, { component: "gateway", operation: "telemetry.observe" });
+  }
+});
+
+test("Gateway telemetry drop watermark advances only after successful export", () => {
+  const counters: number[] = [];
+  let dropped = 2;
+  let settleCounter: ((settlement: "exported" | "rejected") => void) | undefined;
+  const telemetry: any = {
+    enabled: true,
+    status: () => ({
+      state: "running",
+      exporterState: "idle",
+      queued: 0,
+      inFlight: 0,
+      accepted: 0,
+      exported: 0,
+      droppedOverflow: dropped,
+      droppedExportFailure: 0,
+      rejectedInvalid: 0,
+      rejectedAfterShutdown: 0,
+      exportFailures: 0,
+      consecutiveFailures: 0,
+      queuedBytes: 0,
+      inFlightBytes: 0
+    }),
+    recordMetric: (input: any, onSettlement?: (settlement: "exported" | "rejected") => void) => {
+      if (input.name === "odinn.export.dropped") {
+        counters.push(input.value);
+        settleCounter = onSettlement;
+      }
+      return true;
+    }
+  };
+
+  recordGatewayTelemetryHealth(telemetry);
+  settleCounter?.("rejected");
+  dropped = 3;
+  recordGatewayTelemetryHealth(telemetry);
+  settleCounter?.("exported");
+  recordGatewayTelemetryHealth(telemetry);
+  assert.deepEqual(counters, [2, 3]);
 });
 
 test("Gateway telemetry health retains an unadmitted drop watermark", () => {

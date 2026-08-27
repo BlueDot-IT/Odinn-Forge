@@ -70,7 +70,11 @@ export type TelemetryEnvelope = TelemetryEvent | TelemetrySpan | TelemetryMetric
 export interface TelemetryExporter {
   export(
     batch: readonly TelemetryEnvelope[],
-    signal: AbortSignal
+    signal: AbortSignal,
+    reportSettlement?: (
+      kind: TelemetryEnvelope["kind"],
+      settlement: TelemetryExportResult
+    ) => void
   ): Promise<TelemetryExportResult | void> | TelemetryExportResult | void;
   shutdown?(signal: AbortSignal): Promise<void> | void;
 }
@@ -79,6 +83,8 @@ export type TelemetryExportResult = Readonly<{
   exported: number;
   rejected: number;
 }>;
+
+export type TelemetryRecordSettlement = "exported" | "rejected";
 
 export type BufferedTelemetryOptions = {
   enabled?: boolean;
@@ -274,8 +280,22 @@ function freezeEnvelope<T extends TelemetryEnvelope>(envelope: T): T {
   return Object.freeze(envelope);
 }
 
-class ExportTimeoutError extends Error {}
-type QueuedEnvelope = { envelope: TelemetryEnvelope; bytes: number; sequence: number };
+class ExportTimeoutError extends Error {
+  readonly settlement: TelemetryExportResult;
+  constructor(
+    message: string,
+    settlement: TelemetryExportResult = Object.freeze({ exported: 0, rejected: 0 })
+  ) {
+    super(message);
+    this.settlement = settlement;
+  }
+}
+type QueuedEnvelope = {
+  envelope: TelemetryEnvelope;
+  bytes: number;
+  sequence: number;
+  onSettlement?: (settlement: TelemetryRecordSettlement) => void;
+};
 
 export class BufferedTelemetry {
   readonly enabled: boolean;
@@ -410,9 +430,12 @@ export class BufferedTelemetry {
     instrument: "counter" | "gauge" | "histogram";
     value: number;
     unit: "1" | "ms" | "By";
-  }): boolean {
+  }, onSettlement?: (settlement: TelemetryRecordSettlement) => void): boolean {
     if (!this.#canRecord()) return false;
     try {
+      if (onSettlement !== undefined && typeof onSettlement !== "function") {
+        throw new Error("telemetry settlement listener must be a function");
+      }
       const value = strictObject(input, "telemetry metric", METRIC_KEYS);
       if (!["counter", "gauge", "histogram"].includes(String(value.instrument))) {
         throw new Error("telemetry metric instrument is invalid");
@@ -427,7 +450,7 @@ export class BufferedTelemetry {
       instrument: value.instrument as "counter" | "gauge" | "histogram",
       value: finiteNumber(value.value, "telemetry metric value"),
       unit: value.unit as "1" | "ms" | "By"
-      }));
+      }), onSettlement);
     } catch (error) {
       this.#rejectedInvalid += 1;
       throw error;
@@ -497,7 +520,10 @@ export class BufferedTelemetry {
     return true;
   }
 
-  #enqueue(envelope: TelemetryEnvelope): boolean {
+  #enqueue(
+    envelope: TelemetryEnvelope,
+    onSettlement?: (settlement: TelemetryRecordSettlement) => void
+  ): boolean {
     const bytes = Buffer.byteLength(JSON.stringify(envelope), "utf8");
     if (bytes > MAX_RECORD_BYTES) throw new Error(`telemetry record exceeds ${MAX_RECORD_BYTES} UTF-8 bytes`);
     if (
@@ -510,7 +536,7 @@ export class BufferedTelemetry {
       return false;
     }
     this.#accepted += 1;
-    this.#queue.push({ envelope, bytes, sequence: this.#accepted });
+    this.#queue.push({ envelope, bytes, sequence: this.#accepted, ...(onSettlement ? { onSettlement } : {}) });
     this.#queueBytes += bytes;
     if (this.#autoPump) this.#schedulePump();
     return true;
@@ -581,10 +607,27 @@ export class BufferedTelemetry {
     if (!queuedBatch.length) throw new Error("telemetry admission invariant produced an oversized batch record");
     this.#queueBytes -= recordBytes;
     const batch = queuedBatch.map((item) => item.envelope);
+    const progressivelySettledKinds = new Set<TelemetryEnvelope["kind"]>();
+    const settleRemainingListeners = (settlement: TelemetryRecordSettlement): void => {
+      this.#settleListeners(
+        queuedBatch.filter((item) => !progressivelySettledKinds.has(item.envelope.kind)),
+        settlement
+      );
+    };
     this.#inFlight = batch.length;
     this.#inFlightBytes = recordBytes;
     try {
-      const result = await this.#exportBatch(Object.freeze([...batch]), timeoutMs);
+      const result = await this.#exportBatch(
+        Object.freeze([...batch]),
+        timeoutMs,
+        (kind, settlement) => {
+          progressivelySettledKinds.add(kind);
+          this.#settleListeners(
+            queuedBatch.filter((item) => item.envelope.kind === kind),
+            settlement.rejected === 0 ? "exported" : "rejected"
+          );
+        }
+      );
       const exported = result?.exported ?? batch.length;
       const rejected = result?.rejected ?? 0;
       if (
@@ -613,8 +656,13 @@ export class BufferedTelemetry {
         this.#lastFailure = undefined;
         this.#retryDelay = undefined;
       }
+      settleRemainingListeners(rejected === 0 ? "exported" : "rejected");
     } catch (error) {
-      this.#droppedExportFailure += batch.length;
+      const timeoutSettlement = error instanceof ExportTimeoutError
+        ? error.settlement
+        : Object.freeze({ exported: 0, rejected: batch.length });
+      this.#exported += timeoutSettlement.exported;
+      this.#droppedExportFailure += timeoutSettlement.rejected;
       this.#settledThrough = queuedBatch.at(-1)!.sequence;
       this.#firstFailedSequence ??= queuedBatch[0].sequence;
       this.#exportFailures += 1;
@@ -624,17 +672,50 @@ export class BufferedTelemetry {
         const exponent = Math.min(this.#consecutiveFailures - 1, 16);
         this.#retryDelay = Math.min(this.#maxBackoffMs, this.#baseBackoffMs * (2 ** exponent));
       }
+      settleRemainingListeners("rejected");
     } finally {
       this.#inFlight = 0;
       this.#inFlightBytes = 0;
     }
   }
 
-  async #exportBatch(batch: readonly TelemetryEnvelope[], timeoutMs: number): Promise<TelemetryExportResult | void> {
+  async #exportBatch(
+    batch: readonly TelemetryEnvelope[],
+    timeoutMs: number,
+    onProgress?: (kind: TelemetryEnvelope["kind"], settlement: TelemetryExportResult) => void
+  ): Promise<TelemetryExportResult | void> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let physicallySettled = false;
-    const physical = Promise.resolve().then(() => this.#exporter!.export(batch, controller.signal));
+    let progressExported = 0;
+    let progressRejected = 0;
+    const reportedKinds = new Set<TelemetryEnvelope["kind"]>();
+    const reportSettlement = (
+      kind: TelemetryEnvelope["kind"],
+      settlement: TelemetryExportResult
+    ): void => {
+      const kindCount = batch.filter((item) => item.kind === kind).length;
+      if (
+        !["event", "span", "metric"].includes(kind)
+        || reportedKinds.has(kind)
+        || kindCount === 0
+        || !settlement
+        || typeof settlement !== "object"
+        || !Number.isSafeInteger(settlement.exported)
+        || !Number.isSafeInteger(settlement.rejected)
+        || settlement.exported < 0
+        || settlement.rejected < 0
+        || settlement.exported + settlement.rejected !== kindCount
+        || progressExported + progressRejected + settlement.exported + settlement.rejected > batch.length
+      ) {
+        throw new Error("telemetry exporter reported invalid progressive settlement");
+      }
+      reportedKinds.add(kind);
+      progressExported += settlement.exported;
+      progressRejected += settlement.rejected;
+      onProgress?.(kind, settlement);
+    };
+    const physical = Promise.resolve().then(() => this.#exporter!.export(batch, controller.signal, reportSettlement));
     this.#physicalExportPromise = physical;
     void physical.then(
       () => this.#physicalExportSettled(physical),
@@ -644,21 +725,41 @@ export class BufferedTelemetry {
       timer = setTimeout(() => {
         if (!physicallySettled) {
           this.#wedged = true;
-          controller.abort(new ExportTimeoutError("telemetry exporter timed out"));
+          controller.abort(new Error("telemetry exporter timed out"));
         }
-        reject(new ExportTimeoutError("telemetry exporter timed out"));
+        reject(new ExportTimeoutError("telemetry exporter timed out", Object.freeze({
+          exported: progressExported,
+          rejected: batch.length - progressExported
+        })));
       }, timeoutMs);
     });
     try {
-      return await Promise.race([
+      const result = await Promise.race([
         physical.then((result) => {
           physicallySettled = true;
           return result;
         }),
         timeout
       ]);
+      if (result && (result.exported < progressExported || result.rejected < progressRejected)) {
+        throw new Error("telemetry exporter result contradicts progressive settlement");
+      }
+      if (!result && progressExported + progressRejected > 0) {
+        if (progressExported + progressRejected !== batch.length) {
+          throw new Error("telemetry exporter returned incomplete progressive settlement");
+        }
+        return Object.freeze({ exported: progressExported, rejected: progressRejected });
+      }
+      return result;
     } finally {
       if (timer) clearTimeout(timer);
+    }
+  }
+
+  #settleListeners(batch: readonly QueuedEnvelope[], settlement: TelemetryRecordSettlement): void {
+    for (const item of batch) {
+      try { item.onSettlement?.(settlement); }
+      catch { /* settlement listeners cannot affect telemetry delivery */ }
     }
   }
 

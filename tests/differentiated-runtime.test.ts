@@ -421,6 +421,8 @@ test("counterfactual activation and rollback preserve nested state and protected
   if (process.platform !== "win32") {
     await writeFile(join(root, "symlink-target.txt"), "source-link-target\n");
     await symlink("symlink-target.txt", join(root, "preserved-link.txt"));
+    await writeFile(join(root, "late-link.txt"), "pre-snapshot regular file\n");
+    await writeFile(join(root, "late-link-target.txt"), "late-link-target\n");
   }
   const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
   let candidateRoot = "";
@@ -444,6 +446,10 @@ test("counterfactual activation and rollback preserve nested state and protected
   });
   const candidate = group.candidates[0];
   candidateRoot = candidate.workspaceRoot;
+  if (process.platform !== "win32") {
+    await rm(join(root, "late-link.txt"));
+    await symlink("late-link-target.txt", join(root, "late-link.txt"));
+  }
   await runtime.counterfactual.execute(group.groupId, { executor: async () => ({ output: { text: "completed" } }) });
   await writeFile(join(candidateRoot, "ordinary.txt"), "candidate\n");
   for (const protectedRoot of [
@@ -469,6 +475,8 @@ test("counterfactual activation and rollback preserve nested state and protected
   if (process.platform !== "win32") {
     assert.equal((await lstat(join(root, "preserved-link.txt"))).isSymbolicLink(), true);
     assert.equal(await readlink(join(root, "preserved-link.txt")), "symlink-target.txt");
+    assert.equal((await lstat(join(root, "late-link.txt"))).isSymbolicLink(), true);
+    assert.equal(await readlink(join(root, "late-link.txt")), "late-link-target.txt");
   }
 
   const selected = await runtime.counterfactual.select(group.groupId, candidate.runId, { apply: true });
@@ -482,6 +490,8 @@ test("counterfactual activation and rollback preserve nested state and protected
   if (process.platform !== "win32") {
     assert.equal((await lstat(join(root, "preserved-link.txt"))).isSymbolicLink(), true);
     assert.equal(await readlink(join(root, "preserved-link.txt")), "symlink-target.txt");
+    assert.equal((await lstat(join(root, "late-link.txt"))).isSymbolicLink(), true);
+    assert.equal(await readlink(join(root, "late-link.txt")), "late-link-target.txt");
   }
 });
 

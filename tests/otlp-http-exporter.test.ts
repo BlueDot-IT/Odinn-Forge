@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createOtlpHttpExporter, validateOtlpHttpEndpoint } from "../packages/kernel/src/otlp-http-exporter.ts";
-import type { TelemetryEnvelope } from "../packages/kernel/src/async-telemetry.ts";
+import { createBufferedTelemetry, type TelemetryEnvelope } from "../packages/kernel/src/async-telemetry.ts";
 
 const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
 const SPAN_ID = "00f067aa0ba902b7";
@@ -184,6 +184,98 @@ test("OTLP exporter preserves earlier kind settlement when a later request fails
     "https://collector.example/v1/traces",
     "https://collector.example/v1/metrics"
   ]);
+});
+
+test("buffer preserves an acknowledged earlier OTLP kind when a later request times out", async () => {
+  const requests: string[] = [];
+  const exporter = createOtlpHttpExporter({
+    endpoint: "https://collector.example/",
+    fetch: ((input: string | URL | Request, init?: RequestInit) => {
+      requests.push(String(input));
+      if (String(input).endsWith("/v1/traces")) return Promise.resolve(new Response(null, { status: 200 }));
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) return reject(new Error("missing cancellation signal"));
+        if (signal.aborted) return reject(new Error("request aborted"));
+        signal.addEventListener("abort", () => reject(new Error("request aborted")), { once: true });
+      });
+    }) as typeof fetch
+  });
+  const telemetry = createBufferedTelemetry({
+    enabled: true,
+    exporter,
+    exportTimeoutMs: 10,
+    autoPump: false
+  });
+  telemetry.recordSpan({
+    name: "odinn.tool.execution",
+    traceId: TRACE_ID,
+    spanId: SPAN_ID,
+    durationMs: 1,
+    status: "ok"
+  });
+  telemetry.recordMetric({
+    name: "odinn.queue.depth",
+    instrument: "gauge",
+    value: 1,
+    unit: "1"
+  });
+
+  assert.equal(await telemetry.flush(), false);
+  assert.deepEqual(requests, [
+    "https://collector.example/v1/traces",
+    "https://collector.example/v1/metrics"
+  ]);
+  assert.deepEqual({
+    exported: telemetry.status().exported,
+    dropped: telemetry.status().droppedExportFailure,
+    failures: telemetry.status().exportFailures,
+    lastFailure: telemetry.status().lastFailure
+  }, { exported: 1, dropped: 1, failures: 1, lastFailure: "timeout" });
+  await telemetry.shutdown();
+});
+
+test("record settlement listeners preserve an exported metric when later logs time out", async () => {
+  const requests: string[] = [];
+  const exporter = createOtlpHttpExporter({
+    endpoint: "https://collector.example/",
+    fetch: ((input: string | URL | Request, init?: RequestInit) => {
+      requests.push(String(input));
+      if (String(input).endsWith("/v1/metrics")) return Promise.resolve(new Response(null, { status: 200 }));
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) return reject(new Error("missing cancellation signal"));
+        if (signal.aborted) return reject(new Error("request aborted"));
+        signal.addEventListener("abort", () => reject(new Error("request aborted")), { once: true });
+      });
+    }) as typeof fetch
+  });
+  const telemetry = createBufferedTelemetry({
+    enabled: true,
+    exporter,
+    exportTimeoutMs: 10,
+    autoPump: false
+  });
+  let metricSettlement: "exported" | "rejected" | undefined;
+  telemetry.recordMetric({
+    name: "odinn.export.dropped",
+    instrument: "counter",
+    value: 2,
+    unit: "1"
+  }, (settlement) => { metricSettlement = settlement; });
+  telemetry.recordEvent({ name: "odinn.runtime.lifecycle" });
+
+  assert.equal(await telemetry.flush(), false);
+  assert.deepEqual(requests, [
+    "https://collector.example/v1/metrics",
+    "https://collector.example/v1/logs"
+  ]);
+  assert.equal(metricSettlement, "exported");
+  assert.deepEqual({
+    exported: telemetry.status().exported,
+    dropped: telemetry.status().droppedExportFailure
+  }, { exported: 1, dropped: 1 });
+  await telemetry.shutdown();
 });
 
 test("OTLP exporter honors bounded partial-success settlement", async () => {
