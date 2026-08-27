@@ -35,7 +35,7 @@ The stable command groups are:
 | Purpose | Inputs | Output |
 | --- | --- | --- |
 | Setup and runtime | `odinn onboard`, `odinn start`, `odinn status`, `odinn doctor` with the options shown by `odinn help --all` | Guided setup or console startup; status and diagnostics return structured state with secrets redacted |
-| Provider and security configuration | `odinn config provider ...`, `odinn config model ...`, `odinn config security ...` | The saved or current configuration and validation errors |
+| Provider, integration, and security configuration | `odinn config provider ...`, `odinn config model ...`, `odinn config security ...`, `odinn config computer ...` | The saved or current credential-free configuration, safe diagnostics, and validation errors |
 | Application lifecycle | `odinn update check`, `odinn update`, `odinn rollback`, `odinn backup`, `odinn restore`, `odinn uninstall` | JSON describing the inspected release, verification result, state action, final version, or refusal reason |
 | Persistent state | `odinn state status`, `odinn state backup`, `odinn state restore`, `odinn state migrate --dry-run` | JSON describing schema versions, paths, checksums, migration plans, backups, or compatibility blockers |
 | Sessions, goals, and memory | `odinn session ...`, `odinn sessions`, `odinn goal ...`, `odinn memory ...` | JSON records or collections; create/update commands include the resulting event or record identifier |
@@ -142,6 +142,18 @@ credential references remain outside model input. Durable evidence contains
 only digests, bounded counts, and fixed status values, so replay cannot recover
 live node output. See [Authenticated remote-node reads](remote-node-read.md)
 for schemas, onboarding, TLS routing, responder, diagnostics, and recovery.
+
+### Local macOS computer-control contract
+
+`computer.screen`, `computer.act`, `computer.recovery.status`, and
+`computer.recovery.resolve` provide a disabled-by-default, target-bound local
+macOS desktop slice under the separate `computer.read` and `computer.mutate`
+capabilities. Enabling the slice requires `--confirm-impact`; every mutation
+still requires an exact frame-bound approval. Typed text, keys, screenshots,
+and pixels are excluded from durable projections, and uncertain outcomes block
+further mutation until resolved. See [Local macOS computer control](computer-control.md)
+for onboarding, operating-system permissions, diagnostics, audit, recovery,
+tests, and unsupported platforms.
 
 ### `workspace.readText` compatibility contract
 

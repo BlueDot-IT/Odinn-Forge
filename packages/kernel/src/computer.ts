@@ -21,6 +21,43 @@ export interface ComputerScreenProvider {
   close?(): Promise<void> | void;
 }
 
+export type ComputerActionInput = Readonly<{
+  frameId: string;
+  action: "click" | "type" | "key" | "move" | "scroll" | "wait";
+  x?: number;
+  y?: number;
+  button?: "left" | "middle" | "right";
+  text?: string;
+  sensitive?: boolean;
+  key?: string;
+  deltaX?: number;
+  deltaY?: number;
+  durationMs?: number;
+}>;
+
+export type ComputerAction =
+  | Readonly<{ action: "click"; x: number; y: number; button: "left" | "middle" | "right" }>
+  | Readonly<{ action: "type"; text: string; sensitive: boolean }>
+  | Readonly<{ action: "key"; key: string }>
+  | Readonly<{ action: "move"; x: number; y: number }>
+  | Readonly<{ action: "scroll"; deltaX: number; deltaY: number }>
+  | Readonly<{ action: "wait"; durationMs: number }>;
+
+export type ComputerActRequest = Readonly<{
+  target: ComputerScreenTarget;
+  frameId: string;
+  action: ComputerAction;
+  signal?: AbortSignal;
+}>;
+
+export type ComputerRecoveryResolution = "confirmed-applied" | "confirmed-not-applied";
+
+export interface ComputerControlProvider extends ComputerScreenProvider {
+  act(request: ComputerActRequest): Promise<unknown>;
+  recoveryStatus?(): Promise<unknown> | unknown;
+  resolveRecovery?(request: Readonly<{ recoveryId: string; outcome: ComputerRecoveryResolution; signal?: AbortSignal }>): Promise<unknown>;
+}
+
 export type ComputerScreenResult = Readonly<{
   type: "computer.screen";
   frameId: string;
@@ -30,6 +67,32 @@ export type ComputerScreenResult = Readonly<{
   height: number;
   mimeType: "image/png" | "image/jpeg";
   imageBase64: string;
+}>;
+
+export type ComputerActResult =
+  | Readonly<{
+    type: "computer.act";
+    status: "completed";
+    action: ComputerAction["action"];
+    beforeFrameId: string;
+    afterFrame: ComputerScreenResult;
+  }>
+  | Readonly<{
+    type: "computer.act";
+    status: "needs-review";
+    action: ComputerAction["action"];
+    beforeFrameId: string;
+    recoveryId: string;
+    reason: "cancelled-after-dispatch" | "timeout" | "transport-lost" | "provider-uncertain";
+  }>;
+
+export type ComputerRecoveryStatus = Readonly<{
+  type: "computer.recovery.status";
+  unresolved: boolean;
+  recoveryId?: string;
+  frameId?: string;
+  action?: ComputerAction["action"];
+  reason?: "cancelled-after-dispatch" | "timeout" | "transport-lost" | "provider-uncertain";
 }>;
 
 type RecordValue = Record<string, unknown>;
@@ -44,6 +107,62 @@ function boundedIdentifier(value: unknown, label: string): string {
     throw new Error(`${label} must be a bounded identifier`);
   }
   return value;
+}
+
+function boundedInteger(value: unknown, minimum: number, maximum: number, label: string): number {
+  if (!Number.isInteger(value) || Number(value) < minimum || Number(value) > maximum) {
+    throw new Error(`${label} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return Number(value);
+}
+
+function assertOnlyKeys(source: RecordValue, allowed: readonly string[], label: string): void {
+  const allow = new Set(allowed);
+  const unknown = Object.keys(source).filter((key) => !allow.has(key));
+  if (unknown.length) throw new Error(`${label} contains unsupported fields: ${unknown.sort().join(", ")}`);
+}
+
+const COMPUTER_KEY = /^(?:(?:Alt|Command|Control|Option|Shift)\+){0,4}(?:[A-Za-z0-9]|Enter|Tab|Escape|Space|Backspace|Delete|Home|End|PageUp|PageDown|ArrowUp|ArrowDown|ArrowLeft|ArrowRight|F(?:[1-9]|1[0-2]))$/u;
+
+export function normalizeComputerActionInput(value: unknown): Readonly<{ frameId: string; action: ComputerAction }> {
+  const source = plainObject(value, "computer action input");
+  const frameId = boundedIdentifier(source.frameId, "computer action input.frameId");
+  const action = source.action;
+  if (action === "click") {
+    assertOnlyKeys(source, ["frameId", "action", "x", "y", "button"], "computer action input");
+    const button = source.button ?? "left";
+    if (button !== "left" && button !== "middle" && button !== "right") throw new Error("computer action input.button is unsupported");
+    return Object.freeze({ frameId, action: Object.freeze({ action, x: boundedInteger(source.x, 0, MAX_SCREEN_WIDTH - 1, "computer action input.x"), y: boundedInteger(source.y, 0, MAX_SCREEN_HEIGHT - 1, "computer action input.y"), button }) });
+  }
+  if (action === "move") {
+    assertOnlyKeys(source, ["frameId", "action", "x", "y"], "computer action input");
+    return Object.freeze({ frameId, action: Object.freeze({ action, x: boundedInteger(source.x, 0, MAX_SCREEN_WIDTH - 1, "computer action input.x"), y: boundedInteger(source.y, 0, MAX_SCREEN_HEIGHT - 1, "computer action input.y") }) });
+  }
+  if (action === "type") {
+    assertOnlyKeys(source, ["frameId", "action", "text", "sensitive"], "computer action input");
+    if (typeof source.text !== "string" || source.text.length === 0 || Buffer.byteLength(source.text, "utf8") > 4_096 || source.text.includes("\0")) {
+      throw new Error("computer action input.text must be non-empty bounded text");
+    }
+    if (source.sensitive !== undefined && typeof source.sensitive !== "boolean") throw new Error("computer action input.sensitive must be boolean");
+    return Object.freeze({ frameId, action: Object.freeze({ action, text: source.text, sensitive: source.sensitive === true }) });
+  }
+  if (action === "key") {
+    assertOnlyKeys(source, ["frameId", "action", "key"], "computer action input");
+    if (typeof source.key !== "string" || !COMPUTER_KEY.test(source.key)) throw new Error("computer action input.key is unsupported");
+    return Object.freeze({ frameId, action: Object.freeze({ action, key: source.key }) });
+  }
+  if (action === "scroll") {
+    assertOnlyKeys(source, ["frameId", "action", "deltaX", "deltaY"], "computer action input");
+    const deltaX = boundedInteger(source.deltaX ?? 0, -8_192, 8_192, "computer action input.deltaX");
+    const deltaY = boundedInteger(source.deltaY ?? 0, -8_192, 8_192, "computer action input.deltaY");
+    if (deltaX === 0 && deltaY === 0) throw new Error("computer action input scroll delta must not be zero");
+    return Object.freeze({ frameId, action: Object.freeze({ action, deltaX, deltaY }) });
+  }
+  if (action === "wait") {
+    assertOnlyKeys(source, ["frameId", "action", "durationMs"], "computer action input");
+    return Object.freeze({ frameId, action: Object.freeze({ action, durationMs: boundedInteger(source.durationMs, 50, 5_000, "computer action input.durationMs") }) });
+  }
+  throw new Error("computer action input.action is unsupported");
 }
 
 function normalizeTarget(value: unknown, label: string): ComputerScreenTarget {
@@ -145,4 +264,76 @@ export async function captureComputerScreen(provider: ComputerScreenProvider, si
   const currentTarget = normalizeTarget(provider.target, "computer screen provider.target");
   if (!sameTarget(currentTarget, target)) throw new Error("computer screen pairing target changed during capture");
   return normalizeFrame(frame, currentTarget);
+}
+
+function normalizeActResult(value: unknown, target: ComputerScreenTarget, input: Readonly<{ frameId: string; action: ComputerAction }>): ComputerActResult {
+  const source = plainObject(value, "computer action result");
+  const returnedTarget = normalizeTarget(source.target, "computer action result.target");
+  if (!sameTarget(returnedTarget, target)) throw new Error("computer action result target does not match the paired host target");
+  if (source.beforeFrameId !== input.frameId) throw new Error("computer action result does not match the approved frame");
+  if (source.status === "completed") {
+    const afterFrame = normalizeFrame(source.afterFrame, target);
+    return Object.freeze({ type: "computer.act", status: "completed", action: input.action.action, beforeFrameId: input.frameId, afterFrame });
+  }
+  if (source.status === "needs-review") {
+    const reason = source.reason;
+    if (reason !== "cancelled-after-dispatch" && reason !== "timeout" && reason !== "transport-lost" && reason !== "provider-uncertain") {
+      throw new Error("computer action uncertainty reason is unsupported");
+    }
+    return Object.freeze({
+      type: "computer.act",
+      status: "needs-review",
+      action: input.action.action,
+      beforeFrameId: input.frameId,
+      recoveryId: boundedIdentifier(source.recoveryId, "computer action result.recoveryId"),
+      reason
+    });
+  }
+  throw new Error("computer action result status is unsupported");
+}
+
+export async function performComputerAction(provider: ComputerControlProvider, value: unknown, signal?: AbortSignal): Promise<ComputerActResult> {
+  if (!provider || typeof provider.act !== "function") throw new Error("computer control provider is unavailable");
+  const target = normalizeTarget(provider.target, "computer control provider.target");
+  const input = normalizeComputerActionInput(value);
+  throwIfAborted(signal);
+  const result = await provider.act({ target, frameId: input.frameId, action: input.action, signal });
+  const currentTarget = normalizeTarget(provider.target, "computer control provider.target");
+  if (!sameTarget(currentTarget, target)) throw new Error("computer control pairing target changed during action");
+  return normalizeActResult(result, currentTarget, input);
+}
+
+export async function inspectComputerRecovery(provider: ComputerControlProvider): Promise<ComputerRecoveryStatus> {
+  if (typeof provider.recoveryStatus !== "function") return Object.freeze({ type: "computer.recovery.status", unresolved: false });
+  const source = plainObject(await provider.recoveryStatus(), "computer recovery status");
+  if (typeof source.unresolved !== "boolean") throw new Error("computer recovery status.unresolved must be boolean");
+  if (!source.unresolved) return Object.freeze({ type: "computer.recovery.status", unresolved: false });
+  const action = source.action;
+  if (action !== "click" && action !== "type" && action !== "key" && action !== "move" && action !== "scroll" && action !== "wait") {
+    throw new Error("computer recovery status.action is unsupported");
+  }
+  const reason = source.reason;
+  if (reason !== "cancelled-after-dispatch" && reason !== "timeout" && reason !== "transport-lost" && reason !== "provider-uncertain") {
+    throw new Error("computer recovery status.reason is unsupported");
+  }
+  return Object.freeze({
+    type: "computer.recovery.status",
+    unresolved: true,
+    recoveryId: boundedIdentifier(source.recoveryId, "computer recovery status.recoveryId"),
+    frameId: boundedIdentifier(source.frameId, "computer recovery status.frameId"),
+    action,
+    reason
+  });
+}
+
+export async function resolveComputerRecovery(provider: ComputerControlProvider, value: unknown, signal?: AbortSignal): Promise<Readonly<{ type: "computer.recovery.resolve"; status: "resolved"; recoveryId: string; outcome: ComputerRecoveryResolution }>> {
+  if (typeof provider.resolveRecovery !== "function") throw new Error("computer recovery resolution is unavailable");
+  const source = plainObject(value, "computer recovery resolution");
+  assertOnlyKeys(source, ["recoveryId", "outcome"], "computer recovery resolution");
+  const recoveryId = boundedIdentifier(source.recoveryId, "computer recovery resolution.recoveryId");
+  const outcome = source.outcome;
+  if (outcome !== "confirmed-applied" && outcome !== "confirmed-not-applied") throw new Error("computer recovery resolution.outcome is unsupported");
+  throwIfAborted(signal);
+  await provider.resolveRecovery({ recoveryId, outcome, signal });
+  return Object.freeze({ type: "computer.recovery.resolve", status: "resolved", recoveryId, outcome });
 }

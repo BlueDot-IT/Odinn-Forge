@@ -3,7 +3,7 @@ import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, ren
 import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { kill as killProcess } from "node:process";
-import { redactDurableValue } from "@odinn/protocol";
+import { projectDurableToolInput, redactDurableValue } from "@odinn/protocol";
 import { approvalEffectPolicyForTool } from "@odinn/policy";
 
 type NodeError = Error & { code?: string };
@@ -401,7 +401,15 @@ function createApprovalStoreInternal(options: ApprovalStoreOptions, hooks: Appro
         const id = `approval_${randomUUID()}`;
         const normalized = normalizeApprovalAction(action);
         const { executionInput: _executionInput, ...publicAction } = action;
-        const sanitized = redactDurableValue({ ...publicAction, tool: normalized.tool, actor: normalized.actor, summary: normalized.effect?.summary, effect: normalized.effect, input: publicAction.input ?? {} }, { toolName: normalized.tool }) as ApprovalAction;
+        // Existing approval families intentionally retain their established
+        // redacted public shape because restart consumers compare that shape
+        // before opening the authenticated sealed input. Computer requests
+        // need the stricter content-free projection for frame, typed text,
+        // key, and recovery identifiers.
+        const durableInput = normalized.tool.startsWith("computer.")
+          ? projectDurableToolInput(normalized.tool, publicAction.input ?? {})
+          : publicAction.input ?? {};
+        const sanitized = redactDurableValue({ ...publicAction, tool: normalized.tool, actor: normalized.actor, summary: normalized.effect?.summary, effect: normalized.effect, input: durableInput }, { toolName: normalized.tool }) as ApprovalAction;
         const bindingTag = approvalBindingTag(bindingKey, normalized);
         volatile.set(id, normalized);
         pending.set(id, {
@@ -676,12 +684,14 @@ function buildApprovalEffect(tool: string, input: Record<string, unknown>): Appr
   if (externalEffect) {
     const targetValue = externalEffect.targetFields.map((field) => input[field]).find((value) => value !== undefined);
     const target = boundedEffectText(targetValue, externalEffect.targetFallback);
+    const mutation = tool === "computer.act" ? boundedEffectText(input.action, externalEffect.mutation) : externalEffect.mutation;
+    const summaryAction = tool === "computer.act" ? `${mutation} computer input` : externalEffect.summaryAction;
     return {
       ...base,
-      summary: `Perform one approved ${externalEffect.summaryAction} on ${target}.`,
+      summary: `Perform one approved ${summaryAction} on ${target}.`,
       effectClass: externalEffect.effectClass,
       target,
-      mutation: externalEffect.mutation,
+      mutation,
       payloadDigest: digest,
       recovery: externalEffect.recovery,
       reversible: externalEffect.reversible,

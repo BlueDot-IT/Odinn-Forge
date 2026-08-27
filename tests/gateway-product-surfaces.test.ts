@@ -6,10 +6,16 @@ import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createGatewayServer } from "../apps/gateway/src/server.ts";
+import { createGatewayServer, requiresGatewayDurableExecution } from "../apps/gateway/src/server.ts";
 import { createAuditStore, createRunLedger, isOwnerOnlyPath, SqliteJobStore } from "../packages/kernel/src/index.ts";
 
 const DEFAULT_PROJECT_ID = "project_default";
+
+test("gateway keeps computer mutations on the durable approval continuation path", () => {
+  assert.equal(requiresGatewayDurableExecution("computer.act"), true);
+  assert.equal(requiresGatewayDurableExecution("computer.screen"), false);
+  assert.equal(requiresGatewayDurableExecution("text.echo"), false);
+});
 
 async function gatewayFixture(prefix: string, config?: Record<string, unknown>) {
   const workspaceRoot = await mkdtemp(join(tmpdir(), `${prefix}-workspace-`));
@@ -139,6 +145,17 @@ test("configuration API safely edits config.json and rejects stale writes", asyn
       })
     }, 400);
     assert.match(invalidProvider.error, /unsupported auth mode/);
+    assert.deepEqual(JSON.parse(await readFile(join(gateway.stateDir, "config.json"), "utf8")), external);
+
+    const invalidComputer = await requestJson(`${gateway.base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        config: { ...external, integrations: { computer: { enabled: true, executable: "/tmp/desktop-driver" } } },
+        fingerprint: reloaded.fingerprint
+      })
+    }, 400);
+    assert.match(invalidComputer.error, /integrations\.computer contains unsupported fields/u);
     assert.deepEqual(JSON.parse(await readFile(join(gateway.stateDir, "config.json"), "utf8")), external);
   } finally {
     await gateway.close();

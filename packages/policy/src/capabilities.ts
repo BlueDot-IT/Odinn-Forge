@@ -16,6 +16,7 @@ export const CAPABILITY_REGISTRY = Object.freeze([
   capability("browser.read", "Inspect browser tabs, pages, and recovery state."),
   capability("browser.mutate", "Change browser or remote page state."),
   capability("computer.read", "Inspect a paired computer display."),
+  capability("computer.mutate", "Send bounded input to an explicitly paired computer display."),
   capability("email.read", "Read bounded content from explicitly selected email accounts."),
   capability("calendar.read", "Read bounded events from explicitly selected calendar accounts."),
   capability("agent.delegate", "Delegate bounded work to a child agent."),
@@ -221,6 +222,46 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
     safety: Object.freeze({
       effects: Object.freeze(["read", "credential"] as const),
       reversibility: "pure",
+      requiresCapability: true,
+      requiresApproval: false,
+      retrySafe: false
+    })
+  }),
+  tool("computer.act", ["computer.mutate"], [], {
+    approval: "required",
+    safety: Object.freeze({
+      effects: Object.freeze(["credential", "external-state"] as const),
+      reversibility: "irreversible",
+      requiresCapability: true,
+      requiresApproval: true,
+      retrySafe: false
+    }),
+    approvalEffect: Object.freeze({
+      effectClass: "paired computer mutation",
+      summaryAction: "computer input",
+      targetFallback: "the explicitly paired computer display",
+      targetFields: Object.freeze([]),
+      mutation: "act",
+      recovery: "An uncertain computer input outcome requires operator inspection before another action.",
+      reversible: "uncertain",
+      idempotency: "non-idempotent"
+    })
+  }),
+  tool("computer.recovery.status", ["computer.read"], [], {
+    approval: "not-required",
+    safety: Object.freeze({
+      effects: Object.freeze(["read"] as const),
+      reversibility: "pure",
+      requiresCapability: true,
+      requiresApproval: false,
+      retrySafe: true
+    })
+  }),
+  tool("computer.recovery.resolve", ["computer.mutate"], [], {
+    approval: "not-required",
+    safety: Object.freeze({
+      effects: Object.freeze(["filesystem-write", "external-state"] as const),
+      reversibility: "compensatable",
       requiresCapability: true,
       requiresApproval: false,
       retrySafe: false

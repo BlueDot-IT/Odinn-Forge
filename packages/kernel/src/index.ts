@@ -13,6 +13,7 @@ export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkil
 export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isAllowedCredentialEnvironmentKey, isCredentialEnvironmentName, isPhysicalPathInside, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile, ParsedEnvironmentFiles } from "./environment.ts";
 export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, REMOTE_NODE_READ_PLUGIN_MANIFEST, remoteNodeReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin, COMPUTER_CONTROL_PLUGIN_MANIFEST, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerControlHostCapabilityPlugin, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, REMOTE_NODE_READ_PLUGIN_MANIFEST, remoteNodeReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 export type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool, LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
@@ -27,6 +28,7 @@ import { approvalActionForExecution, createApprovalStore, isApprovalStoreContent
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
 import { closeBrowserManagers } from "./browser.ts";
 import { browserHostCapabilityPlugin, calendarReadHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, remoteNodeReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+import { browserHostCapabilityPlugin, calendarReadHostCapabilityPlugin, computerControlHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, remoteNodeReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 import type { CalendarReadProvider } from "./calendar.ts";
 import type { EmailReadProvider } from "./email.ts";
 import { createGitHubReadClient, normalizeGitHubReadConfig } from "./github.ts";
@@ -61,6 +63,7 @@ export type { GitHubHttpRequest, GitHubHttpResponse, GitHubHttpTransport, GitHub
 export { createRemoteNodeReadClient, createRemoteNodeResponder, diagnoseRemoteNodeReadIntegration, normalizeRemoteNodeDiagnosticsResponse, normalizeRemoteNodeReadConfig, normalizeRemoteNodeStatusResponse, REMOTE_NODE_DIAGNOSTICS_PATH, REMOTE_NODE_PROTOCOL_VERSION, REMOTE_NODE_STATUS_PATH } from "./remote-node.ts";
 export type { RemoteNodeCheckName, RemoteNodeDiagnosticCheck, RemoteNodeDiagnosticsResponse, RemoteNodeDiagnosticsSnapshot, RemoteNodeEndpointConfig, RemoteNodeHttpRequest, RemoteNodeHttpResponse, RemoteNodeHttpTransport, RemoteNodeReadClient, RemoteNodeReadConfig, RemoteNodeReadDiagnostic, RemoteNodeReadKind, RemoteNodeReadTarget, RemoteNodeResponderOptions, RemoteNodeStatusResponse, RemoteNodeStatusSnapshot } from "./remote-node.ts";
 import type { SandboxProcessInput } from "./sandbox-process.ts";
+import { createMacOSComputerControlProvider, normalizeMacOSComputerConfig } from "./macos-computer.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
@@ -69,8 +72,10 @@ export type { ProcessExecutionDescriptor, ProcessExecutionSession, ProcessRecove
 export { ExtensionRegistry, ExtensionExecutor, extensionIdentityFingerprint, resolveConfiguredOciBackend } from "./extensions.ts";
 export { PLUGIN_CONTRACT_SCHEMA_VERSION, pluginIdentityFingerprint, validatePluginManifest } from "./plugin-contracts.ts";
 export type { PluginKind, PluginManifest, PluginRuntime, PluginToolContract, PluginToolIdempotency } from "./plugin-contracts.ts";
-export { captureComputerScreen } from "./computer.ts";
-export type { ComputerScreenCaptureRequest, ComputerScreenProvider, ComputerScreenResult, ComputerScreenTarget } from "./computer.ts";
+export { captureComputerScreen, inspectComputerRecovery, normalizeComputerActionInput, performComputerAction, resolveComputerRecovery } from "./computer.ts";
+export type { ComputerActRequest, ComputerActResult, ComputerAction, ComputerActionInput, ComputerControlProvider, ComputerRecoveryResolution, ComputerRecoveryStatus, ComputerScreenCaptureRequest, ComputerScreenProvider, ComputerScreenResult, ComputerScreenTarget } from "./computer.ts";
+export { createMacOSComputerControlProvider, diagnoseMacOSComputerIntegration, normalizeMacOSComputerConfig, runComputerCommand } from "./macos-computer.ts";
+export type { ComputerCommandRequest, ComputerCommandResult, ComputerCommandRunner, MacOSComputerConfig, MacOSComputerDependencies, MacOSComputerDiagnostic } from "./macos-computer.ts";
 export { listEmailAccounts, readEmail, searchEmail, threadEmail } from "./email.ts";
 export type { EmailAccount, EmailAccountMetadataTrust, EmailAttachment, EmailMessage, EmailMessageSummary, EmailProviderHealth, EmailProviderTarget, EmailReadProvider, EmailSearchResponse, EmailThreadResponse } from "./email.ts";
 export { listCalendarEvents, listCalendars, readCalendarEvent } from "./calendar.ts";
@@ -152,6 +157,7 @@ function workspaceTraversalSchema(search: boolean) {
 }
 
 export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, calendarReadProvider, enableCalendar = false, githubReadClient, microsoftGraphReadAdapter, remoteNodeReadClient }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, computerControlProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, calendarReadProvider, enableCalendar = false, githubReadClient, microsoftGraphReadAdapter, remoteNodeReadClient }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -983,30 +989,56 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
     };
   }
   let closeComputerScreen = () => {};
-  if (enableComputerScreen === true && computerScreenProvider) {
+  const computerConfig = normalizeMacOSComputerConfig(config?.integrations?.computer);
+  const configuredComputerProvider = computerControlProvider ?? computerScreenProvider
+    ?? (computerConfig.enabled && process.platform === "darwin" ? createMacOSComputerControlProvider(stateDir, computerConfig) : undefined);
+  if ((enableComputerScreen === true || computerConfig.enabled) && configuredComputerProvider) {
     let active = true;
-    const guardedComputerScreenProvider = {
+    const guardedComputerScreenProvider: AnyRecord = {
       get target() {
         if (!active) throw new Error("computer screen provider is closed");
-        return computerScreenProvider.target;
+        return configuredComputerProvider.target;
       },
       capture(request: any) {
         if (!active) throw new Error("computer screen provider is closed");
-        return computerScreenProvider.capture(request);
+        return configuredComputerProvider.capture.call(configuredComputerProvider, request);
       }
     };
     registerHostCapabilityPlugin(registry, computerScreenHostCapabilityPlugin, {
       stateDir,
       approvalStore,
-      computerScreenProvider: guardedComputerScreenProvider
+      computerScreenProvider: guardedComputerScreenProvider as any
     });
+    if (typeof configuredComputerProvider.act === "function") {
+      guardedComputerScreenProvider.act = (request: any) => {
+        if (!active) throw new Error("computer control provider is closed");
+        return configuredComputerProvider.act.call(configuredComputerProvider, request);
+      };
+      if (typeof configuredComputerProvider.recoveryStatus === "function") {
+        guardedComputerScreenProvider.recoveryStatus = () => {
+          if (!active) throw new Error("computer control provider is closed");
+          return configuredComputerProvider.recoveryStatus.call(configuredComputerProvider);
+        };
+      }
+      if (typeof configuredComputerProvider.resolveRecovery === "function") {
+        guardedComputerScreenProvider.resolveRecovery = (request: any) => {
+          if (!active) throw new Error("computer control provider is closed");
+          return configuredComputerProvider.resolveRecovery.call(configuredComputerProvider, request);
+        };
+      }
+      registerHostCapabilityPlugin(registry, computerControlHostCapabilityPlugin, {
+        stateDir,
+        approvalStore,
+        computerControlProvider: guardedComputerScreenProvider as any
+      });
+    }
     closeComputerScreen = () => {
       if (!active) return;
       active = false;
-      const close = computerScreenProvider.close;
+      const close = configuredComputerProvider.close;
       if (typeof close === "function") {
         try {
-          const result = close.call(computerScreenProvider);
+          const result = close.call(configuredComputerProvider);
           if (result && typeof result.then === "function") void result.catch(() => undefined);
         } catch {
           // Provider shutdown is best-effort; the guarded provider is already closed.
@@ -1869,6 +1901,7 @@ function taskRequestDigest(request: any, tool?: AnyRecord, trustedResource?: Rec
     ? projectDurableToolInput(request.tool, requestInput)
     : requestInput;
   const resource = trustedResource ?? (request.tool === "computer.screen" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool) || isRemoteNodeTool(request.tool)
+  const resource = trustedResource ?? (request.tool.startsWith("computer.") || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool) || isRemoteNodeTool(request.tool)
     ? executionResourceForRequest(request.tool, requestInput, tool)
     : undefined);
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown", ...(resource ? { resource } : {}) })).digest("hex");
@@ -2536,6 +2569,12 @@ async function executeTaskThroughAdmission({
       backendReturned = true;
       const uncertain = new Error("MCP execution outcome requires operator review") as NodeError;
       uncertain.code = "MCP_OUTCOME_NEEDS_REVIEW";
+      throw uncertain;
+    }
+    if (request.tool === "computer.act" && output?.status === "needs-review") {
+      backendReturned = true;
+      const uncertain = new Error("computer action outcome requires operator review") as NodeError;
+      uncertain.code = "COMPUTER_OUTCOME_NEEDS_REVIEW";
       throw uncertain;
     }
     backendReturned = true;
