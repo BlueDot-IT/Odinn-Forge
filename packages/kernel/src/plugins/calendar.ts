@@ -1,6 +1,7 @@
 import { hashCalendarProviderIdentifier } from "@odinn/protocol";
 import { listCalendarEvents, listCalendars, readCalendarEvent } from "../calendar.ts";
 import { validatePluginManifest, type PluginManifest } from "../plugin-contracts.ts";
+import { liveOnlyProviderInputSchema } from "../live-only-provider-contracts.ts";
 import type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool } from "./host-capability.ts";
 
 const calendarReadManifest = {
@@ -62,46 +63,21 @@ export const calendarReadHostCapabilityPlugin: HostCapabilityPlugin = {
       ["calendar.calendars", {
         capability: "calendar.read",
         description: "List bounded calendar metadata for one explicitly selected account.",
-        inputSchema: {
-          type: "object",
-          properties: { accountId: { type: "string", minLength: 1, maxLength: 256 } },
-          required: ["accountId"],
-          additionalProperties: false
-        },
+        inputSchema: liveOnlyProviderInputSchema("calendar.calendars"),
         resourceForInput: accountResource,
         execute: async (input: Record<string, unknown>, context: Record<string, any> = {}) => listCalendars(provider, input, context.signal)
       }],
       ["calendar.events", {
         capability: "calendar.read",
         description: "List a bounded time window from one explicitly selected calendar.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            accountId: { type: "string", minLength: 1, maxLength: 256 },
-            calendarId: { type: "string", minLength: 1, maxLength: 256 },
-            start: { type: "string", minLength: 20, maxLength: 64 },
-            end: { type: "string", minLength: 20, maxLength: 64 },
-            limit: { type: "integer", minimum: 1, maximum: 100 }
-          },
-          required: ["accountId", "calendarId", "start", "end"],
-          additionalProperties: false
-        },
+        inputSchema: liveOnlyProviderInputSchema("calendar.events"),
         resourceForInput: calendarResource,
         execute: async (input: Record<string, unknown>, context: Record<string, any> = {}) => listCalendarEvents(provider, input, context.signal)
       }],
       ["calendar.read", {
         capability: "calendar.read",
         description: "Read one event from one explicitly selected calendar.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            accountId: { type: "string", minLength: 1, maxLength: 256 },
-            calendarId: { type: "string", minLength: 1, maxLength: 256 },
-            eventId: { type: "string", minLength: 1, maxLength: 256 }
-          },
-          required: ["accountId", "calendarId", "eventId"],
-          additionalProperties: false
-        },
+        inputSchema: liveOnlyProviderInputSchema("calendar.read"),
         resourceForInput: (input: Record<string, unknown>) => Object.freeze({
           ...calendarResource(input),
           eventDigest: hashCalendarProviderIdentifier(input.eventId, "calendar resource eventId")

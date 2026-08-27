@@ -111,8 +111,8 @@ test("parent results project bounded nested tool and child summaries", async () 
   const fx = await fixture((_request, index) => index === 1 ? {
     id: "nested-tools",
     choices: [{ message: { role: "assistant", content: "", tool_calls: [
-      { id: "echo-call", type: "function", function: { name: "text.echo", arguments: '{"text":"probe"}' } },
-      { id: "child-call", type: "function", function: { name: "agent.delegate", arguments: '{}' } }
+      { id: "echo-call", type: "function", function: { name: "text_x2e_echo", arguments: '{"text":"probe"}' } },
+      { id: "child-call", type: "function", function: { name: "agent_x2e_delegate", arguments: '{}' } }
     ] } }]
   } : { id: "nested-final", choices: [{ message: { role: "assistant", content: "Parent complete." } }] });
   fx.registry.set("agent.delegate", {
@@ -123,8 +123,20 @@ test("parent results project bounded nested tool and child summaries", async () 
     retrySafe: true,
     execute: async () => ({ graphRunId: "graph:test-child", status: "completed" })
   });
+  fx.registry.set("text.echo", {
+    ...fx.registry.get("text.echo"),
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"],
+      additionalProperties: false
+    }
+  });
   try {
     const result = await runTask({ task: { id: "nested-summary", tool: "agent.run", actor: "test", input: { prompt: "Use both tools." } }, auditStore: fx.auditStore, registry: fx.registry });
+    const advertised = fx.requests[0].tools.map((tool: any) => tool.function.name);
+    assert.equal(advertised.includes("text_x2e_echo"), true);
+    assert.equal(advertised.includes("agent_x2e_delegate"), true);
     assert.deepEqual(result.output.nestedExecutionSummary.toolCalls.map((entry: any) => ({ callId: entry.callId, tool: entry.tool, status: entry.status })), [
       { callId: "echo-call", tool: "text.echo", status: "completed" },
       { callId: "child-call", tool: "agent.delegate", status: "completed" }

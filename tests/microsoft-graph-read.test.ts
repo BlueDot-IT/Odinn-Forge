@@ -490,6 +490,219 @@ test("public Graph requests validate semantic live input before completed replay
   }
 });
 
+test("disabled Graph integrations reject forged and otherwise valid completed-run replays before lookup", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-graph-disabled-replay-"));
+  const stateDir = join(workspace, ".odinn");
+  let providerCalls = 0;
+  let auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  let ledger = createRunLedger({ stateDir, workspaceRoot: workspace });
+  let registry = createBuiltInRegistry({
+    workspaceRoot: workspace,
+    stateDir,
+    auditStore,
+    config: { integrations: { microsoftGraph: config }, runLedger: ledger },
+    microsoftGraphReadAdapter: createMicrosoftGraphReadAdapter(config, {
+      environment,
+      resolveNetworkAddresses: publicResolver,
+      transport: async (request) => {
+        providerCalls += 1;
+        return fixture(request);
+      }
+    })
+  });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["email.read", "calendar.read", "network.access", "secret.reference.use"] });
+  const emailRequest = { id: "disabled-email-replay", tool: "email.search", input: { accountId, query: "exact disabled replay", limit: 1 }, actor: "graph-test" };
+  const calendarRequest = { id: "disabled-calendar-replay", tool: "calendar.read", input: { accountId, calendarId: "calendar-1", eventId: "event-1" }, actor: "graph-test" };
+  try {
+    await runTask({ task: emailRequest, auditStore, registry, runLedger: ledger, policy });
+    await runTask({ task: calendarRequest, auditStore, registry, runLedger: ledger, policy });
+    assert.equal(providerCalls, 2);
+    registry.close();
+    ledger.close();
+    auditStore.close();
+
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    ledger = createRunLedger({ stateDir, workspaceRoot: workspace });
+    registry = createBuiltInRegistry({ workspaceRoot: workspace, stateDir, auditStore, config: { runLedger: ledger } });
+    const projectedEmail = projectDurableToolInput("email.search", emailRequest.input) as Record<string, unknown>;
+    await assert.rejects(() => runTask({
+      task: {
+        ...emailRequest,
+        input: {
+          accountId,
+          queryDigest: projectedEmail.queryDigest,
+          queryBytes: projectedEmail.queryBytes,
+          targetDigest: projectedEmail.targetDigest,
+          resource: { providerDigest: "sha256:" + "1".repeat(64), generationDigest: "sha256:" + "2".repeat(64) }
+        }
+      },
+      auditStore, registry, runLedger: ledger, policy
+    }), /email\.search input\.(?:queryDigest is not allowed|query is required)/u);
+
+    for (const request of [emailRequest, calendarRequest]) {
+      await assert.rejects(() => runTask({
+        task: request,
+        auditStore, registry, runLedger: ledger, policy
+      }), (error: any) => error?.code === "LIVE_ONLY_PROVIDER_UNAVAILABLE");
+    }
+    assert.equal(providerCalls, 2, "disabled replay must not call the provider");
+  } finally {
+    registry.close();
+    ledger.close();
+    auditStore.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a live-only provider result fences every later model-selected durable or external tool", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-agent-taint-fence-"));
+  const stateDir = join(temporary, "state");
+  const backup = join(temporary, "backup");
+  const attempts = new Map<string, { tool: string; arguments: Record<string, unknown>; sentinel: string }>([
+    ["memory", { tool: "memory.remember", arguments: { text: "SENTINEL_GRAPH_MEMORY_TAINT_14e9", kind: "project" }, sentinel: "SENTINEL_GRAPH_MEMORY_TAINT_14e9" }],
+    ["session", { tool: "session.message", arguments: { sessionId: "untrusted-session", role: "assistant", content: "SENTINEL_GRAPH_SESSION_TAINT_b032" }, sentinel: "SENTINEL_GRAPH_SESSION_TAINT_b032" }],
+    ["workspace", { tool: "workspace.mutate", arguments: { operation: "write", path: "tainted.txt", content: "SENTINEL_GRAPH_WORKSPACE_TAINT_c51a" }, sentinel: "SENTINEL_GRAPH_WORKSPACE_TAINT_c51a" }],
+    ["process", { tool: "process.exec", arguments: { command: "printf", args: ["SENTINEL_GRAPH_PROCESS_TAINT_8d4b"] }, sentinel: "SENTINEL_GRAPH_PROCESS_TAINT_8d4b" }],
+    ["external", { tool: "web.fetch", arguments: { url: "https://example.com/SENTINEL_GRAPH_EXTERNAL_TAINT_672c" }, sentinel: "SENTINEL_GRAPH_EXTERNAL_TAINT_672c" }]
+  ]);
+  const modelRequests: any[] = [];
+  const provider = createServer(async (request, response) => {
+    let raw = "";
+    for await (const chunk of request) raw += chunk;
+    const body = JSON.parse(raw);
+    modelRequests.push(body);
+    const prompt = body.messages?.find((entry: any) => entry.role === "user")?.content ?? "";
+    const scenario = attempts.get(String(prompt).replace("scenario:", ""));
+    assert.ok(scenario);
+    const hasGraphResult = body.messages?.some((entry: any) => entry.role === "tool");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: hasGraphResult ? `tainted-${scenario.tool}` : "taint-graph-read",
+      choices: [{ message: { role: "assistant", content: "", tool_calls: [{
+        id: hasGraphResult ? `attempt-${scenario.tool}` : "read-private-email",
+        type: "function",
+        function: hasGraphResult
+          ? { name: scenario.tool, arguments: JSON.stringify(scenario.arguments) }
+          : { name: "email.read", arguments: JSON.stringify({ accountId, messageId: "message-1" }) }
+      }] } }]
+    }));
+  });
+  await new Promise<void>((resolveListen) => provider.listen(0, "127.0.0.1", resolveListen));
+  const address = provider.address();
+  assert.ok(address && typeof address === "object");
+  let auditStore: ReturnType<typeof createAuditStore> | undefined;
+  let ledger: ReturnType<typeof createRunLedger> | undefined;
+  let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
+  try {
+    await initializeBackupCompatibleState(stateDir);
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    registry = createBuiltInRegistry({
+      workspaceRoot: temporary,
+      stateDir,
+      auditStore,
+      config: {
+        defaultModel: "synthetic:graph-model",
+        providers: { synthetic: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${address.port}/v1`, models: ["graph-model"] } },
+        integrations: { microsoftGraph: config },
+        runLedger: ledger
+      },
+      microsoftGraphReadAdapter: adapter()
+    });
+    const policy = createDefaultPolicy({
+      allowedCapabilities: ["agent.run", "email.read", "memory.write", "session.write", "workspace.mutate", "process.exec", "web.read", "network.access", "secret.reference.use"]
+    });
+    for (const [scenario, attempted] of attempts) {
+      await assert.rejects(() => runTask({
+        task: { id: `graph-taint-${scenario}`, tool: "agent.run", input: { model: "synthetic:graph-model", prompt: `scenario:${scenario}` }, actor: "graph-test" },
+        auditStore, registry, runLedger: ledger, policy
+      }), (error: any) => error?.code === "AGENT_TOOL_NOT_ADVERTISED");
+      const secondRequest = modelRequests.at(-1);
+      assert.equal(secondRequest.tools, undefined, "the post-Graph turn must advertise no tools");
+      assert.equal((await treePayload(stateDir)).includes(attempted.sentinel), false, `${attempted.tool} input crossed a durable boundary`);
+    }
+    assert.equal(await readFile(join(temporary, "tainted.txt"), "utf8").then(() => true, () => false), false);
+
+    registry.close(); registry = undefined;
+    ledger.close(); ledger = undefined;
+    auditStore.close(); auditStore = undefined;
+    await createStateBackup(stateDir, backup, { applicationVersion: "1.1.2", applicationCommit: "graph-agent-taint-fence" });
+    for (const attempted of attempts.values()) {
+      assert.equal((await treePayload(backup)).includes(attempted.sentinel), false, `backup retained ${attempted.tool} input`);
+    }
+  } finally {
+    registry?.close();
+    ledger?.close();
+    auditStore?.close();
+    await new Promise<void>((resolveClose, rejectClose) => provider.close((error) => error ? rejectClose(error) : resolveClose()));
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("agent execution rejects same-turn post-Graph calls and every unknown or unadvertised tool before dispatch", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-agent-advertised-tool-fence-"));
+  const stateDir = join(temporary, "state");
+  const sentinel = "SENTINEL_SAME_TURN_GRAPH_WRITE_0da4";
+  let mode: "same-turn" | "unknown" | "policy-hidden" = "same-turn";
+  let modelCalls = 0;
+  const provider = createServer(async (_request, response) => {
+    modelCalls += 1;
+    const calls = mode === "same-turn"
+      ? [
+          { id: "read-private-email", type: "function", function: { name: "email.read", arguments: JSON.stringify({ accountId, messageId: "message-1" }) } },
+          { id: "remember-private-email", type: "function", function: { name: "memory.remember", arguments: JSON.stringify({ text: sentinel }) } }
+        ]
+      : [{ id: `rejected-${mode}`, type: "function", function: { name: mode === "unknown" ? "unknown.retainer" : "memory.remember", arguments: JSON.stringify({ text: sentinel }) } }];
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ id: `advertised-${mode}`, choices: [{ message: { role: "assistant", content: "", tool_calls: calls } }] }));
+  });
+  await new Promise<void>((resolveListen) => provider.listen(0, "127.0.0.1", resolveListen));
+  const address = provider.address();
+  assert.ok(address && typeof address === "object");
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+  const registry = createBuiltInRegistry({
+    workspaceRoot: temporary,
+    stateDir,
+    auditStore,
+    config: {
+      defaultModel: "synthetic:graph-model",
+      providers: { synthetic: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${address.port}/v1`, models: ["graph-model"] } },
+      integrations: { microsoftGraph: config },
+      runLedger: ledger
+    },
+    microsoftGraphReadAdapter: adapter()
+  });
+  try {
+    const broadPolicy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "email.read", "memory.write", "network.access", "secret.reference.use"] });
+    await assert.rejects(() => runTask({
+      task: { id: "same-turn-live-only-fence", tool: "agent.run", input: { model: "synthetic:graph-model", prompt: "same turn" }, actor: "graph-test" },
+      auditStore, registry, runLedger: ledger, policy: broadPolicy
+    }), (error: any) => error?.code === "LIVE_ONLY_PROVIDER_TOOL_FENCE");
+
+    mode = "unknown";
+    await assert.rejects(() => runTask({
+      task: { id: "unknown-tool-fence", tool: "agent.run", input: { model: "synthetic:graph-model", prompt: "unknown" }, actor: "graph-test" },
+      auditStore, registry, runLedger: ledger, policy: broadPolicy
+    }), (error: any) => error?.code === "AGENT_TOOL_NOT_ADVERTISED");
+
+    mode = "policy-hidden";
+    const narrowPolicy = createDefaultPolicy({ allowedCapabilities: ["agent.run"] });
+    await assert.rejects(() => runTask({
+      task: { id: "policy-hidden-tool-fence", tool: "agent.run", input: { model: "synthetic:graph-model", prompt: "hidden" }, actor: "graph-test" },
+      auditStore, registry, runLedger: ledger, policy: narrowPolicy
+    }), (error: any) => error?.code === "AGENT_TOOL_NOT_ADVERTISED");
+    assert.equal(modelCalls, 3);
+    assert.equal((await treePayload(stateDir)).includes(sentinel), false);
+  } finally {
+    registry.close();
+    ledger.close();
+    auditStore.close();
+    await new Promise<void>((resolveClose, rejectClose) => provider.close((error) => error ? rejectClose(error) : resolveClose()));
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("Graph-derived agent answers stay live while sessions and ordinary backups retain only a placeholder", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-session-retention-"));
   const stateDir = join(temporary, "state");
@@ -668,6 +881,122 @@ test("startup quarantines an exactly attributable pre-fix Graph-derived session 
     await createStateBackup(stateDir, backup, { applicationVersion: "1.1.2", applicationCommit: "graph-session-quarantine" });
     for (const rootPath of [stateDir, backup]) {
       assert.equal((await treePayload(rootPath)).includes(legacyReply), false, `${rootPath} retained the quarantined reply`);
+    }
+  } finally {
+    registry?.close();
+    ledger?.close();
+    auditStore?.close();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("startup quarantines exactly attributable post-Graph session and memory descendants before restart or backup", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-descendant-upgrade-"));
+  const stateDir = join(temporary, "state");
+  const backup = join(temporary, "backup");
+  const sessionSentinel = "SENTINEL_LEGACY_GRAPH_DESCENDANT_SESSION_91b2";
+  const memorySentinel = "SENTINEL_LEGACY_GRAPH_DESCENDANT_MEMORY_6fc8";
+  const memorySubject = "SENTINEL_LEGACY_GRAPH_DESCENDANT_SUBJECT_a304";
+  const parentRunId = "legacy-graph-descendant-parent";
+  const sessionRunId = "legacy-graph-descendant-session";
+  const memoryRunId = "legacy-graph-descendant-memory";
+  let auditStore: ReturnType<typeof createAuditStore> | undefined;
+  let ledger: ReturnType<typeof createRunLedger> | undefined;
+  let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
+  try {
+    await initializeBackupCompatibleState(stateDir);
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    registry = createBuiltInRegistry({
+      workspaceRoot: temporary,
+      stateDir,
+      auditStore,
+      config: { integrations: { microsoftGraph: config }, runLedger: ledger },
+      microsoftGraphReadAdapter: adapter()
+    });
+    const policy = createDefaultPolicy({ allowedCapabilities: ["session.write", "memory.write", "email.read", "network.access", "secret.reference.use"] });
+    const created = await runTask({
+      task: { id: "legacy-graph-descendant-session-create", tool: "session.create", input: { title: "Legacy descendant" }, actor: "graph-test" },
+      auditStore, registry, runLedger: ledger, policy
+    });
+    const sessionId = String(created.output.id);
+    ledger.ensureRun({ runId: parentRunId, objective: "pre-fix Graph agent descendant writes" });
+    const parentStep = ledger.beginTool({
+      runId: parentRunId,
+      toolName: "agent.run",
+      input: { sessionId, messages: [{ role: "user", contentDigest: "sha256:" + "3".repeat(64), contentBytes: 10 }] },
+      safety: { effects: ["network", "credential"] }
+    });
+    const preGraphSession = await runTask({
+      task: { id: "legacy-pre-graph-session", tool: "session.message", input: { sessionId, role: "assistant", content: "Benign message written before the provider read." }, actor: "agent" },
+      auditStore, registry, runLedger: ledger, policy, parentRunId
+    });
+    const preGraphMemory = await runTask({
+      task: { id: "legacy-pre-graph-memory", tool: "memory.remember", input: { text: "Benign memory written before the provider read." }, actor: "agent" },
+      auditStore, registry, runLedger: ledger, policy, parentRunId
+    });
+    await runTask({
+      task: { id: "legacy-graph-descendant-read", tool: "email.read", input: { accountId, messageId: "message-1" }, actor: "agent" },
+      auditStore, registry, runLedger: ledger, policy, parentRunId
+    });
+    await runTask({
+      task: { id: sessionRunId, tool: "session.message", input: { sessionId, role: "assistant", content: sessionSentinel }, actor: "agent" },
+      auditStore, registry, runLedger: ledger, policy, parentRunId
+    });
+    await runTask({
+      task: { id: memoryRunId, tool: "memory.remember", input: { text: memorySentinel, subject: memorySubject, tags: [memorySubject] }, actor: "agent" },
+      auditStore, registry, runLedger: ledger, policy, parentRunId
+    });
+    ledger.finishTool({
+      runId: parentRunId,
+      stepId: parentStep.stepId,
+      output: projectDurableToolOutput("agent.run", { content: "safe final answer", provider: "synthetic", model: "graph-model" })
+    });
+    registry.close(); registry = undefined;
+    ledger.close(); ledger = undefined;
+    auditStore.close(); auditStore = undefined;
+    const before = await treePayload(stateDir);
+    assert.equal(before.includes(sessionSentinel), true);
+    assert.equal(before.includes(memorySentinel), true);
+    assert.equal(before.includes(memorySubject), true);
+
+    await ensureStateCompatibility(stateDir, { applicationVersion: "1.1.2", applicationCommit: "graph-descendant-quarantine" });
+    const firstQuarantine = await treePayload(stateDir);
+    await ensureStateCompatibility(stateDir, { applicationVersion: "1.1.2", applicationCommit: "graph-descendant-quarantine" });
+    assert.equal((await treePayload(stateDir)).equals(firstQuarantine), true, "descendant quarantine must be idempotent");
+    const records = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    try {
+      const sessionRecords = await records.queryRecordsPage({ types: ["message.appended"], sessionId, limit: 10 });
+      const quarantinedSession = sessionRecords.records.find((record) => record.id !== preGraphSession.output.id);
+      const retainedSession = sessionRecords.records.find((record) => record.id === preGraphSession.output.id);
+      assert.equal(quarantinedSession?.contentRetention?.contentUnavailable, true);
+      assert.doesNotMatch(String(quarantinedSession?.content), /SENTINEL_LEGACY_GRAPH_DESCENDANT/u);
+      assert.equal(retainedSession?.content, "Benign message written before the provider read.");
+      const memoryRecords = await records.queryRecordsPage({ types: ["memory"], limit: 10 });
+      const quarantinedMemory = memoryRecords.records.find((record) => record.id !== preGraphMemory.output.id);
+      const retainedMemory = memoryRecords.records.find((record) => record.id === preGraphMemory.output.id);
+      assert.equal(quarantinedMemory?.status, "quarantined");
+      assert.equal(quarantinedMemory?.liveOnlyQuarantine?.code, "LIVE_ONLY_DESCENDANT_WRITE_QUARANTINED");
+      assert.doesNotMatch(JSON.stringify(quarantinedMemory), /SENTINEL_LEGACY_GRAPH_DESCENDANT/u);
+      assert.equal(retainedMemory?.text, "Benign memory written before the provider read.");
+      assert.equal(retainedMemory?.status, "active");
+    } finally {
+      records.close();
+    }
+
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    assert.equal((await auditStore.verifyIntegrity({ allowUnsigned: false })).valid, true);
+    auditStore.close(); auditStore = undefined;
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    assert.equal(ledger.verify(sessionRunId).valid, true);
+    assert.equal(ledger.verify(memoryRunId).valid, true);
+    ledger.close(); ledger = undefined;
+    await createStateBackup(stateDir, backup, { applicationVersion: "1.1.2", applicationCommit: "graph-descendant-quarantine" });
+    for (const rootPath of [stateDir, backup]) {
+      const payload = await treePayload(rootPath);
+      for (const sentinel of [sessionSentinel, memorySentinel, memorySubject]) {
+        assert.equal(payload.includes(sentinel), false, `${rootPath} retained ${sentinel}`);
+      }
     }
   } finally {
     registry?.close();

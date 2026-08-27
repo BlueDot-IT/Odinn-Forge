@@ -32,6 +32,15 @@ type QuarantinedMessage = Readonly<{
   content: string;
   projection: ReturnType<typeof projectLiveOnlySessionContent>;
 }>;
+type DescendantRecordBinding = Readonly<{
+  runId: string;
+  recordId: string;
+  tool: "memory.remember" | "session.message";
+  input: RecordValue;
+}>;
+
+const DESCENDANT_CONTENT_RETAINING_TOOLS = new Set(["memory.remember", "session.message"]);
+const DESCENDANT_QUARANTINE_CODE = "LIVE_ONLY_DESCENDANT_WRITE_QUARANTINED";
 
 function hasTable(database: DatabaseSync, table: string): boolean {
   return Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table));
@@ -126,6 +135,129 @@ function attributableSessionBindings(database: DatabaseSync, stateRoot: string):
   return bindings;
 }
 
+function auditRunOrder(stateRoot: string): {
+  started: Map<string, { sequence: number; tool: string }>;
+  completed: Map<string, { sequence: number; tool: string }>;
+} | undefined {
+  const paths = auditConfiguration(stateRoot);
+  if (!paths || !existsSync(paths.databasePath)) return undefined;
+  const audit = new DatabaseSync(paths.databasePath, { readOnly: true });
+  try {
+    if (!hasTable(audit, "audit_events")) return undefined;
+    const keyring = ordinaryRecord(parseJson(readFileSync(paths.keyringPath, "utf8"), "audit keyring"));
+    const keys = ordinaryRecord(keyring?.keys);
+    const state = audit.prepare("SELECT retained_sequence,retained_signature,head_sequence,head_signature,current_key_id FROM audit_state WHERE singleton=1").get() as SqlRow | undefined;
+    if (!keys || !state) throw new Error("signed audit order is unavailable during live-only descendant quarantine");
+    let cursor = Number(state.retained_sequence);
+    let previous = state.retained_signature === null ? null : String(state.retained_signature);
+    const signedRows = audit.prepare("SELECT sequence,event_json,key_id,previous_signature,signature FROM audit_events ORDER BY sequence").all() as SqlRow[];
+    for (const row of signedRows) {
+      const event = ordinaryRecord(parseJson(String(row.event_json), `audit event ${String(row.sequence)}`));
+      const integrity = ordinaryRecord(ordinaryRecord(event?.data)?.__odinnIntegrity);
+      const keyId = typeof integrity?.keyId === "string" ? integrity.keyId : "";
+      const secret = typeof keys[keyId] === "string" ? Buffer.from(keys[keyId], "base64") : undefined;
+      const expected = event && secret?.length
+        ? createHmac("sha256", secret).update(JSON.stringify({ event: unsignedAuditEvent(event), previous })).digest("base64url")
+        : undefined;
+      if (Number(row.sequence) !== cursor + 1
+        || !integrity
+        || integrity.previous !== previous
+        || integrity.signature !== expected
+        || row.key_id !== keyId
+        || row.previous_signature !== integrity.previous
+        || row.signature !== integrity.signature) {
+        throw new Error("signed audit order failed integrity validation during live-only descendant quarantine");
+      }
+      cursor = Number(row.sequence);
+      previous = String(integrity.signature);
+    }
+    if (cursor !== Number(state.head_sequence)
+      || previous !== (state.head_signature === null ? null : String(state.head_signature))
+      || (state.current_key_id !== null && typeof keys[String(state.current_key_id)] !== "string")) {
+      throw new Error("signed audit head failed integrity validation during live-only descendant quarantine");
+    }
+    const started = new Map<string, { sequence: number; tool: string }>();
+    const completed = new Map<string, { sequence: number; tool: string }>();
+    const rows = audit.prepare("SELECT sequence,run_id,type,event_json FROM audit_events WHERE type IN ('task.started','task.completed') ORDER BY sequence").all() as SqlRow[];
+    for (const row of rows) {
+      const event = ordinaryRecord(parseJson(String(row.event_json), `audit event ${String(row.sequence)}`));
+      if (!event || event.runId !== row.run_id || event.type !== row.type || typeof event.tool !== "string") continue;
+      const target = row.type === "task.started" ? started : completed;
+      if (!target.has(String(row.run_id))) target.set(String(row.run_id), { sequence: Number(row.sequence), tool: event.tool });
+    }
+    return { started, completed };
+  } finally {
+    audit.close();
+  }
+}
+
+/**
+ * Bind historical record writes only when the runtime parent edge, successful
+ * tool steps, and global signed-audit order all agree that the write occurred
+ * after a completed live-only read in the same agent execution tree.
+ */
+function attributableDescendantRecordBindings(database: DatabaseSync, stateRoot: string): DescendantRecordBinding[] {
+  if (!hasTable(database, "runs") || !hasTable(database, "run_steps")) return [];
+  const parents = new Map<string, string>();
+  for (const row of database.prepare("SELECT id,parent_run_id FROM runs WHERE parent_run_id IS NOT NULL").all() as SqlRow[]) {
+    parents.set(String(row.id), String(row.parent_run_id));
+  }
+  const steps = database.prepare(`SELECT r.id AS run_id,r.parent_run_id,s.status,s.input_digest,s.output_digest,s.metadata_json
+    FROM runs r JOIN run_steps s ON s.run_id=r.id WHERE r.parent_run_id IS NOT NULL ORDER BY r.id,s.sequence`).all() as SqlRow[];
+  if (!steps.some((step) => step.status === "succeeded" && LIVE_ONLY_TOOLS.has(toolName(step)))) return [];
+  const order = auditRunOrder(stateRoot);
+  if (!order) return [];
+  const taintSequenceByParent = new Map<string, number>();
+  for (const step of steps) {
+    const runId = String(step.run_id);
+    const tool = toolName(step);
+    const completion = order.completed.get(runId);
+    if (!LIVE_ONLY_TOOLS.has(tool) || step.status !== "succeeded" || !completion || completion.tool !== tool) continue;
+    const parentRunId = String(step.parent_run_id);
+    const prior = taintSequenceByParent.get(parentRunId);
+    if (prior === undefined || completion.sequence < prior) taintSequenceByParent.set(parentRunId, completion.sequence);
+  }
+  const taintSequenceForRun = (runId: string): number | undefined => {
+    const visited = new Set<string>();
+    let ancestor = parents.get(runId);
+    while (ancestor && !visited.has(ancestor)) {
+      visited.add(ancestor);
+      const sequence = taintSequenceByParent.get(ancestor);
+      if (sequence !== undefined) return sequence;
+      ancestor = parents.get(ancestor);
+    }
+    return undefined;
+  };
+  const bindings: DescendantRecordBinding[] = [];
+  for (const step of steps) {
+    const runId = String(step.run_id);
+    const tool = toolName(step);
+    const started = order.started.get(runId);
+    const taintSequence = taintSequenceForRun(runId);
+    if (!DESCENDANT_CONTENT_RETAINING_TOOLS.has(tool)
+      || step.status !== "succeeded"
+      || !started
+      || started.tool !== tool
+      || taintSequence === undefined
+      || started.sequence <= taintSequence) continue;
+    const input = ordinaryRecord(readArtifact(database, stateRoot, step.input_digest));
+    const output = ordinaryRecord(readArtifact(database, stateRoot, step.output_digest));
+    if (!input || !output || output.duplicate === true || typeof output.id !== "string") continue;
+    if (tool === "session.message") {
+      if (output.type !== "message.appended"
+        || typeof input.sessionId !== "string"
+        || typeof input.content !== "string"
+        || output.sessionId !== input.sessionId
+        || output.content !== input.content) continue;
+      bindings.push({ runId, recordId: output.id, tool, input });
+      continue;
+    }
+    if (output.type !== "memory" || typeof input.text !== "string" || output.text !== input.text) continue;
+    bindings.push({ runId, recordId: output.id, tool: "memory.remember", input });
+  }
+  return bindings;
+}
+
 function bindingForMessage(record: RecordValue, bindings: SessionBinding[]): SessionBinding | undefined {
   if (record.role !== "assistant" || typeof record.sessionId !== "string" || typeof record.content !== "string") return undefined;
   if (record.contentRetention?.mode === "live-only-provider-read") return undefined;
@@ -195,16 +327,117 @@ function quarantineRecordDatabase(path: string, bindings: SessionBinding[], migr
   return messages;
 }
 
+function memorySensitiveValues(record: RecordValue, input: RecordValue): string[] {
+  const values = new Set<string>();
+  for (const key of ["text", "summary"] as const) {
+    if (typeof record[key] === "string" && record[key]) values.add(record[key]);
+  }
+  for (const key of ["subject", "safeToAct", "avoid"] as const) {
+    if (typeof input[key] === "string" && input[key] && record[key] === input[key]) values.add(input[key]);
+  }
+  if (Array.isArray(input.tags) && Array.isArray(record.tags)) {
+    for (const tag of input.tags) if (typeof tag === "string" && record.tags.includes(tag)) values.add(tag);
+  }
+  return [...values];
+}
+
+function quarantinedMemoryRecord(record: RecordValue, migratedAt: string): JsonObject {
+  const projection = projectLiveOnlySessionContent(record.text);
+  const { origin: _origin, safeToAct: _safeToAct, avoid: _avoid, ...retained } = record;
+  return {
+    ...retained,
+    status: "quarantined",
+    subject: "live-only content quarantined",
+    namespace: `quarantined/live-only/${String(record.id)}`,
+    summary: LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER,
+    text: LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER,
+    tags: [],
+    liveOnlyQuarantine: {
+      schemaVersion: 1,
+      code: DESCENDANT_QUARANTINE_CODE,
+      contentUnavailable: true,
+      contentDigest: projection.contentDigest,
+      contentBytes: projection.contentBytes,
+      quarantinedAfterUpgrade: true,
+      quarantinedAt: migratedAt
+    }
+  };
+}
+
+function quarantineDescendantRecordDatabase(
+  path: string,
+  bindings: DescendantRecordBinding[],
+  migratedAt: string,
+  applyChanges: boolean
+): QuarantinedMessage[] {
+  if (bindings.length === 0) return [];
+  const database = new DatabaseSync(path);
+  const contents: QuarantinedMessage[] = [];
+  try {
+    database.exec("PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; BEGIN IMMEDIATE");
+    try {
+      for (const binding of bindings) {
+        const row = database.prepare("SELECT payload_json FROM record_events WHERE id=?").get(binding.recordId) as SqlRow | undefined;
+        const record = row ? ordinaryRecord(parseJson(String(row.payload_json), `record ${binding.recordId}`)) : undefined;
+        if (!record || record.id !== binding.recordId || record.liveOnlyQuarantine?.code === DESCENDANT_QUARANTINE_CODE) continue;
+        if (binding.tool === "session.message") {
+          if (record.type !== "message.appended"
+            || record.sessionId !== binding.input.sessionId
+            || record.content !== binding.input.content
+            || typeof record.content !== "string"
+            || record.contentRetention?.mode === "live-only-provider-read") continue;
+          const projection = projectLiveOnlySessionContent(record.content);
+          contents.push({ sessionId: String(record.sessionId), content: record.content, projection });
+          if (applyChanges) database.prepare("UPDATE record_events SET payload_json=? WHERE id=?")
+            .run(canonicalJson(quarantinedMessageRecord(record, projection, migratedAt)), binding.recordId);
+          continue;
+        }
+        if (record.type !== "memory" || record.text !== binding.input.text || typeof record.text !== "string") continue;
+        for (const content of memorySensitiveValues(record, binding.input)) {
+          contents.push({ sessionId: "", content, projection: projectLiveOnlySessionContent(content) });
+        }
+        if (applyChanges) {
+          const quarantined = quarantinedMemoryRecord(record, migratedAt);
+          database.prepare("UPDATE record_events SET payload_json=?,status=?,namespace=?,subject=? WHERE id=?")
+            .run(canonicalJson(quarantined), String(quarantined.status), String(quarantined.namespace), String(quarantined.subject), binding.recordId);
+        }
+      }
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    if (applyChanges && contents.length > 0) {
+      database.prepare("PRAGMA wal_checkpoint(TRUNCATE)").all();
+      database.exec("VACUUM");
+      database.prepare("PRAGMA wal_checkpoint(TRUNCATE)").all();
+    }
+  } finally {
+    database.close();
+  }
+  return contents;
+}
+
 function projectionForContent(content: string, messages: QuarantinedMessage[]) {
   return messages.find((message) => message.content === content)?.projection;
 }
 
-function replaceSensitiveContent(value: unknown, messages: QuarantinedMessage[], migratedAt: string): unknown {
+function replaceSensitiveContent(
+  value: unknown,
+  messages: QuarantinedMessage[],
+  migratedAt: string,
+  descendantBindings: ReadonlyMap<string, DescendantRecordBinding> = new Map()
+): unknown {
   if (typeof value === "string") return projectionForContent(value, messages)?.content ?? value;
-  if (Array.isArray(value)) return value.map((item) => replaceSensitiveContent(item, messages, migratedAt));
+  if (Array.isArray(value)) return value.map((item) => replaceSensitiveContent(item, messages, migratedAt, descendantBindings));
   if (!value || typeof value !== "object") return value;
   const source = value as RecordValue;
-  const next = Object.fromEntries(Object.entries(source).map(([key, item]) => [key, replaceSensitiveContent(item, messages, migratedAt)]));
+  const descendant = typeof source.id === "string" ? descendantBindings.get(source.id) : undefined;
+  if (descendant?.tool === "memory.remember" && source.type === "memory") return quarantinedMemoryRecord(source, migratedAt);
+  if (descendant?.tool === "session.message" && source.type === "message.appended" && typeof source.content === "string") {
+    return quarantinedMessageRecord(source, projectLiveOnlySessionContent(source.content), migratedAt);
+  }
+  const next = Object.fromEntries(Object.entries(source).map(([key, item]) => [key, replaceSensitiveContent(item, messages, migratedAt, descendantBindings)]));
   if (typeof source.content === "string") {
     const projection = projectionForContent(source.content, messages);
     if (projection) {
@@ -283,8 +516,16 @@ function rewriteRunLedgerEvents(database: DatabaseSync, runId: string, digestRep
   }
 }
 
-function sanitizeRuntimeDatabase(path: string, stateRoot: string, messages: QuarantinedMessage[], migratedAt: string): Set<string> {
+function sanitizeRuntimeDatabase(
+  path: string,
+  stateRoot: string,
+  messages: QuarantinedMessage[],
+  migratedAt: string,
+  descendantBindings: DescendantRecordBinding[] = []
+): Set<string> {
   const affectedRuns = new Set<string>();
+  for (const binding of descendantBindings) affectedRuns.add(binding.runId);
+  const descendantByRecordId = new Map(descendantBindings.map((binding) => [binding.recordId, binding]));
   const database = new DatabaseSync(path);
   const obsoleteArtifacts = new Set<string>();
   const retainedArtifacts = new Set<string>();
@@ -308,7 +549,7 @@ function sanitizeRuntimeDatabase(path: string, stateRoot: string, messages: Quar
           retainedArtifacts.add(oldDigest);
           continue;
         }
-        const safe = replaceSensitiveContent(raw, messages, migratedAt);
+        const safe = replaceSensitiveContent(raw, messages, migratedAt, descendantByRecordId);
         if (canonicalJson(raw) === canonicalJson(safe)) {
           retainedArtifacts.add(oldDigest);
           continue;
@@ -325,7 +566,7 @@ function sanitizeRuntimeDatabase(path: string, stateRoot: string, messages: Quar
         if (hasTable(database, "policy_evaluations")) {
           const rows = database.prepare("SELECT id,input_json FROM policy_evaluations WHERE run_id=?").all(runId) as SqlRow[];
           for (const row of rows) database.prepare("UPDATE policy_evaluations SET input_json=? WHERE id=?")
-            .run(canonicalJson(replaceSensitiveContent(parseJson(String(row.input_json), "policy evaluation"), messages, migratedAt)), row.id);
+            .run(canonicalJson(replaceSensitiveContent(parseJson(String(row.input_json), "policy evaluation"), messages, migratedAt, descendantByRecordId)), row.id);
         }
         rewriteRunLedgerEvents(database, runId, replacements);
       }
@@ -403,7 +644,13 @@ function segmentInventory(rows: SqlRow[]): RecordValue[] {
   }));
 }
 
-function sanitizeAuditDatabase(stateRoot: string, messages: QuarantinedMessage[], migratedAt: string, runtimeRuns: Set<string>): number {
+function sanitizeAuditDatabase(
+  stateRoot: string,
+  messages: QuarantinedMessage[],
+  migratedAt: string,
+  runtimeRuns: Set<string>,
+  descendantBindings: DescendantRecordBinding[] = []
+): number {
   const paths = auditConfiguration(stateRoot);
   if (!paths || !existsSync(paths.databasePath)) return 0;
   const database = new DatabaseSync(paths.databasePath);
@@ -411,6 +658,7 @@ function sanitizeAuditDatabase(stateRoot: string, messages: QuarantinedMessage[]
   try {
     const rows = database.prepare("SELECT sequence,run_id,event_json FROM audit_events ORDER BY sequence").all() as SqlRow[];
     const affectedRuns = new Set(runtimeRuns);
+    const descendantByRecordId = new Map(descendantBindings.map((binding) => [binding.recordId, binding]));
     for (const row of rows) {
       const event = ordinaryRecord(parseJson(String(row.event_json), `audit event ${String(row.sequence)}`));
       const input = ordinaryRecord(event?.data)?.input;
@@ -438,7 +686,7 @@ function sanitizeAuditDatabase(stateRoot: string, messages: QuarantinedMessage[]
       for (const row of rows) {
         const event = ordinaryRecord(parseJson(String(row.event_json), `audit event ${String(row.sequence)}`))!;
         let safeEvent = affectedRuns.has(String(row.run_id))
-          ? replaceSensitiveContent(unsignedAuditEvent(event), messages, migratedAt) as RecordValue
+          ? replaceSensitiveContent(unsignedAuditEvent(event), messages, migratedAt, descendantByRecordId) as RecordValue
           : unsignedAuditEvent(event);
         const sequence = Number(row.sequence);
         const segmentIndex = projectedSegments.findIndex((segment) => sequence >= Number(segment.first_sequence)
@@ -490,7 +738,7 @@ function sanitizeAuditDatabase(stateRoot: string, messages: QuarantinedMessage[]
       for (const summary of summaries) {
         if (!affectedRuns.has(String(summary.run_id))) continue;
         database.prepare("UPDATE audit_runs SET summary_json=? WHERE run_id=?")
-          .run(canonicalJson(replaceSensitiveContent(parseJson(String(summary.summary_json), "audit run summary"), messages, migratedAt)), summary.run_id);
+          .run(canonicalJson(replaceSensitiveContent(parseJson(String(summary.summary_json), "audit run summary"), messages, migratedAt, descendantByRecordId)), summary.run_id);
       }
       database.exec("COMMIT");
     } catch (error) {
@@ -519,21 +767,29 @@ export function quarantineLegacyLiveOnlySessionState(stateRoot: string): number 
   if (!existsSync(runtimePath) || !existsSync(recordsPath)) return 0;
   const runtime = new DatabaseSync(runtimePath, { readOnly: true });
   let bindings: SessionBinding[];
+  let descendantBindings: DescendantRecordBinding[];
   try {
     bindings = attributableSessionBindings(runtime, stateRoot);
+    descendantBindings = attributableDescendantRecordBindings(runtime, stateRoot);
   } finally {
     runtime.close();
   }
-  if (bindings.length === 0) return 0;
+  if (bindings.length === 0 && descendantBindings.length === 0) return 0;
   const migratedAt = new Date().toISOString();
   // Discover first, then remove attributable copies from the auxiliary
   // ledger/audit stores. Keeping the authoritative record unchanged until
   // those rewrites succeed makes an interrupted run safely retryable.
-  const messages = quarantineRecordDatabase(recordsPath, bindings, migratedAt, false);
+  const messages = [
+    ...quarantineRecordDatabase(recordsPath, bindings, migratedAt, false),
+    ...quarantineDescendantRecordDatabase(recordsPath, descendantBindings, migratedAt, false)
+  ];
   if (messages.length === 0) return 0;
-  const affectedRuns = sanitizeRuntimeDatabase(runtimePath, stateRoot, messages, migratedAt);
-  sanitizeAuditDatabase(stateRoot, messages, migratedAt, affectedRuns);
-  const applied = quarantineRecordDatabase(recordsPath, bindings, migratedAt, true);
+  const affectedRuns = sanitizeRuntimeDatabase(runtimePath, stateRoot, messages, migratedAt, descendantBindings);
+  sanitizeAuditDatabase(stateRoot, messages, migratedAt, affectedRuns, descendantBindings);
+  const applied = [
+    ...quarantineRecordDatabase(recordsPath, bindings, migratedAt, true),
+    ...quarantineDescendantRecordDatabase(recordsPath, descendantBindings, migratedAt, true)
+  ];
   if (applied.length !== messages.length) throw new Error("live-only session state changed during startup quarantine");
   return messages.length;
 }

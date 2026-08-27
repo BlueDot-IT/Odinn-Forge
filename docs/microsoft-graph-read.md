@@ -107,6 +107,14 @@ model answer derived from it. After reload, saved history therefore explains
 that a fresh authorized read is required instead of reconstructing old mail or
 calendar content.
 
+A successful email or calendar result taints that agent execution as
+live-only. The next model turn receives no tools and may only form the visible
+final answer; any additional tool call is rejected. This prevents provider
+content or instructions embedded in it from reaching memory, sessions,
+workspace mutation, processes, browsers, web services, MCP, or another
+external surface. Every model tool call must also match the exact schema set
+advertised for that turn, including when no tools are advertised.
+
 These tools are deliberately unavailable as durable workflow steps or cron
 targets. Workflow definitions and cron schedules are ordinary backed-up state,
 so admitting a live-only provider target there would retain private inputs or
@@ -114,7 +122,11 @@ results beyond the authorized call. Submit a new interactive authorized read
 instead. Existing completed email runs from the immediately preceding durable
 format remain recognizable for content-unavailable replay after upgrade; that
 compatibility check is limited to an exact completed-run binding and never
-replays Graph or writes a legacy identifier projection.
+replays Graph or writes a legacy identifier projection. Public email/calendar
+input is validated against immutable built-in schemas before completed-run
+lookup. Replay also requires the active integration's trusted provider and
+generation binding; disabling or losing the integration fails closed, and a
+caller-supplied fallback resource cannot authorize replay.
 
 Startup also handles state written by the immediately preceding build before
 this live-only admission rule existed. Before compatibility migration can make
@@ -127,9 +139,12 @@ cannot be recovered through Odinn; the operator must submit a fresh live read.
 Where a prior assistant session message has an exact session-and-content-digest
 binding to an agent run with an email/calendar child read, startup replaces the
 message and its attributable audit/ledger copies with the same unavailable
-placeholder. Ambiguous messages are not guessed at. SQLite secure deletion,
-vacuum, and WAL truncation remove the superseded pages before a new migration
-or ordinary backup is created.
+placeholder. Startup also quarantines a later session or memory write only when
+the runtime parent edge, successful tool records, exact authoritative record
+ID, and signed global audit order all bind it to the post-read portion of that
+same agent execution tree. Earlier or otherwise ambiguous records are not
+guessed at. SQLite secure deletion, vacuum, and WAL truncation remove the
+superseded pages before a new migration or ordinary backup is created.
 
 Backups and audit archives created before this upgrade are historical copies;
 Odinn cannot retroactively rewrite copies that are no longer the active state
@@ -152,8 +167,10 @@ responses, provider-specific untrusted account metadata, durable
 workflow/cron refusal, policy-invariant projections, immediate-parent
 cron/workflow/runtime-job quarantine, SQLite/WAL/full-state and ordinary-backup
 sentinel scans, attributable session/audit/ledger quarantine, live caller plus
-durable-placeholder behavior, exact immediate-base upgrade replay, pre-replay
-semantic request validation, durable redaction, and
+durable-placeholder behavior, post-read memory/session descendant quarantine,
+post-read model tool fencing, exact advertised-tool enforcement, exact
+immediate-base upgrade replay, active and disabled-integration pre-replay
+semantic/resource validation, durable redaction, and
 restart no-replay behavior. Live service
 availability, tenant consent, account permissions, throttling, and conditional
 access remain provider-dependent acceptance gates.

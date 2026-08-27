@@ -1,6 +1,7 @@
 import { durableEmailProviderIdentifier, hashEmailProviderIdentifier } from "@odinn/protocol";
 import { listEmailAccounts, readEmail, searchEmail, threadEmail } from "../email.ts";
 import { validatePluginManifest, type PluginManifest } from "../plugin-contracts.ts";
+import { liveOnlyProviderInputSchema } from "../live-only-provider-contracts.ts";
 import type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool } from "./host-capability.ts";
 
 const emailReadManifest = {
@@ -85,7 +86,7 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
       ["email.accounts", {
         capability: "email.read",
         description: "List configured email accounts and bounded provider health metadata.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        inputSchema: liveOnlyProviderInputSchema("email.accounts"),
         resourceForInput: resourceForProvider,
         legacyRequestResourceForInput: legacyRequestResourceForProvider,
         execute: async (_input: unknown, context: Record<string, any> = {}) => listEmailAccounts(pluginContext.emailReadProvider!, context.signal)
@@ -93,17 +94,7 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
       ["email.search", {
         capability: "email.read",
         description: "Search messages in one explicitly selected email account.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            accountId: { type: "string", minLength: 1, maxLength: 256 },
-            query: { type: "string", minLength: 1, maxLength: 2_048 },
-            limit: { type: "integer", minimum: 1, maximum: 100 },
-            cursor: { type: "string", minLength: 1, maxLength: 4_096 }
-          },
-          required: ["accountId", "query"],
-          additionalProperties: false
-        },
+        inputSchema: liveOnlyProviderInputSchema("email.search"),
         resourceForInput: resourceForAccount,
         legacyRequestResourceForInput: legacyRequestResourceForAccount,
         execute: async (input: Record<string, unknown>, context: Record<string, any> = {}) => searchEmail(pluginContext.emailReadProvider!, input, context.signal)
@@ -111,15 +102,7 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
       ["email.read", {
         capability: "email.read",
         description: "Read one message from one explicitly selected email account.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            accountId: { type: "string", minLength: 1, maxLength: 256 },
-            messageId: { type: "string", minLength: 1, maxLength: 256 }
-          },
-          required: ["accountId", "messageId"],
-          additionalProperties: false
-        },
+        inputSchema: liveOnlyProviderInputSchema("email.read"),
         resourceForInput: (input: Record<string, unknown>) => ({
           ...resourceForAccount(input),
           messageDigest: hashEmailProviderIdentifier(input.messageId, "email resource messageId")
@@ -130,16 +113,7 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
       ["email.thread", {
         capability: "email.read",
         description: "Read a bounded message thread from one explicitly selected email account.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            accountId: { type: "string", minLength: 1, maxLength: 256 },
-            threadId: { type: "string", minLength: 1, maxLength: 256 },
-            limit: { type: "integer", minimum: 1, maximum: 100 }
-          },
-          required: ["accountId", "threadId"],
-          additionalProperties: false
-        },
+        inputSchema: liveOnlyProviderInputSchema("email.thread"),
         resourceForInput: (input: Record<string, unknown>) => ({
           ...resourceForAccount(input),
           threadDigest: hashEmailProviderIdentifier(input.threadId, "email resource threadId")
