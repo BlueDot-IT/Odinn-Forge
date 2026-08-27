@@ -17,6 +17,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { extractSecureArchive } from "../packages/kernel/src/secure-archive.ts";
 import { createDeterministicStandaloneArchive, normalizeStandaloneTree } from "../scripts/release/standalone-archive.ts";
+import { buildNativeLauncher, verifyNativeLauncher } from "../scripts/release/native-launcher.ts";
 import { standaloneUnixLauncher } from "../scripts/release/standalone-launchers.ts";
 import { sanitizedReleaseEnvironment, trustedTool, type TrustedToolName } from "../scripts/release/trusted-tools.ts";
 
@@ -45,6 +46,7 @@ test("packaged and installed launchers remove hostile TLS settings and ignore PA
     await mkdir(join(packageRoot, "bin"), { recursive: true });
     await mkdir(join(packageRoot, "dist", "cli"), { recursive: true });
     await mkdir(join(packageRoot, "dist", "gateway"), { recursive: true });
+    await mkdir(join(packageRoot, "install"), { recursive: true });
     await mkdir(join(packageRoot, "runtime"), { recursive: true });
     await mkdir(join(packageRoot, "THIRD_PARTY_NOTICES"), { recursive: true });
     await copyFile(process.execPath, runtime);
@@ -54,6 +56,32 @@ test("packaged and installed launchers remove hostile TLS settings and ignore PA
     const policyBytes = Buffer.from("test controlled runtime policy\n");
     const runtimePolicySha256 = createHash("sha256").update(policyBytes).digest("hex");
     await writeFile(policyPath, policyBytes);
+    const launcher = join(packageRoot, "bin", "odinn");
+    await buildNativeLauncher("linux-x64", launcher);
+    const launcherBytes = await readFile(launcher);
+    const launcherSha256 = createHash("sha256").update(launcherBytes).digest("hex");
+    verifyNativeLauncher(launcherBytes, "linux-x64");
+    await writeFile(join(packageRoot, "bin", "odinn-gateway"), launcherBytes, { mode: 0o755 });
+    await writeFile(join(packageRoot, "install", "install.sh"), launcherBytes, { mode: 0o755 });
+    const preloadSource = join(temporary, "hostile-preload.c");
+    const preloadLibrary = join(temporary, "hostile-preload.so");
+    const preloadSentinel = join(sentinelRoot, "preload");
+    await writeFile(preloadSource, `
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+__attribute__((constructor)) static void mark_preload(void) {
+  const char *path = getenv("ODINN_PRELOAD_SENTINEL");
+  if (path == NULL) return;
+  const int descriptor = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+  if (descriptor >= 0) close(descriptor);
+}
+`);
+    const preloadBuild = spawnSync(trustedTool("cc"), ["-shared", "-fPIC", preloadSource, "-o", preloadLibrary], {
+      encoding: "utf8",
+      env: sanitizedReleaseEnvironment()
+    });
+    assert.equal(preloadBuild.status, 0, preloadBuild.stderr);
     const target = `${process.platform}-${process.arch}`;
     const embeddedRuntime = {
       version: process.version.slice(1),
@@ -66,7 +94,7 @@ test("packaged and installed launchers remove hostile TLS settings and ignore PA
       name: "@bluedot-it/odinn",
       version: "1.0.0",
       type: "module",
-      odinnStandalone: { runtime: "node", ...embeddedRuntime }
+      odinnStandalone: { runtime: "node", ...embeddedRuntime, runtimeBoundary: "linux-static-pie", launcherSha256 }
     }, null, 2)}\n`);
     await writeFile(join(packageRoot, "release-info.json"), `${JSON.stringify({
       schemaVersion: 2,
@@ -84,8 +112,9 @@ const result = await fetch(process.argv[2])
 console.log(JSON.stringify({ tls: process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? null, ...result }));
 `);
     await writeFile(join(packageRoot, "dist", "gateway", "server.js"), "export {};\n");
-    const launcher = join(packageRoot, "bin", "odinn");
-    await writeFile(launcher, standaloneUnixLauncher("dist/cli/index.js", "linux-x64", executableSha256), { mode: 0o755 });
+    await writeFile(`${launcher}.runtime.sh`, standaloneUnixLauncher("dist/cli/index.js", "linux-x64", executableSha256));
+    await writeFile(join(packageRoot, "bin", "odinn-gateway.runtime.sh"), standaloneUnixLauncher("dist/gateway/server.js", "linux-x64", executableSha256));
+    await writeFile(join(packageRoot, "install", "install.sh.runtime.sh"), standaloneUnixLauncher("dist/install/install.js", "linux-x64", executableSha256));
 
     const key = join(temporary, "key.pem");
     const certificate = join(temporary, "certificate.pem");
@@ -109,15 +138,21 @@ server.listen(0, "127.0.0.1", () => console.log(server.address().port));
       PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
     };
+    const hostileLoaderEnvironment = {
+      ...hostileEnvironment,
+      LD_PRELOAD: preloadLibrary,
+      ODINN_PRELOAD_SENTINEL: preloadSentinel
+    };
 
     const bypassed = await run(runtime, [join(packageRoot, "dist", "cli", "index.js"), url], temporary, hostileEnvironment);
     assert.equal(bypassed.status, 0, bypassed.stderr);
     assert.deepEqual(JSON.parse(bypassed.stdout), { tls: "0", ok: true, status: 200 });
 
-    const packaged = await run(launcher, [url], temporary, hostileEnvironment);
+    const packaged = await run(launcher, [url], temporary, hostileLoaderEnvironment);
     assert.equal(packaged.status, 0, packaged.stderr);
     assert.equal(JSON.parse(packaged.stdout).tls, null);
     assert.equal(JSON.parse(packaged.stdout).ok, false);
+    await assert.rejects(() => access(preloadSentinel), { code: "ENOENT" });
 
     const prefix = join(temporary, "installed");
     const installed = await run(runtime, [
@@ -126,10 +161,11 @@ server.listen(0, "127.0.0.1", () => console.log(server.address().port));
     ], root, hostileEnvironment);
     assert.equal(installed.status, 0, installed.stderr);
     const installedLauncher = join(prefix, "bin", "odinn");
-    const installedProbe = await run(installedLauncher, [url], temporary, hostileEnvironment);
+    const installedProbe = await run(installedLauncher, [url], temporary, hostileLoaderEnvironment);
     assert.equal(installedProbe.status, 0, installedProbe.stderr);
     assert.equal(JSON.parse(installedProbe.stdout).tls, null);
     assert.equal(JSON.parse(installedProbe.stdout).ok, false);
+    await assert.rejects(() => access(preloadSentinel), { code: "ENOENT" });
 
     for (const name of ["gpg", "gpgv"] as TrustedToolName[]) {
       const result = spawnSync(trustedTool(name), ["--version"], { encoding: "utf8", env: sanitizedReleaseEnvironment({ PATH: fakeBin }) });

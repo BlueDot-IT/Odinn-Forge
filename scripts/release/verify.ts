@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
 import { extractSecureArchive } from "../../packages/kernel/src/secure-archive.ts";
 import { readRuntimePolicy, runtimePolicySha256, verifyRuntimeExecutableIdentity, type RuntimeTarget } from "./node-runtime.ts";
+import { verifyNativeLauncher } from "./native-launcher.ts";
 import { retainsTypeScriptRuntimeReference } from "./typescript-runtime-reference.ts";
 
 const PLAYWRIGHT_VERSION = "1.62.1";
@@ -270,6 +271,14 @@ for (const artifact of standaloneArtifacts) {
     await extractSecureArchive(archive, destination, { expectedRoot: standaloneRoot });
     const packageRoot = join(destination, standaloneRoot);
     const files = (await walk(packageRoot)).sort();
+    const unixLauncherFiles = [
+      "bin/odinn",
+      "bin/odinn.runtime.sh",
+      "bin/odinn-gateway",
+      "bin/odinn-gateway.runtime.sh",
+      "install/install.sh",
+      "install/install.sh.runtime.sh"
+    ];
     for (const required of [
       "runtime/node",
       "runtime/node.exe",
@@ -277,10 +286,10 @@ for (const artifact of standaloneArtifacts) {
       "THIRD_PARTY_NOTICES/NODE_RUNTIME.json",
       "THIRD_PARTY_NOTICES/node-runtime-policy.json",
       "release-info.json",
-      "bin/odinn",
       "bin/odinn.cmd",
-      "install/install.sh",
-      "install/install.ps1"
+      "bin/odinn-gateway.cmd",
+      "install/install.ps1",
+      ...(target === "win32-x64" ? [] : unixLauncherFiles)
     ].filter((path) => !path.startsWith("runtime/") || path === `runtime/${target === "win32-x64" ? "node.exe" : "node"}`)) {
       if (!files.includes(required)) throw new Error(`${artifact.name} is missing ${required}`);
     }
@@ -301,7 +310,10 @@ for (const artifact of standaloneArtifacts) {
       || JSON.stringify(runtimeEvidence) !== JSON.stringify(artifact.embeddedRuntime)) {
       throw new Error(`${artifact.name} release metadata does not bind the embedded runtime`);
     }
-    for (const launcher of ["bin/odinn", "bin/odinn.cmd", "bin/odinn-gateway", "bin/odinn-gateway.cmd", "install/install.sh", "install/install.ps1"]) {
+    const textLaunchers = target === "win32-x64"
+      ? ["bin/odinn.cmd", "bin/odinn-gateway.cmd", "install/install.ps1"]
+      : ["bin/odinn.runtime.sh", "bin/odinn-gateway.runtime.sh", "install/install.sh.runtime.sh", "bin/odinn.cmd", "bin/odinn-gateway.cmd", "install/install.ps1"];
+    for (const launcher of textLaunchers) {
       const content = await readFile(join(packageRoot, launcher), "utf8");
       if (!content.includes("NODE_OPTIONS")
         || !content.includes("NODE_PATH")
@@ -309,8 +321,18 @@ for (const artifact of standaloneArtifacts) {
         || !content.includes("runtime")) {
         throw new Error(`${artifact.name} ${launcher} does not enforce the controlled runtime environment`);
       }
-      if (launcher.endsWith(".sh") || !launcher.includes(".")) {
+      if (launcher.endsWith(".runtime.sh")) {
         if (/exec node\b/u.test(content)) throw new Error(`${artifact.name} ${launcher} falls back to ambient Node`);
+        if (!content.includes("ODINN_NATIVE_BOUNDARY")) throw new Error(`${artifact.name} ${launcher} can bypass the native runtime boundary`);
+      }
+    }
+    if (target === "win32-x64") {
+      for (const path of unixLauncherFiles) {
+        if (files.includes(path)) throw new Error(`${artifact.name} contains an unsupported Unix launcher: ${path}`);
+      }
+    } else {
+      for (const launcher of ["bin/odinn", "bin/odinn-gateway", "install/install.sh"]) {
+        verifyNativeLauncher(await readFile(join(packageRoot, launcher)), target);
       }
     }
     for (const path of files) {

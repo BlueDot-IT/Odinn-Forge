@@ -272,8 +272,17 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /^  verify:\s*[\s\S]*?^    needs: release-policy/m);
   assert.match(
     release,
-    /^  source-package:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- verify/m
+    /^  source-package:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- verify\s*\n\s{6}- native-launchers/m
   );
+  const nativeLaunchers = release.match(/^  native-launchers:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
+  assert.match(nativeLaunchers, /matrix:\s*\n\s+include:\s*\n\s+- os: ubuntu-latest\s*\n\s+target: linux-x64\s*\n\s+- os: macos-15-large\s*\n\s+target: darwin-x64/u);
+  assert.match(nativeLaunchers, /node scripts\/release\/native-launcher\.ts "\$TARGET" "dist\/native-launchers\/odinn-launcher-\$TARGET\.first"/u);
+  assert.match(nativeLaunchers, /cmp "dist\/native-launchers\/odinn-launcher-\$TARGET\.first" "dist\/native-launchers\/odinn-launcher-\$TARGET\.second"/u);
+  assert.match(nativeLaunchers, /name: odinn-native-launcher-\$\{\{ matrix\.target \}\}/u);
+  const sourcePackage = release.match(/^  source-package:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
+  assert.match(sourcePackage, /pattern: odinn-native-launcher-\*/u);
+  assert.match(sourcePackage, /path: dist\/native-launchers/u);
+  assert.match(sourcePackage, /merge-multiple: true/u);
   assert.match(
     release,
     /^  stage-release-assets:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- source-package/m

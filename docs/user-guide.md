@@ -9,6 +9,13 @@ a checksum- and signature-verified Node 24 runtime and do not use ambient
 and npm package intentionally remain Node-dependent for advanced installation
 and unsupported platforms.
 
+On Linux, the standalone entrypoint is a reproducible static PIE that removes
+loader and Node hook variables before starting a fixed companion script. On
+macOS, the equivalent entrypoint is signed with the hardened runtime before it
+performs the same sanitization. Windows uses the fixed system command and
+PowerShell boundary. Release validation injects a real hostile preload probe
+on Unix and rejects any package or installed launcher that admits it.
+
 The standalone installer stages the complete application/runtime pair under
 an immutable version identity before switching the current pointer. Upgrade
 and rollback never mix application and runtime versions; user state and

@@ -67,9 +67,18 @@ test("secure archive admission rejects unsafe paths and collisions before writin
     { name: "absolute", entries: [{ name: "/pkg/file", data: "x" }] },
     { name: "drive", entries: [{ name: "C:/pkg/file", data: "x" }] },
     { name: "backslash", entries: [{ name: "pkg\\outside", data: "x" }] },
+    { name: "alternate data stream", entries: [{ name: "pkg/file:payload", data: "x" }] },
+    { name: "trailing dot", entries: [{ name: "pkg/alias.", data: "x" }] },
+    { name: "trailing space", entries: [{ name: "pkg/alias ", data: "x" }] },
+    { name: "reserved con", entries: [{ name: "pkg/CON", data: "x" }] },
+    { name: "reserved device extension", entries: [{ name: "pkg/aux.txt", data: "x" }] },
+    { name: "reserved numbered device", entries: [{ name: "pkg/Lpt1.log", data: "x" }] },
+    { name: "reserved superscript device", entries: [{ name: "pkg/COM¹.txt", data: "x" }] },
+    { name: "Win32 wildcard", entries: [{ name: "pkg/a?b", data: "x" }] },
     { name: "duplicate", entries: [{ name: "pkg/file", data: "x" }, { name: "pkg/file", data: "y" }] },
     { name: "case collision", entries: [{ name: "pkg/File", data: "x" }, { name: "pkg/file", data: "y" }] },
     { name: "unicode collision", entries: [{ name: "pkg/café", data: "x" }, { name: "pkg/cafe\u0301", data: "y" }] },
+    { name: "unicode casefold collision", entries: [{ name: "pkg/straße", data: "x" }, { name: "pkg/STRASSE", data: "y" }] },
     { name: "alien root", entries: [{ name: "other/file", data: "x" }] },
     { name: "file shadow", entries: [{ name: "pkg/file", data: "x" }, { name: "pkg/file/child", data: "y" }] }
   ];

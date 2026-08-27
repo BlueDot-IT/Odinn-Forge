@@ -30,11 +30,11 @@ const WINDOWS_PHYSICAL_PATH_ASSERTION = "function Assert-OdinnPhysicalPath([stri
 
 export function standaloneUnixLauncher(entry: string, target: "linux-x64" | "darwin-x64", executableSha256: string): string {
   assertDigest(executableSha256);
-  return `#!/bin/sh
-set -eu
+  return `set -eu
+[ "\${ODINN_NATIVE_BOUNDARY-}" = "1" ] || { echo "Ódinn native runtime boundary was bypassed" >&2; exit 126; }
+unset ODINN_NATIVE_BOUNDARY
 unset ${HOSTILE_NODE_ENVIRONMENT_VARIABLES.join(" ")}
 SCRIPT=$0
-case "$SCRIPT" in */*) ;; *) SCRIPT=$(command -v -- "$SCRIPT") || { echo "Ódinn launcher path cannot be resolved" >&2; exit 126; };; esac
 BIN_DIR=\${SCRIPT%/*}
 [ "$BIN_DIR" != "$SCRIPT" ] || { echo "Ódinn launcher path is invalid" >&2; exit 126; }
 ROOT=$(CDPATH= cd -- "$BIN_DIR/.." && pwd -P)

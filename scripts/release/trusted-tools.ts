@@ -1,9 +1,11 @@
 import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
-export type TrustedToolName = "gpg" | "gpgv" | "gzip" | "sha256sum" | "shasum" | "tar" | "unzip" | "zip" | "zipinfo";
+export type TrustedToolName = "cc" | "codesign" | "gpg" | "gpgv" | "gzip" | "sha256sum" | "shasum" | "tar" | "unzip" | "zip" | "zipinfo";
 
 const UNIX_TOOLS: Record<TrustedToolName, string[]> = {
+  cc: ["/usr/bin/cc"],
+  codesign: ["/usr/bin/codesign"],
   gpg: ["/usr/bin/gpg"],
   gpgv: ["/usr/bin/gpgv"],
   gzip: ["/usr/bin/gzip"],

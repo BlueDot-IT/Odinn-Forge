@@ -40,7 +40,11 @@ test("runtime archive validation rejects traversal, absolute paths, aliases, lin
   assert.throws(() => validateArchiveEntries([{ name: "C:/node-v24/node.exe", type: "file" }], "node-v24"), /unsafe/);
   assert.throws(() => validateArchiveEntries([{ name: "node-v24\\node.exe", type: "file" }], "node-v24"), /unsafe/);
   assert.throws(() => validateArchiveEntries([{ name: "node-v24//node", type: "file" }], "node-v24"), /unsafe/);
+  assert.throws(() => validateArchiveEntries([{ name: "node-v24/node:stream", type: "file" }], "node-v24"), /unsafe/);
+  assert.throws(() => validateArchiveEntries([{ name: "node-v24/AUX.txt", type: "file" }], "node-v24"), /unsafe/);
+  assert.throws(() => validateArchiveEntries([{ name: "node-v24/runtime. ", type: "file" }], "node-v24"), /unsafe/);
   assert.throws(() => validateArchiveEntries([...valid, ...valid], "node-v24"), /duplicate/);
+  assert.throws(() => validateArchiveEntries([...valid, { name: "NODE-V24/BIN/NODE", type: "file" }], "node-v24"), /duplicate/);
   assert.throws(() => validateArchiveEntries([{ name: "node-v24/node", type: "link" }], "node-v24"), /unsupported/);
   assert.throws(() => validateArchiveEntries([{ name: "node-v24/node", type: "device" }], "node-v24"), /unsupported/);
   assert.throws(() => validateArchiveEntries([{ name: "other/node", type: "file" }], "node-v24"), /top-level/);

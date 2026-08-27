@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { acquireNodeRuntime, readRuntimePolicy, runtimePolicySha256, type RuntimeTarget } from "./node-runtime.ts";
+import { verifyNativeLauncher, type NativeLauncherTarget } from "./native-launcher.ts";
 import { createDeterministicStandaloneArchive, normalizeStandaloneTree } from "./standalone-archive.ts";
 import { standalonePowerShellInstaller, standaloneUnixLauncher, standaloneWindowsLauncher } from "./standalone-launchers.ts";
 
@@ -21,6 +22,7 @@ if (new Set(targets).size !== targets.length || targets.some((target) => !policy
   throw new Error("standalone packaging target list is invalid");
 }
 const cache = process.env.ODINN_NODE_RUNTIME_CACHE || join(root, ".cache/node-runtime");
+const nativeLauncherDirectory = process.env.ODINN_NATIVE_LAUNCHER_DIR || join(root, "dist/native-launchers");
 const manifestPath = join(output, "release-manifest.json");
 const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
 const standaloneArtifacts: Array<{ name: string; target: RuntimeTarget; bytes: number; sha256: string; embeddedRuntime: Record<string, unknown> }> = [];
@@ -47,13 +49,24 @@ for (const target of targets) {
     await cp(join(root, "release", "node-runtime-policy.json"), join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json"), { dereference: false });
     await writeFile(join(packageRoot, "THIRD_PARTY_NOTICES", "NODE_RUNTIME.json"), `${JSON.stringify(evidence, null, 2)}\n`);
 
+    const nativeLauncher = target === "win32-x64"
+      ? null
+      : await readFile(join(nativeLauncherDirectory, `odinn-launcher-${target}`));
+    if (nativeLauncher) verifyNativeLauncher(nativeLauncher, target as NativeLauncherTarget);
     const packageManifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+    const runtimeBoundary = target === "win32-x64"
+      ? "win32-system-launcher"
+      : target === "linux-x64"
+        ? "linux-static-pie"
+        : "darwin-hardened-runtime";
     packageManifest.odinnStandalone = {
       runtime: "node",
       version: policy.version,
       target,
       runtimePolicySha256: policySha256,
-      executableSha256: selected.executableSha256
+      executableSha256: selected.executableSha256,
+      runtimeBoundary,
+      ...(nativeLauncher ? { launcherSha256: createHash("sha256").update(nativeLauncher).digest("hex") } : {})
     };
     await writeFile(join(packageRoot, "package.json"), `${JSON.stringify(packageManifest, null, 2)}\n`);
     const releaseInfo = JSON.parse(await readFile(join(packageRoot, "release-info.json"), "utf8"));
@@ -61,19 +74,30 @@ for (const target of targets) {
     releaseInfo.embeddedRuntime = evidence;
     await writeFile(join(packageRoot, "release-info.json"), `${JSON.stringify(releaseInfo, null, 2)}\n`);
 
-    const unixTarget = target === "darwin-x64" ? "darwin-x64" : "linux-x64";
-    await writeFile(join(packageRoot, "bin", "odinn"), standaloneUnixLauncher("dist/cli/index.js", unixTarget, selected.executableSha256), { mode: 0o755 });
-    await writeFile(join(packageRoot, "bin", "odinn-gateway"), standaloneUnixLauncher("dist/gateway/server.js", unixTarget, selected.executableSha256), { mode: 0o755 });
+    if (target === "win32-x64") {
+      await rm(join(packageRoot, "bin", "odinn"), { force: true });
+      await rm(join(packageRoot, "bin", "odinn-gateway"), { force: true });
+      await rm(join(packageRoot, "install", "install.sh"), { force: true });
+    } else {
+      const launchers = [
+        ["bin/odinn", "dist/cli/index.js", false],
+        ["bin/odinn-gateway", "dist/gateway/server.js", false],
+        ["install/install.sh", "dist/install/install.js", true]
+      ] as const;
+      for (const [path, entry, installer] of launchers) {
+        await writeFile(join(packageRoot, path), nativeLauncher!, { mode: 0o755 });
+        let companion = standaloneUnixLauncher(entry, target, selected.executableSha256);
+        if (installer) {
+          companion = companion.replace(
+            'exec "$NODE" "$ROOT/dist/install/install.js" "$@"',
+            'exec "$NODE" "$ROOT/dist/install/install.js" install --source "$ROOT" "$@"'
+          );
+        }
+        await writeFile(join(packageRoot, `${path}.runtime.sh`), companion, { mode: 0o644 });
+      }
+    }
     await writeFile(join(packageRoot, "bin", "odinn.cmd"), standaloneWindowsLauncher("dist/cli/index.js", selected.executableSha256));
     await writeFile(join(packageRoot, "bin", "odinn-gateway.cmd"), standaloneWindowsLauncher("dist/gateway/server.js", selected.executableSha256));
-    await writeFile(
-      join(packageRoot, "install", "install.sh"),
-      standaloneUnixLauncher("dist/install/install.js", unixTarget, selected.executableSha256).replace(
-        'exec "$NODE" "$ROOT/dist/install/install.js" "$@"',
-        'exec "$NODE" "$ROOT/dist/install/install.js" install --source "$ROOT" "$@"'
-      ),
-      { mode: 0o755 }
-    );
     await writeFile(
       join(packageRoot, "install", "install.ps1"),
       standalonePowerShellInstaller("dist/install/install.js", selected.executableSha256)

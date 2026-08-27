@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promis
 import { createGunzip } from "node:zlib";
 import { dirname, join, parse, resolve, sep } from "node:path";
 import { Unzip, UnzipInflate } from "fflate";
+import { canonicalPortableArchivePath, portableArchivePathIdentity } from "./portable-archive-path.ts";
 
 export type SecureArchiveEntry = {
   name: string;
@@ -27,8 +28,6 @@ const ZIP_EOCD_MAXIMUM_BYTES = 65_557;
 const ZIP_CENTRAL_DIRECTORY_MAXIMUM_BYTES = 64 * 1024 * 1024;
 const TAR_BLOCK_BYTES = 512;
 const TAR_METADATA_MAXIMUM_BYTES = 2 * 1024 * 1024;
-const ARCHIVE_PATH_MAXIMUM_BYTES = 4_096;
-const ARCHIVE_PATH_MAXIMUM_DEPTH = 128;
 
 type ResolvedOptions = Required<SecureArchiveOptions>;
 type ZipEntry = SecureArchiveEntry & {
@@ -58,20 +57,11 @@ function resolvedOptions(options: SecureArchiveOptions): ResolvedOptions {
 
 function normalizeArchivePath(raw: string): string {
   const label = archivePathLabel(raw);
-  if (!raw || Buffer.byteLength(raw, "utf8") > ARCHIVE_PATH_MAXIMUM_BYTES || raw.includes("\\") || /[\0-\x1f\x7f]/u.test(raw)) {
+  try {
+    return canonicalPortableArchivePath(raw);
+  } catch {
     throw new Error(`release archive contains an unsafe path: ${label}`);
   }
-  let end = raw.length;
-  while (end > 0 && raw.charCodeAt(end - 1) === 0x2f) end -= 1;
-  const name = end === raw.length ? raw : raw.slice(0, end);
-  if (!name || name.startsWith("/") || name.startsWith("//") || /^[A-Za-z]:/u.test(name)) {
-    throw new Error(`release archive contains an unsafe path: ${label}`);
-  }
-  const parts = name.split("/");
-  if (parts.length > ARCHIVE_PATH_MAXIMUM_DEPTH || parts.some((part) => !part || part === "." || part === "..")) {
-    throw new Error(`release archive contains an unsafe path: ${label}`);
-  }
-  return name;
 }
 
 function archivePathLabel(raw: string): string {
@@ -80,7 +70,7 @@ function archivePathLabel(raw: string): string {
 }
 
 function archiveIdentity(name: string): string {
-  return name.normalize("NFC").toLocaleLowerCase("en-US");
+  return portableArchivePathIdentity(name);
 }
 
 function validateEntries(entries: SecureArchiveEntry[], options: ResolvedOptions): SecureArchiveEntry[] {

@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
+import { canonicalPortableArchivePath, portableArchivePathIdentity } from "../../packages/kernel/src/portable-archive-path.ts";
 import { sanitizedReleaseEnvironment, trustedTool } from "./trusted-tools.ts";
 
 export type RuntimeTarget = "linux-x64" | "darwin-x64" | "win32-x64";
@@ -88,27 +89,29 @@ export async function readRuntimePolicy(root: string): Promise<RuntimePolicy> {
 }
 
 function normalizedArchivePath(raw: string): string {
-  if (!raw || raw.includes("\\") || /[\0-\x1f\x7f]/u.test(raw)) throw new Error(`unsafe Node archive path: ${raw}`);
-  const name = raw.replace(/^\.\//u, "").replace(/\/$/u, "");
-  if (!name || name.startsWith("/") || /^[A-Za-z]:/u.test(name)) throw new Error(`unsafe Node archive path: ${raw}`);
-  if (name.split("/").some((part) => !part || part === "." || part === "..")) throw new Error(`unsafe Node archive path: ${raw}`);
-  return name;
+  const name = raw.startsWith("./") ? raw.slice(2) : raw;
+  try {
+    return canonicalPortableArchivePath(name);
+  } catch {
+    throw new Error(`unsafe Node archive path: ${JSON.stringify(raw.slice(0, 160))}`);
+  }
 }
 
-function validateArchivePaths(entries: ArchiveEntry[], expectedRoot: string, caseInsensitive: boolean): void {
+function validateArchivePaths(entries: ArchiveEntry[], expectedRoot: string): void {
   const seen = new Set<string>();
+  const canonicalRoot = normalizedArchivePath(expectedRoot);
   for (const entry of entries) {
     const name = normalizedArchivePath(entry.name);
-    const identity = caseInsensitive ? name.toLowerCase() : name;
+    const identity = portableArchivePathIdentity(name);
     if (seen.has(identity)) throw new Error(`duplicate Node archive path: ${name}`);
     seen.add(identity);
-    if (name !== expectedRoot && !name.startsWith(`${expectedRoot}/`)) throw new Error(`unexpected Node archive top-level layout: ${name}`);
+    if (name !== canonicalRoot && !name.startsWith(`${canonicalRoot}/`)) throw new Error(`unexpected Node archive top-level layout: ${name}`);
   }
   if (!seen.size) throw new Error("empty Node runtime archive");
 }
 
 export function validateArchiveEntries(entries: ArchiveEntry[], expectedRoot: string): void {
-  validateArchivePaths(entries, expectedRoot, false);
+  validateArchivePaths(entries, expectedRoot);
   for (const entry of entries) {
     if (entry.type === "link" || entry.type === "device") {
       throw new Error(`unsupported Node archive entry: ${normalizedArchivePath(entry.name)}`);
@@ -117,7 +120,7 @@ export function validateArchiveEntries(entries: ArchiveEntry[], expectedRoot: st
 }
 
 function validateSelectedRuntimeEntries(entries: ArchiveEntry[], expectedRoot: string, required: string[], caseInsensitive: boolean): void {
-  validateArchivePaths(entries, expectedRoot, caseInsensitive);
+  validateArchivePaths(entries, expectedRoot);
   const byName = new Map(entries.map((entry) => [normalizedArchivePath(entry.name), entry]));
   const selected: ArchiveEntry[] = [];
   for (const path of required) {

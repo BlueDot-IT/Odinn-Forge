@@ -21,6 +21,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { buildNativeLauncher } from "../scripts/release/native-launcher.ts";
+import { standaloneUnixLauncher } from "../scripts/release/standalone-launchers.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -352,8 +354,26 @@ async function writeStandaloneFixture(temporary: string, version: string, commit
     version: policy.version,
     target: `${process.platform}-${process.arch}`,
     executableSha256,
-    runtimePolicySha256
+    runtimePolicySha256,
+    runtimeBoundary: process.platform === "win32"
+      ? "win32-system-launcher"
+      : process.platform === "linux"
+        ? "linux-static-pie"
+        : "darwin-hardened-runtime"
   };
+  if (process.platform !== "win32") {
+    await mkdir(join(source, "bin"), { recursive: true });
+    await mkdir(join(source, "install"), { recursive: true });
+    const launcher = join(source, "bin", "odinn");
+    await buildNativeLauncher(`${process.platform}-${process.arch}` as "linux-x64" | "darwin-x64", launcher);
+    const launcherBytes = await readFile(launcher);
+    (odinnStandalone as any).launcherSha256 = createHash("sha256").update(launcherBytes).digest("hex");
+    await writeFile(join(source, "bin", "odinn-gateway"), launcherBytes, { mode: 0o755 });
+    await writeFile(join(source, "install", "install.sh"), launcherBytes, { mode: 0o755 });
+    await writeFile(join(source, "bin", "odinn.runtime.sh"), standaloneUnixLauncher("dist/cli/index.js", process.platform === "linux" ? "linux-x64" : "darwin-x64", executableSha256));
+    await writeFile(join(source, "bin", "odinn-gateway.runtime.sh"), standaloneUnixLauncher("dist/gateway/server.js", process.platform === "linux" ? "linux-x64" : "darwin-x64", executableSha256));
+    await writeFile(join(source, "install", "install.sh.runtime.sh"), standaloneUnixLauncher("dist/install/install.js", process.platform === "linux" ? "linux-x64" : "darwin-x64", executableSha256));
+  }
   await writeFile(join(source, "package.json"), `${JSON.stringify({ name: "@bluedot-it/odinn", version, type: "module", odinnStandalone }, null, 2)}\n`);
   await writeFile(join(source, "release-info.json"), `${JSON.stringify({
     schemaVersion: 2,

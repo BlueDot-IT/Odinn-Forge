@@ -104,11 +104,57 @@ jobs:
             <<<"$release"
           echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
 
+  native-launchers:
+    name: Build native launcher (${{ matrix.target }})
+    needs:
+      - release-policy
+      - verify
+    if: ${{ !inputs.resume_staged_assets }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: macos-15-large
+            target: darwin-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release-policy.outputs.release_commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ needs.release-policy.outputs.node_version }}
+      - name: Build and reproduce the host-native loader boundary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist/native-launchers
+          node scripts/release/native-launcher.ts "$TARGET" "dist/native-launchers/odinn-launcher-$TARGET.first"
+          node scripts/release/native-launcher.ts "$TARGET" "dist/native-launchers/odinn-launcher-$TARGET.second"
+          cmp "dist/native-launchers/odinn-launcher-$TARGET.first" "dist/native-launchers/odinn-launcher-$TARGET.second"
+          mv "dist/native-launchers/odinn-launcher-$TARGET.first" "dist/native-launchers/odinn-launcher-$TARGET"
+          rm "dist/native-launchers/odinn-launcher-$TARGET.second"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: odinn-native-launcher-${{ matrix.target }}
+          path: dist/native-launchers/odinn-launcher-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 1
+
   source-package:
     name: Build release assets
     needs:
       - release-policy
       - verify
+      - native-launchers
     if: ${{ !inputs.resume_staged_assets }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -136,6 +182,11 @@ jobs:
       - run: pnpm release:package
         env:
           GITHUB_SHA: ${{ env.ODINN_RELEASE_COMMIT }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: odinn-native-launcher-*
+          path: dist/native-launchers
+          merge-multiple: true
       - run: pnpm release:package-standalone
       - run: pnpm release:soak
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0

@@ -7,6 +7,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { spawnPnpmSync } from "./lib/package-manager.ts";
+import { verifyNativeLauncher, type NativeLauncherTarget } from "./release/native-launcher.ts";
 
 const [command = "status", ...args] = process.argv.slice(2);
 const prefix = resolve(option("--prefix", process.env.ODINN_INSTALL_PREFIX || join(homedir(), ".local", "share", "odinn")));
@@ -96,7 +97,7 @@ async function install(operation: any) {
   const activation = deferredParentPid
     ? await scheduleDeferredLauncherActivation(destination, standalone, versionId, deferredParentPid)
     : null;
-  if (!activation) await writeLaunchers();
+  if (!activation) await writeLaunchers(destination, standalone);
   await writeState(next);
   await writeCurrentPointer(versionId, toolchain.distribution, standalone ? releaseInfo.embeddedRuntime.executableSha256 : "");
   console.log(JSON.stringify({
@@ -233,7 +234,7 @@ async function rollback() {
   if (!current.previous) throw new Error("no previous Odinn Forge installation is available for rollback");
   const priorMetadata = await readInstalledMetadata(current.previous);
   const next = { ...current, current: current.previous, currentVersion: priorMetadata.version, currentCommit: priorMetadata.commit, previous: current.current, rolledBackAt: new Date().toISOString(), operation: "rollback" };
-  await writeLaunchers();
+  await writeLaunchers(join(prefix, "versions", current.previous), priorMetadata.toolchain?.distribution === "standalone");
   await writeState(next);
   await writeCurrentPointer(next.current, priorMetadata.toolchain?.distribution ?? "compiled", priorMetadata.toolchain?.embeddedRuntime?.executableSha256 ?? "");
   console.log(JSON.stringify({ ok: true, prefix, current: next.current, previous: next.previous }, null, 2));
@@ -379,6 +380,11 @@ async function validateDistributionRuntime(
   const standalone = actualPackage.odinnStandalone;
   const expectedTarget = `${process.platform}-${process.arch}`;
   const expectedRuntimeName = process.platform === "win32" ? "node.exe" : "node";
+  const expectedRuntimeBoundary = process.platform === "win32"
+    ? "win32-system-launcher"
+    : process.platform === "linux"
+      ? "linux-static-pie"
+      : "darwin-hardened-runtime";
   const runtimeExecutable = join(runtimeDirectory, expectedRuntimeName);
   const policyDirectory = join(root, "THIRD_PARTY_NOTICES");
   const policyPath = join(policyDirectory, "node-runtime-policy.json");
@@ -390,6 +396,10 @@ async function validateDistributionRuntime(
     || standalone.target !== expectedTarget
     || standalone.executableSha256 !== evidence.executableSha256
     || standalone.runtimePolicySha256 !== evidence.runtimePolicySha256
+    || standalone.runtimeBoundary !== expectedRuntimeBoundary
+    || (process.platform === "win32"
+      ? standalone.launcherSha256 !== undefined
+      : !/^[a-f0-9]{64}$/u.test(String(standalone.launcherSha256 ?? "")))
     || !/^[a-f0-9]{64}$/u.test(String(evidence.executableSha256 ?? ""))
     || !/^[a-f0-9]{64}$/u.test(String(evidence.runtimePolicySha256 ?? ""))
     || !Number.isSafeInteger(evidence.executableBytes)
@@ -411,6 +421,30 @@ async function validateDistributionRuntime(
   }
   if (await digestIfPresent(policyPath) !== evidence.runtimePolicySha256) {
     throw new Error("embedded runtime policy digest does not match signed release metadata");
+  }
+  if (process.platform !== "win32") {
+    const nativeTarget = expectedTarget as NativeLauncherTarget;
+    for (const [launcher, companion] of [
+      ["bin/odinn", "bin/odinn.runtime.sh"],
+      ["bin/odinn-gateway", "bin/odinn-gateway.runtime.sh"],
+      ["install/install.sh", "install/install.sh.runtime.sh"]
+    ]) {
+      const launcherPath = join(root, launcher);
+      const companionPath = join(root, companion);
+      await requirePhysicalFile(launcherPath, "native standalone launcher");
+      await requirePhysicalFile(companionPath, "native standalone launcher companion");
+      const launcherBytes = await readFile(launcherPath);
+      if (createHash("sha256").update(launcherBytes).digest("hex") !== standalone.launcherSha256) {
+        throw new Error("native standalone launcher digest does not match release metadata");
+      }
+      verifyNativeLauncher(launcherBytes, nativeTarget);
+      const companionBytes = await readFile(companionPath, "utf8");
+      if (!companionBytes.includes("ODINN_NATIVE_BOUNDARY")
+        || !companionBytes.includes("runtime/node")
+        || /exec node\b/u.test(companionBytes)) {
+        throw new Error("native standalone launcher companion does not preserve the controlled runtime boundary");
+      }
+    }
   }
   if (requireExecutingRuntime && (await digestIfPresent(process.execPath) !== evidence.executableSha256
     || normalizePhysicalPath(await realpath(process.execPath)) !== normalizePhysicalPath(await realpath(runtimeExecutable)))) {
@@ -454,25 +488,58 @@ async function digestIfPresent(path: string): Promise<string> {
   }
 }
 
-async function writeLaunchers() {
+async function writeLaunchers(targetRoot?: string, standalone = false) {
   const bin = join(prefix, "bin");
   await ensurePhysicalDirectory(bin, "launcher root");
   const hostileNodeEnvironment = "NODE_CHANNEL_FD NODE_COMPILE_CACHE NODE_COMPILE_CACHE_PORTABLE NODE_EXTRA_CA_CERTS NODE_OPTIONS NODE_PATH NODE_REDIRECT_WARNINGS NODE_REPL_EXTERNAL_MODULE NODE_TLS_REJECT_UNAUTHORIZED NODE_UNIQUE_ID NODE_V8_COVERAGE OPENSSL_CONF SSL_CERT_DIR SSL_CERT_FILE";
-  const unix = installedUnixLauncher("dist/cli/index.js", "apps/cli/src/cli.ts", hostileNodeEnvironment);
-  const gateway = installedUnixLauncher("dist/gateway/server.js", "apps/gateway/src/server.ts", hostileNodeEnvironment);
-  await atomicLauncher(join(bin, "odinn"), unix, 0o755);
-  await atomicLauncher(join(bin, "odinn-gateway"), gateway, 0o755);
+  const nativeTarget = `${process.platform}-${process.arch}` as NativeLauncherTarget;
+  const nativeLaunchers = new Map<string, Buffer>();
+  if (process.platform !== "win32") {
+    for (const name of ["odinn", "odinn-gateway"]) {
+      const source = standalone && targetRoot ? join(targetRoot, "bin", name) : join(bin, name);
+      try {
+        await requirePhysicalFile(source, standalone ? "versioned native standalone launcher" : "installed native standalone launcher");
+        const bytes = await readFile(source);
+        verifyNativeLauncher(bytes, nativeTarget);
+        nativeLaunchers.set(name, bytes);
+      } catch (error) {
+        if (standalone) throw error;
+      }
+    }
+    if (nativeLaunchers.size !== 0 && nativeLaunchers.size !== 2) {
+      throw new Error("installed native launcher pair is incomplete");
+    }
+    if (standalone && nativeLaunchers.size !== 2) {
+      throw new Error("native standalone launcher activation requires an immutable version root");
+    }
+  }
+  const useNativeBoundary = nativeLaunchers.size === 2;
+  const unix = installedUnixLauncher("dist/cli/index.js", "apps/cli/src/cli.ts", hostileNodeEnvironment, useNativeBoundary);
+  const gateway = installedUnixLauncher("dist/gateway/server.js", "apps/gateway/src/server.ts", hostileNodeEnvironment, useNativeBoundary);
+  if (process.platform !== "win32" && useNativeBoundary) {
+    for (const [name, companion] of [["odinn", unix], ["odinn-gateway", gateway]] as const) {
+      const bytes = nativeLaunchers.get(name)!;
+      await atomicLauncher(join(bin, `${name}.runtime.sh`), companion, 0o600);
+      await atomicLauncher(join(bin, name), bytes, 0o755);
+    }
+  } else if (process.platform !== "win32") {
+    await atomicLauncher(join(bin, "odinn"), unix, 0o755);
+    await atomicLauncher(join(bin, "odinn-gateway"), gateway, 0o755);
+  }
   const cmd = installedWindowsLauncher("dist\\cli\\index.js", "apps\\cli\\src\\cli.ts");
   const gatewayCmd = installedWindowsLauncher("dist\\gateway\\server.js", "apps\\gateway\\src\\server.ts");
   await atomicLauncher(join(bin, "odinn.cmd"), cmd, 0o600);
   await atomicLauncher(join(bin, "odinn-gateway.cmd"), gatewayCmd, 0o600);
 }
 
-function installedUnixLauncher(compiledEntry: string, sourceEntry: string, hostileNodeEnvironment: string): string {
+function installedUnixLauncher(compiledEntry: string, sourceEntry: string, hostileNodeEnvironment: string, nativeBoundary: boolean): string {
   const digestCommand = process.platform === "darwin"
     ? 'ACTUAL=$(/usr/bin/shasum -a 256 "$NODE"); ACTUAL=${ACTUAL%% *}'
     : 'ACTUAL=$(/usr/bin/sha256sum "$NODE"); ACTUAL=${ACTUAL%% *}';
-  return `#!/bin/sh\nset -eu\nPREFIX=${shellQuote(prefix)}\nunset ${hostileNodeEnvironment}\n{ IFS= read -r CURRENT; IFS= read -r DISTRIBUTION; IFS= read -r RUNTIME_SHA256; } < "$PREFIX/current"\ncase "$CURRENT" in ''|*[!A-Za-z0-9._-]*) echo "Ódinn current pointer is invalid" >&2; exit 126;; esac\ncase "$DISTRIBUTION" in\n  standalone)\n    case "$RUNTIME_SHA256" in *[!a-f0-9]*|'') echo "Ódinn embedded runtime digest is invalid" >&2; exit 126;; esac\n    [ "${RUNTIME_SHA256.length}" -eq 64 ] || { echo "Ódinn embedded runtime digest is invalid" >&2; exit 126; }\n    ROOT="$PREFIX/versions/$CURRENT"; NODE="$ROOT/runtime/node"\n    for PHYSICAL in "$PREFIX" "$PREFIX/versions" "$ROOT" "$ROOT/runtime" "$NODE"; do [ ! -L "$PHYSICAL" ] || { echo "Ódinn embedded runtime path is linked" >&2; exit 126; }; done\n    [ -f "$NODE" ] && [ -x "$NODE" ] || { echo "Ódinn embedded runtime is missing or not executable" >&2; exit 126; }\n    PHYSICAL_ROOT=$(CDPATH= cd -- "$ROOT/runtime" && pwd -P)\n    [ "$PHYSICAL_ROOT" = "$ROOT/runtime" ] || { echo "Ódinn embedded runtime path is not physical" >&2; exit 126; }\n    ${digestCommand}\n    [ "$ACTUAL" = "$RUNTIME_SHA256" ] || { echo "Ódinn embedded runtime digest mismatch" >&2; exit 126; }\n    exec "$NODE" "$ROOT/${compiledEntry}" "$@";;\n  compiled) exec node "$PREFIX/versions/$CURRENT/${compiledEntry}" "$@";;\n  source) exec node "$PREFIX/versions/$CURRENT/${sourceEntry}" "$@";;\n  *) echo "Ódinn current distribution is invalid" >&2; exit 126;;\nesac\n`;
+  const boundary = nativeBoundary
+    ? `[ "\${ODINN_NATIVE_BOUNDARY-}" = "1" ] || { echo "Ódinn native runtime boundary was bypassed" >&2; exit 126; }\nunset ODINN_NATIVE_BOUNDARY\n`
+    : "#!/bin/sh\n";
+  return `${boundary}set -eu\nPREFIX=${shellQuote(prefix)}\nunset ${hostileNodeEnvironment}\n{ IFS= read -r CURRENT; IFS= read -r DISTRIBUTION; IFS= read -r RUNTIME_SHA256; } < "$PREFIX/current"\ncase "$CURRENT" in ''|*[!A-Za-z0-9._-]*) echo "Ódinn current pointer is invalid" >&2; exit 126;; esac\ncase "$DISTRIBUTION" in\n  standalone)\n    case "$RUNTIME_SHA256" in *[!a-f0-9]*|'') echo "Ódinn embedded runtime digest is invalid" >&2; exit 126;; esac\n    [ "${RUNTIME_SHA256.length}" -eq 64 ] || { echo "Ódinn embedded runtime digest is invalid" >&2; exit 126; }\n    ROOT="$PREFIX/versions/$CURRENT"; NODE="$ROOT/runtime/node"\n    for PHYSICAL in "$PREFIX" "$PREFIX/versions" "$ROOT" "$ROOT/runtime" "$NODE"; do [ ! -L "$PHYSICAL" ] || { echo "Ódinn embedded runtime path is linked" >&2; exit 126; }; done\n    [ -f "$NODE" ] && [ -x "$NODE" ] || { echo "Ódinn embedded runtime is missing or not executable" >&2; exit 126; }\n    PHYSICAL_ROOT=$(CDPATH= cd -- "$ROOT/runtime" && pwd -P)\n    [ "$PHYSICAL_ROOT" = "$ROOT/runtime" ] || { echo "Ódinn embedded runtime path is not physical" >&2; exit 126; }\n    ${digestCommand}\n    [ "$ACTUAL" = "$RUNTIME_SHA256" ] || { echo "Ódinn embedded runtime digest mismatch" >&2; exit 126; }\n    exec "$NODE" "$ROOT/${compiledEntry}" "$@";;\n  compiled) exec node "$PREFIX/versions/$CURRENT/${compiledEntry}" "$@";;\n  source) exec node "$PREFIX/versions/$CURRENT/${sourceEntry}" "$@";;\n  *) echo "Ódinn current distribution is invalid" >&2; exit 126;;\nesac\n`;
 }
 
 function installedWindowsLauncher(compiledEntry: string, sourceEntry: string): string {
@@ -483,7 +550,7 @@ function installedWindowsLauncher(compiledEntry: string, sourceEntry: string): s
   return `@echo off\r\nsetlocal DisableDelayedExpansion\r\n${clears}\r\nset "ODINN_CURRENT="\r\nset "ODINN_DISTRIBUTION="\r\nset "ODINN_RUNTIME_SHA256="\r\nset /p ODINN_CURRENT=<"${currentPath}"\r\nfor /f "usebackq skip=1 delims=" %%i in ("${currentPath}") do if not defined ODINN_DISTRIBUTION set "ODINN_DISTRIBUTION=%%i"\r\nfor /f "usebackq skip=2 delims=" %%i in ("${currentPath}") do if not defined ODINN_RUNTIME_SHA256 set "ODINN_RUNTIME_SHA256=%%i"\r\nset "ODINN_CURRENT_PATH=${currentPath}"\r\nset "ODINN_PREFIX=${prefix}"\r\nset "ODINN_VERSIONS=${prefix}\\versions"\r\nset "ODINN_ROOT=${prefix}\\versions\\%ODINN_CURRENT%"\r\nset "ODINN_RUNTIME_DIR=%ODINN_ROOT%\\runtime"\r\nset "ODINN_NODE=%ODINN_RUNTIME_DIR%\\node.exe"\r\nset "ODINN_POWERSHELL=${powershell}"\r\nif not exist "%ODINN_POWERSHELL%" (echo Trusted PowerShell is unavailable 1>&2 & exit /b 126)\r\n"%ODINN_POWERSHELL%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${physicalPathAssertion};if($env:ODINN_CURRENT -cnotmatch '^[A-Za-z0-9._-]+$'){exit 126};if(@('standalone','compiled','source') -cnotcontains $env:ODINN_DISTRIBUTION){exit 126};Assert-OdinnPhysicalPath $env:ODINN_CURRENT_PATH;Assert-OdinnPhysicalPath $env:ODINN_PREFIX;Assert-OdinnPhysicalPath $env:ODINN_VERSIONS;Assert-OdinnPhysicalPath $env:ODINN_ROOT;if($env:ODINN_DISTRIBUTION -ceq 'standalone'){if($env:ODINN_RUNTIME_SHA256 -cnotmatch '^[a-f0-9]{64}$'){exit 126};Assert-OdinnPhysicalPath $env:ODINN_RUNTIME_DIR;Assert-OdinnPhysicalPath $env:ODINN_NODE;$i=Get-Item -LiteralPath $env:ODINN_NODE -Force -ErrorAction Stop;if($i.PSIsContainer){exit 126};if((Get-FileHash -LiteralPath $env:ODINN_NODE -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:ODINN_RUNTIME_SHA256){exit 126}}elseif($env:ODINN_RUNTIME_SHA256){exit 126}"\r\nif errorlevel 1 (echo Odinn installation pointer or runtime identity check failed 1>&2 & exit /b 126)\r\nif "%ODINN_DISTRIBUTION%"=="standalone" goto standalone\r\nif "%ODINN_DISTRIBUTION%"=="compiled" goto compiled\r\nif "%ODINN_DISTRIBUTION%"=="source" goto source\r\necho Odinn current distribution is invalid 1>&2\r\nexit /b 126\r\n:standalone\r\n"%ODINN_NODE%" "%ODINN_ROOT%\\${compiledEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n:compiled\r\nnode "%ODINN_ROOT%\\${compiledEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n:source\r\nnode "%ODINN_ROOT%\\${sourceEntry}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
 }
 
-async function atomicLauncher(path: string, content: string, mode: number) {
+async function atomicLauncher(path: string, content: string | Buffer, mode: number) {
   try {
     const metadata = await lstat(path);
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
@@ -513,9 +580,9 @@ async function validatePrefix(path: string) {
   try {
     const metadata = await lstat(bin);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("launcher root must be a physical directory");
-    const allowed = new Set(["odinn", "odinn.cmd", "odinn-gateway", "odinn-gateway.cmd"]);
+    const allowed = new Set(["odinn", "odinn.runtime.sh", "odinn.cmd", "odinn-gateway", "odinn-gateway.runtime.sh", "odinn-gateway.cmd"]);
     for (const entry of await readdir(bin, { withFileTypes: true })) {
-      const temporary = /^(?:odinn|odinn-gateway)(?:\.cmd)?\.[A-Za-z0-9_.-]+\.tmp$/u.test(entry.name);
+      const temporary = /^(?:odinn|odinn-gateway)(?:\.runtime\.sh|\.cmd)?\.[A-Za-z0-9_.-]+\.tmp$/u.test(entry.name);
       if ((!allowed.has(entry.name) && !temporary) || !entry.isFile() || entry.isSymbolicLink()) {
         throw new Error(`install prefix contains an unrelated launcher entry: ${entry.name}`);
       }
@@ -567,7 +634,7 @@ async function cleanupStaleInstallEntries() {
   const bin = join(prefix, "bin");
   try {
     for (const entry of await readdir(bin, { withFileTypes: true })) {
-      if (/^(?:odinn|odinn-gateway)(?:\.cmd)?\.[A-Za-z0-9_.-]+\.tmp$/u.test(entry.name)) candidates.push(join(bin, entry.name));
+      if (/^(?:odinn|odinn-gateway)(?:\.runtime\.sh|\.cmd)?\.[A-Za-z0-9_.-]+\.tmp$/u.test(entry.name)) candidates.push(join(bin, entry.name));
     }
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
