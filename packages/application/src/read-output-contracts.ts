@@ -404,6 +404,18 @@ export interface GitHubReadDiagnosticV1 {
   readonly redirectsAllowed: false;
 }
 
+export interface MicrosoftGraphReadDiagnosticV1 {
+  readonly enabled: boolean;
+  readonly configured: boolean;
+  readonly accountCount: 0 | 1;
+  readonly emailEnabled: boolean;
+  readonly calendarEnabled: boolean;
+  readonly endpoint: "graph.microsoft.com";
+  readonly readOnly: true;
+  readonly mutationsAvailable: false;
+  readonly redirectsAllowed: false;
+}
+
 /** Versioned, explicitly redacted diagnostics read model. */
 export interface DiagnosticsReportV1 {
   readonly ok: boolean;
@@ -423,6 +435,7 @@ export interface DiagnosticsReportV1 {
   readonly sandbox: SandboxDiagnosticV1;
   readonly processRecovery: ProcessRecoveryDiagnosticV1;
   readonly githubRead?: GitHubReadDiagnosticV1;
+  readonly microsoftGraphRead?: MicrosoftGraphReadDiagnosticV1;
   readonly state: DiagnosticStateSummaryV1;
 }
 
@@ -592,7 +605,7 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
   object(
     input,
     "diagnostics report",
-    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "state"],
+    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "microsoftGraphRead", "state"],
     ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserRecovery", "jobs", "sandbox", "processRecovery", "state"]
   );
   bool(input.ok, "diagnostics report.ok");
@@ -631,6 +644,13 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
     const github = object(input.githubRead, "diagnostics report.githubRead", ["enabled", "configured", "repositoryCount", "endpoint", "readOnly", "mutationsAvailable", "redirectsAllowed"]);
     bool(github.enabled, "diagnostics report.githubRead.enabled"); bool(github.configured, "diagnostics report.githubRead.configured"); count(github.repositoryCount, "diagnostics report.githubRead.repositoryCount");
     literal(github.endpoint, "diagnostics report.githubRead.endpoint", "api.github.com"); literal(github.readOnly, "diagnostics report.githubRead.readOnly", true); literal(github.mutationsAvailable, "diagnostics report.githubRead.mutationsAvailable", false); literal(github.redirectsAllowed, "diagnostics report.githubRead.redirectsAllowed", false);
+  }
+  if (input.microsoftGraphRead !== undefined) {
+    const graph = object(input.microsoftGraphRead, "diagnostics report.microsoftGraphRead", ["enabled", "configured", "accountCount", "emailEnabled", "calendarEnabled", "endpoint", "readOnly", "mutationsAvailable", "redirectsAllowed"]);
+    bool(graph.enabled, "diagnostics report.microsoftGraphRead.enabled"); bool(graph.configured, "diagnostics report.microsoftGraphRead.configured"); count(graph.accountCount, "diagnostics report.microsoftGraphRead.accountCount");
+    bool(graph.emailEnabled, "diagnostics report.microsoftGraphRead.emailEnabled"); bool(graph.calendarEnabled, "diagnostics report.microsoftGraphRead.calendarEnabled");
+    literal(graph.endpoint, "diagnostics report.microsoftGraphRead.endpoint", "graph.microsoft.com"); literal(graph.readOnly, "diagnostics report.microsoftGraphRead.readOnly", true); literal(graph.mutationsAvailable, "diagnostics report.microsoftGraphRead.mutationsAvailable", false); literal(graph.redirectsAllowed, "diagnostics report.microsoftGraphRead.redirectsAllowed", false);
+    if (![0, 1].includes(Number(graph.accountCount))) throw new ApplicationContractValidationError("diagnostics report.microsoftGraphRead.accountCount must be 0 or 1");
   }
   const state = object(input.state, "diagnostics report.state", ["ownerOnly", "runtimeStateOutsideSourceCheckout", "secretsExcludedFromDiagnostics"]);
   bool(state.ownerOnly, "diagnostics report.state.ownerOnly"); bool(state.runtimeStateOutsideSourceCheckout, "diagnostics report.state.runtimeStateOutsideSourceCheckout"); literal(state.secretsExcludedFromDiagnostics, "diagnostics report.state.secretsExcludedFromDiagnostics", true);

@@ -10,7 +10,7 @@ import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateOperatorIdentifierV1, validateOperatorSnapshotResponseV1, validateRuntimeSecuritySummaryV1, type CliStatusSnapshotV1, type DiagnosticsReportV1, type OperatorSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, diagnoseGitHubReadIntegration, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeChromiumEngine, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteOperatorReadStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, diagnoseGitHubReadIntegration, diagnoseMicrosoftGraphReadIntegration, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeMicrosoftGraphReadConfig, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeChromiumEngine, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteOperatorReadStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { createCliReadCommandContext } from "./application-context.ts";
@@ -123,6 +123,13 @@ const DANGEROUS_IMPACT_SUMMARIES = Object.freeze({
     approvals: "Domain, private-network, and browser-mutation approval checks remain explicit; allowing private networks increases exposure to local services and metadata endpoints.",
     rollback: "Set the changed security option back to false and restart the gateway where required. Existing external requests cannot be rolled back.",
     audit: "Requests and policy decisions are recorded in the configured Odinn audit journal without storing credentials or raw secrets."
+  },
+  "microsoft-graph-read": {
+    title: "Microsoft Graph read integration impact summary",
+    authority: "Permits bounded live reads from one explicit Microsoft 365 account at the fixed graph.microsoft.com origin for the selected email and calendar resources.",
+    approvals: "Each tool still requires its separate read capability, network.access, and secret.reference.use. No email, calendar, or account mutation surface is installed.",
+    rollback: "Disable or remove the integration and restart the local runtime. Reads have no remote effect to undo, and interrupted reads are never reconstructed from durable state.",
+    audit: "Audit and run-ledger records retain only digests, counts, byte sizes, and categorical outcomes; tokens and Microsoft 365 content are excluded."
   },
   "autonomous-self-improvement": {
     title: "Autonomous self-improvement impact summary",
@@ -397,6 +404,9 @@ function usage() {
   odinn config provider list [--state .odinn]
   odinn config provider catalog
   odinn config provider remove <name> [--state .odinn]
+  odinn config integration add microsoft-graph --token-env <ENV_NAME> --account-id <directory-object-id> --resources email,calendar [--state .odinn]
+  odinn config integration list [--state .odinn]
+  odinn config integration enable|disable|remove microsoft-graph [--confirm-impact] [--state .odinn]
   odinn config security show [--state .odinn]
   odinn config security set --surface web|browser [--enabled true|false] [--allow-private-network true|false] [--allowed-domains a,b] [--blocked-domains a,b] [--require-approval true|false] [--confirm-impact] [--state .odinn]
   odinn config experimental show [--state .odinn]
@@ -1524,6 +1534,7 @@ async function readDoctorDiagnostics(args: any): Promise<DiagnosticsReportV1> {
       quarantined: processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0)
     },
     githubRead: diagnoseGitHubReadIntegration(config?.integrations?.github ?? {}),
+    microsoftGraphRead: diagnoseMicrosoftGraphReadIntegration(config?.integrations?.microsoftGraph ?? {}),
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: !isPhysicalPathInside(invocationRoot(), state), secretsExcludedFromDiagnostics: true }
   };
 }
@@ -1793,8 +1804,8 @@ function providerVerificationTimeoutMs(requested = "") {
 
 async function configCommand(args: any) {
   const [section, subcommand, ...rest] = args;
-  if (!["provider", "model", "channel", "security", "experimental", "self-improvement"].includes(section)) {
-    throw new Error("config requires provider, model, channel, security, experimental, or self-improvement");
+  if (!["provider", "model", "channel", "integration", "security", "experimental", "self-improvement"].includes(section)) {
+    throw new Error("config requires provider, model, channel, integration, security, experimental, or self-improvement");
   }
   const state = stateDir(rest);
   const config = await readConfig(state);
@@ -1884,6 +1895,46 @@ async function configCommand(args: any) {
       return;
     }
     throw new Error("config channel requires add, list, enable, disable, or remove");
+  }
+  if (section === "integration") {
+    config.integrations ??= {};
+    if (subcommand === "list" || !subcommand) {
+      await printJson({ microsoftGraph: diagnoseMicrosoftGraphReadIntegration(config.integrations.microsoftGraph ?? {}) });
+      return;
+    }
+    const integration = rest[0];
+    if (integration !== "microsoft-graph") throw new Error("config integration requires microsoft-graph");
+    if (subcommand === "add") {
+      if (rest.includes("--token") || rest.includes("--access-token")) throw new Error("Microsoft Graph credential values are not accepted; provide only --token-env");
+      const tokenEnv = option(rest, "--token-env", "");
+      if (!isAllowedCredentialEnvironmentKey(tokenEnv)) throw new Error("config integration add requires --token-env with a credential-oriented, non-reserved environment name");
+      const accountId = option(rest, "--account-id", "");
+      const resources = splitCsv(option(rest, "--resources", ""));
+      config.integrations.microsoftGraph = normalizeMicrosoftGraphReadConfig({ enabled: false, tokenEnv, accountId, resources });
+      await saveConfig(state, config);
+      await printJson({
+        ok: true,
+        integration,
+        diagnostic: diagnoseMicrosoftGraphReadIntegration(config.integrations.microsoftGraph),
+        requiredCapabilities: ["email.read or calendar.read", "network.access", "secret.reference.use"],
+        nextAction: "Set the referenced environment value securely, then enable with --confirm-impact."
+      });
+      return;
+    }
+    if (!["enable", "disable", "remove"].includes(subcommand)) throw new Error("config integration requires add, list, enable, disable, or remove");
+    const current = config.integrations.microsoftGraph;
+    if (!current) throw new Error("Microsoft Graph integration is not configured");
+    if (subcommand === "remove") {
+      delete config.integrations.microsoftGraph;
+      await saveConfig(state, config);
+      await printJson({ ok: true, removed: integration });
+      return;
+    }
+    if (subcommand === "enable") requireImpactConfirmation(rest.slice(1), "microsoft-graph-read");
+    config.integrations.microsoftGraph = normalizeMicrosoftGraphReadConfig({ ...current, enabled: subcommand === "enable" });
+    await saveConfig(state, config);
+    await printJson({ ok: true, integration, diagnostic: diagnoseMicrosoftGraphReadIntegration(config.integrations.microsoftGraph) });
+    return;
   }
   if (section === "self-improvement") {
     if (subcommand === "show" || !subcommand) { await printJson(normalizeSelfImprovementConfig(config.selfImprovement)); return; }

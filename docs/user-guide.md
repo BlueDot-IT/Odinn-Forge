@@ -151,8 +151,10 @@ Normal backups include configuration, projects, sessions, goals, memory, jobs,
 cron definitions, audit records and verification keys, approval and browser
 recovery journals, registries, schema versions, and application identity.
 OAuth tokens, gateway tokens, browser profiles and cookies, capability signing
-keys, and multi-user password records are excluded. Every included file is
-checksummed. Restore validates the manifest and checksums, rejects future
+keys, the state-directory `.env`, and multi-user password records are excluded.
+The `.env` remains local credential/runtime input and must be restored through
+the operator's secure credential setup rather than a normal backup. Every
+included file is checksummed. Restore validates the manifest and checksums, rejects future
 schemas and unsafe links, creates a protected backup of current state, verifies
 a staging tree, and switches it atomically.
 
@@ -185,7 +187,7 @@ and unexpected files in a custom installation prefix.
 
 ## Privacy and external services
 
-Ódinn Forge has no built-in product telemetry. Runtime state, browser profiles, audit records, memory, and credentials stay in the configured local state directory unless you deliberately use a remote host or external provider. Optional bounded GitHub reads send authenticated requests only to the fixed GitHub API origin for repositories on the configured allowlist; see [Bounded GitHub reads](github-read.md).
+Ódinn Forge has no built-in product telemetry. Runtime state, browser profiles, audit records, memory, and credentials stay in the configured local state directory unless you deliberately use a remote host or external provider. Optional bounded GitHub reads send authenticated requests only to the fixed GitHub API origin for repositories on the configured allowlist; see [Bounded GitHub reads](github-read.md). Optional Microsoft Graph email and calendar reads send authenticated requests only to the fixed Graph origin for one configured account and selected resources; see [Bounded Microsoft Graph reads](microsoft-graph-read.md).
 
 Model providers receive the prompts, recalled context, and tool results sent to their configured API. Websites receive normal browser or fetch traffic. Imported skills, MCP servers, extensions, and browser pages are untrusted input. Review them before enabling them and never post `.odinn`, OAuth files, gateway tokens, browser profiles, or raw diagnostic bundles publicly. External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
@@ -204,7 +206,8 @@ odinn runs
 The diagnostic report includes the Odinn version and commit, platform and Node
 version, provider mode without credentials, experimental flags, audit status,
 pending approvals, path-free Chromium candidate and configuration state,
-browser recovery, job counts, and optional path-free GitHub read health. A
+browser recovery, job counts, and optional path-free GitHub and Microsoft Graph
+read health. A
 configured `ODINN_CHROMIUM_PATH` is reported as unverified without dereferencing
 or executing it; browser execution performs
 the normal policy-bound validation only when a browser tool is requested. If no

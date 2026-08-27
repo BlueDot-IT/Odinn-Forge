@@ -994,6 +994,12 @@ export class RunLedger {
     });
   }
 
+  readRunRequestBinding(runId: string): { runId: string; requestDigest: string } | undefined {
+    if (!runId) throw new Error("run request binding requires runId");
+    const row = this.database.db.prepare("SELECT request_digest FROM run_request_bindings WHERE run_id = ?").get(runId) as SqlRow | undefined;
+    return row ? { runId, requestDigest: String(row.request_digest) } : undefined;
+  }
+
   recordExecutionEnvelope(input: unknown) {
     const envelope = validateExecutionEnvelopeV1(input);
     const canonical = canonicalizeExecutionEnvelopeV1(envelope);

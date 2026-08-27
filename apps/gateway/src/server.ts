@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, diagnoseGitHubReadIntegration, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeGitHubReadConfig, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeChromiumEngine, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, diagnoseGitHubReadIntegration, diagnoseMicrosoftGraphReadIntegration, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isLiveOnlyAutomationTool, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeGitHubReadConfig, normalizeMicrosoftGraphReadConfig, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, projectDurableToolInput, ProjectContextService, probeChromiumEngine, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -179,6 +179,7 @@ export class CronStore {
   async create(input: any) {
     return this.mutate((jobs) => {
       const job = normalizeCronJob({ ...input, id: input.id || `cron_${randomBytes(8).toString("hex")}`, createdAt: new Date().toISOString() });
+      assertDurableScheduleTool(job.tool);
       if (jobs.length >= CRON_MAX_JOBS) throw new GatewayError(409, `cron state is at its ${CRON_MAX_JOBS}-job limit`);
       if (jobs.some((item) => item.id === job.id)) throw new GatewayError(409, "cron job id already exists");
       jobs.push(job);
@@ -186,20 +187,56 @@ export class CronStore {
     });
   }
   async update(id: string, patch: any) {
+    if (patch?.tool !== undefined) assertDurableScheduleTool(String(patch.tool).trim());
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
       const current = normalizeCronJob(jobs[index]);
       const scheduleChanged = patch.schedule !== undefined || patch.timezone !== undefined;
       if (scheduleChanged && current.dispatchLease) throw new GatewayError(409, "cannot change an active cron schedule until its occurrence lease settles");
-      jobs[index] = normalizeCronJob({
+      const updated = normalizeCronJob({
         ...current,
         ...patch,
         ...(scheduleChanged ? { nextRunAt: undefined, scheduledFor: undefined, dispatchLease: undefined } : {}),
         id,
         updatedAt: new Date().toISOString()
       });
-      return jobs[index];
+      assertDurableScheduleTool(updated.tool);
+      jobs[index] = updated;
+      return updated;
+    });
+  }
+  async quarantineLiveOnly(id: string) {
+    return this.mutate((jobs) => {
+      const index = jobs.findIndex((item) => item.id === id);
+      if (index < 0) throw new GatewayError(404, "cron job not found");
+      const current = normalizeCronJob(jobs[index]);
+      if (!isLiveOnlyAutomationTool(current.tool)) return current;
+      if (current.enabled === false
+        && current.liveOnlyQuarantine?.code === "LIVE_ONLY_AUTOMATION_INPUT_REMOVED"
+        && current.liveOnlyQuarantine?.originalTool === current.tool) return current;
+      const updated = normalizeCronJob({
+        ...current,
+        enabled: false,
+        input: {
+          quarantinedTool: current.tool,
+          liveInputAvailable: false,
+          ...(projectDurableToolInput(current.tool, current.input) as Record<string, unknown>)
+        },
+        dispatchLease: undefined,
+        scheduledFor: undefined,
+        lastStatus: "error",
+        lastError: `live-only tool ${current.tool} requires fresh input and cannot be persisted in cron`,
+        liveOnlyQuarantine: {
+          schemaVersion: 1,
+          code: "LIVE_ONLY_AUTOMATION_INPUT_REMOVED",
+          originalTool: current.tool,
+          migratedAt: new Date().toISOString()
+        },
+        updatedAt: new Date().toISOString()
+      });
+      jobs[index] = updated;
+      return updated;
     });
   }
   async remove(id: string) {
@@ -577,6 +614,12 @@ function normalizeCronJob(value: any) {
   };
 }
 
+function assertDurableScheduleTool(tool: string): void {
+  if (isLiveOnlyAutomationTool(tool)) {
+    throw new GatewayError(400, `live-only tool ${tool} cannot be persisted in cron`);
+  }
+}
+
 function cronMutationInput(value: any, creating: boolean) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new GatewayError(400, "cron request must be a JSON object");
   const allowed = new Set(creating ? ["id", "name", "schedule", "timezone", "enabled", "tool", "input"] : ["name", "schedule", "timezone", "enabled", "tool", "input"]);
@@ -656,6 +699,7 @@ export function nextCronWake(schedule: string, timezone = "UTC", after = new Dat
 async function runCronJob(store: CronStore, id: string, executor: any, tenantScope?: GatewayTenantScope) {
   const job = (await store.list()).find((item: any) => item.id === id);
   if (!job) throw new GatewayError(404, "cron job not found");
+  assertDurableScheduleTool(job.tool);
   const startedAt = new Date().toISOString();
   try {
     const task = { id: `${job.id}:${Date.now()}`, tool: job.tool, input: job.input, actor: "cron", reason: `cron:${job.id}` };
@@ -713,6 +757,10 @@ async function dispatchCronOccurrence(store: CronStore, supervisor: JobSuperviso
 export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor, now = new Date(), retrySafeFor: (tool: string) => boolean = () => false, tenantScope?: GatewayTenantScope) {
   const dispatches: Promise<void>[] = [];
   for (const job of await store.list()) {
+    if (isLiveOnlyAutomationTool(job.tool)) {
+      await store.quarantineLiveOnly(job.id);
+      continue;
+    }
     if (!job.enabled) continue;
     const claim = await store.claimDueOccurrence(job.id, now);
     if (!claim.claimed) continue;
@@ -3246,6 +3294,9 @@ function validateHostedProviderConfig(config: any) {
   if (config?.integrations?.github?.enabled === true) {
     throw new GatewayError(400, "multi-user host does not allow a shared GitHub read credential");
   }
+  if (config?.integrations?.microsoftGraph?.enabled === true) {
+    throw new GatewayError(400, "multi-user host does not allow a shared Microsoft Graph read credential");
+  }
   for (const [name, provider] of Object.entries(config?.providers ?? {}) as Array<[string, any]>) {
     const auth = provider?.auth && typeof provider.auth === "object" && !Array.isArray(provider.auth) ? provider.auth : {};
     if (provider?.type === "cli" || String(provider?.transport ?? "").startsWith("cli-") || auth.mode === "cli") {
@@ -3374,6 +3425,10 @@ function validateGatewayConfig(config: any) {
     if (config.integrations.github !== undefined) {
       try { normalizeGitHubReadConfig(config.integrations.github); }
       catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.integrations.github is invalid"); }
+    }
+    if (config.integrations.microsoftGraph !== undefined) {
+      try { normalizeMicrosoftGraphReadConfig(config.integrations.microsoftGraph); }
+      catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.integrations.microsoftGraph is invalid"); }
     }
   }
   try { normalizeMcpConfiguration(config.mcp); }
@@ -4094,6 +4149,7 @@ async function diagnostics({ state, workspaceRoot, config, featureFlags, auditSt
       quarantined: processRecoveryStartupError === true || processRecovery.invalid === true || (Array.isArray(processRecovery.pending) && processRecovery.pending.length > 0)
     },
     githubRead: diagnoseGitHubReadIntegration(config?.integrations?.github ?? {}),
+    microsoftGraphRead: diagnoseMicrosoftGraphReadIntegration(config?.integrations?.microsoftGraph ?? {}),
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: !isPhysicalPathInside(workspaceRoot, state), secretsExcludedFromDiagnostics: true }
   };
 }

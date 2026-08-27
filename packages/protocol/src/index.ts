@@ -89,9 +89,11 @@ const SKILL_HYDRATE_TOOLS = new Set(["skill.hydrate"]);
 const SKILL_LIFECYCLE_TOOLS = new Set(["skill.install", "skill.lifecycle"]);
 const MCP_DISCOVER_TOOLS = new Set(["mcp.discover"]);
 const MCP_INVOKE_TOOLS = new Set(["mcp.invoke"]);
+const SESSION_MESSAGE_TOOLS = new Set(["session.message"]);
 const EMAIL_TOOLS = new Set(["email.accounts", "email.search", "email.read", "email.thread"]);
+const CALENDAR_TOOLS = new Set(["calendar.calendars", "calendar.events", "calendar.read"]);
 const GITHUB_TOOLS = new Set(["github.repository", "github.issue", "github.pull-request", "github.checks"]);
-const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", ...EMAIL_TOOLS, ...GITHUB_TOOLS]);
+const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", ...EMAIL_TOOLS, ...CALENDAR_TOOLS, ...GITHUB_TOOLS]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -101,12 +103,44 @@ export function isEmailTool(toolName: unknown): boolean {
   return typeof toolName === "string" && EMAIL_TOOLS.has(toolName);
 }
 
+export function isCalendarTool(toolName: unknown): boolean {
+  return typeof toolName === "string" && CALENDAR_TOOLS.has(toolName);
+}
+
 export function isGitHubTool(toolName: unknown): boolean {
   return typeof toolName === "string" && GITHUB_TOOLS.has(toolName);
 }
 
 export function isReplayUnavailableTool(toolName: unknown): boolean {
   return typeof toolName === "string" && REPLAY_UNAVAILABLE_TOOLS.has(toolName);
+}
+
+export const LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER = "[Live provider content is unavailable in saved session history. Run a fresh authorized read to view current content.]";
+
+export type LiveOnlySessionContentProjection = Readonly<{
+  schemaVersion: 1;
+  mode: "live-only-provider-read";
+  content: typeof LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER;
+  contentUnavailable: true;
+  contentDigest: string;
+  contentBytes: number;
+}>;
+
+/**
+ * Return the safe session-history representation of a live provider-derived
+ * model answer. The live answer remains available to the authorized caller;
+ * only this projection may be appended to durable conversation history.
+ */
+export function projectLiveOnlySessionContent(content: unknown): LiveOnlySessionContentProjection {
+  const text = typeof content === "string" ? content : "";
+  return Object.freeze({
+    schemaVersion: 1,
+    mode: "live-only-provider-read",
+    content: LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER,
+    contentUnavailable: true,
+    contentDigest: sha256Reference(text),
+    contentBytes: Buffer.byteLength(text, "utf8")
+  });
 }
 
 /**
@@ -123,8 +157,10 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleInput(input);
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverInput(input);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeInput(input);
+  if (SESSION_MESSAGE_TOOLS.has(toolName)) return projectSessionMessage(input);
   if (GITHUB_TOOLS.has(toolName)) return projectGitHubInput(toolName, input);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailInput(input);
+  if (CALENDAR_TOOLS.has(toolName)) return projectCalendarInput(toolName, input);
   if (toolName.startsWith("git.")) return projectGitInput(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
@@ -176,8 +212,10 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleOutput(output);
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverOutput(output);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeOutput(output);
+  if (SESSION_MESSAGE_TOOLS.has(toolName)) return projectSessionMessage(output);
   if (GITHUB_TOOLS.has(toolName)) return projectGitHubOutput(toolName, output);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailOutput(toolName, output);
+  if (CALENDAR_TOOLS.has(toolName)) return projectCalendarOutput(toolName, output);
   if (toolName.startsWith("git.")) return projectGitOutput(toolName, output);
   if (REPLAY_UNAVAILABLE_TOOLS.has(toolName)) return projectComputerScreenOutput(output);
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
@@ -305,6 +343,7 @@ function boundedEmailString(value: unknown, maximum: number): string | undefined
 
 const EMAIL_IDENTIFIER_MAX_BYTES = 256;
 const EMAIL_IDENTIFIER_CONTEXT = "odinn:email-provider-identifier:";
+const CALENDAR_IDENTIFIER_CONTEXT = "odinn:calendar-provider-identifier:";
 const OPAQUE_EMAIL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,255}$/u;
 
 /**
@@ -320,6 +359,16 @@ export function hashEmailProviderIdentifier(value: unknown, label = "email provi
     throw new Error(`${label} must be a bounded visible provider identifier`);
   }
   return sha256Reference(`${EMAIL_IDENTIFIER_CONTEXT}${value}`);
+}
+
+export function hashCalendarProviderIdentifier(value: unknown, label = "calendar provider identifier", maximum = EMAIL_IDENTIFIER_MAX_BYTES): string {
+  if (typeof value !== "string"
+    || value.length === 0
+    || Buffer.byteLength(value, "utf8") > maximum
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(`${label} must be a bounded visible provider identifier`);
+  }
+  return sha256Reference(`${CALENDAR_IDENTIFIER_CONTEXT}${value}`);
 }
 
 /**
@@ -342,13 +391,48 @@ function hasOwn(record: JsonObject, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
 }
 
+function normalizedLiveOnlySessionRetention(value: unknown): JsonObject | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as JsonObject;
+  if (record.schemaVersion !== 1
+    || record.mode !== "live-only-provider-read"
+    || record.contentUnavailable !== true
+    || typeof record.contentDigest !== "string"
+    || !/^sha256:[a-f0-9]{64}$/u.test(record.contentDigest)
+    || !Number.isSafeInteger(record.contentBytes)
+    || Number(record.contentBytes) < 0) return undefined;
+  return {
+    schemaVersion: 1,
+    mode: "live-only-provider-read",
+    contentUnavailable: true,
+    contentDigest: record.contentDigest,
+    contentBytes: Number(record.contentBytes)
+  };
+}
+
+function projectSessionMessage(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const source = value as JsonObject;
+  const retention = normalizedLiveOnlySessionRetention(source.contentRetention);
+  if (!retention) return value;
+  return {
+    ...source,
+    content: LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER,
+    contentRetention: retention
+  };
+}
+
 function projectEmailInput(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const source = value as JsonObject;
   const projected: JsonObject = {};
-  for (const key of ["accountId", "messageId", "threadId"] as const) {
-    if (hasOwn(source, key)) projected[key] = durableEmailProviderIdentifier(source[key], `email input ${key}`);
-  }
+  const identifiers = ["accountId", "messageId", "threadId"].map((key) => hasOwn(source, key)
+    ? hashEmailProviderIdentifier(source[key], `email input ${key}`)
+    : null);
+  const existingTargetDigest = boundedEmailString(source.targetDigest, 128);
+  projected.targetDigest = identifiers.some((identifier) => identifier !== null)
+    ? sha256Reference(JSON.stringify(identifiers))
+    : existingTargetDigest ?? sha256Reference(JSON.stringify(identifiers));
   if (Number.isSafeInteger(source.limit)) projected.limit = source.limit;
   for (const [sourceKey, digestKey] of [["query", "queryDigest"], ["cursor", "cursorDigest"]] as const) {
     const raw = boundedEmailString(source[sourceKey], 4_096);
@@ -364,66 +448,99 @@ function projectEmailInput(value: unknown): unknown {
   return projected;
 }
 
-function projectEmailMessageMetadata(value: unknown): JsonObject {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const record = value as JsonObject;
-  const projected: JsonObject = {};
-  if (hasOwn(record, "messageId")) projected.messageId = durableEmailProviderIdentifier(record.messageId, "email message.messageId");
-  if (hasOwn(record, "threadId")) projected.threadId = durableEmailProviderIdentifier(record.threadId, "email message.threadId");
-  const receivedAt = boundedEmailString(record.receivedAt, 256);
-  if (receivedAt !== undefined) projected.receivedAt = receivedAt;
-  for (const [sourceKey, digestKey] of [["subject", "subjectDigest"], ["from", "fromDigest"], ["snippet", "snippetDigest"], ["bodyText", "bodyDigest"]] as const) {
-    const raw = boundedEmailString(record[sourceKey], 128 * 1024);
-    if (raw !== undefined) {
-      projected[digestKey] = sha256Reference(raw);
-      projected[`${sourceKey}Bytes`] = Buffer.byteLength(raw, "utf8");
-    }
-  }
-  if (typeof record.hasAttachments === "boolean") projected.hasAttachments = record.hasAttachments;
-  if (Array.isArray(record.to)) projected.toCount = record.to.length;
-  if (Array.isArray(record.cc)) projected.ccCount = record.cc.length;
-  if (Array.isArray(record.attachments)) projected.attachmentCount = record.attachments.length;
-  return projected;
-}
-
 function projectEmailOutput(toolName: string, value: unknown): unknown {
   const base: JsonObject = { type: toolName, contentUnavailableOnReplay: true };
   if (!value || typeof value !== "object" || Array.isArray(value)) return base;
   const record = value as JsonObject;
-  for (const key of ["providerId", "accountId", "threadId"] as const) {
-    if (hasOwn(record, key)) base[key] = durableEmailProviderIdentifier(record[key], `email ${toolName} output.${key}`);
-  }
-  if (typeof record.contentTrust === "string" && record.contentTrust.length <= 64) base.contentTrust = record.contentTrust;
+  const identifiers: Array<string | null> = ["providerId", "accountId", "threadId", "messageId"].map((key) => hasOwn(record, key)
+    ? hashEmailProviderIdentifier(record[key], `email ${toolName} output.${key}`)
+    : null);
   if (toolName === "email.accounts") {
-    const health = record.health && typeof record.health === "object" && !Array.isArray(record.health) ? record.health as JsonObject : {};
-    if (typeof health.status === "string" && health.status.length <= 32) base.health = { status: health.status };
     const accounts = Array.isArray(record.accounts) ? record.accounts.slice(0, 32).flatMap((value) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
       const account = value as JsonObject;
       if (!hasOwn(account, "accountId")) return [];
-      const accountId = durableEmailProviderIdentifier(account.accountId, "email account.accountId");
-      const provider = boundedEmailString(account.provider, 128);
-      const status = boundedEmailString(account.status, 32);
-      return [{ accountId, ...(provider === undefined ? {} : { provider }), ...(status === undefined ? {} : { status }) }];
+      return [hashEmailProviderIdentifier(account.accountId, "email account.accountId")];
     }) : [];
-    base.accounts = accounts;
     base.accountCount = accounts.length;
+    identifiers.push(...accounts);
   } else if (toolName === "email.search") {
-    const nextCursor = boundedEmailString(record.nextCursor, 4_096);
-    if (nextCursor !== undefined) {
-      base.nextCursorDigest = sha256Reference(nextCursor);
-      base.nextCursorBytes = Buffer.byteLength(nextCursor, "utf8");
+    const messages = Array.isArray(record.messages) ? record.messages.slice(0, 100) : [];
+    for (const [index, message] of messages.entries()) {
+      if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+      const item = message as JsonObject;
+      if (hasOwn(item, "messageId")) identifiers.push(hashEmailProviderIdentifier(item.messageId, `email message[${index}].messageId`));
+      if (hasOwn(item, "threadId")) identifiers.push(hashEmailProviderIdentifier(item.threadId, `email message[${index}].threadId`));
     }
-    const messages = Array.isArray(record.messages) ? record.messages.slice(0, 100).map(projectEmailMessageMetadata) : [];
-    base.messages = messages;
     base.messageCount = messages.length;
   } else if (toolName === "email.read") {
-    Object.assign(base, projectEmailMessageMetadata(record));
+    if (Array.isArray(record.to)) base.toCount = record.to.length;
+    if (Array.isArray(record.cc)) base.ccCount = record.cc.length;
+    if (Array.isArray(record.attachments)) base.attachmentCount = record.attachments.length;
   } else if (toolName === "email.thread") {
-    const messages = Array.isArray(record.messages) ? record.messages.slice(0, 100).map(projectEmailMessageMetadata) : [];
-    base.messages = messages;
+    const messages = Array.isArray(record.messages) ? record.messages.slice(0, 100) : [];
+    for (const [index, message] of messages.entries()) {
+      if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+      const item = message as JsonObject;
+      if (hasOwn(item, "messageId")) identifiers.push(hashEmailProviderIdentifier(item.messageId, `email thread message[${index}].messageId`));
+      if (hasOwn(item, "threadId")) identifiers.push(hashEmailProviderIdentifier(item.threadId, `email thread message[${index}].threadId`));
+    }
     base.messageCount = messages.length;
   }
+  const encoded = JSON.stringify(value) ?? "null";
+  base.targetDigest = sha256Reference(JSON.stringify(identifiers));
+  base.payloadDigest = sha256Reference(encoded);
+  base.payloadBytes = Buffer.byteLength(encoded, "utf8");
+  return base;
+}
+
+function projectCalendarInput(toolName: string, value: unknown): JsonObject {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const source = value as JsonObject;
+  let hasLiveTarget = false;
+  const target = [toolName, ...["accountId", "calendarId", "eventId"].map((key) => {
+    if (!hasOwn(source, key)) return null;
+    hasLiveTarget = true;
+    return hashCalendarProviderIdentifier(source[key], `calendar input ${key}`);
+  })];
+  for (const key of ["start", "end"] as const) {
+    const timestamp = boundedEmailString(source[key], 64);
+    if (timestamp !== undefined) hasLiveTarget = true;
+    target.push(timestamp === undefined ? null : sha256Reference(timestamp));
+  }
+  const existingTargetDigest = boundedEmailString(source.targetDigest, 128);
+  const projected: JsonObject = {
+    targetDigest: hasLiveTarget
+      ? sha256Reference(JSON.stringify(target))
+      : existingTargetDigest ?? sha256Reference(JSON.stringify(target))
+  };
+  if (Number.isSafeInteger(source.limit)) projected.limit = source.limit;
+  return projected;
+}
+
+function projectCalendarOutput(toolName: string, value: unknown): JsonObject {
+  const base: JsonObject = { type: toolName, contentUnavailableOnReplay: true };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return base;
+  const record = value as JsonObject;
+  const target: Array<string | null> = [toolName, ...["providerId", "accountId", "calendarId", "eventId"].map((key) => hasOwn(record, key)
+    ? hashCalendarProviderIdentifier(record[key], `calendar ${toolName} output.${key}`)
+    : null)];
+  const entries = toolName === "calendar.calendars" ? record.calendars : toolName === "calendar.events" ? record.events : undefined;
+  if (Array.isArray(entries)) {
+    base.itemCount = entries.length;
+    for (const [index, entry] of entries.slice(0, 100).entries()) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const item = entry as JsonObject;
+      for (const key of ["calendarId", "eventId"] as const) {
+        if (hasOwn(item, key)) target.push(hashCalendarProviderIdentifier(item[key], `calendar ${toolName} item[${index}].${key}`));
+      }
+    }
+  }
+  if (toolName === "calendar.read" && Array.isArray(record.attendees)) base.attendeeCount = record.attendees.length;
+  const encoded = JSON.stringify(value) ?? "null";
+  base.targetDigest = sha256Reference(JSON.stringify(target));
+  base.payloadDigest = sha256Reference(encoded);
+  base.payloadBytes = Buffer.byteLength(encoded, "utf8");
   return base;
 }
 
@@ -786,6 +903,16 @@ function projectAgentOutput(value: unknown, delegation: boolean): unknown {
   if (typeof output.content === "string") {
     projected.contentDigest = sha256Reference(output.content);
     projected.contentBytes = Buffer.byteLength(output.content, "utf8");
+  }
+  const sessionProjection = output.durableSessionProjection;
+  if (sessionProjection && typeof sessionProjection === "object" && !Array.isArray(sessionProjection)) {
+    const retention = normalizedLiveOnlySessionRetention(sessionProjection);
+    if (retention && typeof output.content === "string" && retention.contentDigest === sha256Reference(output.content)) {
+      projected.durableSessionProjection = {
+        ...retention,
+        content: LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER
+      };
+    }
   }
   for (const key of ["provider", "model", "usage", "answerShape", "memory", "modelRecovery"] as const) {
     if (output[key] !== undefined) projected[key] = redactDurableValue(output[key]);

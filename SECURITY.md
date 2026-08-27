@@ -88,7 +88,8 @@ operate on a staging tree, verify audit integrity, and fail closed on unknown
 future schemas.
 
 Normal `odinn backup` output excludes OAuth tokens, gateway tokens, browser
-profiles and cookies, capability signing keys, and multi-user password records.
+profiles and cookies, capability signing keys, the state-directory `.env`, and
+multi-user password records.
 It uses SQLite's backup API for the runtime database and checksums every
 included file. Restore validates the manifest and every checksum, rejects
 unsafe links and future schemas, creates a protected pre-restore backup, and
@@ -122,6 +123,7 @@ Runemark is evidence-based: model text cannot set `verified`. Gatewatch decision
 - Model output and imported skills are untrusted input; they cannot bypass the kernel policy evaluator.
 - Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled. The active Docker adapter verifies the complete immutable bundle, uses read-only scoped mounts, disables network access, drops capabilities, enables no-new-privileges, selects and attests `seccomp=builtin`, and requires engine-reported plus stopped-container-attested CPU, memory/swap, PID, temporary-filesystem, timeout, and output controls before start. Podman remains inactive until an explicit operator-trusted seccomp profile is compiled and attested. Effective kernel enforcement remains a disclosed OCI-runtime trust dependency. Exact pre-start audit evidence and a durable cleanup-recovery reservation bound to the trusted engine path are required; uncertain cleanup quarantines later dispatch. `unconfined-process` declarations remain inactive even when host execution is configured; they refuse until a host-approved backend can bind exact commands, roots, limits, and one-time approval evidence.
 - Public web content is untrusted data and may contain prompt injection. Ódinn Forge must not treat page instructions as operator authorization.
+- Live-only email and calendar output is also untrusted. After one such result, the agent may form a visible final answer but receives no further tool authority in that run; unadvertised tool calls and replay without the active integration's trusted resource binding fail closed.
 - State directories are repaired to `0700` and sensitive JSON/JSONL records to `0600` when the gateway opens them. Idempotency keys are bound to a canonical request hash; reusing a key with different content returns `409`.
 - Durable external-channel session bindings are capped at 10,000 entries. New conversations fail closed at that ceiling while existing bindings remain usable.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.

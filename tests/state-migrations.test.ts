@@ -369,6 +369,19 @@ test("corrupted and unknown future state fail closed without replacing working f
     await writeFile(join(corrupted.state, "config.json"), "{\"version\":1,\"auditLog\":");
     await assert.rejects(() => planStateMigration(corrupted.state), /Unexpected end of JSON input|JSON/u);
     const futureJobs = await readFile(join(future.state, "jobs.json"), "utf8");
+    const liveOnlyCron = `${JSON.stringify({
+      schemaVersion: 2,
+      jobs: [{
+        id: "future-state-live-only-cron",
+        name: "Must not be rewritten by an older binary",
+        schedule: "0 9 * * 1-5",
+        timezone: "UTC",
+        enabled: true,
+        tool: "email.search",
+        input: { accountId: "future-account", query: "future private query" }
+      }]
+    })}\n`;
+    await writeFile(join(future.state, "cron-jobs.json"), liveOnlyCron);
     const plan = await planStateMigration(future.state);
     assert.match(plan.blockingIncompatibilities.join("\n"), /jobs schema 99 is newer/u);
     assert.match(plan.blockingIncompatibilities.join("\n"), /channelBindings schema 99 is newer/u);
@@ -383,6 +396,7 @@ test("corrupted and unknown future state fail closed without replacing working f
     assert.equal(status.schemas.find((surface) => surface.surface === "channelDedupe")?.healthy, false);
     await assert.rejects(() => ensureStateCompatibility(future.state), /jobs schema 99 is newer/u);
     assert.equal(await readFile(join(future.state, "jobs.json"), "utf8"), futureJobs);
+    assert.equal(await readFile(join(future.state, "cron-jobs.json"), "utf8"), liveOnlyCron);
   } finally {
     await rm(corrupted.temporary, { recursive: true, force: true });
     await rm(future.temporary, { recursive: true, force: true });

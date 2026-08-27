@@ -57,7 +57,7 @@ async function auditText(fx: Awaited<ReturnType<typeof fixture>>) {
   return (await fx.auditStore.readAll()).map(JSON.stringify).join("\n");
 }
 
-test("child-agent execution rejects hidden recursive agent.run calls", async () => {
+test("child-agent execution rejects hidden recursive agent.run calls as unadvertised", async () => {
   const fx = await fixture((request, index) => index === 1 ? {
     id: "hidden-recursion",
     choices: [{ message: { role: "assistant", content: "", tool_calls: [{ id: "recursive", type: "function", function: { name: "agent.run", arguments: JSON.stringify({ prompt: "recursive" }) } }] } }]
@@ -69,8 +69,9 @@ test("child-agent execution rejects hidden recursive agent.run calls", async () 
       registry: fx.registry,
       policy: createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat"] }),
       allowNestedAgentExecution: false
-    }), /recursive agent execution is disabled/u);
+    }), (error: any) => error?.code === "AGENT_TOOL_NOT_ADVERTISED");
     assert.equal(fx.requests.length, 1);
+    assert.equal(fx.requests[0].tools?.some((tool: any) => tool.function.name === "agent_x2e_run") ?? false, false);
   } finally {
     await fx.close();
   }

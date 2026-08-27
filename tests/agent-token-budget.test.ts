@@ -19,7 +19,7 @@ test("agent turns adapt output limits while preserving a visible-answer reserve"
       choices: [{ message: { role: "assistant", content: "", tool_calls: [{
         id: "echo_1",
         type: "function",
-        function: { name: "text.echo", arguments: JSON.stringify({ text: "probe" }) }
+        function: { name: "text_x2e_echo", arguments: JSON.stringify({ text: "probe" }) }
       }] } }],
       usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 }
     } : {
@@ -41,6 +41,15 @@ test("agent turns adapt output limits while preserving a visible-answer reserve"
       providers: { test: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${address.port}/v1`, models: ["test-model"] } }
     }
   });
+  registry.set("text.echo", {
+    ...registry.get("text.echo"),
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"],
+      additionalProperties: false
+    }
+  });
   try {
     const result = await runTask({
       task: {
@@ -53,6 +62,7 @@ test("agent turns adapt output limits while preserving a visible-answer reserve"
       registry
     });
     assert.equal(result.output.content, "Visible answer.");
+    assert.equal(requests[0].tools.some((tool: any) => tool.function.name === "text_x2e_echo"), true);
     assert.deepEqual(requests.map((request) => request.max_tokens), [700, 1_000]);
     assert.equal(result.output.tokenBudget.visibleAnswerReserve, 400);
     assert.equal(result.output.tokenBudget.lastTurnAllocation, 1_000);

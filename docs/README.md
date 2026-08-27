@@ -88,6 +88,9 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
   cursors, and platform limits.
 - [Bounded GitHub reads](github-read.md) — fixed-origin, repository-allowlisted
   live reads with credential references and digest-only durable evidence.
+- [Bounded Microsoft Graph reads](microsoft-graph-read.md) — one-account,
+  read-only email and calendar access with a fixed origin, credential
+  references, bounded live content, and no-replay durable evidence.
 
 ## Advanced capability notes
 

@@ -53,6 +53,7 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     await writeFile(join(fixture.state, "browser-profile", "Cookies"), "do-not-copy\n");
     await writeFile(join(fixture.state, "gateway.token"), "do-not-copy\n");
     await writeFile(join(fixture.state, "capability-signing.key"), "do-not-copy\n");
+    await writeFile(join(fixture.state, ".env"), "ODINN_TEST_BACKUP_ENV=SENTINEL_STATE_ENV_MUST_NOT_COPY_8f31\n");
     const approvalSecret = "do-not-copy-process-command";
     createApprovalStore({ path: join(fixture.state, "approvals.json") }).create({
       tool: "process.exec",
@@ -77,7 +78,7 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     assert.ok(created.manifest.files.some((file) => file.path === "channel-dedupe.json"));
     assert.equal(created.manifest.stateSchemas.channelBindings, 1);
     assert.equal(created.manifest.stateSchemas.channelDedupe, 1);
-    for (const forbidden of ["oauth/openai.json", "credentials/custom-oauth.json", "browser-profile/Cookies", "gateway.token", "capability-signing.key", "approvals.json", "approvals.json.key", "bundles/sha256/bundle/workspace-secret.txt"]) {
+    for (const forbidden of [".env", "oauth/openai.json", "credentials/custom-oauth.json", "browser-profile/Cookies", "gateway.token", "capability-signing.key", "approvals.json", "approvals.json.key", "bundles/sha256/bundle/workspace-secret.txt"]) {
       assert.equal(created.manifest.files.some((file) => file.path === forbidden), false);
     }
     assert.equal(created.manifest.files.some((file) => /^db\/custom-audit\.sqlite(?:-(?:wal|shm)|\.notify)$/u.test(file.path)), false);
@@ -88,7 +89,9 @@ test("normal backup is checksummed and excludes credentials while preserving sta
     assert.ok(created.manifest.excluded.includes("approvals.json"));
     assert.ok(created.manifest.excluded.includes("approvals.json.key"));
     assert.ok(created.manifest.excluded.includes("bundles/"));
-    assert.doesNotMatch(JSON.stringify(created), /do-not-copy|workspace-secret-must-not-copy|private-argument/u);
+    assert.ok(created.manifest.excluded.includes(".env"));
+    assert.doesNotMatch(JSON.stringify(created), /do-not-copy|workspace-secret-must-not-copy|private-argument|SENTINEL_STATE_ENV_MUST_NOT_COPY/u);
+    assert.doesNotMatch((await Promise.all(created.manifest.files.map((file) => readFile(join(backup, file.path))))).map((value) => value.toString("utf8")).join("\n"), /SENTINEL_STATE_ENV_MUST_NOT_COPY/u);
     const inspected = await inspectStateBackup(backup);
     assert.equal(inspected.valid, true);
     assert.equal(inspected.manifest.sourceApplication.version, "1.0.0");

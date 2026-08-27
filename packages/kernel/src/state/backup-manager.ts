@@ -12,6 +12,7 @@ const BACKUP_MANIFEST = "backup-manifest.json";
 const BACKUP_SCHEMA_VERSION = 1;
 const LEGACY_BROWSER_PROFILE_DIRECTORIES = new Set(["browser-profile", "browser-profiles"]);
 const DEFAULT_EXCLUSIONS = Object.freeze([
+  ".env",
   "oauth/",
   "browser-profile/",
   "browser-profiles/",
