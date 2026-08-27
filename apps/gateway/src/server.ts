@@ -2013,7 +2013,7 @@ export async function createGatewayServer(options: any = {}) {
       }
       if (request.method === "POST" && url.pathname === "/proof") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await proofVerifier.verify(body));
+        return json(response, 200, await runRequestMutation("proof.verify", (signal) => proofVerifier.verify(body, { signal })));
       }
       if (request.method === "GET" && url.pathname.startsWith("/proof/")) {
         const runId = decodeURIComponent(url.pathname.slice("/proof/".length));
@@ -2225,21 +2225,35 @@ export async function createGatewayServer(options: any = {}) {
       if (request.method === "POST" && url.pathname.startsWith("/counterfactual/") && url.pathname.endsWith("/execute")) {
         const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length, -"/execute".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await runRequestMutation("counterfactual.execute", (signal) => runtime.counterfactual.execute(groupId, {
-          capabilities: runtime.capabilities,
-          proof: {
-            run: async (runId: string, contract: any, { workspaceRoot = root }: any = {}) => {
-              return new ProofVerifier({
-                runLedger: runtime.ledger,
-                allowedRoot: workspaceRoot,
-                ...proofOptions
-              }).verify({ ...contract, runId });
+        const candidateExecutors = new Map<string, any>();
+        try {
+          const result = await runRequestMutation("counterfactual.execute", (signal) => runtime.counterfactual.execute(groupId, {
+            capabilities: runtime.capabilities,
+            proof: {
+              run: async (runId: string, contract: any, { workspaceRoot = root, signal: proofSignal }: any = {}) => {
+                return new ProofVerifier({
+                  runLedger: runtime.ledger,
+                  allowedRoot: workspaceRoot,
+                  ...proofOptions
+                }).verify({ ...contract, runId }, { signal: proofSignal });
+              }
+            },
+            policy,
+            signal,
+            executor: (task: any, context: any) => {
+              const candidateRoot = resolve(context.workspaceRoot);
+              let candidateExecutor = candidateExecutors.get(candidateRoot);
+              if (!candidateExecutor) {
+                candidateExecutor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot: candidateRoot, config, policy });
+                candidateExecutors.set(candidateRoot, candidateExecutor);
+              }
+              return candidateExecutor(scopeTaskRequest({ task, workspaceRoot: candidateRoot }, tenantScope), { signal });
             }
-          },
-          policy,
-          signal,
-          executor: (task: any, context: any) => runRequestIsolatedTask({ task, workspaceRoot: context.workspaceRoot })
-        })));
+          }));
+          return json(response, 200, result);
+        } finally {
+          await Promise.allSettled([...candidateExecutors.values()].map((candidateExecutor) => candidateExecutor.shutdown?.()));
+        }
       }
       if (request.method === "POST" && url.pathname.startsWith("/counterfactual/") && url.pathname.endsWith("/select")) {
         const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length, -"/select".length));

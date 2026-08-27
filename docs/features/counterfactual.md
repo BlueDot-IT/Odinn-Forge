@@ -3,10 +3,13 @@
 Worldtree Paths is Ódinn Forge's optional scenario-comparison plugin module.
 The existing `counterfactual` CLI command, configuration key, gateway routes,
 and SDK names remain compatibility identifiers. It recursively copies a
-workspace into separate candidate directories under
-`.odinn-worktrees/<group>/<plan>` and creates independent run records, ledger
-relationships, and candidate plans. They are filesystem copies, not Git
-worktrees or operating-system sandboxes. Generated and cache-heavy roots
+workspace into separate candidate directories outside the source workspace,
+under a runtime-owned worktree root such as
+`<state>/worktrees/<group>/<plan>`. If the configured state path overlaps the
+source workspace, Ódinn Forge selects a disjoint sibling or temporary root
+instead. The candidates create independent run records, ledger relationships,
+and plans. They are filesystem copies, not Git worktrees or operating-system
+sandboxes. Generated and cache-heavy roots
 (`.git`, `node_modules`, `dist`, `build`, `coverage`, `.next`, `.cache`,
 `.turbo`, and `.pnpm-store`) are excluded. The source workspace is not modified
 by branch creation.

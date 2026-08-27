@@ -123,7 +123,7 @@ function metricPoint(metric: TelemetryMetric): Record<string, unknown> {
       name: metric.name,
       unit: metric.unit,
       sum: {
-        aggregationTemporality: 2,
+        aggregationTemporality: 1,
         isMonotonic: true,
         dataPoints: [{ ...common, asDouble: metric.value }]
       }

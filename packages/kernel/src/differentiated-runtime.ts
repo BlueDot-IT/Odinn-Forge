@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
+import { readFile, writeFile, mkdir, mkdtemp, readdir, stat, lstat, rm, cp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { Unzip, UnzipInflate, zipSync } from "fflate";
@@ -313,7 +314,7 @@ export class ProofEngine {
     this.includeRawEvidence = includeRawEvidence === true;
     this.verifierOptions = { allowedCommands, maxOutputBytes, maxFileBytes, commandEnvironment, includeRawEvidence: this.includeRawEvidence };
   }
-  async run(runId: string, contract: AnyRecord, { workspaceRoot = currentWorkingDirectory() }: AnyRecord = {}) {
+  async run(runId: string, contract: AnyRecord, { workspaceRoot = currentWorkingDirectory(), signal }: AnyRecord = {}) {
     if (contract?.schemaVersion === 1) {
       const verifierOptions = Object.fromEntries(Object.entries(this.verifierOptions).filter(([, value]) => value !== undefined));
       return new ProofVerifier({
@@ -321,7 +322,7 @@ export class ProofEngine {
         ...verifierOptions,
         allowedRoot: workspaceRoot,
         allowExternalHttp: this.allowExternalHttp
-      }).verify({ ...contract, runId });
+      }).verify({ ...contract, runId }, { signal });
     }
     validateContract(contract);
     const id = contract.id ?? `contract_${randomUUID()}`;
@@ -968,47 +969,167 @@ function assertCounterfactualActive(signal?: AbortSignal): void {
   throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "counterfactual operation was cancelled before durable settlement", { cancelled: true });
 }
 
-async function copyWorkspaceTree(sourceRoot: string, destinationRoot: string, signal?: AbortSignal) {
-  const excluded = new Set([
-    ".git", ".odinn", ".odinn-worktrees", ".cache", ".next", ".pnpm-store",
-    ".turbo", "build", "coverage", "dist", "node_modules"
-  ]);
+const COUNTERFACTUAL_PROTECTED_COMPONENTS = new Set([".git", ".odinn", ".odinn-worktrees"]);
+const COUNTERFACTUAL_GENERATED_COMPONENTS = new Set([
+  ...COUNTERFACTUAL_PROTECTED_COMPONENTS,
+  ".cache", ".next", ".pnpm-store", ".turbo", "build", "coverage", "dist", "node_modules"
+]);
+
+function physicalCounterfactualPath(path: string): string {
+  let cursor = resolve(path);
+  const suffix: string[] = [];
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    suffix.unshift(basename(cursor));
+    cursor = parent;
+  }
+  return resolve(realpathSync(cursor), ...suffix);
+}
+
+function counterfactualRootsOverlap(left: string, right: string): boolean {
+  const resolvedLeft = resolve(left);
+  const resolvedRight = resolve(right);
+  if (isWithin(resolvedLeft, resolvedRight) || isWithin(resolvedRight, resolvedLeft)) return true;
+  const physicalLeft = physicalCounterfactualPath(resolvedLeft);
+  const physicalRight = physicalCounterfactualPath(resolvedRight);
+  return isWithin(physicalLeft, physicalRight) || isWithin(physicalRight, physicalLeft);
+}
+
+function assertDisjointCounterfactualRoots(sourceRoot: string, destinationRoot: string): void {
+  if (counterfactualRootsOverlap(sourceRoot, destinationRoot)) {
+    throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "counterfactual copy source and destination must not contain one another", {
+      sourceRoot: resolve(sourceRoot),
+      destinationRoot: resolve(destinationRoot)
+    });
+  }
+}
+
+function relativeWorkspaceComponents(root: string, candidate: string): string[] {
+  const relativePath = relative(resolve(root), resolve(candidate));
+  if (relativePath === "") return [];
+  if (relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
+    throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "counterfactual copy escaped its declared root");
+  }
+  return relativePath.split(sep).filter(Boolean);
+}
+
+function counterfactualCopyFilter({
+  sourceRoot,
+  destinationRoot,
+  stateRoot,
+  excludedComponents,
+  signal
+}: {
+  sourceRoot: string;
+  destinationRoot: string;
+  stateRoot: string;
+  excludedComponents: ReadonlySet<string>;
+  signal?: AbortSignal;
+}) {
+  const resolvedSourceRoot = resolve(sourceRoot);
+  const resolvedDestinationRoot = resolve(destinationRoot);
+  const resolvedStateRoot = resolve(stateRoot);
+  const stateNestedInSource = isWithin(resolvedSourceRoot, resolvedStateRoot);
+  const stateNestedInDestination = isWithin(resolvedDestinationRoot, resolvedStateRoot);
+  return (sourcePath: string, destinationPath: string): boolean => {
+    assertCounterfactualActive(signal);
+    const resolvedSourcePath = resolve(sourcePath);
+    const resolvedDestinationPath = resolve(destinationPath);
+    const sourceComponents = relativeWorkspaceComponents(resolvedSourceRoot, resolvedSourcePath);
+    const destinationComponents = relativeWorkspaceComponents(resolvedDestinationRoot, resolvedDestinationPath);
+    if (sourceComponents.some((component) => excludedComponents.has(component))) return false;
+    if (destinationComponents.some((component) => excludedComponents.has(component))) return false;
+    if (stateNestedInSource && isWithin(resolvedStateRoot, resolvedSourcePath)) return false;
+    if (stateNestedInDestination && isWithin(resolvedStateRoot, resolvedDestinationPath)) return false;
+    try {
+      if (lstatSync(resolvedSourcePath).isSymbolicLink()) return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    return true;
+  };
+}
+
+function counterfactualWorktreeBase(sourceRoot: string, stateRoot: string): string {
+  const stateWorktrees = resolve(stateRoot, "worktrees");
+  if (!counterfactualRootsOverlap(sourceRoot, stateWorktrees)) return stateWorktrees;
+  const sourceParent = dirname(resolve(sourceRoot));
+  if (sourceParent !== resolve(sourceRoot)) {
+    return resolve(sourceParent, ".odinn-worktrees", `${basename(sourceRoot)}-${hash(resolve(sourceRoot)).slice(0, 16)}`);
+  }
+  return resolve(tmpdir(), "odinn-worktrees", hash(resolve(sourceRoot)).slice(0, 16));
+}
+
+function counterfactualGroupRoot(sourceRoot: string, stateRoot: string, groupId: string): string {
+  return resolve(counterfactualWorktreeBase(sourceRoot, stateRoot), groupId);
+}
+
+function authorizedCounterfactualCandidateRoot({
+  sourceRoot: sourceRootValue,
+  candidateRoot: candidateRootValue,
+  stateRoot,
+  groupId
+}: {
+  sourceRoot: string;
+  candidateRoot: string;
+  stateRoot: string;
+  groupId: string;
+}): { sourceRoot: string; candidateRoot: string } {
+  const sourceRoot = resolve(sourceRootValue);
+  const candidateRoot = resolve(candidateRootValue);
+  const authorizedGroupRoot = counterfactualGroupRoot(sourceRoot, stateRoot, groupId);
+  if (candidateRoot === authorizedGroupRoot || !isWithin(authorizedGroupRoot, candidateRoot)) {
+    throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "candidate workspace is not an authorized isolated branch");
+  }
+  assertDisjointCounterfactualRoots(sourceRoot, candidateRoot);
+  return { sourceRoot, candidateRoot };
+}
+
+async function copyWorkspaceTree(sourceRoot: string, destinationRoot: string, stateRoot: string, signal?: AbortSignal) {
+  assertDisjointCounterfactualRoots(sourceRoot, destinationRoot);
+  const filter = counterfactualCopyFilter({
+    sourceRoot,
+    destinationRoot,
+    stateRoot,
+    excludedComponents: COUNTERFACTUAL_GENERATED_COMPONENTS,
+    signal
+  });
   assertCounterfactualActive(signal);
-  await mkdir(destinationRoot, { recursive: true });
+  await mkdir(destinationRoot, { recursive: true, mode: 0o700 });
   assertCounterfactualActive(signal);
   const entries = await readdir(sourceRoot, { withFileTypes: true });
   assertCounterfactualActive(signal);
   for (const entry of entries) {
-    if (excluded.has(entry.name)) continue;
     assertCounterfactualActive(signal);
     await cp(join(sourceRoot, entry.name), join(destinationRoot, entry.name), {
       recursive: true,
-      filter: () => {
-        assertCounterfactualActive(signal);
-        return true;
-      }
+      filter
     });
     assertCounterfactualActive(signal);
   }
 }
 
-async function copyWorkspaceRollbackBackup(sourceRoot: string, destinationRoot: string, signal?: AbortSignal) {
-  const excluded = new Set([".git", ".odinn", ".odinn-worktrees"]);
+async function copyWorkspaceRollbackBackup(sourceRoot: string, destinationRoot: string, stateRoot: string, signal?: AbortSignal) {
+  assertDisjointCounterfactualRoots(sourceRoot, destinationRoot);
+  const filter = counterfactualCopyFilter({
+    sourceRoot,
+    destinationRoot,
+    stateRoot,
+    excludedComponents: COUNTERFACTUAL_PROTECTED_COMPONENTS,
+    signal
+  });
   assertCounterfactualActive(signal);
-  await mkdir(destinationRoot, { recursive: true });
+  await mkdir(destinationRoot, { recursive: true, mode: 0o700 });
   assertCounterfactualActive(signal);
   const entries = await readdir(sourceRoot, { withFileTypes: true });
   assertCounterfactualActive(signal);
   for (const entry of entries) {
-    if (excluded.has(entry.name)) continue;
     assertCounterfactualActive(signal);
     await cp(join(sourceRoot, entry.name), join(destinationRoot, entry.name), {
       recursive: true,
       preserveTimestamps: true,
-      filter: () => {
-        assertCounterfactualActive(signal);
-        return true;
-      }
+      filter
     });
     assertCounterfactualActive(signal);
   }
@@ -1041,7 +1162,8 @@ export class CounterfactualManager {
     const expectedRoot = resolve(sourceRun.workspaceRoot);
     if (sourceRoot !== expectedRoot) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "counterfactual workspace must match the source run workspace", { expectedRoot, requestedRoot: sourceRoot });
     const groupId = `cf_${randomUUID()}`;
-    const groupRoot = resolve(sourceRoot, ".odinn-worktrees", groupId);
+    const groupRoot = counterfactualGroupRoot(sourceRoot, this.stateDir, groupId);
+    assertDisjointCounterfactualRoots(sourceRoot, groupRoot);
     const candidates: AnyRecord[] = [];
     const createdRunIds: string[] = [];
     assertCounterfactualActive(signal);
@@ -1052,7 +1174,7 @@ export class CounterfactualManager {
         const runId = `run_${randomUUID()}`;
         const branchRoot = resolve(groupRoot, plan.id);
         if (!isWithin(groupRoot, branchRoot) || branchRoot === groupRoot) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "counterfactual branch escaped its group directory", { planId: plan.id });
-        await copyWorkspaceTree(sourceRoot, branchRoot, signal);
+        await copyWorkspaceTree(sourceRoot, branchRoot, this.stateDir, signal);
         await __testOnlyAfterWorkspaceCopy?.({ groupId, planId: plan.id, branchRoot });
         assertCounterfactualActive(signal);
         this.ledger.ensureRun({ runId, parentRunId: sourceRunId, branchPointStepId: sourceStepId, objective: plan.summary, workspaceRoot: branchRoot });
@@ -1081,8 +1203,16 @@ export class CounterfactualManager {
     requireExperimental(this.featureFlags, "counterfactual", this.ledger);
     assertCounterfactualActive(signal);
     if (typeof executor !== "function") throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual execution requires an executor");
-    const rows = this.ledger.database.db.prepare("SELECT c.*, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId);
+    const rows = this.ledger.database.db.prepare("SELECT c.*, r.workspace_root, parent.workspace_root AS source_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id JOIN counterfactual_groups g ON g.id = c.group_id JOIN runs parent ON parent.id = g.source_run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId);
     if (!rows.length) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual group not found");
+    for (const row of rows) {
+      authorizedCounterfactualCandidateRoot({
+        sourceRoot: row.source_root,
+        candidateRoot: row.workspace_root,
+        stateRoot: this.stateDir,
+        groupId
+      });
+    }
     const results = [];
     for (const row of rows) {
       assertCounterfactualActive(signal);
@@ -1150,29 +1280,38 @@ export class CounterfactualManager {
     return { groupId, results };
   }
   compare(groupId: string) { requireExperimental(this.featureFlags, "counterfactual", this.ledger); const rows = this.ledger.database.db.prepare("SELECT c.*, c.status AS candidate_status, r.status AS run_status, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId) as AnyRecord[]; return { groupId, candidates: rows.map((row: AnyRecord) => ({ ...row, status: row.candidate_status, runStatus: row.run_status, plan: parse(row.plan_json), proof: this.ledger.database.db.prepare("SELECT status, COUNT(*) count FROM assertion_results WHERE run_id = ? GROUP BY status").all(row.run_id) })) }; }
-  async commit(groupId: string, runId: string, { apply = false, signal, __testOnlyAfterBackup }: AnyRecord = {}) {
+  async commit(groupId: string, runId: string, { apply = false, signal, __testOnlyAfterBackup, __testOnlyAfterActivation }: AnyRecord = {}) {
     requireExperimental(this.featureFlags, "counterfactual", this.ledger);
     assertCounterfactualActive(signal);
     const candidate = this.ledger.database.db.prepare("SELECT c.*, r.workspace_root AS candidate_root, parent.workspace_root AS source_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id JOIN runs parent ON parent.id = (SELECT source_run_id FROM counterfactual_groups WHERE id = c.group_id) WHERE c.group_id = ? AND c.run_id = ?").get(groupId, runId) as AnyRecord | undefined;
     if (!candidate) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual candidate not found");
     if (candidate.status !== "completed" && candidate.status !== "verified" && candidate.status !== "completed-unverified") throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "only a completed candidate can be selected", { status: candidate.status });
-    const sourceRoot = resolve(candidate.source_root); const candidateRoot = resolve(candidate.candidate_root);
-    const internalBranchRoot = join(sourceRoot, ".odinn-worktrees");
-    const authorizedInternalBranch = candidateRoot.startsWith(`${internalBranchRoot}${sep}`);
-    if (sourceRoot === candidateRoot || (candidateRoot.startsWith(`${sourceRoot}${sep}`) && !authorizedInternalBranch)) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "candidate workspace is not an authorized isolated branch");
+    const { sourceRoot, candidateRoot } = authorizedCounterfactualCandidateRoot({
+      sourceRoot: candidate.source_root,
+      candidateRoot: candidate.candidate_root,
+      stateRoot: this.stateDir,
+      groupId
+    });
     const actions = [{ action: "replace-workspace", source: candidateRoot, destination: sourceRoot }];
     if (!apply) return { groupId, runId, applied: false, actions, warning: "dry-run; pass --apply to replace the source workspace" };
-    const backup = join(this.stateDir, "worktrees", `${groupId}-${randomUUID()}`);
+    let backup: string | undefined;
     let backupReady = false;
     let activationStarted = false;
     try {
       assertCounterfactualActive(signal);
-      await copyWorkspaceRollbackBackup(sourceRoot, backup, signal);
+      backup = await mkdtemp(join(tmpdir(), "odinn-counterfactual-rollback-"));
+      assertCounterfactualActive(signal);
+      await copyWorkspaceRollbackBackup(sourceRoot, backup, this.stateDir, signal);
       backupReady = true;
       await __testOnlyAfterBackup?.({ groupId, runId, backup, sourceRoot, candidateRoot });
       assertCounterfactualActive(signal);
-      activationStarted = true;
-      await syncWorkspace(candidateRoot, sourceRoot, { signal });
+      await syncWorkspace(candidateRoot, sourceRoot, {
+        signal,
+        stateRoot: this.stateDir,
+        onMutationStart: () => { activationStarted = true; }
+      });
+      assertCounterfactualActive(signal);
+      await __testOnlyAfterActivation?.({ groupId, runId, backup, sourceRoot, candidateRoot });
       assertCounterfactualActive(signal);
       const sourceRunId = (this.ledger.database.db.prepare("SELECT source_run_id FROM counterfactual_groups WHERE id = ?").get(groupId) as AnyRecord | undefined)?.source_run_id;
       const selectedAt = now();
@@ -1183,42 +1322,102 @@ export class CounterfactualManager {
       });
       return { groupId, runId, applied: true, actions };
     } catch (error) {
-      if (backupReady && activationStarted) await syncWorkspace(backup, sourceRoot).catch(() => undefined);
+      if (backup && backupReady && activationStarted) {
+        await syncWorkspace(backup, sourceRoot, { stateRoot: this.stateDir }).catch(() => undefined);
+      }
       assertCounterfactualActive(signal);
       throw new OdinnRuntimeError("WORKSPACE_CONFLICT", `selected branch could not be applied: ${failureMessage(error)}`, { groupId, runId });
-    } finally { await rm(backup, { recursive: true, force: true }); }
+    } finally {
+      if (backup) await rm(backup, { recursive: true, force: true });
+    }
   }
   async select(groupId: string, runId: string, options: AnyRecord = {}) { const result = await this.commit(groupId, runId, options); if (!result.applied) return result; return { ...result, selected: true }; }
 }
 
-async function syncWorkspace(source: string, destination: string, { signal }: { signal?: AbortSignal } = {}) {
-  const excluded = new Set([".odinn", ".git", ".odinn-worktrees"]);
-  assertCounterfactualActive(signal);
-  const sourceDirectoryEntries = await readdir(source, { withFileTypes: true });
-  assertCounterfactualActive(signal);
-  const sourceEntries = new Set(sourceDirectoryEntries.filter((entry) => !excluded.has(entry.name)).map((entry) => entry.name));
-  const destinationEntries = await readdir(destination, { withFileTypes: true });
-  assertCounterfactualActive(signal);
-  for (const entry of destinationEntries) {
-    if (excluded.has(entry.name) || sourceEntries.has(entry.name)) continue;
+async function syncWorkspace(source: string, destination: string, {
+  signal,
+  stateRoot,
+  onMutationStart
+}: {
+  signal?: AbortSignal;
+  stateRoot: string;
+  onMutationStart?: () => void;
+}) {
+  assertDisjointCounterfactualRoots(source, destination);
+  const filter = counterfactualCopyFilter({
+    sourceRoot: source,
+    destinationRoot: destination,
+    stateRoot,
+    excludedComponents: COUNTERFACTUAL_PROTECTED_COMPONENTS,
+    signal
+  });
+  let mutationStarted = false;
+  const beforeMutation = () => {
     assertCounterfactualActive(signal);
-    await rm(join(destination, entry.name), { recursive: true, force: true });
+    if (!mutationStarted) {
+      mutationStarted = true;
+      onMutationStart?.();
+      assertCounterfactualActive(signal);
+    }
+  };
+
+  const syncDirectory = async (sourceDirectory: string, destinationDirectory: string): Promise<void> => {
     assertCounterfactualActive(signal);
-  }
-  for (const name of sourceEntries) {
+    const sourceDirectoryEntries = await readdir(sourceDirectory, { withFileTypes: true });
     assertCounterfactualActive(signal);
-    await rm(join(destination, name), { recursive: true, force: true });
+    const destinationDirectoryEntries = await readdir(destinationDirectory, { withFileTypes: true });
     assertCounterfactualActive(signal);
-    await cp(join(source, name), join(destination, name), {
-      recursive: true,
-      preserveTimestamps: true,
-      filter: () => {
+    const sourceEntries = new Map(sourceDirectoryEntries.map((entry) => [entry.name, entry]));
+    const destinationEntries = new Map(destinationDirectoryEntries.map((entry) => [entry.name, entry]));
+
+    for (const entry of destinationDirectoryEntries) {
+      if (entry.isSymbolicLink()) continue;
+      const sourcePath = join(sourceDirectory, entry.name);
+      const destinationPath = join(destinationDirectory, entry.name);
+      if (!filter(sourcePath, destinationPath) || sourceEntries.has(entry.name)) continue;
+      beforeMutation();
+      await rm(destinationPath, { recursive: true, force: true });
+      assertCounterfactualActive(signal);
+    }
+
+    for (const entry of sourceDirectoryEntries) {
+      const sourcePath = join(sourceDirectory, entry.name);
+      const destinationPath = join(destinationDirectory, entry.name);
+      if (!filter(sourcePath, destinationPath)) continue;
+      const destinationEntry = destinationEntries.get(entry.name);
+      if (entry.isDirectory()) {
+        if (destinationEntry && !destinationEntry.isDirectory()) {
+          beforeMutation();
+          await rm(destinationPath, { recursive: true, force: true });
+          assertCounterfactualActive(signal);
+        }
+        if (!destinationEntry || !destinationEntry.isDirectory()) {
+          beforeMutation();
+          await mkdir(destinationPath, { recursive: false });
+          assertCounterfactualActive(signal);
+        }
+        await syncDirectory(sourcePath, destinationPath);
         assertCounterfactualActive(signal);
-        return true;
+        continue;
       }
-    });
-    assertCounterfactualActive(signal);
-  }
+      if (destinationEntry) {
+        beforeMutation();
+        await rm(destinationPath, { recursive: true, force: true });
+        assertCounterfactualActive(signal);
+      }
+      beforeMutation();
+      await cp(sourcePath, destinationPath, {
+        recursive: true,
+        preserveTimestamps: true,
+        filter
+      });
+      assertCounterfactualActive(signal);
+    }
+  };
+
+  await syncDirectory(source, destination);
+  assertCounterfactualActive(signal);
+  return { mutated: mutationStarted };
 }
 
 export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = currentWorkingDirectory(), featureFlags = {}, proofOptions = {} }: AnyRecord = {}) {

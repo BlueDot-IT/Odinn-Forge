@@ -1953,7 +1953,8 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
       }]
     });
     assert.equal(branch.candidates.length, 2);
-    assert.ok(branch.candidates.every((candidate: any) => candidate.workspaceRoot.startsWith(`${join(workspaceRoot, ".odinn-worktrees")}${sep}`)));
+    assert.ok(branch.candidates.every((candidate: any) => candidate.workspaceRoot.startsWith(`${join(stateDir, "worktrees", branch.groupId)}${sep}`)));
+    assert.ok(branch.candidates.every((candidate: any) => !candidate.workspaceRoot.startsWith(`${workspaceRoot}${sep}`)));
     assert.equal((await getJson(`${base}/counterfactual/${branch.groupId}`)).candidates.length, 2);
     await rm(join(workspaceRoot, "branch-evidence.txt"));
     const executed = await postJson(`${base}/counterfactual/${branch.groupId}/execute`, {});

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -359,6 +360,73 @@ test("Gateway shutdown fences direct control-plane mutations before synchronous 
       }
     });
   } finally {
+    if (previousAuth === undefined) delete process.env.ODINN_GATEWAY_AUTH;
+    else process.env.ODINN_GATEWAY_AUTH = previousAuth;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Gateway shutdown aborts a stalled loopback Proof assertion without post-barrier settlement", async () => {
+  const previousAuth = process.env.ODINN_GATEWAY_AUTH;
+  process.env.ODINN_GATEWAY_AUTH = "off";
+  const root = await mkdtemp(join(tmpdir(), "odinn-shutdown-proof-http-"));
+  const stateDir = join(root, "state");
+  const runId = "proof-must-remain-unsettled";
+  const contractId = "proof_stalled_during_shutdown";
+  const assertionEntered = deferred();
+  const assertionServer: any = createHttpServer(() => { assertionEntered.resolve(); });
+  let gateway: any;
+  try {
+    await mkdir(stateDir, { recursive: true });
+    const setupLedger = createRunLedger({ stateDir, workspaceRoot: root });
+    setupLedger.ensureRun({ runId, objective: "remain unsettled across the shutdown barrier" });
+    const statusBefore = setupLedger.getRun(runId).status;
+    setupLedger.close();
+
+    const assertionBase = await listen(assertionServer);
+    gateway = await createGatewayServer(withGatewayTestHooks({ stateDir, workspaceRoot: root }, { shutdownTimeoutMs: 1_500 }));
+    const gatewayBase = await listen(gateway);
+    const request = fetch(`${gatewayBase}/proof`, {
+      method: "POST",
+      headers: { "connection": "close", "content-type": "application/json" },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        id: contractId,
+        runId,
+        assertions: [{
+          id: "stalled-loopback",
+          type: "http",
+          url: `${assertionBase}/never-settles`,
+          timeoutMs: 30_000,
+          expect: { status: 200 }
+        }]
+      })
+    }).then(async (response) => {
+      await response.arrayBuffer();
+      return response.status;
+    }).catch(() => 0);
+
+    await assertionEntered.promise;
+    const closed = new Promise<Error | undefined>((resolveClose) => gateway.close((error?: Error) => resolveClose(error)));
+    const [status, closeError] = await Promise.all([request, closed]);
+    assert.ok(status === 0 || status === 503, `Proof returned ${status} after shutdown admission closed`);
+    assert.equal(closeError, undefined);
+
+    const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+    try {
+      assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM verification_contracts WHERE id = ?").get(contractId).count, 1);
+      assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM assertion_results WHERE contract_id = ?").get(contractId).count, 0);
+      assert.equal(ledger.getRun(runId).status, statusBefore);
+      const proofEvents = ledger.getRun(runId).events.filter((event: any) => event.type.startsWith("verification") || event.type === "assertion-result");
+      assert.deepEqual(proofEvents.map((event: any) => event.type), ["verification-started"]);
+      assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM artifacts").get().count, 1);
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    assertionServer.closeAllConnections?.();
+    if (assertionServer.listening) await new Promise<void>((resolveClose) => assertionServer.close(() => resolveClose()));
+    if (gateway?.listening) await new Promise<void>((resolveClose) => gateway.close(() => resolveClose()));
     if (previousAuth === undefined) delete process.env.ODINN_GATEWAY_AUTH;
     else process.env.ODINN_GATEWAY_AUTH = previousAuth;
     await rm(root, { recursive: true, force: true });

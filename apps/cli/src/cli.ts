@@ -3613,16 +3613,16 @@ async function counterfactualCommand(args: any) {
       executionAuditStore = createAuditStore(join(stateDir(rest), config.auditLog ?? "audit.jsonl"));
       const result = await runtime.counterfactual.execute(created.groupId, {
         proof: {
-          run: async (runId: any, contract: any, { workspaceRoot = invocationRoot() }: any = {}) => {
+          run: async (runId: any, contract: any, { workspaceRoot = invocationRoot(), signal }: any = {}) => {
             if (contract?.schemaVersion === 1) {
               return new ProofVerifier({
                 runLedger: runtime.ledger,
                 allowedRoot: workspaceRoot,
                 allowedCommands: config.proof?.allowedCommands ?? [],
                 includeRawEvidence: config.proof?.includeRawEvidence === true
-              }).verify({ ...contract, runId });
+              }).verify({ ...contract, runId }, { signal });
             }
-            return runtime.proof.run(runId, contract, { workspaceRoot });
+            return runtime.proof.run(runId, contract, { workspaceRoot, signal });
           }
         },
         capabilities: runtime.capabilities,

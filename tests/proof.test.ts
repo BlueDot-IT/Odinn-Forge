@@ -222,6 +222,52 @@ test("Proof verifies HTTP and git assertions through bounded real operations", a
   }
 });
 
+test("Proof aborts a running process assertion without durable assertion or run settlement", async () => {
+  const { root, ledger, runId } = await fixture("run_proof_process_abort");
+  const startedMarker = join(root, "process-assertion-started.txt");
+  const stalledCommand = [
+    process.execPath,
+    "-e",
+    `require("node:fs").writeFileSync(${JSON.stringify(startedMarker)}, "started"); setInterval(() => {}, 1_000)`
+  ];
+  const controller = new AbortController();
+  const statusBefore = ledger.getRun(runId).status;
+  try {
+    const verification = new ProofVerifier({
+      runLedger: ledger,
+      allowedRoot: root,
+      allowedCommands: [stalledCommand]
+    }).verify(contract(runId, [{
+      id: "stalled-process",
+      type: "command",
+      command: stalledCommand,
+      timeoutMs: 30_000,
+      expect: { exitCode: 0 }
+    }], "proof_process_abort"), { signal: controller.signal });
+
+    const markerDeadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await access(startedMarker);
+        break;
+      } catch (error) {
+        if (Date.now() >= markerDeadline) throw error;
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+    controller.abort(new Error("proof process assertion cancelled"));
+    await assert.rejects(verification, /proof process assertion cancelled/u);
+
+    assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM verification_contracts WHERE id = ?").get("proof_process_abort").count, 1);
+    assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM assertion_results WHERE contract_id = ?").get("proof_process_abort").count, 0);
+    assert.equal(ledger.getRun(runId).status, statusBefore);
+    assert.deepEqual(ledger.getRun(runId).events.map((event: any) => event.type), ["verification-started"]);
+  } finally {
+    controller.abort();
+    ledger.close();
+  }
+});
+
 test("Proof persists every failed assertion and marks the run failed", async () => {
   const { root, ledger, runId } = await fixture("run_proof_fail");
   const wrongExitCommand = [process.execPath, "-e", "process.stdout.write('wrong'); process.exit(3)"];

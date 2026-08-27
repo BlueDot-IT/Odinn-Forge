@@ -83,6 +83,34 @@ test("OTLP exporter emits bounded trace, metric, and log JSON without redirects 
   assert.doesNotMatch(JSON.stringify(requests), /secret|token=/u);
 });
 
+test("OTLP exporter declares repeated dropped-counter samples as deltas", async () => {
+  const payloads: any[] = [];
+  const exporter = createOtlpHttpExporter({
+    endpoint: "https://collector.example/",
+    fetch: (async (_input: string | URL | Request, init?: RequestInit) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(null, { status: 200 });
+    }) as typeof fetch
+  });
+  const dropped = (value: number, timeUnixMs: number): TelemetryEnvelope => ({
+    schemaVersion: 1,
+    kind: "metric",
+    name: "odinn.export.dropped",
+    timeUnixMs,
+    instrument: "counter",
+    value,
+    unit: "1",
+    attributes: Object.freeze({ component: "gateway", operation: "telemetry.observe", "item.count": value })
+  });
+
+  await exporter.export([dropped(3, 1_000)], new AbortController().signal);
+  await exporter.export([dropped(1, 2_000)], new AbortController().signal);
+
+  const sums = payloads.map((payload) => payload.resourceMetrics[0].scopeMetrics[0].metrics[0].sum);
+  assert.deepEqual(sums.map((sum) => sum.aggregationTemporality), [1, 1]);
+  assert.deepEqual(sums.map((sum) => sum.dataPoints[0].asDouble), [3, 1]);
+});
+
 test("OTLP exporter settles categorical request failures without copying endpoint details", async () => {
   let requests = 0;
   const exporter = createOtlpHttpExporter({

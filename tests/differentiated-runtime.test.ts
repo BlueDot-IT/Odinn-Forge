@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { test } from "node:test";
 import { unzipSync } from "fflate";
 import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, OdinnRuntimeError, ProofVerifier, SnapshotManager, runTask } from "../packages/kernel/src/index.ts";
@@ -321,6 +321,168 @@ test("counterfactual candidates receive isolated workspaces", async () => {
     await assert.rejects(readFile(join(group.candidates[1].workspaceRoot, "only-a.txt"), "utf8"), { code: "ENOENT" });
     await assert.rejects(readFile(join(group.candidates[0].workspaceRoot, "node_modules", "should-not-copy.txt"), "utf8"), { code: "ENOENT" });
   } finally { runtime.ledger.close(); }
+});
+
+test("counterfactual execution rejects a substituted candidate workspace before dispatch", async (t) => {
+  const { root, runtime } = await fixture();
+  const attackerRoot = await mkdtemp(join(tmpdir(), "odinn-counterfactual-attacker-"));
+  let candidateRoot = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (candidateRoot) await rm(dirname(candidateRoot), { recursive: true, force: true });
+    await rm(attackerRoot, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-root-substitution", objective: "reject substituted branch roots" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-root-substitution",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{
+      id: "candidate",
+      title: "Candidate",
+      summary: "must remain bound to its isolated root",
+      tasks: [{ tool: "text.echo", input: { text: "never dispatch" }, readOnly: true }]
+    }]
+  });
+  const candidate = group.candidates[0];
+  candidateRoot = candidate.workspaceRoot;
+  runtime.ledger.database.db.prepare("UPDATE runs SET workspace_root = ? WHERE id = ?").run(attackerRoot, candidate.runId);
+  let dispatches = 0;
+  await assert.rejects(
+    runtime.counterfactual.execute(group.groupId, { executor: async () => { dispatches += 1; } }),
+    (error: any) => error instanceof OdinnRuntimeError && error.code === "WORKSPACE_CONFLICT"
+  );
+  assert.equal(dispatches, 0);
+});
+
+test("counterfactual creation excludes protected components and an arbitrarily nested state root", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-counterfactual-nested-state-"));
+  const state = join(root, "config", "private-runtime-state");
+  const protectedFiles = [
+    join(root, "nested", ".git", "credential.txt"),
+    join(root, "nested", ".odinn", "credential.txt"),
+    join(root, "nested", ".odinn-worktrees", "credential.txt"),
+    join(root, "nested", "node_modules", "generated.txt"),
+    join(state, "credential.txt")
+  ];
+  for (const path of protectedFiles) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `private:${path}\n`);
+  }
+  await mkdir(join(root, "nested", "ordinary"), { recursive: true });
+  await writeFile(join(root, "nested", "ordinary", "copied.txt"), "copied\n");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
+  let candidateRoot = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (candidateRoot) await rm(dirname(dirname(candidateRoot)), { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-nested-state-create", objective: "exclude nested runtime state" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-nested-state-create",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{ id: "isolated", title: "Isolated", summary: "copy only workspace data" }]
+  });
+  candidateRoot = group.candidates[0].workspaceRoot;
+  const candidateRelative = relative(root, candidateRoot);
+  assert.ok(candidateRelative === ".." || candidateRelative.startsWith(`..${sep}`), "candidate copy must not be a descendant of its source");
+  assert.equal(await readFile(join(candidateRoot, "nested", "ordinary", "copied.txt"), "utf8"), "copied\n");
+  for (const path of [
+    join(candidateRoot, "nested", ".git", "credential.txt"),
+    join(candidateRoot, "nested", ".odinn", "credential.txt"),
+    join(candidateRoot, "nested", ".odinn-worktrees", "credential.txt"),
+    join(candidateRoot, "nested", "node_modules", "generated.txt"),
+    join(candidateRoot, "config", "private-runtime-state", "credential.txt")
+  ]) {
+    await assert.rejects(readFile(path, "utf8"), (error: any) => error?.code === "ENOENT");
+  }
+});
+
+test("counterfactual activation and rollback preserve nested state and protected workspace components", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-counterfactual-nested-state-select-"));
+  const state = join(root, "config", "private-runtime-state");
+  const protectedRoots = [
+    join(root, "nested", ".git"),
+    join(root, "nested", ".odinn"),
+    join(root, "nested", ".odinn-worktrees")
+  ];
+  for (const protectedRoot of protectedRoots) {
+    await mkdir(protectedRoot, { recursive: true });
+    await writeFile(join(protectedRoot, "preserved.txt"), "source-private\n");
+  }
+  await mkdir(state, { recursive: true });
+  await writeFile(join(state, "credential.txt"), "state-private\n");
+  await writeFile(join(root, "ordinary.txt"), "source\n");
+  if (process.platform !== "win32") {
+    await writeFile(join(root, "symlink-target.txt"), "source-link-target\n");
+    await symlink("symlink-target.txt", join(root, "preserved-link.txt"));
+  }
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
+  let candidateRoot = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (candidateRoot) await rm(dirname(dirname(candidateRoot)), { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-nested-state-select", objective: "preserve nested state during selection" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-nested-state-select",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{
+      id: "candidate",
+      title: "Candidate",
+      summary: "activate without copying state",
+      tasks: [{ tool: "text.echo", input: { text: "candidate" }, readOnly: true }]
+    }]
+  });
+  const candidate = group.candidates[0];
+  candidateRoot = candidate.workspaceRoot;
+  await runtime.counterfactual.execute(group.groupId, { executor: async () => ({ output: { text: "completed" } }) });
+  await writeFile(join(candidateRoot, "ordinary.txt"), "candidate\n");
+  for (const protectedRoot of [
+    join(candidateRoot, "nested", ".git"),
+    join(candidateRoot, "nested", ".odinn"),
+    join(candidateRoot, "nested", ".odinn-worktrees"),
+    join(candidateRoot, "config", "private-runtime-state")
+  ]) {
+    await mkdir(protectedRoot, { recursive: true });
+    await writeFile(join(protectedRoot, "must-not-activate.txt"), "candidate-private\n");
+  }
+
+  await assert.rejects(runtime.counterfactual.select(group.groupId, candidate.runId, {
+    apply: true,
+    __testOnlyAfterActivation: () => { throw new Error("injected activation settlement failure"); }
+  }), /injected activation settlement failure/u);
+  assert.equal(await readFile(join(root, "ordinary.txt"), "utf8"), "source\n");
+  assert.equal(await readFile(join(state, "credential.txt"), "utf8"), "state-private\n");
+  for (const protectedRoot of protectedRoots) {
+    assert.equal(await readFile(join(protectedRoot, "preserved.txt"), "utf8"), "source-private\n");
+    await assert.rejects(readFile(join(protectedRoot, "must-not-activate.txt"), "utf8"), (error: any) => error?.code === "ENOENT");
+  }
+  if (process.platform !== "win32") {
+    assert.equal((await lstat(join(root, "preserved-link.txt"))).isSymbolicLink(), true);
+    assert.equal(await readlink(join(root, "preserved-link.txt")), "symlink-target.txt");
+  }
+
+  const selected = await runtime.counterfactual.select(group.groupId, candidate.runId, { apply: true });
+  assert.equal(selected.applied, true);
+  assert.equal(await readFile(join(root, "ordinary.txt"), "utf8"), "candidate\n");
+  assert.equal(await readFile(join(state, "credential.txt"), "utf8"), "state-private\n");
+  await assert.rejects(readFile(join(state, "must-not-activate.txt"), "utf8"), (error: any) => error?.code === "ENOENT");
+  for (const protectedRoot of protectedRoots) {
+    assert.equal(await readFile(join(protectedRoot, "preserved.txt"), "utf8"), "source-private\n");
+  }
+  if (process.platform !== "win32") {
+    assert.equal((await lstat(join(root, "preserved-link.txt"))).isSymbolicLink(), true);
+    assert.equal(await readlink(join(root, "preserved-link.txt")), "symlink-target.txt");
+  }
 });
 
 test("counterfactual execution runs real audited tasks and supports selection preview", async () => {
