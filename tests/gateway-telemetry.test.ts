@@ -399,6 +399,37 @@ test("Gateway shutdown closes admission immediately and remains bounded when tel
   }
 });
 
+test("Gateway shutdown refuses admission at the stop barrier before listener teardown", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-gateway-shutdown-barrier-"));
+  const previousAuth = process.env.ODINN_GATEWAY_AUTH;
+  process.env.ODINN_GATEWAY_AUTH = "off";
+  let barrierStatus = 0;
+  let listenerWasStillUp = false;
+  const options = withGatewayTestHooks({ stateDir: join(root, "state"), workspaceRoot: root }, {
+    afterShutdownBarrier: async () => {
+      listenerWasStillUp = server.listening;
+      const response = await fetch(base, { method: "GET", signal: AbortSignal.timeout(1_000) }).catch(() => undefined);
+      barrierStatus = response?.status ?? 0;
+    }
+  });
+  const server: any = await createGatewayServer(options);
+  let base = "";
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    base = `http://127.0.0.1:${address.port}/status`;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    assert.equal(barrierStatus, 503);
+    assert.equal(listenerWasStillUp, true);
+  } finally {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (previousAuth === undefined) delete process.env.ODINN_GATEWAY_AUTH;
+    else process.env.ODINN_GATEWAY_AUTH = previousAuth;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Gateway shutdown aborts a delayed mutation body before config can change", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-gateway-shutdown-mutation-"));
   const stateDir = join(root, "state");

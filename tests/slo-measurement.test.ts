@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,7 @@ function passingSamples(count = 2): Record<SloId, SloSample[]> {
     ...(id === "durable-run-acceptance" ? { accepted: true } : {}),
     ...(id === "startup-recovery" ? { quarantined: true } : {}),
     ...(id === "graceful-shutdown" ? { admissionBlocked: true } : {}),
+    ...(id === "graceful-shutdown" ? { barrierToCloseMs: 1 } : {}),
   }))])) as Record<SloId, SloSample[]>;
 }
 
@@ -119,11 +121,12 @@ test("development profile measures real local operations and writes a bound coll
       samplePlan: Object.fromEntries(SLO_IDS.map((id) => [id, 2])) as Record<SloId, number>,
       memoryDocuments: 50,
       reportPath,
-      source: { repository: "BlueDot-IT/Odinn-Forge", revision: REVISION, tree: TREE, clean: true },
     });
     assert.equal(report.ok, true, report.violations.join("\n"));
     assert.equal(report.collector.exported, 12);
     assert.equal(report.collector.dropped, 0);
+    assert.equal(report.source.revision, execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+    assert.equal(report.source.tree, execFileSync("git", ["rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim());
     assert.deepEqual(report.objectives.map((objective) => objective.id), SLO_IDS);
     assert.equal(report.objectives.find((objective) => objective.id === "startup-recovery")?.semanticSuccesses, 2);
     assert.equal(report.objectives.find((objective) => objective.id === "graceful-shutdown")?.semanticSuccesses, 2);
@@ -133,6 +136,15 @@ test("development profile measures real local operations and writes a bound coll
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("runSloMeasurement rejects caller-supplied identity that is not the live Git identity", async () => {
+  await assert.rejects(() => runSloMeasurement({
+    profile: "development",
+    samplePlan: Object.fromEntries(SLO_IDS.map((id) => [id, 1])) as Record<SloId, number>,
+    memoryDocuments: 1,
+    source: { repository: "BlueDot-IT/Odinn-Forge", revision: REVISION, tree: TREE, clean: true },
+  }), /current Git HEAD\/tree/u);
 });
 
 test("nightly retains exact-commit SLO evidence without write authority or secrets", async () => {

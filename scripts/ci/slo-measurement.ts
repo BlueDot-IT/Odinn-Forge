@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createGatewayServer } from "../../apps/gateway/src/server.ts";
+import { withGatewayTestHooks } from "../../apps/gateway/src/testing.ts";
 import {
   createAuditStore,
   createBuiltInRegistry,
@@ -111,6 +112,7 @@ export type SloSample = {
   accepted?: boolean;
   quarantined?: boolean;
   admissionBlocked?: boolean;
+  barrierToCloseMs?: number;
   failureCategory?: "operation-failed" | "semantic-check-failed";
 };
 
@@ -524,11 +526,27 @@ async function collectGracefulShutdown(workDirectory: string, count: number): Pr
   try {
     for (let index = 0; index < count; index += 1) {
       const stateDir = join(workDirectory, `shutdown-state-${index}`);
-      const server = await createGatewayServer({ stateDir, workspaceRoot: workDirectory });
+      let base = "";
+      let barrierAt = 0;
+      let listenerClosedAt = 0;
+      let admissionBlocked = false;
+      const server = await createGatewayServer(withGatewayTestHooks({ stateDir, workspaceRoot: workDirectory }, {
+        afterShutdownBarrier: async ({ listenerClosed }) => {
+          barrierAt = performance.now();
+          listenerClosed.then(() => { listenerClosedAt = performance.now(); });
+          const response = await fetch(`${base}/jobs`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "idempotency-key": `slo-after-barrier-${index}` },
+            body: JSON.stringify({ task: { tool: "text.echo", input: { text: "must-not-run" } } }),
+            signal: AbortSignal.timeout(1_000),
+          }).catch(() => undefined);
+          admissionBlocked = response?.status === 503;
+        }
+      }));
       await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
       const address = server.address();
       assert.ok(address && typeof address === "object");
-      const base = `http://127.0.0.1:${address.port}`;
+      base = `http://127.0.0.1:${address.port}`;
       const started = performance.now();
       let closeSucceeded = false;
       try {
@@ -538,22 +556,13 @@ async function collectGracefulShutdown(workDirectory: string, count: number): Pr
         // The sample records the bounded categorical failure below.
       }
       const durationMs = round(Math.min(performance.now() - started, MAX_SAMPLE_DURATION_MS));
-      let admissionBlocked = false;
-      try {
-        await fetch(`${base}/jobs`, {
-          method: "POST",
-          headers: { "content-type": "application/json", "idempotency-key": `slo-after-close-${index}` },
-          body: JSON.stringify({ task: { tool: "text.echo", input: { text: "must-not-run" } } }),
-          signal: AbortSignal.timeout(1_000),
-        });
-      } catch {
-        admissionBlocked = true;
-      }
+      const barrierToCloseMs = round(Math.max(0, listenerClosedAt - barrierAt));
       const success = closeSucceeded && admissionBlocked;
       samples.push({
         durationMs,
         success,
         admissionBlocked,
+        barrierToCloseMs,
         ...(success ? {} : { failureCategory: "semantic-check-failed" }),
       });
     }
@@ -683,12 +692,13 @@ function validateSource(
 function validateSample(value: unknown, id: SloId, index: number): SloSample {
   const sample = record(value, `${id} sample ${index}`);
   const semanticMarker = SLO_DEFINITIONS[id].semanticMarker;
-  const allowed = ["durationMs", "success", "failureCategory", ...(semanticMarker ? [semanticMarker] : [])];
+  const allowed = ["durationMs", "success", "failureCategory", ...(semanticMarker ? [semanticMarker] : []), ...(id === "graceful-shutdown" ? ["barrierToCloseMs"] : [])];
   const unexpected = Object.keys(sample).filter((key) => !allowed.includes(key));
   if (unexpected.length) throw new Error(`${id} sample ${index} contains unknown fields: ${unexpected.join(", ")}`);
   finiteNonNegative(sample.durationMs, `${id} sample ${index} duration`);
   if (typeof sample.success !== "boolean") throw new Error(`${id} sample ${index} success must be boolean`);
   if (semanticMarker && typeof sample[semanticMarker] !== "boolean") throw new Error(`${id} sample ${index} ${semanticMarker} must be boolean`);
+  if (id === "graceful-shutdown") finiteNonNegative(sample.barrierToCloseMs, `${id} sample ${index} barrier-to-close duration`);
   if (sample.failureCategory !== undefined && !["operation-failed", "semantic-check-failed"].includes(String(sample.failureCategory))) {
     throw new Error(`${id} sample ${index} failureCategory is invalid`);
   }
@@ -811,7 +821,11 @@ export async function runSloMeasurement(options: SloMeasurementOptions = {}): Pr
   const profile = options.profile ?? "acceptance";
   const plan = samplePlan(profile, options.samplePlan);
   const memoryDocuments = strictPositiveInteger(options.memoryDocuments ?? (profile === "acceptance" ? 1_000 : 100), "memory document fixture", 100_000);
-  const source = options.source ?? sourceIdentity();
+  const currentSource = sourceIdentity();
+  if (options.source && JSON.stringify(options.source) !== JSON.stringify(currentSource)) {
+    throw new Error("SLO source identity does not match the current Git HEAD/tree");
+  }
+  const source = currentSource;
   if (profile === "acceptance" && !source.clean) throw new Error("acceptance SLO evidence requires a clean exact-commit tree");
   const expectedRevision = options.expectedRevision ?? process.env.ODINN_SLO_EXPECTED_SHA ?? process.env.GITHUB_SHA;
   if (expectedRevision && source.revision !== expectedRevision) throw new Error(`SLO source revision ${source.revision} does not match expected ${expectedRevision}`);

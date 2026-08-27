@@ -3246,25 +3246,7 @@ export async function createGatewayServer(options: any = {}) {
       const shutdownStartedAt = Date.now();
       const shutdownDeadline = shutdownStartedAt + shutdownTimeoutMs;
       let forceConnections: ReturnType<typeof setTimeout> | undefined;
-      const nativeClosed = new Promise<unknown>((resolveNativeClose) => {
-        let settled = false;
-        const settle = (error?: unknown) => {
-          if (settled) return;
-          settled = true;
-          if (forceConnections) clearTimeout(forceConnections);
-          resolveNativeClose(error);
-        };
-        try {
-          forceConnections = setTimeout(() => {
-            server.closeAllConnections?.();
-            settle(new Error(`gateway shutdown exceeded ${shutdownTimeoutMs}ms`));
-          }, shutdownTimeoutMs);
-          nativeClose((error: any) => settle(error?.code === "ERR_SERVER_NOT_RUNNING" ? undefined : error));
-          server.closeIdleConnections?.();
-        } catch (error: any) {
-          settle(error?.code === "ERR_SERVER_NOT_RUNNING" ? undefined : error);
-        }
-      });
+      let nativeClosed!: Promise<unknown>;
       const beforeDeadline = async <T>(operation: Promise<T>, label: string): Promise<T> => {
         const remaining = Math.max(0, shutdownDeadline - Date.now());
         if (!remaining) throw new Error(`gateway shutdown timed out before ${label}`);
@@ -3298,6 +3280,33 @@ export async function createGatewayServer(options: any = {}) {
       shutdownPromise = (async () => {
         let shutdownError: unknown;
         let componentResults: PromiseSettledResult<unknown>[] = [];
+        let resolveListenerClosed!: () => void;
+        const listenerClosed = new Promise<void>((resolve) => { resolveListenerClosed = resolve; });
+        try {
+          await testHooks?.afterShutdownBarrier?.({ listenerClosed });
+        } catch (error) {
+          shutdownError = error;
+        }
+        nativeClosed = new Promise<unknown>((resolveNativeClose) => {
+          let settled = false;
+          const settle = (error?: unknown) => {
+            if (settled) return;
+            settled = true;
+            if (forceConnections) clearTimeout(forceConnections);
+            resolveListenerClosed();
+            resolveNativeClose(error);
+          };
+          try {
+            forceConnections = setTimeout(() => {
+              server.closeAllConnections?.();
+              settle(new Error(`gateway shutdown exceeded ${shutdownTimeoutMs}ms`));
+            }, shutdownTimeoutMs);
+            nativeClose((error: any) => settle(error?.code === "ERR_SERVER_NOT_RUNNING" ? undefined : error));
+            server.closeIdleConnections?.();
+          } catch (error: any) {
+            settle(error?.code === "ERR_SERVER_NOT_RUNNING" ? undefined : error);
+          }
+        });
         if (quarantinedMutations.length) {
           try {
             await beforeDeadline(Promise.resolve(auditStore.append({
