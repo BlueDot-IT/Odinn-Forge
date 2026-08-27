@@ -59,11 +59,16 @@ export interface RuntimeJobRecord {
 }
 
 type ProtectedResultRecoveryExpectation = {
-  updatedAt: string;
-  requestHash: string;
+  status: string;
+  updatedAt?: string;
+  requestHash?: string;
+  occurrenceKey?: string;
   executionRunId?: string;
   executionAttemptId?: string;
-  leaseToken?: string;
+  envelopeDigest?: string;
+  auditCorrelationId?: string;
+  cancellationControlReference?: string;
+  dispatchLease?: JsonObject;
 };
 
 type NormalizedRuntimeJob = RuntimeJobRecord & {
@@ -562,10 +567,14 @@ export class SqliteJobStore {
 
   async adoptProtectedResult(id: string, {
     result,
-    expected
+    expected,
+    interrupted,
+    source = "recovery"
   }: {
     result: unknown;
     expected: ProtectedResultRecoveryExpectation;
+    interrupted?: string;
+    source?: "live" | "recovery";
   }): Promise<RuntimeJobRecord> {
     return this.ledger.database.transaction((db) => {
       const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;
@@ -586,19 +595,31 @@ export class SqliteJobStore {
       // bind the already-verified record to the exact runtime-job snapshot
       // that was used to verify it. The remaining job, attempt, lease, and
       // cancellation checks and all state changes share this transaction.
-      const snapshotMatches = current.updatedAt === expected.updatedAt
+      const expectedLeaseToken = optionalString(expected.dispatchLease?.token);
+      const snapshotMatches = current.status === expected.status
+        && current.updatedAt === expected.updatedAt
         && current.requestHash === expected.requestHash
+        && current.occurrenceKey === expected.occurrenceKey
         && current.executionRunId === expected.executionRunId
-        && current.executionAttemptId === expected.executionAttemptId
-        && current.dispatchLease?.token === expected.leaseToken;
+        && current.dispatchLease?.token === expectedLeaseToken
+        && current.dispatchLease?.owner === optionalString(expected.dispatchLease?.owner)
+        && current.dispatchLease?.epoch === optionalString(expected.dispatchLease?.epoch)
+        && current.dispatchLease?.acquiredAt === optionalString(expected.dispatchLease?.acquiredAt)
+        && current.dispatchLease?.expiresAt === optionalString(expected.dispatchLease?.expiresAt)
+        && current.dispatchLease?.occurrenceKey === optionalString(expected.dispatchLease?.occurrenceKey);
       const executionIdentityMatches = Boolean(
         current.executionRunId
+        && current.executionRunId === expected.executionRunId
         && linked?.attemptId
-        && (!current.executionAttemptId || current.executionAttemptId === linked.attemptId)
-        && (!current.envelopeDigest || current.envelopeDigest === linked.envelopeDigest)
-        && (!current.auditCorrelationId || current.auditCorrelationId === linked.auditCorrelationId)
+        && expected.executionAttemptId === linked.attemptId
+        && expected.envelopeDigest === linked.envelopeDigest
+        && expected.auditCorrelationId === linked.auditCorrelationId
+        && expected.cancellationControlReference === linked.cancellationControlReference
+        && (!current.executionAttemptId || current.executionAttemptId === expected.executionAttemptId)
+        && (!current.envelopeDigest || current.envelopeDigest === expected.envelopeDigest)
+        && (!current.auditCorrelationId || current.auditCorrelationId === expected.auditCorrelationId)
         && (!current.cancellationControlReference
-          || current.cancellationControlReference === linked.cancellationControlReference)
+          || current.cancellationControlReference === expected.cancellationControlReference)
       );
       const cancellationControlMatches = Boolean(
         cancellation
@@ -606,8 +627,9 @@ export class SqliteJobStore {
         && String(cancellation.id) === linked.cancellationControlReference
       );
       const cancellationObserved = Boolean(cancellation?.requested_at || cancellation?.acknowledged_at);
+      const settlementInterrupted = optionalString(interrupted);
       const leaseMatches = Boolean(
-        expected.leaseToken
+        expectedLeaseToken
         && current.dispatchLease
         && lease
         && lease.released_at === null
@@ -623,6 +645,7 @@ export class SqliteJobStore {
         && executionIdentityMatches
         && cancellationControlMatches
         && !cancellationObserved
+        && !settlementInterrupted
         && leaseMatches
         && compatibleAttempt;
       const now = new Date().toISOString();
@@ -631,7 +654,9 @@ export class SqliteJobStore {
         ? undefined
         : current.status === "cancelling" || cancellationObserved || linked?.attemptState === "cancelling"
           ? "protected channel result cannot override a cancellation; external outcome requires operator review"
-          : "protected channel result could not be atomically bound to its execution state; external outcome requires operator review";
+          : settlementInterrupted
+            ? "protected channel result settlement was interrupted; external outcome requires operator review"
+            : "protected channel result could not be atomically bound to its execution state; external outcome requires operator review";
 
       if (current.dispatchLease?.token) {
         db.prepare(`UPDATE runtime_job_leases
@@ -664,7 +689,7 @@ export class SqliteJobStore {
         completedAt: now,
         result: canAdopt ? result : undefined,
         error: recoveryError,
-        recoveredAt: now,
+        ...(source === "recovery" ? { recoveredAt: now } : {}),
         dispatchLease: undefined,
         ...(linked ? {
           executionAttemptId: linked.attemptId,
@@ -679,6 +704,22 @@ export class SqliteJobStore {
       }
       writeJob(db, normalized);
       return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow);
+    });
+  }
+
+  async getProtectedResultSnapshot(id: string): Promise<RuntimeJobRecord | undefined> {
+    return this.ledger.database.transaction((db) => {
+      const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;
+      if (!row) return undefined;
+      const current = hydrate(row);
+      const linked = correlation(this.ledger, current.executionRunId);
+      return linked ? {
+        ...current,
+        executionAttemptId: linked.attemptId,
+        envelopeDigest: linked.envelopeDigest,
+        auditCorrelationId: linked.auditCorrelationId,
+        cancellationControlReference: linked.cancellationControlReference
+      } : current;
     });
   }
 

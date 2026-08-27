@@ -1207,6 +1207,52 @@ test("gateway persists a bound channel result before completion and serves it af
     assert.equal(providerCalls, 3, "startup must adopt the protected result without replaying the model");
 
     await closeGateway();
+    // An approval continuation retains its earlier non-terminal projection
+    // while it runs. Recreate the post-dispatch crash boundary with the
+    // protected terminal record already durable: startup must not mistake the
+    // empty approval projection for a conflicting terminal digest.
+    const approvedContinuationCrash = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    const approvedContinuationAt = new Date().toISOString();
+    const approvedContinuationLeaseExpiry = new Date(Date.now() + 120_000).toISOString();
+    approvedContinuationCrash.database.db.prepare(`UPDATE runtime_job_leases
+      SET expires_at = ?, released_at = NULL, release_reason = NULL WHERE token = ?`)
+      .run(approvedContinuationLeaseExpiry, interruptedLease.token);
+    approvedContinuationCrash.database.db.prepare(`UPDATE runtime_jobs
+      SET status = 'running', result_json = ?, error = NULL, completed_at = NULL, updated_at = ?, recovered_at = NULL,
+        lease_token = ?, lease_owner = ?, lease_epoch = ?, lease_acquired_at = ?, lease_expires_at = ?
+      WHERE id = ?`).run(
+        JSON.stringify({ ok: true, output: {} }),
+        approvedContinuationAt,
+        interruptedLease.token,
+        interruptedLease.owner,
+        interruptedLease.epoch,
+        interruptedLease.acquired_at,
+        approvedContinuationLeaseExpiry,
+        executionKey
+      );
+    approvedContinuationCrash.database.db.prepare(`UPDATE execution_attempts
+      SET state = 'running', settled_at = NULL, outcome_digest = NULL, error_code = NULL,
+        owner_released_at = NULL, owner_heartbeat_at = ?
+      WHERE id = (SELECT execution_attempt_id FROM runtime_jobs WHERE id = ?)`)
+      .run(approvedContinuationAt, executionKey);
+    approvedContinuationCrash.database.db.prepare(`UPDATE cancellation_controls
+      SET requested_at = NULL, requested_by = NULL, reason = NULL,
+        acknowledged_at = NULL, settled_at = NULL WHERE run_id = ?`)
+      .run(executionKey);
+    approvedContinuationCrash.close();
+    server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    base = `http://127.0.0.1:${(server.address() as any).port}`;
+    const approvedContinuationRecovered = await (await fetch(`${base}/jobs/${executionKey}`)).json();
+    assert.equal(approvedContinuationRecovered.status, "completed");
+    assert.match(approvedContinuationRecovered.result.output.contentDigest, /^sha256:[a-f0-9]{64}$/u);
+    assert.doesNotMatch(JSON.stringify(approvedContinuationRecovered), /PRIVATE_CHANNEL_OUTPUT|PRIVATE_CHANNEL_PROMPT/u);
+    const approvedContinuationResult = await fetch(`${base}/jobs/${executionKey}/result`);
+    assert.equal(approvedContinuationResult.status, 200);
+    assert.equal((await approvedContinuationResult.json()).result.output.content, "PRIVATE_CHANNEL_OUTPUT");
+    assert.equal(providerCalls, 3, "approved-continuation recovery must adopt without provider replay");
+
+    await closeGateway();
     const records = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
     const persisted = (await records.queryRecords({ types: ["channel.result.persisted"] }))[0] as any;
     assert.equal(persisted.jobId, executionKey);
@@ -1278,7 +1324,21 @@ test("gateway restart preserves a winning cancellation over a persisted channel 
     channels: {}
   }, null, 2)}\n`, { mode: 0o600 });
 
-  let server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  const liveCancellationKey = "stage7-channel-live-cancelled-during-persist";
+  let markPersistenceEntered!: () => void;
+  let releasePersistence!: () => void;
+  const persistenceEntered = new Promise<void>((resolve) => { markPersistenceEntered = resolve; });
+  const persistenceReleased = new Promise<void>((resolve) => { releasePersistence = resolve; });
+  let server = await createGatewayServer(withGatewayTestHooks(
+    { stateDir, workspaceRoot: stateDir },
+    {
+      async beforeChannelResultPersist({ jobId }) {
+        if (jobId !== liveCancellationKey) return;
+        markPersistenceEntered();
+        await persistenceReleased;
+      }
+    }
+  ));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   let base = `http://127.0.0.1:${(server.address() as any).port}`;
   const closeGateway = async () => {
@@ -1294,6 +1354,38 @@ test("gateway restart preserves a winning cancellation over a persisted channel 
     });
     assert.equal(sessionResponse.status, 200);
     const sessionId = String((await sessionResponse.json()).id);
+    const liveSubmission = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": liveCancellationKey },
+      body: JSON.stringify({
+        executionKey: liveCancellationKey,
+        task: { tool: "agent.run", input: { sessionId, model: "test:test-model", prompt: "cancel live persist", maxTurns: 1, maxTokens: 128 } }
+      })
+    });
+    assert.equal(liveSubmission.status, 202);
+    await Promise.race([
+      persistenceEntered,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("protected persistence hook was not reached")), 20_000))
+    ]);
+    const liveCancellation = await fetch(`${base}/jobs/${liveCancellationKey}/cancel`, { method: "POST" });
+    assert.equal(liveCancellation.status, 200);
+    assert.equal((await liveCancellation.json()).job.status, "cancelling");
+    releasePersistence();
+    let liveCancelled: any;
+    const liveCancellationDeadline = Date.now() + 20_000;
+    while (Date.now() < liveCancellationDeadline) {
+      liveCancelled = await (await fetch(`${base}/jobs/${liveCancellationKey}`)).json();
+      if (["completed", "failed", "cancelled", "needs-review"].includes(liveCancelled.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(liveCancelled.status, "needs-review");
+    assert.equal(liveCancelled.result, undefined);
+    assert.match(liveCancelled.error, /cannot override a cancellation/u);
+    const liveInaccessibleResult = await fetch(`${base}/jobs/${liveCancellationKey}/result`);
+    assert.equal(liveInaccessibleResult.status, 409);
+    assert.doesNotMatch(await liveInaccessibleResult.text(), /CANCELLED_PROTECTED_OUTPUT/u);
+    assert.equal(providerCalls, 1, "live cancellation settlement must not replay the provider");
+
     const submission = await fetch(`${base}/jobs`, {
       method: "POST",
       headers: { "content-type": "application/json", "idempotency-key": executionKey },
@@ -1311,7 +1403,7 @@ test("gateway restart preserves a winning cancellation over a persisted channel 
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert.equal(completed.status, "completed");
-    assert.equal(providerCalls, 1);
+    assert.equal(providerCalls, 2);
 
     const records = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
     const protectedResult = (await records.queryRecords({ types: ["channel.result.persisted"] }))
@@ -1379,7 +1471,7 @@ test("gateway restart preserves a winning cancellation over a persisted channel 
     const inaccessibleResult = await fetch(`${base}/jobs/${executionKey}/result`);
     assert.equal(inaccessibleResult.status, 409);
     assert.doesNotMatch(await inaccessibleResult.text(), /CANCELLED_PROTECTED_OUTPUT/u);
-    assert.equal(providerCalls, 1, "restart must not replay the provider after cancellation won");
+    assert.equal(providerCalls, 2, "restart must not replay the provider after cancellation won");
 
     const recoveredLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
     try {
@@ -1401,6 +1493,7 @@ test("gateway restart preserves a winning cancellation over a persisted channel 
       recoveredLedger.close();
     }
   } finally {
+    releasePersistence();
     await closeGateway();
     await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
     if (previousKey === undefined) delete process.env.ODINN_STAGE7_CHANNEL_API_KEY;

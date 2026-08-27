@@ -806,10 +806,12 @@ export async function createGatewayServer(options: any = {}) {
     store: jobStore,
     execute: isolatedTaskExecutor,
     persistResult: async (job, result) => {
-      if (durableChannelResultBinding(job, tenantScope)) {
+      const protectedResult = Boolean(durableChannelResultBinding(job, tenantScope));
+      if (protectedResult) {
         await testHooks?.beforeChannelResultPersist?.({ jobId: job.id });
       }
       await persistDurableChannelResult(channelResultRecords, job, result, tenantScope);
+      return protectedResult ? { settlement: "protected" as const } : undefined;
     },
     onCancel: (job) => {
       const task = job.payload?.task;
@@ -2999,9 +3001,28 @@ function assertDurableChannelResultRecord(record: any, binding: ReturnType<typeo
     throw new Error("durable channel result record failed integrity verification");
   }
   const projectedOutput = job?.result?.output;
-  if (projectedOutput && typeof projectedOutput === "object" && !Array.isArray(projectedOutput)) {
-    if ((projectedOutput as Record<string, unknown>).contentDigest !== normalized.contentDigest
-      || (projectedOutput as Record<string, unknown>).contentBytes !== normalized.contentBytes) {
+  const projectedOutputIsObject = Boolean(projectedOutput
+    && typeof projectedOutput === "object"
+    && !Array.isArray(projectedOutput));
+  const projectedRecord = projectedOutputIsObject
+    ? projectedOutput as Record<string, unknown>
+    : undefined;
+  const hasContentDigest = projectedRecord
+    ? Object.prototype.hasOwnProperty.call(projectedRecord, "contentDigest")
+    : false;
+  const hasContentBytes = projectedRecord
+    ? Object.prototype.hasOwnProperty.call(projectedRecord, "contentBytes")
+    : false;
+  // A running approval continuation can legitimately retain the earlier
+  // non-terminal approval projection (`output: {}`). Once a job is public and
+  // terminal, or either terminal binding field is present, the projection must
+  // contain the complete exact digest/length pair for this protected record.
+  if (job?.status === "completed" || hasContentDigest || hasContentBytes) {
+    if (!projectedRecord
+      || !hasContentDigest
+      || !hasContentBytes
+      || projectedRecord.contentDigest !== normalized.contentDigest
+      || projectedRecord.contentBytes !== normalized.contentBytes) {
       throw new Error("durable channel result does not match the terminal job projection");
     }
   }
@@ -3040,41 +3061,43 @@ async function recoverPersistedChannelResults(store: SqliteJobStore, records: Sq
   for (const status of ["running", "cancelling", "completed"] as const) {
     const page = await store.queryJobs({ status, limit: 100_000 });
     for (const job of page.items) {
-      const task = job.payload?.task;
-      const channelShaped = job.payload?.executionKey === job.id
+      const listedTask = job.payload?.task;
+      const listedChannelShaped = job.payload?.executionKey === job.id
+        && listedTask && typeof listedTask === "object" && !Array.isArray(listedTask)
+        && (listedTask as Record<string, unknown>).tool === "agent.run";
+      if (!listedChannelShaped) continue;
+      const snapshot = await store.getProtectedResultSnapshot(job.id);
+      if (!snapshot) continue;
+      const task = snapshot.payload?.task;
+      const channelShaped = snapshot.payload?.executionKey === snapshot.id
         && task && typeof task === "object" && !Array.isArray(task)
         && (task as Record<string, unknown>).tool === "agent.run";
       if (!channelShaped) continue;
       let result: unknown;
       let integrityError: unknown;
-      try { result = await readDurableChannelResult(records, job, scope); }
+      try { result = await readDurableChannelResult(records, snapshot, scope); }
       catch (error) { integrityError = error; }
-      const attempt = job.executionAttemptId
-        ? store.ledger.getExecutionAttempt(job.executionAttemptId)
+      const attempt = snapshot.executionAttemptId
+        ? store.ledger.getExecutionAttempt(snapshot.executionAttemptId)
         : undefined;
       if (integrityError || (result === undefined && attempt?.state === "completed")) {
-        await store.update(job.id, {
+        await store.update(snapshot.id, {
           status: "needs-review",
           completedAt: new Date().toISOString(),
           error: integrityError
             ? "protected channel result failed integrity verification"
             : "protected channel result is unavailable after completed execution",
-          expectedLeaseToken: job.dispatchLease?.token,
+          expectedLeaseToken: snapshot.dispatchLease?.token,
           dispatchLease: undefined
         });
         continue;
       }
       if (result === undefined) continue;
-      if (status === "completed") continue;
-      await store.adoptProtectedResult(job.id, {
+      if (snapshot.status === "completed") continue;
+      await store.adoptProtectedResult(snapshot.id, {
         result,
-        expected: {
-          updatedAt: job.updatedAt,
-          requestHash: job.requestHash ?? "",
-          executionRunId: job.executionRunId,
-          executionAttemptId: job.executionAttemptId,
-          leaseToken: typeof job.dispatchLease?.token === "string" ? job.dispatchLease.token : undefined
-        }
+        expected: snapshot,
+        source: "recovery"
       });
     }
   }

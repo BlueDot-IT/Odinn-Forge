@@ -283,21 +283,42 @@ test("protected result recovery atomically fences cancellation, lease drift, and
     assert.ok(job?.dispatchLease?.token);
     return { admitted, job };
   };
-  const recover = (job: NonNullable<Awaited<ReturnType<typeof store.get>>>) => store.adoptProtectedResult(job.id, {
-    result: { output: { text: `protected:${job.id}` } },
-    expected: {
-      updatedAt: job.updatedAt,
-      requestHash: job.requestHash ?? "",
-      executionRunId: job.executionRunId,
-      executionAttemptId: job.executionAttemptId,
-      leaseToken: typeof job.dispatchLease?.token === "string" ? job.dispatchLease.token : undefined
-    }
-  });
+  const recover = async (job: NonNullable<Awaited<ReturnType<typeof store.get>>>) => {
+    const snapshot = await store.getProtectedResultSnapshot(job.id);
+    assert.ok(snapshot);
+    return store.adoptProtectedResult(job.id, {
+      result: { output: { text: `protected:${job.id}` } },
+      expected: snapshot
+    });
+  };
 
   const safe = await seed("protected-safe");
   const adopted = await recover(safe.job);
   assert.equal(adopted.status, "completed");
   assert.equal(ledger.getExecutionAttempt(safe.admitted.attempt.id)?.state, "completed");
+
+  const attemptDrift = await seed("protected-attempt-drift");
+  const staleAttemptSnapshot = await store.getProtectedResultSnapshot(attemptDrift.job.id);
+  assert.ok(staleAttemptSnapshot);
+  assert.equal(staleAttemptSnapshot.executionAttemptId, attemptDrift.admitted.attempt.id);
+  ledger.transitionExecutionAttempt({
+    attemptId: attemptDrift.admitted.attempt.id,
+    from: "running",
+    to: "failed",
+    errorCode: "ATTEMPT_REPLACED_BEFORE_RESULT_SETTLEMENT"
+  });
+  const replacementAttempt = ledger.createExecutionAttempt({
+    runId: attemptDrift.job.id,
+    attemptId: "attempt-protected-result-replacement"
+  });
+  ledger.transitionExecutionAttempt({ attemptId: replacementAttempt.id, from: "queued", to: "running" });
+  const quarantinedAttemptDrift = await store.adoptProtectedResult(attemptDrift.job.id, {
+    result: { output: { text: "protected:stale-attempt" } },
+    expected: staleAttemptSnapshot
+  });
+  assert.equal(quarantinedAttemptDrift.status, "needs-review");
+  assert.equal(quarantinedAttemptDrift.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(replacementAttempt.id)?.state, "needs-review");
 
   const cancelled = await seed("protected-cancelled");
   const cancelling = await store.cancel(cancelled.job.id, { requestedBy: "test", reason: "cancel protected result" });

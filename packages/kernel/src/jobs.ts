@@ -26,7 +26,16 @@ export interface JobRecord {
   occurrenceKey?: string;
   scheduledFor?: string;
   nextRunAt?: string | null;
+  executionRunId?: string;
+  executionAttemptId?: string;
+  envelopeDigest?: string;
+  auditCorrelationId?: string;
+  cancellationControlReference?: string;
   dispatchLease?: JsonObject;
+}
+
+export interface JobResultPersistence {
+  settlement: "protected";
 }
 
 export interface JobCreationControl extends JsonObject {
@@ -51,6 +60,13 @@ export interface JobStore {
     dispatched: boolean;
     interrupted?: string;
   }): Promise<JobRecord>;
+  adoptProtectedResult?(id: string, settlement: {
+    result: unknown;
+    expected: JobRecord;
+    interrupted?: string;
+    source?: "live" | "recovery";
+  }): Promise<JobRecord>;
+  getProtectedResultSnapshot?(id: string): Promise<JobRecord | undefined>;
   update(id: string, patch: JsonObject): Promise<JobRecord>;
   get(id: string): Promise<JobRecord | undefined>;
   list(options?: { limit?: number; offset?: number }): Promise<JobRecord[]>;
@@ -75,7 +91,7 @@ export type JobExecute = (payload: JsonObject, context: JobExecutionContext) => 
 export interface JobSupervisorOptions {
   store: JobStore;
   execute: JobExecute;
-  persistResult?: (job: JobRecord, result: unknown) => Promise<void> | void;
+  persistResult?: (job: JobRecord, result: unknown) => Promise<JobResultPersistence | void> | JobResultPersistence | void;
   onCancel?: (job: JobRecord) => Promise<void> | void;
   concurrency?: number;
   maxAttempts?: number;
@@ -100,7 +116,7 @@ const PROCESS_WORKER_ABORT_GRACE_MS = 30_000;
 export class JobSupervisor {
   readonly store: JobStore;
   readonly execute: JobExecute;
-  readonly persistResult?: (job: JobRecord, result: unknown) => Promise<void> | void;
+  readonly persistResult?: (job: JobRecord, result: unknown) => Promise<JobResultPersistence | void> | JobResultPersistence | void;
   readonly onCancel?: (job: JobRecord) => Promise<void> | void;
   readonly concurrency: number;
   readonly maxAttempts: number;
@@ -542,13 +558,6 @@ export class JobSupervisor {
         if (controller.signal.aborted) throw controller.signal.reason ?? new Error("job aborted");
         const awaitingApproval = Boolean(result && typeof result === "object"
           && (result as { output?: { type?: unknown } }).output?.type === "approval.required");
-        // Content-bearing results that must survive restart are committed to
-        // their protected store before the public job is allowed to become
-        // terminal. A persistence failure therefore quarantines non-retry-safe
-        // work instead of publishing a completed receipt with no retrievable
-        // outcome. Approval requests are non-terminal control results and must
-        // not be mistaken for an assistant reply.
-        if (!awaitingApproval) await this.persistResult?.(job, result);
         const terminalStatus = result && typeof result === "object"
           && ["completed", "failed", "cancelled", "needs-review"].includes(String((result as { terminalStatus?: unknown }).terminalStatus))
           ? String((result as { terminalStatus?: unknown }).terminalStatus)
@@ -556,6 +565,34 @@ export class JobSupervisor {
             && ["completed", "failed", "cancelled", "needs-review"].includes(String((result as { output?: { status?: unknown } }).output?.status))
             ? String((result as { output?: { status?: unknown } }).output?.status)
             : undefined;
+        // Content-bearing results that must survive restart are committed to
+        // their protected store before the public job is allowed to become
+        // terminal. A persistence failure therefore quarantines non-retry-safe
+        // work instead of publishing a completed receipt with no retrievable
+        // outcome. Approval requests are non-terminal control results and must
+        // not be mistaken for an assistant reply.
+        const persistence = !awaitingApproval
+          ? await this.persistResult?.(job, result)
+          : undefined;
+        if (persistence?.settlement === "protected") {
+          if (!this.store.getProtectedResultSnapshot) throw new Error("protected result snapshot fencing is unavailable");
+          const snapshot = await this.store.getProtectedResultSnapshot(job.id);
+          if (!snapshot) throw new Error(`protected result job disappeared before settlement: ${job.id}`);
+          if (!this.store.adoptProtectedResult) throw new Error("protected result settlement is unavailable");
+          const protectedResultInterruption = controller.signal.aborted
+            ? errorMessage(controller.signal.reason ?? new Error("job aborted"))
+            : terminalStatus && terminalStatus !== "completed"
+              ? `protected result requested ${terminalStatus} settlement`
+              : undefined;
+          await this.store.adoptProtectedResult(job.id, {
+            result,
+            expected: snapshot,
+            ...(protectedResultInterruption ? { interrupted: protectedResultInterruption } : {}),
+            source: "live"
+          });
+          return;
+        }
+        if (controller.signal.aborted) throw controller.signal.reason ?? new Error("job aborted");
         await this.store.update(job.id, {
           status: awaitingApproval ? "awaiting-approval" : terminalStatus ?? "completed",
           ...(awaitingApproval ? {} : { completedAt: new Date().toISOString() }),
