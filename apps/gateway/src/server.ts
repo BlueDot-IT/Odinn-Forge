@@ -1457,7 +1457,8 @@ export async function createGatewayServer(options: any = {}) {
     type,
     tool,
     data,
-    controlDigest
+    controlDigest,
+    signal
   }: {
     action: "cancel" | "reassign" | "checkpoint";
     graphRunId: string;
@@ -1467,8 +1468,11 @@ export async function createGatewayServer(options: any = {}) {
     tool: string;
     data: Record<string, unknown>;
     controlDigest?: string;
+    signal?: AbortSignal;
   }) => {
+    assertGatewayRequestActive(signal);
     const auditRun = await auditStore.readRun(parentRunId);
+    assertGatewayRequestActive(signal);
     const existing = auditRun?.events?.find((event: any) => event.type === type
       && event.data?.graphRunId === graphRunId
       && event.data?.operationId === operationId);
@@ -1484,6 +1488,7 @@ export async function createGatewayServer(options: any = {}) {
       return false;
     }
     await testHooks?.beforeAgentGraphControlAudit?.({ action, graphRunId, operationId });
+    assertGatewayRequestActive(signal);
     await auditStore.append({
       at: new Date().toISOString(),
       runId: parentRunId,
@@ -1494,6 +1499,7 @@ export async function createGatewayServer(options: any = {}) {
       decision: "allow",
       data: { ...data, graphRunId, operationId, ...(controlDigest ? { controlDigest } : {}) }
     });
+    assertGatewayRequestActive(signal);
     return true;
   };
 
@@ -1515,7 +1521,8 @@ export async function createGatewayServer(options: any = {}) {
     operationId,
     type,
     tool,
-    data
+    data,
+    signal
   }: {
     runId: string;
     graphRunId: string;
@@ -1523,8 +1530,11 @@ export async function createGatewayServer(options: any = {}) {
     type: string;
     tool: string;
     data: Record<string, unknown>;
+    signal?: AbortSignal;
   }) => {
+    assertGatewayRequestActive(signal);
     const auditRun = await auditStore.readRun(runId);
+    assertGatewayRequestActive(signal);
     const exists = auditRun?.events?.some((event: any) => event.type === type
       && event.data?.graphRunId === graphRunId
       && event.data?.operationId === operationId);
@@ -1539,6 +1549,7 @@ export async function createGatewayServer(options: any = {}) {
       decision: "allow",
       data: { ...data, graphRunId, operationId }
     });
+    assertGatewayRequestActive(signal);
     return true;
   };
 
@@ -1564,8 +1575,10 @@ export async function createGatewayServer(options: any = {}) {
   const prepareDurableJobSubmission = async (
     body: any,
     idempotencyKey?: string,
-    delegation?: { reassignedFromGraphRunId: string; reassignedFromRequestDigest: string }
+    delegation?: { reassignedFromGraphRunId: string; reassignedFromRequestDigest: string },
+    signal?: AbortSignal
   ): Promise<PreparedDurableJobSubmission> => {
+    assertGatewayRequestActive(signal);
     const task = body.task && typeof body.task === "object" && !Array.isArray(body.task) ? body.task : body;
     if (task.tool === "agent.delegate" && body.kind !== "agent-graph") {
       throw new GatewayError(400, "agent.delegate jobs require kind=agent-graph");
@@ -1620,6 +1633,7 @@ export async function createGatewayServer(options: any = {}) {
       })()
       : undefined;
     const activeJobs = (await supervisor.list()).filter((job: any) => ["queued", "running"].includes(job.status)).length;
+    assertGatewayRequestActive(signal);
     if (activeJobs >= quotaGate.maximumActiveJobs) throw new GatewayError(429, "tenant active-job quota exceeded");
     const id = channelExecutionKey ?? (body.id || idempotencyKey || undefined);
     const requestHash = hashRequest(delegation ? { ...body, delegation } : body);
@@ -1636,6 +1650,7 @@ export async function createGatewayServer(options: any = {}) {
     };
     if (id) {
       const existing = await supervisor.get(String(id));
+      assertGatewayRequestActive(signal);
       if (existing) {
         if (!durableJobReplayIdentityMatches({ existing, requestHash, scopedPayload })) {
           return {
@@ -1708,7 +1723,7 @@ export async function createGatewayServer(options: any = {}) {
     delegation?: { reassignedFromGraphRunId: string; reassignedFromRequestDigest: string },
     signal?: AbortSignal
   ): Promise<{ status: number; payload: any }> => commitDurableJobSubmission(
-    await prepareDurableJobSubmission(body, idempotencyKey, delegation),
+    await prepareDurableJobSubmission(body, idempotencyKey, delegation, signal),
     undefined,
     signal
   );
@@ -2317,6 +2332,8 @@ export async function createGatewayServer(options: any = {}) {
         if (!graph) return json(response, 404, { ok: false, error: "agent graph not found" });
         if (request.method === "GET" && !action) return json(response, 200, { graph });
         if (request.method === "POST" && action === "cancel") {
+          const signal = requestAbort.signal;
+          assertGatewayRequestActive(signal);
           const operationId = `cancel:${graph.requestDigest}`;
           ensureGraphControlLedgerIntent({
             parentRunId: graph.parentRunId,
@@ -2331,9 +2348,11 @@ export async function createGatewayServer(options: any = {}) {
             operationId,
             type: "agent.graph.cancellation.requested",
             tool: AGENT_GRAPH_TOOL,
-            data: { requestDigest: graph.requestDigest }
+            data: { requestDigest: graph.requestDigest },
+            signal
           });
           const parentJob = await supervisor.get(graph.parentRunId);
+          assertGatewayRequestActive(signal);
           if (!parentJob) {
             if (["validated", "running", "publishing"].includes(graph.status)) {
               runtime.ledger.cancelAgentGraphRun({ graphRunId, errorCode: "GRAPH_PARENT_JOB_MISSING" });
@@ -2344,7 +2363,7 @@ export async function createGatewayServer(options: any = {}) {
               graph: runtime.ledger.getAgentGraphRun(graphRunId)
             });
           }
-          const job = await supervisor.cancel(graph.parentRunId);
+          const job = await supervisor.cancel(graph.parentRunId, { signal });
           await ensureGraphControlAuditOutcome({
             runId: graph.parentRunId,
             graphRunId,
@@ -2355,11 +2374,14 @@ export async function createGatewayServer(options: any = {}) {
               requestDigest: graph.requestDigest,
               jobStatus: job.status,
               graphStatus: runtime.ledger.getAgentGraphRun(graphRunId)?.status
-            }
+            },
+            signal
           });
           return json(response, 200, { ok: true, job, graph: runtime.ledger.getAgentGraphRun(graphRunId) });
         }
         if (request.method === "POST" && action === "reassign") {
+          const signal = requestAbort.signal;
+          assertGatewayRequestActive(signal);
           if (!["failed", "cancelled", "needs-review"].includes(graph.status)) {
             throw new GatewayError(409, "agent graph must be terminal and incomplete before reassignment");
           }
@@ -2406,7 +2428,7 @@ export async function createGatewayServer(options: any = {}) {
             reassignedFromGraphRunId: graphRunId,
             reassignedFromRequestDigest: graph.requestDigest
           };
-          const preparedSubmission = await prepareDurableJobSubmission(replacement, replacementId, delegation);
+          const preparedSubmission = await prepareDurableJobSubmission(replacement, replacementId, delegation, signal);
           const replacementRequestHash = preparedSubmission.requestHash;
           const replacementIdentityDigest = hashRequest({
             tool: replacementTask.tool,
@@ -2430,6 +2452,7 @@ export async function createGatewayServer(options: any = {}) {
             principalId: tenantScope.principalId,
             scopeDigest
           });
+          assertGatewayRequestActive(signal);
           try {
             runtime.ledger.reserveAgentGraphReassignment({
               graphRunId,
@@ -2463,7 +2486,8 @@ export async function createGatewayServer(options: any = {}) {
                 trustedPrincipalId: tenantScope.principalId,
                 scopeDigest
               },
-              controlDigest
+              controlDigest,
+              signal
             });
           } catch (error) {
             runtime.ledger.releaseAgentGraphReassignment({ graphRunId, replacementJobId: replacementId });
@@ -2479,7 +2503,7 @@ export async function createGatewayServer(options: any = {}) {
                 replacementIdentityDigest,
                 trustedPrincipalId: tenantScope.principalId
               }
-            });
+            }, signal);
           } catch (error) {
             runtime.ledger.releaseAgentGraphReassignment({ graphRunId, replacementJobId: replacementId });
             throw error;
@@ -2489,6 +2513,7 @@ export async function createGatewayServer(options: any = {}) {
             return json(response, submission.status, submission.payload);
           }
           const replacementJobId = String(submission.payload.job.id);
+          assertGatewayRequestActive(signal);
           runtime.ledger.markAgentGraphReassignmentSubmitted({ graphRunId, replacementJobId, replacementRequestHash });
           await ensureGraphControlAuditOutcome({
             runId: graph.parentRunId,
@@ -2496,11 +2521,14 @@ export async function createGatewayServer(options: any = {}) {
             operationId,
             type: "agent.graph.reassigned",
             tool: AGENT_GRAPH_TOOL,
-            data: { requestDigest: graph.requestDigest, replacementJobId, replacementRequestHash }
+            data: { requestDigest: graph.requestDigest, replacementJobId, replacementRequestHash },
+            signal
           });
           return json(response, submission.status, { ...submission.payload, reassignedFrom: graphRunId });
         }
         if (request.method === "POST" && action === "checkpoint") {
+          const signal = requestAbort.signal;
+          assertGatewayRequestActive(signal);
           const body = await readJson(request, { maxBytes: requestMaxBytes });
           if (graph.status !== "completed") throw new GatewayError(409, "agent graph must complete before checkpoint admission");
           const nodeId = String(body.nodeId || "");
@@ -2514,6 +2542,7 @@ export async function createGatewayServer(options: any = {}) {
           const tool = body.tool === "workspace.patch" ? "workspace.patch" : body.tool === "workspace.mutate" ? "workspace.mutate" : undefined;
           if (!tool) throw new GatewayError(400, "agent graph checkpoint tool must be workspace.mutate or workspace.patch");
           const parentJob = await supervisor.get(graph.parentRunId);
+          assertGatewayRequestActive(signal);
           if (!parentJob) throw new GatewayError(409, "agent graph parent job is unavailable for authority comparison");
           const parentCapabilities = assertCapabilityIds(parentJob.payload?.parentCapabilities, "parentCapabilities");
           if (!parentCapabilities.includes(tool)) throw new GatewayError(403, `agent graph parent authority does not include ${tool}`);
@@ -2559,6 +2588,7 @@ export async function createGatewayServer(options: any = {}) {
             tool,
             input
           });
+          assertGatewayRequestActive(signal);
           ensureGraphControlLedgerIntent({
             parentRunId: graph.parentRunId,
             type: "agent-graph-checkpoint-requested",
@@ -2572,7 +2602,8 @@ export async function createGatewayServer(options: any = {}) {
             operationId,
             type: "agent.graph.checkpoint.requested",
             tool,
-            data: { nodeId, resultDigest: node.resultDigest, checkpointRunId: runId, checkpointControlDigest, apply: body.apply === true }
+            data: { nodeId, resultDigest: node.resultDigest, checkpointRunId: runId, checkpointControlDigest, apply: body.apply === true },
+            signal
           });
           const result = await runGovernedTask({
             task: {
@@ -2585,7 +2616,7 @@ export async function createGatewayServer(options: any = {}) {
             parentRunId: graph.parentRunId,
             parentCapabilities,
             durableExecution: true
-          });
+          }, { signal });
           await ensureGraphControlAuditOutcome({
             runId,
             graphRunId,
@@ -2598,7 +2629,8 @@ export async function createGatewayServer(options: any = {}) {
               checkpointRunId: runId,
               checkpointControlDigest,
               apply: body.apply === true
-            }
+            },
+            signal
           });
           return json(response, 200, { ok: true, graphRunId, nodeId, result });
         }
