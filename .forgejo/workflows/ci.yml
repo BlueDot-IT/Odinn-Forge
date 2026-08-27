@@ -63,6 +63,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install pinned Chromium for console regressions
+        run: pnpm --filter @odinn/kernel exec playwright-core install --with-deps chromium
+
       - name: Release preflight
         run: pnpm release:preflight
 

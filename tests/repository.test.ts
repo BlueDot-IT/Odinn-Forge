@@ -35,19 +35,62 @@ test("package metadata names Odinn Forge and pins the toolchain", async () => {
 test("operator console keeps typed view and component boundaries", async () => {
   const root = "apps/gateway/src/public/console/src";
   const required = [
-    "views/chat.ts", "views/sessions.ts", "views/settings.ts", "views/approvals.ts", "views/audit.ts",
+    "views/chat.ts", "views/sessions.ts", "views/settings.ts", "views/approvals.ts", "views/audit.ts", "views/agent-graphs.ts",
     "components/dialog.ts", "components/message-item.ts", "components/tool-call.ts", "components/local-attachments.ts",
     "types.ts", "state.ts", "api.ts", "dom.ts"
   ];
   const sources = new Map(await Promise.all(required.map(async (path) => [path, await read(`${root}/${path}`)] as const)));
   const entry = await read(`${root}/main.js`);
+  const shell = await read("apps/gateway/src/public/console/index.html");
   for (const path of required) assert.ok(sources.get(path)?.trim(), `${path} must remain a non-empty source boundary`);
-  for (const path of ["chat", "sessions", "settings", "approvals", "audit"]) assert.match(entry, new RegExp(`from ["']\\./views/${path}\\.ts["']`));
+  for (const path of ["chat", "sessions", "settings", "approvals", "audit", "agent-graphs"]) assert.match(entry, new RegExp(`from ["']\\./views/${path}\\.ts["']`));
   for (const path of ["dialog", "tool-call", "local-attachments"]) assert.match(entry, new RegExp(`from ["']\\./components/${path}\\.ts["']`));
   assert.match(await read(`${root}/state.ts`), /ConsoleState/u);
   assert.match(await read(`${root}/api.ts`), /Promise<T>/u);
   assert.match(sources.get("components/message-item.ts") ?? "", /renderMessageItem/u);
   assert.match(sources.get("components/tool-call.ts") ?? "", /terminalReason/u);
+  assert.match(shell, /id="agent-graph-checkpoint-token" type="password" autocomplete="off" required/u);
+  assert.match(shell, /id="agent-graph-checkpoint-close" value="cancel" type="submit" formnovalidate/u);
+  assert.match(sources.get("views/agent-graphs.ts") ?? "", /aria-current=/u);
+  assert.match(entry, /expectedResultDigest: node\.resultDigest, capabilityToken/u);
+  assert.match(entry, /function clearAgentGraphCheckpointToken\(\)[\s\S]*agent-graph-checkpoint-token"\)\.value = ""/u);
+  assert.match(entry, /agent-graph-checkpoint-dialog"\)\.addEventListener\("cancel", clearAgentGraphCheckpointToken\)/u);
+  assert.match(entry, /agent-graph-checkpoint-dialog"\)\.addEventListener\("close", clearAgentGraphCheckpointToken\)/u);
+  const serialization = entry.indexOf("const serializedRequest = JSON.stringify(");
+  const immediateClear = entry.indexOf("clearAgentGraphCheckpointToken();", serialization);
+  const checkpointRequest = entry.indexOf('await api("/agent-graphs/"', serialization);
+  const serializedBody = entry.indexOf("body: serializedRequest", serialization);
+  assert.ok(serialization >= 0 && serialization < immediateClear && immediateClear < checkpointRequest && checkpointRequest < serializedBody,
+    "checkpoint tokens must clear after serialization and before starting the request");
+
+  const styles = await read(`${root}/styles.css`);
+  const graphBase = styles.indexOf(".agent-graph-layout { display: grid;");
+  const responsiveGraphLayout = styles.indexOf("@container agent-graph-list-panel (max-width: 540px)");
+  assert.ok(graphBase >= 0 && responsiveGraphLayout > graphBase, "delegation component-responsive rules must follow the base graph layout");
+  assert.match(styles, /\.agent-graph-layout \{ display: grid; grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/u);
+  assert.match(styles, /\.agent-graph-head, \.agent-graph-row \{[^\n]*grid-template-columns: minmax\(0, 1\.5fr\) minmax\(0, \.85fr\) minmax\(0, \.5fr\) minmax\(0, \.75fr\)/u);
+  assert.match(styles.slice(responsiveGraphLayout), /\.agent-graph-row \{[\s\S]*grid-template-columns: minmax\(0, 1fr\) auto/u);
+});
+
+test("required quality lanes provision the pinned browser before console regressions", async () => {
+  const kernel = JSON.parse(await read("packages/kernel/package.json"));
+  assert.equal(kernel.dependencies["playwright-core"], "1.62.1");
+
+  for (const [path, nextJob] of [[".github/workflows/ci.yml", "cross-platform"], [".forgejo/workflows/ci.yml", "integration"]]) {
+    const workflow = await read(path);
+    const qualityStart = workflow.indexOf("  quality:");
+    const qualityEnd = workflow.indexOf(`  ${nextJob}:`, qualityStart);
+    assert.ok(qualityStart >= 0 && qualityEnd > qualityStart, `${path} must keep a bounded required quality job`);
+    const quality = workflow.slice(qualityStart, qualityEnd);
+    const browserInstall = quality.indexOf("pnpm --filter @odinn/kernel exec playwright-core install --with-deps chromium");
+    const regressionGate = quality.indexOf("pnpm test");
+    assert.ok(browserInstall >= 0 && regressionGate > browserInstall, `${path} must install pinned Chromium before the required test gate`);
+    assert.doesNotMatch(quality, /continue-on-error/u);
+  }
+
+  const browserRegression = await read("tests/console-product-regressions.test.ts");
+  assert.match(browserRegression, /const responsiveWidths = \[375, 600, 601, 980, 981, 1440\]/u);
+  assert.doesNotMatch(browserRegression, /t\.skip|\/usr\/bin\/chromium/u);
 });
 
 test("routine dependency groups exclude runtime and Node typing migrations", async () => {

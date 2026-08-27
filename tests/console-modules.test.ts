@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { renderApproval } from "../apps/gateway/src/public/console/src/views/approvals.ts";
 import { auditFacetLabel } from "../apps/gateway/src/public/console/src/views/audit.ts";
+import { agentGraphStatusLabel, canReassignAgentGraph, isAgentGraphActive, renderAgentGraphDetail, renderAgentGraphRow } from "../apps/gateway/src/public/console/src/views/agent-graphs.ts";
 import { suggestedChatTitle } from "../apps/gateway/src/public/console/src/views/chat.ts";
 import { relativeTime, renderSessionRow } from "../apps/gateway/src/public/console/src/views/sessions.ts";
 import { cloneConfig, configLines, configNumber, renderOptions } from "../apps/gateway/src/public/console/src/views/settings.ts";
@@ -80,4 +81,30 @@ test("session, settings, approval, audit, and tool modules expose deterministic 
   assert.equal(auditFacetLabel("outcomes", "failed"), "Needs attention");
   assert.equal(toolCallStatus({ tool: "workspace.read" }), "Running workspace.read");
   assert.match(renderToolCall({ tool: "workspace.read", status: "running" }), /role="status"/u);
+});
+
+test("agent graph view renders bounded durable child-session projections", () => {
+  const graph = {
+    graphRunId: 'graph"><script>',
+    parentRunId: "parent-1",
+    requestDigest: "a".repeat(64),
+    status: "needs-review",
+    maxConcurrency: 2,
+    maxRunMs: 120_000,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    errorCode: "GRAPH_OUTCOME_UNCERTAIN",
+    nodes: [{ nodeId: "child-1", manifestId: "research", status: "completed", resultRef: "result:child-1" }]
+  };
+  assert.equal(agentGraphStatusLabel("publishing"), "Collecting results");
+  assert.equal(isAgentGraphActive("running"), true);
+  assert.equal(canReassignAgentGraph("needs-review"), true);
+  const selectedRow = renderAgentGraphRow(graph, true, Date.parse("2026-01-01T00:01:00.000Z"));
+  const unselectedRow = renderAgentGraphRow(graph, false, Date.parse("2026-01-01T00:01:00.000Z"));
+  assert.doesNotMatch(selectedRow, /<script>/u);
+  assert.match(selectedRow, /1\/1/u);
+  assert.match(selectedRow, /aria-current="true"/u);
+  assert.match(unselectedRow, /aria-current="false"/u);
+  assert.match(selectedRow, /aria-label="1 of 1 children completed"/u);
+  assert.match(renderAgentGraphDetail(graph), /GRAPH_OUTCOME_UNCERTAIN/u);
+  assert.match(renderAgentGraphDetail(graph), /result:child-1/u);
 });

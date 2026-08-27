@@ -78,6 +78,25 @@ Cron state uses schema v2. On upgrade, Odinn creates the normal protected migrat
 
 Tasks is the operator view over meaningful user, agent, and automation runs. Routine console reads are hidden unless **System activity** is enabled. Server-side search, filtering, and pagination keep the list bounded. Operators can select tasks, stop active supervised jobs, and run tasks again only when recorded input is declared retry-safe. The replay endpoint enforces the same classification server-side; external effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
+## Delegation
+
+The **Delegation** page lists bounded durable child-agent graphs and their
+projected child status, budgets, result references, and terminal reason. It
+does not expose child prompts, provider output, credentials, or raw result
+content. Operators can stop an active graph; because physical child work may
+already be uncertain, cancellation can quarantine the graph for review rather
+than claiming that every effect was absent.
+
+Terminal incomplete graphs can be reassigned only through a new durable
+`agent-graph` job. The replacement must bind the prior request digest, preserve
+the trusted tenant, principal, and principal namespace, use a new idempotency
+key, and request no capability outside the original parent set. Completed
+child results can anchor a governed workspace checkpoint. Both preview and
+apply require a one-use capability token issued for the same run and workspace
+tool; the console keeps the token only in the password field for the current
+request and clears it after submission. These controls do not grant authority
+to child output or bypass normal policy, approval, audit, or recovery checks.
+
 The History tab in Activity provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Runemark is a core advanced service; command assertions still require exact operator-owned argument-vector allowlisting through the compatibility `proof` configuration key. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
 
 Runtime errors return a stable request correlation ID in the `x-odinn-request-id`
