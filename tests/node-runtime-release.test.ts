@@ -142,6 +142,7 @@ test("Windows launchers clear CLR, .NET, and module loader hooks before trusted 
   const installerSource = await readFile(resolve(root, "scripts/install.ts"), "utf8");
   assert.doesNotMatch(installerSource, /Get-FileHash/u);
   assert.doesNotMatch(installerSource, /"%ODINN_ACTIVATION_NODE%"/u);
+  assert.doesNotMatch(installerSource, /return `@echo off\\r\\ncall /u);
   assert.equal(installerSource.match(/WINDOWS_RUNTIME_TRUST_ASSERTIONS/gu)?.length, 3);
 });
 

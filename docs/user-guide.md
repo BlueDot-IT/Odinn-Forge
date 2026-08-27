@@ -17,6 +17,10 @@ PowerShell boundary, clears CLR hooks and `PSModulePath` before PowerShell
 starts, and verifies the embedded runtime with direct .NET SHA-256 APIs rather
 than an auto-loadable command. Release validation injects hostile preload and
 module probes and rejects any package or installed launcher that admits them.
+The `*.runtime.sh` companions are non-executable internal inputs to those native
+entrypoints. Running one explicitly through a shell bypasses the native
+sanitization boundary and is unsupported, just like invoking the bundled
+JavaScript directly instead of using the documented launcher.
 
 The standalone installer stages the complete application/runtime pair under
 an immutable version identity before switching the current pointer. Upgrade

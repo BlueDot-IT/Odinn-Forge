@@ -84,6 +84,16 @@ test("standalone install uses only its bundled runtime and rolls back byte-equiv
       assert.doesNotMatch(generation, /Get-FileHash|Get-Item/u);
       assert.match(generation, /\[System\.Security\.Cryptography\.SHA256\]::Create\(\)/u);
     }
+    if (process.platform === "win32") {
+      const trampoline = await readFile(join(prefix, "bin", "odinn.cmd"), "utf8");
+      assert.doesNotMatch(trampoline, /\bcall\b/iu);
+      const injectionSentinel = join(temporary, "call-double-expansion.txt");
+      runInstalled(prefix, ["%%ODINN_REVIEW_NAME%%"], {
+        ODINN_REVIEW_NAME: "ODINN_REVIEW_PAYLOAD",
+        ODINN_REVIEW_PAYLOAD: `^& echo injected^>"${injectionSentinel}" ^& rem`
+      });
+      await assert.rejects(() => access(injectionSentinel), { code: "ENOENT" });
+    }
 
     const fakeBin = join(temporary, "hostile-bin");
     await mkdir(fakeBin);
@@ -208,7 +218,7 @@ test("standalone installer fails closed for missing or tampered runtime policy a
     await writeFile(policyPath, policy);
 
     await appendFile(executable, Buffer.from([0]));
-    const runtimeResult = runWithRuntimeFailure(executable, [
+    const runtimeResult = runWithRuntimeFailure(process.execPath, [
       "install", "--source", fixture.root, "--prefix", join(temporary, "runtime-install"), "--version", "1.0.0"
     ]);
     assert.match(runtimeResult, /runtime executable digest/u);
@@ -411,6 +421,7 @@ async function writeCompiledFixture(temporary: string, version: string, commit: 
   const source = join(temporary, `compiled-${version}`);
   await mkdir(join(source, "dist", "cli"), { recursive: true });
   await mkdir(join(source, "dist", "gateway"), { recursive: true });
+  await mkdir(join(source, "dist", "install"), { recursive: true });
   await writeFile(join(source, "package.json"), `${JSON.stringify({ name: "@bluedot-it/odinn", version, type: "module" }, null, 2)}\n`);
   await writeFile(join(source, "release-info.json"), `${JSON.stringify({
     schemaVersion: 2,
@@ -422,6 +433,10 @@ async function writeCompiledFixture(temporary: string, version: string, commit: 
   }, null, 2)}\n`);
   await writeFile(join(source, "dist", "cli", "index.js"), fixtureCli(version));
   await writeFile(join(source, "dist", "gateway", "server.js"), "export {};\n");
+  await writeFile(
+    join(source, "dist", "install", "install.js"),
+    `import ${JSON.stringify(new URL("../scripts/install.ts", import.meta.url).href)};\n`
+  );
   return source;
 }
 

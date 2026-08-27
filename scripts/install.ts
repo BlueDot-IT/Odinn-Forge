@@ -143,7 +143,7 @@ async function install(operation: any) {
   // On Windows, install the immutable generation launcher and its short stable
   // trampoline before publishing the activation intent. Replacing a legacy
   // active batch file with the shorter trampoline leaves its old read cursor at
-  // EOF, while every later generation keeps the same call/exit layout.
+  // EOF, while every later generation keeps the same direct-transfer layout.
   await writeLaunchers(destination, distribution, activation ?? undefined);
   if (activation) await writeLauncherActivationMarker(activation, null);
   await writeCurrentPointer(versionId, toolchain.distribution, standalone ? releaseInfo.embeddedRuntime.executableSha256 : "");
@@ -457,6 +457,12 @@ async function finalizeDeferredLaunchers() {
   }
   const deadline = Date.parse(initial.deadlineAt);
   while (processIsAlive(waitForPid)) {
+    // Ordinary startup or synchronous rollback can reconcile/retire this exact
+    // marker before the original parent exits. Stop the detached waiter as
+    // soon as it no longer owns the activation instead of retaining the
+    // installation directory until the parent or timeout ends.
+    const active = await readLauncherActivationMarker();
+    if (!active || active.token !== token) return;
     if (Date.now() >= deadline) {
       await assertNoLinkedAncestors(prefix, "install prefix");
       await ensurePhysicalDirectory(prefix, "install prefix");
@@ -872,8 +878,9 @@ async function writeLaunchers(
   await atomicLauncher(join(bin, gatewayGenerationName), gatewayCmd, 0o600);
   const cliTrampoline = installedWindowsTrampoline(cliGenerationName);
   const gatewayTrampoline = installedWindowsTrampoline(gatewayGenerationName);
-  await assertSafeWindowsTrampolineReplacement(join(bin, "odinn.cmd"), cliTrampoline);
-  await assertSafeWindowsTrampolineReplacement(join(bin, "odinn-gateway.cmd"), gatewayTrampoline);
+  const repairingInterruptedActivation = activation?.phase === "applying";
+  await assertSafeWindowsTrampolineReplacement(join(bin, "odinn.cmd"), cliTrampoline, repairingInterruptedActivation);
+  await assertSafeWindowsTrampolineReplacement(join(bin, "odinn-gateway.cmd"), gatewayTrampoline, repairingInterruptedActivation);
   await atomicLauncher(join(bin, "odinn.cmd"), cliTrampoline, 0o600);
   await atomicLauncher(join(bin, "odinn-gateway.cmd"), gatewayTrampoline, 0o600);
 }
@@ -930,15 +937,28 @@ function installedWindowsTrampoline(generationName: string): string {
   if (!WINDOWS_LAUNCHER_GENERATION_NAME.test(generationName)) {
     throw new Error("Windows launcher generation name is invalid");
   }
-  return `@echo off\r\ncall "%~dp0${generationName}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
+  // Batch-to-batch transfer preserves the generation's exit status without
+  // CALL. CALL reparses %* and can turn a caller-controlled argument into a
+  // second environment expansion (and then batch metacharacter execution).
+  return `@echo off\r\n"%~dp0${generationName}" %*\r\n`;
 }
 
-async function assertSafeWindowsTrampolineReplacement(path: string, trampoline: string): Promise<void> {
+async function assertSafeWindowsTrampolineReplacement(
+  path: string,
+  trampoline: string,
+  repairingInterruptedActivation = false
+): Promise<void> {
   try {
     const metadata = await requirePhysicalFile(path, "installed Windows launcher trampoline");
     const existing = await readFile(path, "utf8");
-    const versionedTrampoline = /^@echo off\r?\ncall "%~dp0(?:odinn|odinn-gateway)\.[0-9a-f-]{36}\.cmd" %\*\r?\nexit \/b %ERRORLEVEL%\r?\n$/iu.test(existing);
-    if (!versionedTrampoline && Buffer.byteLength(trampoline, "utf8") >= metadata.size) {
+    const currentTrampoline = /^@echo off\r?\n"%~dp0(?:odinn|odinn-gateway)\.[0-9a-f-]{36}\.cmd" %\*\r?\n$/iu.test(existing);
+    const legacyCallTrampoline = /^@echo off\r?\ncall "%~dp0(?:odinn|odinn-gateway)\.[0-9a-f-]{36}\.cmd" %\*\r?\nexit \/b %ERRORLEVEL%\r?\n$/iu.test(existing);
+    const versionedTrampoline = currentTrampoline || legacyCallTrampoline;
+    // The authenticated applying marker proves the prior owner has exited and
+    // permits repair of a physically truncated trampoline after power loss.
+    // Initial activation still refuses a replacement that could strand an
+    // active legacy cmd.exe read cursor.
+    if (!versionedTrampoline && !repairingInterruptedActivation && Buffer.byteLength(trampoline, "utf8") >= metadata.size) {
       throw new Error("active legacy Windows launcher cannot transition to a bounded trampoline safely");
     }
   } catch (error: any) {

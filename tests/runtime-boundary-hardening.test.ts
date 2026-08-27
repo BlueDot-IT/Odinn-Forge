@@ -120,6 +120,11 @@ console.log(JSON.stringify({ tls: process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? nu
     await writeFile(`${launcher}.runtime.sh`, standaloneUnixLauncher("dist/cli/index.js", "linux-x64", executableSha256));
     await writeFile(join(packageRoot, "bin", "odinn-gateway.runtime.sh"), standaloneUnixLauncher("dist/gateway/server.js", "linux-x64", executableSha256));
     await writeFile(join(packageRoot, "install", "install.sh.runtime.sh"), standaloneUnixLauncher("dist/install/install.js", "linux-x64", executableSha256));
+    const companion = `${launcher}.runtime.sh`;
+    assert.equal((await lstat(companion)).mode & 0o111, 0, "native launcher companions must not be executable entrypoints");
+    const directCompanion = await run("/bin/sh", [companion], temporary, process.env);
+    assert.equal(directCompanion.status, 126);
+    assert.match(directCompanion.stderr, /native runtime boundary was bypassed/iu);
 
     const key = join(temporary, "key.pem");
     const certificate = join(temporary, "certificate.pem");
@@ -166,6 +171,7 @@ server.listen(0, "127.0.0.1", () => console.log(server.address().port));
     ], root, hostileEnvironment);
     assert.equal(installed.status, 0, installed.stderr);
     const installedLauncher = join(prefix, "bin", "odinn");
+    assert.equal((await lstat(`${installedLauncher}.runtime.sh`)).mode & 0o177, 0, "installed companion must remain owner-readable only");
     const installedProbe = await run(installedLauncher, [url], temporary, hostileLoaderEnvironment);
     assert.equal(installedProbe.status, 0, installedProbe.stderr);
     assert.equal(JSON.parse(installedProbe.stdout).tls, null);

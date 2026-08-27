@@ -7,6 +7,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { STATE_SCHEMA_TARGETS } from "../packages/kernel/src/state/schema-registry.ts";
 import { buildNativeLauncher } from "../scripts/release/native-launcher.ts";
+import { trustedTool } from "../scripts/release/trusted-tools.ts";
 import {
   HOSTILE_WINDOWS_RUNTIME_ENVIRONMENT_VARIABLES,
   standaloneUnixLauncher
@@ -318,7 +319,7 @@ test("Windows deferred launcher activation recovers after finalizer crash and ap
     });
     assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
     await assert.rejects(() => readFile(markerPath), { code: "ENOENT" });
-    assert.match(await readFile(launcherPath, "utf8"), /ODINN_CURRENT/u);
+    assert.match(await readActiveWindowsGeneration(fixture.prefix), /ODINN_CURRENT/u);
 
     await writeFile(launcherPath, "partial launcher from interrupted activation\r\n");
     await writeTestLauncherActivationMarker({
@@ -332,6 +333,7 @@ test("Windows deferred launcher activation recovers after finalizer crash and ap
     assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
     await assert.rejects(() => readFile(markerPath), { code: "ENOENT" });
     assert.doesNotMatch(await readFile(launcherPath, "utf8"), /partial launcher/u);
+    assert.match(await readActiveWindowsGeneration(fixture.prefix), /ODINN_CURRENT/u);
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
   }
@@ -405,12 +407,12 @@ test("Windows deferred launcher activation persists write failure and retries sa
     ]));
     const failed = JSON.parse(await readFile(markerPath, "utf8"));
     assert.equal(failed.phase, "failed");
-    assert.match(failed.lastError, /physical file/u);
+    assert.match(failed.lastError, /physical file|unrelated launcher entry/u);
 
     await rm(externalLink);
     assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
     await assert.rejects(() => readFile(markerPath), { code: "ENOENT" });
-    assert.match(await readFile(launcher, "utf8"), /ODINN_CURRENT/u);
+    assert.match(await readActiveWindowsGeneration(fixture.prefix), /ODINN_CURRENT/u);
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
   }
@@ -1050,8 +1052,7 @@ async function createRelease(
   const artifactName = process.platform === "win32" ? `odinn-v${version}.zip` : `odinn-v${version}.tar.gz`;
   const artifact = join(releases, artifactName);
   if (process.platform === "win32") {
-    const command = `Compress-Archive -LiteralPath '${packageRoot.replaceAll("'", "''")}' -DestinationPath '${artifact.replaceAll("'", "''")}' -Force`;
-    run("powershell", ["-NoProfile", "-Command", command], releases);
+    run(trustedTool("tar"), ["-a", "-cf", artifact, "-C", releases, basename(packageRoot)], releases);
   } else {
     run("tar", ["-czf", artifact, "-C", releases, basename(packageRoot)], releases);
   }
@@ -1072,6 +1073,14 @@ async function createRelease(
   const checksums = join(releases, "SHA256SUMS.txt");
   await writeFile(checksums, `${digest}  ${artifactName}\n`);
   return { artifact, manifest, checksums };
+}
+
+async function readActiveWindowsGeneration(prefix: string): Promise<string> {
+  const bin = join(prefix, "bin");
+  const trampoline = await readFile(join(bin, "odinn.cmd"), "utf8");
+  const match = trampoline.match(/^@echo off\r?\n(?:call )?"%~dp0([^"\r\n]+\.cmd)" %\*/iu);
+  assert.ok(match?.[1], "installed Windows launcher must point to an immutable generation");
+  return await readFile(join(bin, match[1]), "utf8");
 }
 
 async function createStandaloneRelease(
