@@ -70,6 +70,19 @@ async function navigateWithKeyboard(page: any, name: string | RegExp) {
   await page.keyboard.press("Enter");
 }
 
+async function selectAgentGraphWithReadiness(page: any, graphRunId: string) {
+  const graphDetail = page.locator("#agent-graph-detail");
+  const detailPath = `/agent-graphs/${encodeURIComponent(graphRunId)}`;
+  const detailResponse = page.waitForResponse((response: any) => response.url().includes(detailPath)
+    && response.request().method() === "GET"
+    && response.ok());
+  await page.keyboard.press("Enter");
+  await detailResponse;
+  const terminalSummary = graphDetail.locator(".agent-graph-summary .item").filter({ hasText: "Terminal reason" });
+  await terminalSummary.getByText("Terminal reason", { exact: true }).waitFor({ timeout: 15_000 });
+  await terminalSummary.getByText("Completed", { exact: true }).waitFor({ timeout: 15_000 });
+}
+
 async function openAdvancedNavigation(page: any) {
   const advanced = page.locator("details.nav-labs");
   if (!await advanced.evaluate((element: HTMLDetailsElement) => element.open)) {
@@ -308,8 +321,7 @@ test("a source-blind operator completes Phase C against durable state across a r
     const graphRow = first.page.getByRole("button", { name: new RegExp(escapeRegExp(seed.graphRunId), "u") });
     await graphRow.waitFor();
     await graphRow.focus();
-    await first.page.keyboard.press("Enter");
-    await first.page.getByText("Terminal reason").waitFor();
+    await selectAgentGraphWithReadiness(first.page, seed.graphRunId);
     assert.match(await first.page.locator("#agent-graph-detail").innerText(), /Terminal reason\s+Completed/u);
     assert.match(await first.page.locator("#agent-graph-detail").innerText(), /checkpoint-reader/u);
 
@@ -430,7 +442,10 @@ test("a source-blind operator completes Phase C against durable state across a r
     assert.equal(expectedDialogs.length, 1, JSON.stringify(expectedDialogs));
 
     await navigateWithKeyboard(second.page, /^Delegation\b/u);
-    await second.page.getByRole("button", { name: new RegExp(escapeRegExp(seed.graphRunId), "u") }).waitFor();
+    const restartedGraphRow = second.page.getByRole("button", { name: new RegExp(escapeRegExp(seed.graphRunId), "u") });
+    await restartedGraphRow.waitFor();
+    await restartedGraphRow.focus();
+    await selectAgentGraphWithReadiness(second.page, seed.graphRunId);
     assert.match(await second.page.locator("#agent-graph-detail").innerText(), /Terminal reason\s+Completed/u);
     const auditIntegrity = await jsonRequest(harness.base, "/audit/verify");
     assert.equal(auditIntegrity.valid, true);
