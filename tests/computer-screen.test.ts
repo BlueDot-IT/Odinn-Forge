@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -57,6 +57,24 @@ function controlProvider(overrides: Record<string, unknown> = {}) {
     recoveryStatus: async () => ({ unresolved: false }),
     resolveRecovery: async () => ({ status: "resolved" })
   };
+}
+
+async function assertTreeExcludes(root: string, markers: ReadonlyArray<Readonly<{ label: string; value: string }>>): Promise<void> {
+  const inspect = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await inspect(path);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const content = await readFile(path);
+      for (const marker of markers) {
+        assert.equal(content.includes(Buffer.from(marker.value, "utf8")), false, `${marker.label} crossed the durable state boundary`);
+      }
+    }
+  };
+  await inspect(root);
 }
 
 test("computer.screen is target-bound and returns a bounded frame projection", async () => {
@@ -298,6 +316,179 @@ test("computer.act requires one exact durable approval, binds the paired frame, 
   registry.close();
   assert.equal(closed, true);
   await assert.rejects(() => recoveryTool.execute({}, {}), /provider is closed/u);
+});
+
+test("computer.act capability authority is broker-only and exact approval continuation consumes it once", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-computer-capability-"));
+  const stateDir = join(root, ".odinn");
+  const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const runtime = createDifferentiatedRuntime({
+    stateDir,
+    workspaceRoot: root,
+    featureFlags: { capabilities: true, capsules: false, counterfactual: false }
+  });
+  let currentTarget = target;
+  let actions = 0;
+  let dispatchedRequest: Record<string, any> | undefined;
+  const paired = {
+    ...controlProvider(),
+    get target() { return currentTarget; },
+    act: async (request: Record<string, any>) => {
+      actions += 1;
+      dispatchedRequest = request;
+      return controlProvider().act(request);
+    }
+  };
+  const registry = createBuiltInRegistry({
+    workspaceRoot: root,
+    stateDir,
+    approvalStore,
+    auditStore,
+    enableComputerScreen: true,
+    computerControlProvider: paired
+  });
+  t.after(async () => {
+    registry.close();
+    auditStore.close();
+    runtime.ledger.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const runId = "computer-capability-exact";
+  const actor = "desktop-operator";
+  const typedText = "typed-value-that-must-not-persist-71f9";
+  const businessInput = { frameId: "frame-1", action: "type", text: typedText, sensitive: true };
+  runtime.ledger.ensureRun({ runId, objective: "perform one exact governed desktop action" });
+  const issued = runtime.capabilities.issue({
+    runId,
+    stepId: "desktop-action",
+    toolName: "computer.act",
+    resourceConstraints: { ...target, frameId: businessInput.frameId },
+    maxUses: 1
+  });
+  const input = { ...businessInput, capabilityToken: issued.token };
+  const options = {
+    auditStore,
+    approvalStore,
+    policy: createDefaultPolicy({ allowedCapabilities: ["computer.read", "computer.mutate"] }),
+    registry,
+    runLedger: runtime.ledger,
+    durableExecution: true
+  };
+
+  const first = await runTask({ ...options, task: { id: runId, tool: "computer.act", input, actor } });
+  assert.equal(first.output.type, "approval.required");
+  assert.equal(actions, 0);
+  assert.equal(runtime.capabilities.list(runId)[0].uses, 0, "approval creation validates but must not consume authority");
+  assert.equal(runtime.capabilities.list(runId)[0].status, "active");
+  const approvalId = first.output.approvalId as string;
+  assert.ok(approvalStore.claim(approvalId));
+  assert.deepEqual(approvalStore.recover(approvalId)?.input, businessInput, "the trusted approval stores only business input");
+  const publicApproval = JSON.stringify(approvalStore.list());
+  assert.equal(publicApproval.includes(issued.token), false);
+  assert.equal(publicApproval.includes(typedText), false);
+  assert.equal(publicApproval.includes("capabilityToken"), false);
+  await assertTreeExcludes(stateDir, [
+    { label: "capability token", value: issued.token },
+    { label: "typed computer text", value: typedText }
+  ]);
+
+  for (const changedInput of [
+    { ...input, frameId: "frame-stale" },
+    { frameId: "frame-1", action: "key", key: "Enter", capabilityToken: issued.token }
+  ]) {
+    await assert.rejects(
+      runTask({
+        ...options,
+        task: { id: runId, tool: "computer.act", input: changedInput, actor },
+        trustedApprovalId: approvalId,
+        trustedApprovalRunId: runId,
+        trustedRecovery: true
+      }),
+      (error: any) => error.code === "APPROVAL_CONTINUATION_DENIED"
+    );
+  }
+  await assert.rejects(
+    runTask({
+      ...options,
+      task: { id: runId, tool: "computer.act", input, actor },
+      trustedApprovalId: "approval_forged",
+      trustedApprovalRunId: runId,
+      trustedRecovery: true
+    }),
+    (error: any) => error.code === "APPROVAL_CONTINUATION_DENIED"
+  );
+  assert.equal(actions, 0);
+  assert.equal(runtime.capabilities.list(runId)[0].uses, 0);
+
+  const second = await runTask({
+    ...options,
+    task: { id: runId, tool: "computer.act", input, actor },
+    trustedApprovalId: approvalId,
+    trustedApprovalRunId: runId
+  });
+  assert.equal(second.output.status, "completed");
+  assert.equal(actions, 1);
+  assert.equal(runtime.capabilities.list(runId)[0].uses, 1);
+  assert.equal(runtime.capabilities.list(runId)[0].status, "consumed");
+  assert.equal("capabilityToken" in (dispatchedRequest ?? {}), false, "authority must not reach the computer provider");
+  assert.deepEqual(dispatchedRequest?.target, target);
+  assert.equal(dispatchedRequest?.frameId, businessInput.frameId);
+  const capabilityUse = runtime.ledger.database.db.prepare("SELECT resource_json FROM capability_uses WHERE capability_id = ?").get(issued.claims.id) as { resource_json: string };
+  assert.deepEqual(JSON.parse(capabilityUse.resource_json), { ...target, frameId: businessInput.frameId });
+
+  await assert.rejects(
+    runTask({
+      ...options,
+      task: { id: runId, tool: "computer.act", input, actor },
+      trustedApprovalId: approvalId,
+      trustedApprovalRunId: runId,
+      trustedRecovery: true
+    }),
+    (error: any) => error.code === "APPROVAL_CONTINUATION_DENIED"
+  );
+  assert.throws(
+    () => runtime.capabilities.consume(issued.token, { runId, toolName: "computer.act", resource: { ...target, frameId: businessInput.frameId } }),
+    (error: any) => error.code === "CAPABILITY_DENIED"
+  );
+  const replay = await runTask({
+    ...options,
+    task: { id: runId, tool: "computer.act", input: businessInput, actor }
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.contentUnavailableOnReplay, true);
+  assert.equal(actions, 1, "completed replay must not call the computer provider");
+  await assertTreeExcludes(stateDir, [
+    { label: "capability token", value: issued.token },
+    { label: "typed computer text", value: typedText }
+  ]);
+
+  const targetRunId = "computer-capability-target-rotation";
+  runtime.ledger.ensureRun({ runId: targetRunId, objective: "reject a changed paired target" });
+  const targetIssued = runtime.capabilities.issue({
+    runId: targetRunId,
+    stepId: "desktop-target",
+    toolName: "computer.act",
+    resourceConstraints: { ...target, frameId: "frame-1" },
+    maxUses: 1
+  });
+  const targetInput = { frameId: "frame-1", action: "click", x: 0, y: 0, capabilityToken: targetIssued.token };
+  const targetFirst = await runTask({ ...options, task: { id: targetRunId, tool: "computer.act", input: targetInput, actor } });
+  const targetApprovalId = targetFirst.output.approvalId as string;
+  assert.ok(approvalStore.claim(targetApprovalId));
+  currentTarget = { ...target, pairingGeneration: "pair-rotated" };
+  await assert.rejects(
+    runTask({
+      ...options,
+      task: { id: targetRunId, tool: "computer.act", input: targetInput, actor },
+      trustedApprovalId: targetApprovalId,
+      trustedApprovalRunId: targetRunId
+    }),
+    (error: any) => error.code === "IDEMPOTENCY_CONFLICT"
+  );
+  assert.equal(runtime.capabilities.list(targetRunId)[0].uses, 0);
+  assert.equal(actions, 1, "a changed node/display/pairing target must fail before provider dispatch");
 });
 
 test("uncertain computer actions quarantine the durable attempt until operator resolution", async (t) => {

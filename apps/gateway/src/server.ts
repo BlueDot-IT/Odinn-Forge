@@ -1173,7 +1173,13 @@ export async function createGatewayServer(options: any = {}) {
     ? approvalStore.revokeAsync(id, { signal })
     : Promise.resolve(approvalStore.revoke(id, { signal }));
 
-  const recoverGatewayApprovalContinuation = async (id: string, pending: any, linkedTask: Record<string, unknown> | undefined, signal?: AbortSignal) => {
+  const recoverGatewayApprovalContinuation = async (
+    id: string,
+    pending: any,
+    linkedTask: Record<string, unknown> | undefined,
+    signal?: AbortSignal,
+    capabilityToken?: string
+  ) => {
     const recovered = await recoverGatewayApproval(id, signal);
     const runId = String(pending?.runId ?? "");
     const tool = String(pending?.tool ?? "");
@@ -1197,7 +1203,10 @@ export async function createGatewayServer(options: any = {}) {
     return {
       runId,
       tool,
-      input: input as Record<string, unknown>,
+      input: {
+        ...input as Record<string, unknown>,
+        ...(capabilityToken ? { capabilityToken } : {})
+      },
       actor: recoveredActor || linkedActor || "local"
     };
   };
@@ -1222,7 +1231,7 @@ export async function createGatewayServer(options: any = {}) {
         const requestSignal = signal;
         let result: unknown;
         try {
-          result = await supervisor.runApproval(linkedJob.id, async ({ signal: approvalSignal, job, markDispatched }) => {
+          result = await supervisor.runApproval(linkedJob.id, async ({ signal: approvalSignal, job, markDispatched, capabilityToken }) => {
             claimedLinkedJob = job;
             const signal = requestSignal
               ? AbortSignal.any([requestSignal, approvalSignal])
@@ -1251,7 +1260,7 @@ export async function createGatewayServer(options: any = {}) {
             const linkedTask = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task)
               ? job.payload.task as Record<string, unknown>
               : undefined;
-            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask, signal);
+            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask, signal, capabilityToken);
             markDispatched();
             await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
             assertGatewayRequestActive(signal);

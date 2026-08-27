@@ -1849,6 +1849,16 @@ function sanitizeExecutionRequest(task: any) {
   return sanitized;
 }
 
+function separateCapabilityAuthority(request: ReturnType<typeof normalizeTaskRequest>): { request: ReturnType<typeof normalizeTaskRequest>; capabilityToken: unknown } {
+  const businessInput = { ...request.input };
+  const capabilityToken = businessInput.capabilityToken;
+  delete businessInput.capabilityToken;
+  return {
+    request: { ...request, input: businessInput },
+    capabilityToken
+  };
+}
+
 function canonicalTaskInput(toolName: string, input: any, tool?: AnyRecord): Record<string, unknown> {
   const normalized = normalizeApprovalExecutionInput(toolName, input && typeof input === "object" && !Array.isArray(input)
     ? input
@@ -2267,7 +2277,9 @@ async function executeTaskThroughAdmission({
   parentCapabilities,
   admissionService
 }: any) {
-  const request = normalizeTaskRequest(task);
+  const separated = separateCapabilityAuthority(normalizeTaskRequest(task));
+  const request = separated.request;
+  const capabilityToken = separated.capabilityToken;
   const registeredTool = registry.get(request.tool);
   let declaredCapabilities;
   try {
@@ -2435,7 +2447,7 @@ async function executeTaskThroughAdmission({
       });
     }
     if (runLedger?.featureFlags?.capabilities === true && safety.requiresCapability) {
-      const token = request.input?.capabilityToken;
+      const token = capabilityToken;
       if (typeof token !== "string" || !token) {
         const error = new Error(`capability token required for ${request.tool}`) as NodeError;
         error.code = "CAPABILITY_DENIED";
