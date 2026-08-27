@@ -51,3 +51,33 @@ jobs:
           path: dist/release/
           if-no-files-found: error
           retention-days: 7
+
+  slo-acceptance:
+    name: Exact-commit SLO measurement
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ODINN_SLO_EXPECTED_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm slo:measure
+      - run: pnpm slo:validate
+      - name: Preserve exact-commit SLO collector evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nightly-slo-evidence-${{ github.sha }}
+          path: dist/reports/slo-collector-report.json
+          if-no-files-found: error
+          retention-days: 30

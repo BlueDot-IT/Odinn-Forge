@@ -10,6 +10,8 @@ export type AgentGraphControlAuditTestEvent = {
 };
 
 export type GatewayTestHooks = {
+  /** @internal Test-only hook at the in-process admission stop barrier. */
+  afterShutdownBarrier?: (event: { listenerClosed: Promise<void> }) => void | Promise<void>;
   afterApprovalJobClaimed?: (event: ApprovalJobClaimedTestEvent) => void | Promise<void>;
   afterApprovalDispatchStarted?: (event: ApprovalJobClaimedTestEvent & { signal: AbortSignal }) => void | Promise<void>;
   beforeAgentGraphControlAudit?: (event: AgentGraphControlAuditTestEvent) => void | Promise<void>;
