@@ -57,6 +57,8 @@
     "smoke:onboarding": "node scripts/ci/onboarding-smoke.ts",
     "storage:drill": "node scripts/ci/storage-drill.ts",
     "soak:audit": "node scripts/ci/audit-soak.ts",
+    "slo:measure": "node scripts/ci/slo-measurement.ts run",
+    "slo:validate": "node scripts/ci/slo-measurement.ts validate",
     "release:preflight": "node scripts/release/preflight.ts",
     "release:package": "node scripts/release/package.ts",
     "release:checksums": "node scripts/release/checksums.ts",

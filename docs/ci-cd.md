@@ -105,7 +105,10 @@ It includes:
 
 Runs the complete repository check, integration and product-invariant tests,
 protocol smoke, dependency audit, and compiled production packaging every day.
-Nightly artifacts are retained for seven days.
+The release candidate is retained for seven days. A separate credential-free
+job measures and fail-closed validates all six local-runtime SLOs against the
+exact clean commit, then retains its machine-readable collector report for 30
+days. See [Exact-commit SLO acceptance](slo-acceptance.md).
 
 ### Package Integrity
 
