@@ -166,6 +166,9 @@ test("ordinary Windows startup reconciles a power-loss activation with the candi
   const candidateSource = join(fixture.temporary, "standalone-power-loss-candidate");
   const fakeBin = join(fixture.temporary, "hostile-bin");
   const ambientNodeSentinel = join(fixture.temporary, "ambient-node-used");
+  const powerShellModuleSentinel = join(fixture.temporary, "powershell-module-used");
+  const powerShellModules = join(fixture.temporary, "hostile-powershell-modules");
+  const utilityModule = join(powerShellModules, "Microsoft.PowerShell.Utility");
   const waitingParent = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], {
     cwd: root,
     stdio: "ignore",
@@ -216,12 +219,23 @@ test("ordinary Windows startup reconciles a power-loss activation with the candi
       const clearIndex = generationBytes.indexOf(`set "${name}="`);
       assert.ok(clearIndex >= 0 && clearIndex < powershellIndex, `${name} must be cleared before PowerShell starts`);
     }
+    assert.doesNotMatch(generationBytes, /Get-FileHash|Get-Item/u);
+    assert.match(generationBytes, /\[System\.Security\.Cryptography\.SHA256\]::Create\(\)/u);
 
     await mkdir(fakeBin);
+    await mkdir(utilityModule, { recursive: true });
     await writeFile(
       join(fakeBin, "node.cmd"),
       `@echo hostile>"${ambientNodeSentinel}"\r\n@exit /b 99\r\n`
     );
+    await writeFile(join(utilityModule, "Microsoft.PowerShell.Utility.psm1"), `
+[System.IO.File]::WriteAllText($env:ODINN_MODULE_SENTINEL, 'loaded')
+function Get-FileHash {
+  param([string]$LiteralPath, [string]$Algorithm)
+  [pscustomobject]@{ Hash = $env:ODINN_FORGED_SHA256 }
+}
+Export-ModuleMember -Function Get-FileHash
+`);
     const launched = spawnSync(join(fixture.prefix, "bin", "odinn.cmd"), ["--version"], {
       cwd: fixture.prefix,
       encoding: "utf8",
@@ -233,13 +247,17 @@ test("ordinary Windows startup reconciles a power-loss activation with the candi
         COR_PROFILER_PATH: join(fixture.temporary, "hostile-profiler.dll"),
         COMPlus_EnableProfiling: "1",
         COMPlus_ProfilerPath: join(fixture.temporary, "hostile-complus-profiler.dll"),
-        DOTNET_STARTUP_HOOKS: join(fixture.temporary, "hostile-startup-hook.dll")
+        DOTNET_STARTUP_HOOKS: join(fixture.temporary, "hostile-startup-hook.dll"),
+        PSModulePath: powerShellModules,
+        ODINN_MODULE_SENTINEL: powerShellModuleSentinel,
+        ODINN_FORGED_SHA256: candidate.executableSha256
       }
     });
     assert.equal(launched.status, 0, String(launched.stderr || launched.stdout));
     assert.equal(launched.stdout.trim(), "1.0.0");
     await assert.rejects(() => readFile(markerPath, "utf8"), { code: "ENOENT" });
     await assert.rejects(() => readFile(ambientNodeSentinel, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(powerShellModuleSentinel, "utf8"), { code: "ENOENT" });
     const settled = JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8"));
     assert.equal(settled.currentVersion, "1.0.0");
     assert.equal((await readFile(join(fixture.prefix, "current"), "utf8")).split(/\r?\n/u)[0], settled.current);

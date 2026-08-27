@@ -69,9 +69,21 @@ test("standalone install uses only its bundled runtime and rolls back byte-equiv
     ]);
     const first = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
     const firstRoot = join(prefix, "versions", first.current);
-  const firstTree = await treeDigest(firstRoot);
+    const firstTree = await treeDigest(firstRoot);
     const firstRuntimeDigest = standalone.executableSha256;
     assert.equal(await readFile(join(prefix, "current"), "utf8"), `${first.current}${lineEnding}standalone${lineEnding}${firstRuntimeDigest}${lineEnding}`);
+    const windowsGenerationNames = (await readdir(join(prefix, "bin")))
+      .filter((name) => /^(?:odinn|odinn-gateway)\.[0-9a-f-]{36}\.cmd$/iu.test(name));
+    assert.equal(windowsGenerationNames.length, 2);
+    for (const generationName of windowsGenerationNames) {
+      const generation = await readFile(join(prefix, "bin", generationName), "utf8");
+      const powershellIndex = generation.indexOf("C:\\Windows\\System32\\WindowsPowerShell");
+      assert.ok(powershellIndex > 0);
+      const moduleClearIndex = generation.indexOf('set "PSModulePath="');
+      assert.ok(moduleClearIndex >= 0 && moduleClearIndex < powershellIndex);
+      assert.doesNotMatch(generation, /Get-FileHash|Get-Item/u);
+      assert.match(generation, /\[System\.Security\.Cryptography\.SHA256\]::Create\(\)/u);
+    }
 
     const fakeBin = join(temporary, "hostile-bin");
     await mkdir(fakeBin);

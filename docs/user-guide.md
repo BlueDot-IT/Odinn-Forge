@@ -13,8 +13,10 @@ On Linux, the standalone entrypoint is a reproducible static PIE that removes
 loader and Node hook variables before starting a fixed companion script. On
 macOS, the equivalent entrypoint is signed with the hardened runtime before it
 performs the same sanitization. Windows uses the fixed system command and
-PowerShell boundary. Release validation injects a real hostile preload probe
-on Unix and rejects any package or installed launcher that admits it.
+PowerShell boundary, clears CLR hooks and `PSModulePath` before PowerShell
+starts, and verifies the embedded runtime with direct .NET SHA-256 APIs rather
+than an auto-loadable command. Release validation injects hostile preload and
+module probes and rejects any package or installed launcher that admits them.
 
 The standalone installer stages the complete application/runtime pair under
 an immutable version identity before switching the current pointer. Upgrade

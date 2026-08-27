@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   readRuntimePolicy,
@@ -11,6 +13,8 @@ import {
 } from "../scripts/release/node-runtime.ts";
 import {
   HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES,
+  HOSTILE_WINDOWS_POWERSHELL_ENVIRONMENT_VARIABLES,
+  standalonePowerShellInstaller,
   standaloneWindowsInstaller,
   standaloneWindowsLauncher
 } from "../scripts/release/standalone-launchers.ts";
@@ -107,10 +111,11 @@ test("standalone launchers use only the relative embedded runtime and sanitize N
   assert.doesNotMatch(launchers, /exec node /);
 });
 
-test("Windows launchers clear CLR and .NET loader hooks before starting trusted PowerShell", () => {
+test("Windows launchers clear CLR, .NET, and module loader hooks before trusted PowerShell", async () => {
   assert.ok(HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES.includes("COR_ENABLE_PROFILING"));
   assert.ok(HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES.includes("COMPlus_EnableProfiling"));
   assert.ok(HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES.includes("DOTNET_STARTUP_HOOKS"));
+  assert.deepEqual(HOSTILE_WINDOWS_POWERSHELL_ENVIRONMENT_VARIABLES, ["PSModulePath"]);
   for (const generated of [
     standaloneWindowsLauncher("dist/cli/index.js", "a".repeat(64)),
     standaloneWindowsInstaller("dist/install/install.js", "a".repeat(64))
@@ -121,5 +126,96 @@ test("Windows launchers clear CLR and .NET loader hooks before starting trusted 
       const clearIndex = generated.indexOf(`set "${name}="`);
       assert.ok(clearIndex >= 0 && clearIndex < powershellIndex, `${name} must be cleared before PowerShell starts`);
     }
+    const moduleClearIndex = generated.indexOf('set "PSModulePath="');
+    assert.ok(moduleClearIndex >= 0 && moduleClearIndex < powershellIndex, "PSModulePath must be cleared before PowerShell starts");
+    assert.doesNotMatch(generated, /Get-FileHash/u);
+    assert.match(generated, /\[System\.Security\.Cryptography\.SHA256\]::Create\(\)/u);
+    assert.match(generated, /\$digest\.Length -ne 32/u);
+    assert.match(generated, /\$hex\.Length -ne 64/u);
+  }
+
+  const powerShellInstaller = standalonePowerShellInstaller("dist/install/install.js", "a".repeat(64));
+  assert.doesNotMatch(powerShellInstaller, /Get-FileHash|Get-Item|Join-Path|Split-Path/u);
+  assert.match(powerShellInstaller, /\$env:PSModulePath = \$null/u);
+  assert.match(powerShellInstaller, /\[System\.Security\.Cryptography\.SHA256\]::Create\(\)/u);
+
+  const installerSource = await readFile(resolve(root, "scripts/install.ts"), "utf8");
+  assert.doesNotMatch(installerSource, /Get-FileHash/u);
+  assert.equal(installerSource.match(/WINDOWS_RUNTIME_TRUST_ASSERTIONS/gu)?.length, 3);
+});
+
+test("Windows standalone runtime identity ignores a forged Utility module digest", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-hostile-psmodule-"));
+  const packageRoot = join(temporary, "package");
+  const nodePath = join(packageRoot, "runtime", "node.exe");
+  const launcherPath = join(packageRoot, "bin", "odinn.cmd");
+  const sentinel = join(temporary, "module-loaded.txt");
+  const moduleRoot = join(temporary, "modules", "Microsoft.PowerShell.Utility");
+  const expected = createHash("sha256").update(await readFile(process.execPath)).digest("hex");
+  try {
+    await mkdir(join(packageRoot, "runtime"), { recursive: true });
+    await mkdir(join(packageRoot, "bin"), { recursive: true });
+    await mkdir(join(packageRoot, "dist", "cli"), { recursive: true });
+    await mkdir(moduleRoot, { recursive: true });
+    await copyFile(process.execPath, nodePath);
+    await writeFile(join(packageRoot, "dist", "cli", "index.js"), "console.log('trusted runtime executed');\n");
+    await writeFile(launcherPath, standaloneWindowsLauncher("dist/cli/index.js", expected));
+    await writeFile(join(moduleRoot, "Microsoft.PowerShell.Utility.psm1"), `
+[System.IO.File]::WriteAllText($env:ODINN_MODULE_SENTINEL, 'loaded')
+function Get-FileHash {
+  param([string]$LiteralPath, [string]$Algorithm)
+  [pscustomobject]@{ Hash = $env:ODINN_FORGED_SHA256 }
+}
+Export-ModuleMember -Function Get-FileHash
+`);
+    const hostileEnvironment = {
+      ...process.env,
+      PSModulePath: join(temporary, "modules"),
+      ODINN_MODULE_SENTINEL: sentinel,
+      ODINN_FORGED_SHA256: expected,
+      ODINN_TEST_FILE: nodePath
+    };
+    const vulnerablePrimitive = spawnSync(
+      String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "(Get-FileHash -LiteralPath $env:ODINN_TEST_FILE -Algorithm SHA256).Hash.ToLowerInvariant()"
+      ],
+      { cwd: packageRoot, encoding: "utf8", env: hostileEnvironment }
+    );
+    assert.equal(vulnerablePrimitive.status, 0, String(vulnerablePrimitive.stderr));
+    assert.equal(vulnerablePrimitive.stdout.trim(), expected);
+    assert.equal(await readFile(sentinel, "utf8"), "loaded");
+
+    await rm(sentinel);
+    const admitted = spawnSync(launcherPath, [], {
+      cwd: packageRoot,
+      encoding: "utf8",
+      env: hostileEnvironment,
+      shell: true
+    });
+    assert.equal(admitted.status, 0, String(admitted.stderr || admitted.stdout));
+    assert.equal(admitted.stdout.trim(), "trusted runtime executed");
+    await assert.rejects(() => readFile(sentinel), { code: "ENOENT" });
+
+    await writeFile(nodePath, Buffer.concat([await readFile(nodePath), Buffer.from([0])]), { flag: "w" });
+    const forgedTampered = spawnSync(launcherPath, [], {
+      cwd: packageRoot,
+      encoding: "utf8",
+      env: hostileEnvironment,
+      shell: true
+    });
+    assert.notEqual(forgedTampered.status, 0);
+    assert.match(String(forgedTampered.stderr || forgedTampered.stdout), /runtime identity check failed/u);
+    await assert.rejects(() => readFile(sentinel), { code: "ENOENT" });
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
   }
 });
