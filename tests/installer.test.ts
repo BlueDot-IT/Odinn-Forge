@@ -346,9 +346,12 @@ test("installer revalidates source and staging runtime identity after a copy rac
       child.once("close", resolveStatus);
     });
     assert.notEqual(status, 0, stdout);
-    assert.match(stderr, /runtime executable digest|declared platform runtime/u);
+    assert.match(stderr, /(?:install source changed during guarded copy|embedded runtime executable digest does not match signed release metadata|standalone installer is not executing its declared platform runtime|embedded runtime version output does not match signed release metadata|embedded runtime executable must be a physical, uniquely linked file)/u);
     await assert.rejects(() => access(join(prefix, "install-state.json")), { code: "ENOENT" });
-    assert.deepEqual((await readdir(join(prefix, "versions"))).filter((entry) => !entry.startsWith(".")), []);
+    await assert.rejects(() => access(join(prefix, "current")), { code: "ENOENT" });
+    await assert.rejects(() => access(join(prefix, ".launcher-activation.json")), { code: "ENOENT" });
+    await assert.rejects(() => access(join(prefix, "bin")), { code: "ENOENT" });
+    assert.deepEqual(await readdir(join(prefix, "versions")), [], "copy-race failure left a version or staging directory");
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

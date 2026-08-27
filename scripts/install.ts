@@ -102,7 +102,12 @@ async function install(operation: any) {
   const staging = await mkdtemp(join(versions, ".staging-"));
   const metadata = { schemaVersion: 2, version, commit, runtimeSha256, lockfileSha256: lockfileSha256 || undefined, artifactSha256, toolchain, installedAt: new Date().toISOString() };
   try {
-    await cp(source, staging, { recursive: true, dereference: false, filter: (path: any) => !excluded(path, source, compiled) });
+    try {
+      await cp(source, staging, { recursive: true, dereference: false, filter: (path: any) => !excluded(path, source, compiled) });
+    } catch (error: any) {
+      if (error?.code === "ENOENT") throw new Error("install source changed during guarded copy");
+      throw error;
+    }
     if (!compiled && !has("--skip-deps")) runPnpm(["install", "--frozen-lockfile"], staging);
     await writeFile(join(staging, "install-metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
     if (compiled) await validateCompiledSourceTree(staging);
@@ -415,6 +420,26 @@ async function applyLauncherActivation(marker: LauncherActivationMarker): Promis
         ? { installedAt: applying.activationAt }
         : { rolledBackAt: applying.activationAt })
     });
+    // v1.0.0 predates UUID-named Windows generation launchers and rejects
+    // those files during its startup validation. Once a candidate upgraded
+    // from that release is fully applied, publish stable launchers and remove
+    // the temporary generation companions before the old runtime can be
+    // selected by a later rollback. Newer source releases retain the deferred
+    // generation protocol and its crash-safe handoff.
+    const legacySourceVersionId = applying.operation === "upgrade"
+      ? applying.sourceVersionId ?? state.previous ?? null
+      : null;
+    if (legacySourceVersionId) {
+      const sourceMetadata = await readInstalledMetadata(legacySourceVersionId);
+      if (sourceMetadata.version === "1.0.0") {
+        await writeLaunchers(
+          join(prefix, "versions", applying.versionId),
+          distribution,
+          undefined,
+          true
+        );
+      }
+    }
     await retireLauncherActivation(applying.token);
     return "applied";
   } catch (error) {
@@ -505,7 +530,13 @@ async function rollback() {
   const priorMetadata = await readInstalledMetadata(current.previous);
   const activationAt = new Date().toISOString();
   const next = { ...current, current: current.previous, currentVersion: priorMetadata.version, currentCommit: priorMetadata.commit, previous: current.current, rolledBackAt: activationAt, operation: "rollback" };
-  const deferredParentPid = deferredLauncherParentPid("rollback");
+  // Rollback is the recovery path: do not leave the older runtime dependent
+  // on a deferred finalizer unless the operator explicitly supplied a wait
+  // PID. This also prevents a legacy runtime from observing a newer marker or
+  // generation launcher during the handoff.
+  const deferredParentPid = has("--defer-launchers-until-pid")
+    ? deferredLauncherParentPid("rollback")
+    : null;
   const activation = deferredParentPid
     ? await prepareDeferredLauncherActivation({
       versionId: current.previous,
@@ -525,10 +556,21 @@ async function rollback() {
     if (pendingActivation) await retireLauncherActivation(pendingActivation.token);
   }
   const distribution = priorMetadata.toolchain?.distribution ?? "compiled";
-  await writeLaunchers(join(prefix, "versions", current.previous), distribution, activation ?? undefined);
+  await writeLaunchers(join(prefix, "versions", current.previous), distribution, activation ?? undefined, !activation);
   if (activation) await writeLauncherActivationMarker(activation, null);
   await writeCurrentPointer(next.current, distribution, priorMetadata.toolchain?.embeddedRuntime?.executableSha256 ?? "");
   await writeState(next);
+  if (!activation) {
+    const lingeringActivation = await readLauncherActivationMarker();
+    if (lingeringActivation) await retireLauncherActivation(lingeringActivation.token);
+    if (process.platform === "win32") {
+      for (const entry of await readdir(join(prefix, "bin"), { withFileTypes: true })) {
+        if (WINDOWS_LAUNCHER_GENERATION_NAME.test(entry.name)) {
+          await rm(join(prefix, "bin", entry.name), { force: true });
+        }
+      }
+    }
+  }
   if (activation) {
     await startDeferredLauncherFinalizer(
       join(prefix, "versions", current.previous),
@@ -823,7 +865,8 @@ async function digestIfPresent(path: string): Promise<string> {
 async function writeLaunchers(
   targetRoot?: string,
   distribution: Distribution = "source",
-  activation?: LauncherActivationMarker
+  activation?: LauncherActivationMarker,
+  legacyCompatibleSynchronousRollback = false
 ) {
   const bin = join(prefix, "bin");
   await ensurePhysicalDirectory(bin, "launcher root");
@@ -872,6 +915,21 @@ async function writeLaunchers(
   } : undefined;
   const cmd = installedWindowsLauncher("dist\\cli\\index.js", "apps\\cli\\src\\cli.ts", windowsActivation);
   const gatewayCmd = installedWindowsLauncher("dist\\gateway\\server.js", "apps\\gateway\\src\\server.ts", windowsActivation);
+  if (legacyCompatibleSynchronousRollback && process.platform === "win32") {
+    // An older installation becomes the active runtime immediately after a
+    // synchronous rollback. Its validatePrefix cannot know about the newer
+    // UUID-named generation companions, so leave the stable launchers in the
+    // legacy shape before publishing the old pointer. Deferred activation
+    // retains generation launchers until the new runtime has taken ownership.
+    await atomicLauncher(join(bin, "odinn.cmd"), cmd, 0o600);
+    await atomicLauncher(join(bin, "odinn-gateway.cmd"), gatewayCmd, 0o600);
+    for (const entry of await readdir(bin, { withFileTypes: true })) {
+      if (WINDOWS_LAUNCHER_GENERATION_NAME.test(entry.name)) {
+        await rm(join(bin, entry.name), { force: true });
+      }
+    }
+    return;
+  }
   const cliGenerationName = `odinn.${generation}.cmd`;
   const gatewayGenerationName = `odinn-gateway.${generation}.cmd`;
   await atomicLauncher(join(bin, cliGenerationName), cmd, 0o600);

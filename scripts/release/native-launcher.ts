@@ -167,7 +167,11 @@ function safeNumber(value: bigint, label: string): number {
   return result;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Bundlers inline this module into the installer. In that case import.meta.url
+// points at the installer bundle, so comparing it with argv[1] would wrongly
+// execute this module's CLI during every normal install.
+const invokedAsNativeLauncher = /(?:^|[\\/])native-launcher(?:\.[cm]?[jt]s)?$/u.test(process.argv[1] ?? "");
+if (invokedAsNativeLauncher && process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const target = process.argv[2] as NativeLauncherTarget;
   const destination = process.argv[3];
   if ((target !== "linux-x64" && target !== "darwin-x64") || !destination) {

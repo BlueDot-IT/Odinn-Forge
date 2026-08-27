@@ -142,13 +142,42 @@ test("release validation jobs are read-only and staged recovery uses secure extr
   const publication = workflow.slice(workflow.indexOf("  publish-release:"));
   assert.match(releasePolicy, /permissions:\n\s+contents: read/u);
   assert.doesNotMatch(releasePolicy, /contents: write/u);
-  assert.match(downloadedValidation, /permissions:\n\s+contents: read/u);
+  assert.match(downloadedValidation, /permissions:\n(?:\s+[a-z-]+: read\n)*\s+contents: read/u);
   assert.doesNotMatch(downloadedValidation, /contents: write/u);
   for (const section of [stagedValidation, downloadedValidation, publication]) {
     assert.match(section, /pnpm\/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86/u);
     assert.match(section, /pnpm install --frozen-lockfile --ignore-scripts/u);
   }
   assert.match(workflow, /scripts\/release\/extract-secure-archive\.ts/u);
+  assert.match(workflow, /staged_run_id:\s*\n\s+description: Original release workflow run/u);
+  assert.match(workflow, /staged_artifact_id:\s*\n\s+description: Immutable odinn-release-assets artifact ID/u);
+  assert.match(workflow, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/runs\/\$\{attestation_run_id\}"/u);
+  assert.match(workflow, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/artifacts\/\$\{release_assets_artifact_id\}"/u);
+  assert.match(workflow, /artifact-ids: \$\{\{ inputs\.resume_staged_assets && needs\.release-policy\.outputs\.release_assets_artifact_id \|\| needs\.stage-release-assets\.outputs\.release_assets_artifact_id \}\}/u);
+  assert.ok(
+    stagedValidation.indexOf("verify-attested-assets.ts") < stagedValidation.indexOf("install-smoke.ts"),
+    "initial staging must authenticate every downloaded asset before execution"
+  );
+  assert.ok(
+    downloadedValidation.indexOf("verify-attested-assets.ts") < downloadedValidation.indexOf("standalone-smoke.ts"),
+    "every platform must authenticate every downloaded asset before execution"
+  );
+  const recovery = publication.indexOf("Recover npm package from verified staged release archive");
+  const recoveryVerification = publication.indexOf("verify-attested-assets.ts", recovery);
+  const recoveryExtraction = publication.indexOf("extract-secure-archive.ts", recovery);
+  assert.ok(recovery >= 0 && recoveryVerification > recovery && recoveryVerification < recoveryExtraction,
+    "resume must bind and compare the original Actions artifact before extraction");
+  const promotion = publication.indexOf("Promote verified GitHub release");
+  const promotionVerification = publication.indexOf("verify-attested-assets.ts", promotion);
+  const promotionMutation = publication.indexOf('gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false', promotion);
+  assert.ok(promotion >= 0 && promotionVerification > promotion && promotionVerification < promotionMutation,
+    "promotion must freshly redownload, compare, and authenticate the draft before making it public");
+  assert.ok(
+    promotionMutation < publication.indexOf('published="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"', promotion),
+    "publication must re-read the exact release after promotion"
+  );
+  assert.match(publication, /releases\/tags\/\$\{TAG\}/u);
+  assert.match(publication, /\.draft == false and\n\s+\.prerelease == \$expectedPrerelease and \.immutable == true/u);
   assert.doesNotMatch(workflow, /tar -xzf "dist\/resume-assets/u);
   assert.doesNotMatch(workflow, /\$\(dirname\b/u);
 });
