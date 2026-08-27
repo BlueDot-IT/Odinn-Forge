@@ -116,6 +116,12 @@ The same persist-before-terminal ordering applies after an approval
 continuation: the claimed job and its lease remain authoritative until the
 protected result is committed, and persistence failure quarantines both the
 job and execution attempt instead of publishing completion.
+The supervisor also owns the continuation cancellation signal. A cancellation
+that wins before executor dispatch settles as `cancelled`; once dispatch has
+started, an abort or non-cooperative late return settles as `needs-review`.
+SQLite atomically fences that terminal decision to the exact approval lease,
+job state, and active continuation attempt, so a late completion cannot
+overwrite a concurrent cancellation or restart recovery.
 
 The Gateway exposes an operator control plane for this durable state:
 

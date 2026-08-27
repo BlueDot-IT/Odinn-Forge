@@ -743,7 +743,7 @@ test("release packaging removes stale assets before creating a version", async (
 test("gateway approval continuation passes its exact claimed job into isolated execution", async () => {
   const gateway = await read("apps/gateway/src/server.ts");
   assert.match(gateway, /options\?: \{ signal\?: AbortSignal; job\?: any \}/u);
-  assert.match(gateway, /\}, linkedJob \? \{ job: linkedJob \} : undefined\);/u);
+  assert.match(gateway, /\}, \{ signal, job \}\);/u);
 });
 
 test("release soak uses a valid provider credential name and direct Node execution", async () => {

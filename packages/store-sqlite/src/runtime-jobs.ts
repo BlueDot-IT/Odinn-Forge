@@ -471,6 +471,87 @@ export class SqliteJobStore {
     });
   }
 
+  async settleApproval(id: string, {
+    expectedLeaseToken,
+    result,
+    error,
+    dispatched,
+    interrupted
+  }: {
+    expectedLeaseToken: string;
+    result?: unknown;
+    error?: string;
+    dispatched: boolean;
+    interrupted?: string;
+  }): Promise<RuntimeJobRecord> {
+    return this.ledger.database.transaction((db) => {
+      const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;
+      if (!row) throw new Error(`job not found: ${id}`);
+      const current = hydrate(row);
+      if (!expectedLeaseToken || current.dispatchLease?.token !== expectedLeaseToken) {
+        const staleLease = new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`) as Error & { code?: string };
+        staleLease.code = "STALE_APPROVAL_LEASE";
+        throw staleLease;
+      }
+      if (!["running", "cancelling"].includes(current.status)) {
+        const staleState = new Error(`runtime job ${id} has no claimed approval execution`) as Error & { code?: string };
+        staleState.code = "STALE_APPROVAL_STATE";
+        throw staleState;
+      }
+      const linked = correlation(this.ledger, current.executionRunId);
+      if (!linked?.attemptId || !["awaiting-approval", "running", "cancelling"].includes(String(linked.attemptState))) {
+        const staleAttempt = new Error(`runtime job ${id} approval execution attempt is no longer active for settlement`) as Error & { code?: string };
+        staleAttempt.code = "STALE_APPROVAL_ATTEMPT";
+        throw staleAttempt;
+      }
+      const interruption = optionalString(interrupted)
+        ?? (current.status === "cancelling" ? "job cancellation was requested" : undefined);
+      const targetStatus = interruption
+        ? dispatched ? "needs-review" : "cancelled"
+        : error !== undefined ? "needs-review" : "completed";
+      const settlementError = targetStatus === "completed"
+        ? undefined
+        : interruption
+          ? dispatched
+            ? `approval continuation was interrupted after dispatch; external outcome requires review: ${interruption}`
+            : `approval continuation was cancelled before dispatch: ${interruption}`
+          : optionalString(error) ?? "approval continuation failed without a bounded error";
+      const now = new Date().toISOString();
+      db.prepare(`UPDATE runtime_job_leases
+        SET released_at = COALESCE(released_at, ?), release_reason = COALESCE(release_reason, ?)
+        WHERE token = ? AND job_id = ? AND released_at IS NULL`)
+        .run(now, targetStatus, expectedLeaseToken, id);
+      transitionAttempt(
+        db,
+        linked.attemptId,
+        linked.attemptState,
+        targetStatus as ExecutionAttemptState,
+        targetStatus === "needs-review"
+          ? interruption ? "APPROVAL_CONTINUATION_OUTCOME_UNCERTAIN" : "EXECUTION_OUTCOME_UNCERTAIN"
+          : targetStatus === "cancelled" ? "EXECUTION_CANCELLED" : undefined,
+        this.executionOwnershipEnabled
+      );
+      if (current.executionRunId) {
+        db.prepare("UPDATE cancellation_controls SET settled_at = COALESCE(settled_at, ?) WHERE run_id = ?")
+          .run(now, current.executionRunId);
+      }
+      const normalized = normalizeJob({
+        ...current,
+        status: targetStatus,
+        completedAt: now,
+        result: targetStatus === "completed" ? result : undefined,
+        error: settlementError,
+        dispatchLease: undefined,
+        executionAttemptId: linked.attemptId,
+        envelopeDigest: linked.envelopeDigest,
+        auditCorrelationId: linked.auditCorrelationId,
+        cancellationControlReference: linked.cancellationControlReference
+      }, current);
+      writeJob(db, normalized);
+      return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow);
+    });
+  }
+
   async update(id: string, patch: JsonObject): Promise<RuntimeJobRecord> {
     return this.ledger.database.transaction((db) => {
       const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;

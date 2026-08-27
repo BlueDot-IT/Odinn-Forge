@@ -2,7 +2,7 @@ process.env.ODINN_GATEWAY_AUTH = "off";
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -101,6 +101,81 @@ test("gateway exposes durable jobs with idempotent submission", async () => {
     await assert.rejects(() => access(join(stateDir, "jobs.json")), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway approval dispatch propagates cancellation and cannot complete over a cancelling job", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-approval-cancel-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  let signalDispatchStarted!: () => void;
+  const dispatchStarted = new Promise<void>((resolve) => { signalDispatchStarted = resolve; });
+  let releaseDispatch!: () => void;
+  const dispatchCanContinue = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+  let observedSignal: AbortSignal | undefined;
+  const server = await createGatewayServer(withGatewayTestHooks(
+    { stateDir, workspaceRoot: stateDir },
+    {
+      async afterApprovalDispatchStarted({ signal }) {
+        observedSignal = signal;
+        signalDispatchStarted();
+        await dispatchCanContinue;
+      }
+    }
+  ));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(server.address() as any).port}`;
+  try {
+    const runId = "job_gateway_approval_active_cancel";
+    const submission = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": runId },
+      body: JSON.stringify({ task: { tool: "browser.click", input: { tabId: "tab_fixture", selector: "#apply" } } })
+    });
+    assert.equal(submission.status, 202);
+    let job: any;
+    const awaitingDeadline = Date.now() + 10_000;
+    while (Date.now() < awaitingDeadline) {
+      job = await (await fetch(`${base}/jobs/${runId}`)).json();
+      if (job.status === "awaiting-approval") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(job.status, "awaiting-approval");
+    const pending = (await (await fetch(`${base}/approvals`)).json())
+      .find((approval: any) => approval.runId === runId);
+    assert.ok(pending?.id);
+
+    const approving = fetch(`${base}/approvals/${encodeURIComponent(pending.id)}/approve`, { method: "POST" });
+    await Promise.race([
+      dispatchStarted,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("approval dispatch hook was not reached")), 10_000))
+    ]);
+    const cancellation = await fetch(`${base}/jobs/${runId}/cancel`, { method: "POST" });
+    assert.equal(cancellation.status, 200);
+    assert.equal((await cancellation.json()).job.status, "cancelling");
+    assert.equal(observedSignal?.aborted, true);
+    releaseDispatch();
+    const approvalResponse = await approving;
+    assert.notEqual(approvalResponse.status, 200);
+
+    const finalDeadline = Date.now() + 10_000;
+    while (Date.now() < finalDeadline) {
+      job = await (await fetch(`${base}/jobs/${runId}`)).json();
+      if (["cancelled", "needs-review"].includes(job.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(job.status, "needs-review");
+    assert.equal(job.result, undefined);
+    assert.equal(job.dispatchLease, undefined);
+    assert.match(job.error, /interrupted after dispatch/u);
+    const ledger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    try {
+      assert.equal(ledger.getExecutionAttempt(job.executionAttemptId)?.state, "needs-review");
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    releaseDispatch();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });
 

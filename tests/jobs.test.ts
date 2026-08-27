@@ -117,13 +117,18 @@ test("job supervisor does not persist an approval request as a terminal channel 
   await supervisor.shutdown();
 });
 
-test("isolated agent continuation defers execution settlement only for its exact linked runtime job", async () => {
+test("isolated approval continuations defer execution settlement only for their exact linked runtime job", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-jobs-deferred-approval-worker-"));
   const workerPath = join(root, "capture-worker.mjs");
   await writeFile(workerPath, `process.on("message", (message) => {
-    process.send({ ok: true, result: { deferExecutionSettlement: message.deferExecutionSettlement === true } });
+    process.send({ id: message.id, ok: true, result: { deferExecutionSettlement: message.deferExecutionSettlement === true } });
   });\n`);
-  const executor = createIsolatedTaskExecutor({ stateDir: root, workspaceRoot: root, taskWorkerPath: workerPath });
+  const executor = createIsolatedTaskExecutor({
+    stateDir: root,
+    workspaceRoot: root,
+    taskWorkerPath: workerPath,
+    browserWorkerPath: workerPath
+  });
   try {
     const id = "linked-agent-approval";
     const linked = await executor({ task: { id, tool: "agent.run", input: {} } } as any, {
@@ -147,6 +152,28 @@ test("isolated agent continuation defers execution settlement only for its exact
       }
     });
     assert.deepEqual(unrelated, { deferExecutionSettlement: false });
+
+    const browserLinked = await executor({
+      approvalId: "approval_fixture",
+      approvalRunId: id,
+      task: { id, tool: "browser.click", input: {} }
+    } as any, {
+      job: {
+        id,
+        status: "running",
+        payload: { task: { id, tool: "browser.click", input: {} } },
+        attempts: 1,
+        timeoutMs: 30_000
+      }
+    });
+    assert.deepEqual(browserLinked, { deferExecutionSettlement: true });
+
+    const browserUnlinked = await executor({
+      approvalId: "approval_fixture",
+      approvalRunId: id,
+      task: { id, tool: "browser.click", input: {} }
+    } as any);
+    assert.deepEqual(browserUnlinked, { deferExecutionSettlement: false });
   } finally {
     await executor.shutdown?.();
   }
