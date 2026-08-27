@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -20,6 +21,7 @@ import {
   normalizeMicrosoftGraphReadConfig,
   runTask,
   SqliteJobStore,
+  SqliteRecordStore,
   SqliteWorkflowStore,
   calendarReadHostCapabilityPlugin,
   emailReadHostCapabilityPlugin,
@@ -414,6 +416,264 @@ test("Microsoft Graph content is live-only and restart replay remains digest-onl
     ledger.close();
     auditStore.close();
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("public Graph requests validate semantic live input before completed replay", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-graph-pre-replay-validation-"));
+  const stateDir = join(workspace, ".odinn");
+  let transportCalls = 0;
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const ledger = createRunLedger({ stateDir, workspaceRoot: workspace });
+  const registry = createBuiltInRegistry({
+    workspaceRoot: workspace,
+    stateDir,
+    auditStore,
+    config: { integrations: { microsoftGraph: config }, runLedger: ledger },
+    microsoftGraphReadAdapter: createMicrosoftGraphReadAdapter(config, {
+      environment,
+      resolveNetworkAddresses: publicResolver,
+      transport: async (request) => {
+        transportCalls += 1;
+        return fixture(request);
+      }
+    })
+  });
+  const policy = createDefaultPolicy({ allowedCapabilities: ["email.read", "calendar.read", "network.access", "secret.reference.use"] });
+  try {
+    const searchInput = { accountId, query: "semantic replay binding", limit: 1 };
+    const first = await runTask({
+      task: { id: "graph-search-semantic-replay", tool: "email.search", input: searchInput, actor: "graph-test" },
+      auditStore, registry, runLedger: ledger, policy
+    });
+    assert.equal(first.replayed, undefined);
+    const projected = projectDurableToolInput("email.search", searchInput) as Record<string, unknown>;
+    await assert.rejects(() => runTask({
+      task: {
+        id: "graph-search-semantic-replay",
+        tool: "email.search",
+        input: {
+          accountId,
+          limit: 1,
+          queryDigest: projected.queryDigest,
+          queryBytes: projected.queryBytes
+        },
+        actor: "graph-test"
+      },
+      auditStore, registry, runLedger: ledger, policy
+    }), /email\.search input\.(?:queryDigest is not allowed|query is required)/u);
+    assert.equal(transportCalls, 1, "forged persistence metadata must not replay or call Graph");
+
+    const replay = await runTask({
+      task: { id: "graph-search-semantic-replay", tool: "email.search", input: searchInput, actor: "graph-test" },
+      auditStore, registry, runLedger: ledger, policy
+    });
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.contentUnavailableOnReplay, true);
+    assert.equal(transportCalls, 1, "an exact valid completed request remains provider-no-replay");
+
+    await assert.rejects(() => runTask({
+      task: {
+        id: "graph-calendar-missing-live-range",
+        tool: "calendar.events",
+        input: { accountId, calendarId: "calendar-1", targetDigest: "sha256:" + "0".repeat(64), limit: 1 },
+        actor: "graph-test"
+      },
+      auditStore, registry, runLedger: ledger, policy
+    }), /calendar\.events input\.(?:targetDigest is not allowed|start is required)/u);
+    assert.equal(transportCalls, 1);
+  } finally {
+    registry.close();
+    ledger.close();
+    auditStore.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("Graph-derived agent answers stay live while sessions and ordinary backups retain only a placeholder", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-session-retention-"));
+  const stateDir = join(temporary, "state");
+  const backup = join(temporary, "backup");
+  const finalSentinel = "SENTINEL_GRAPH_MODEL_ANSWER_7e41";
+  const providerRequests: any[] = [];
+  const provider = createServer(async (request, response) => {
+    let raw = "";
+    for await (const chunk of request) raw += chunk;
+    const body = JSON.parse(raw);
+    providerRequests.push(body);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(providerRequests.length === 1 ? {
+      id: "graph-agent-tool-call",
+      choices: [{ message: { role: "assistant", content: "", tool_calls: [{
+        id: "read-private-email",
+        type: "function",
+        function: { name: "email.read", arguments: JSON.stringify({ accountId, messageId: "message-1" }) }
+      }] } }]
+    } : {
+      id: "graph-agent-final",
+      choices: [{ message: { role: "assistant", content: `${finalSentinel}: ${message.subject} / ${message.body.content}` } }]
+    }));
+  });
+  await new Promise<void>((resolveListen) => provider.listen(0, "127.0.0.1", resolveListen));
+  const address = provider.address();
+  assert.ok(address && typeof address === "object");
+  let auditStore: ReturnType<typeof createAuditStore> | undefined;
+  let ledger: ReturnType<typeof createRunLedger> | undefined;
+  let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
+  try {
+    await initializeBackupCompatibleState(stateDir);
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    registry = createBuiltInRegistry({
+      workspaceRoot: temporary,
+      stateDir,
+      auditStore,
+      config: {
+        defaultModel: "synthetic:graph-model",
+        providers: { synthetic: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${address.port}/v1`, models: ["graph-model"] } },
+        integrations: { microsoftGraph: config },
+        runLedger: ledger
+      },
+      microsoftGraphReadAdapter: adapter()
+    });
+    const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "session.write", "session.read", "email.read", "network.access", "secret.reference.use"] });
+    const created = await runTask({ task: { id: "graph-session-create", tool: "session.create", input: { title: "Graph retention" }, actor: "graph-test" }, auditStore, registry, runLedger: ledger, policy });
+    const sessionId = String(created.output.id);
+    const live = await runTask({
+      task: {
+        id: "graph-agent-live-session",
+        tool: "agent.run",
+        input: { sessionId, model: "synthetic:graph-model", messages: [{ role: "user", content: "Read the selected message." }] },
+        actor: "graph-test"
+      },
+      auditStore, registry, runLedger: ledger, policy
+    });
+    assert.match(live.output.content, new RegExp(finalSentinel, "u"));
+    assert.match(providerRequests[1].messages.find((entry: any) => entry.role === "tool")?.content ?? "", /PRIVATE_GRAPH_EMAIL_BODY/u);
+    assert.equal(live.output.durableSessionProjection.contentUnavailable, true);
+    assert.doesNotMatch(live.output.durableSessionProjection.content, /PRIVATE_GRAPH|SENTINEL_GRAPH_MODEL/u);
+
+    await runTask({
+      task: {
+        id: "graph-session-save-placeholder",
+        tool: "session.message",
+        input: {
+          sessionId,
+          role: "assistant",
+          content: live.output.content,
+          contentRetention: live.output.durableSessionProjection,
+          model: live.output.model,
+          provider: live.output.provider,
+          source: "synthetic-console"
+        },
+        actor: "graph-test"
+      },
+      auditStore, registry, runLedger: ledger, policy
+    });
+    const saved = await runTask({ task: { id: "graph-session-read-placeholder", tool: "session.read", input: { sessionId }, actor: "graph-test" }, auditStore, registry, runLedger: ledger, policy });
+    assert.equal(saved.output.messages[0].content, live.output.durableSessionProjection.content);
+    assert.equal(saved.output.messages[0].contentRetention.contentUnavailable, true);
+
+    registry.close(); registry = undefined;
+    ledger.close(); ledger = undefined;
+    auditStore.close(); auditStore = undefined;
+    await createStateBackup(stateDir, backup, { applicationVersion: "1.1.2", applicationCommit: "graph-session-retention" });
+    for (const payload of [await treePayload(stateDir), await treePayload(backup)]) {
+      for (const sentinel of [finalSentinel, message.subject, message.body.content]) {
+        assert.equal(payload.includes(sentinel), false, `durable session state retained ${sentinel}`);
+      }
+    }
+  } finally {
+    registry?.close();
+    ledger?.close();
+    auditStore?.close();
+    await new Promise<void>((resolveClose, rejectClose) => provider.close((error) => error ? rejectClose(error) : resolveClose()));
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("startup quarantines an exactly attributable pre-fix Graph-derived session reply and its durable copies", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-session-upgrade-"));
+  const stateDir = join(temporary, "state");
+  const backup = join(temporary, "backup");
+  const legacyReply = "SENTINEL_LEGACY_GRAPH_SESSION_REPLY_5a7c";
+  const sessionMessageRunId = "legacy-graph-session-message-save";
+  let auditStore: ReturnType<typeof createAuditStore> | undefined;
+  let ledger: ReturnType<typeof createRunLedger> | undefined;
+  let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
+  try {
+    await initializeBackupCompatibleState(stateDir);
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    registry = createBuiltInRegistry({ workspaceRoot: temporary, stateDir, auditStore, config: { runLedger: ledger } });
+    const policy = createDefaultPolicy({ allowedCapabilities: ["session.write"] });
+    const created = await runTask({ task: { id: "legacy-graph-session-create", tool: "session.create", input: { title: "Legacy Graph reply" }, actor: "graph-test" }, auditStore, registry, runLedger: ledger, policy });
+    const sessionId = String(created.output.id);
+
+    ledger.ensureRun({ runId: "legacy-graph-agent-run", objective: "pre-fix Graph-backed answer" });
+    const parentStep = ledger.beginTool({
+      runId: "legacy-graph-agent-run",
+      toolName: "agent.run",
+      input: { sessionId, messages: [{ role: "user", contentDigest: "sha256:" + "2".repeat(64), contentBytes: 4 }] },
+      safety: { effects: ["read"] }
+    });
+    ledger.ensureRun({ runId: "legacy-graph-child-read", parentRunId: "legacy-graph-agent-run", objective: "pre-fix Graph child" });
+    const childStep = ledger.beginTool({
+      runId: "legacy-graph-child-read",
+      toolName: "email.read",
+      input: projectDurableToolInput("email.read", { accountId, messageId: "message-1" }),
+      safety: { effects: ["read", "network", "credential"] }
+    });
+    ledger.finishTool({
+      runId: "legacy-graph-child-read",
+      stepId: childStep.stepId,
+      output: projectDurableToolOutput("email.read", { type: "email.read", accountId, messageId: "message-1", bodyText: message.body.content })
+    });
+    ledger.finishTool({
+      runId: "legacy-graph-agent-run",
+      stepId: parentStep.stepId,
+      output: projectDurableToolOutput("agent.run", { content: legacyReply, provider: "synthetic", model: "graph-model" })
+    });
+
+    await runTask({
+      task: {
+        id: sessionMessageRunId,
+        tool: "session.message",
+        input: { sessionId, role: "assistant", content: legacyReply, source: "console-chat", provider: "synthetic", model: "graph-model" },
+        actor: "graph-test"
+      },
+      auditStore, registry, runLedger: ledger, policy
+    });
+    registry.close(); registry = undefined;
+    ledger.close(); ledger = undefined;
+    auditStore.close(); auditStore = undefined;
+    assert.equal((await treePayload(stateDir)).includes(legacyReply), true, "fixture must reproduce the pre-fix retention bug");
+
+    await ensureStateCompatibility(stateDir, { applicationVersion: "1.1.2", applicationCommit: "graph-session-quarantine" });
+    const records = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    try {
+      const stored = await records.queryRecordsPage({ types: ["message.appended"], sessionId, limit: 10 });
+      assert.equal(stored.records[0]?.contentRetention?.contentUnavailable, true);
+      assert.doesNotMatch(String(stored.records[0]?.content), /SENTINEL_LEGACY_GRAPH_SESSION/u);
+    } finally {
+      records.close();
+    }
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    assert.equal((await auditStore.verifyIntegrity({ allowUnsigned: false })).valid, true);
+    auditStore.close(); auditStore = undefined;
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    assert.equal(ledger.verify(sessionMessageRunId).valid, true);
+    ledger.close(); ledger = undefined;
+
+    await createStateBackup(stateDir, backup, { applicationVersion: "1.1.2", applicationCommit: "graph-session-quarantine" });
+    for (const rootPath of [stateDir, backup]) {
+      assert.equal((await treePayload(rootPath)).includes(legacyReply), false, `${rootPath} retained the quarantined reply`);
+    }
+  } finally {
+    registry?.close();
+    ledger?.close();
+    auditStore?.close();
+    await rm(temporary, { recursive: true, force: true });
   }
 });
 

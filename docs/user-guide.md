@@ -151,8 +151,10 @@ Normal backups include configuration, projects, sessions, goals, memory, jobs,
 cron definitions, audit records and verification keys, approval and browser
 recovery journals, registries, schema versions, and application identity.
 OAuth tokens, gateway tokens, browser profiles and cookies, capability signing
-keys, and multi-user password records are excluded. Every included file is
-checksummed. Restore validates the manifest and checksums, rejects future
+keys, the state-directory `.env`, and multi-user password records are excluded.
+The `.env` remains local credential/runtime input and must be restored through
+the operator's secure credential setup rather than a normal backup. Every
+included file is checksummed. Restore validates the manifest and checksums, rejects future
 schemas and unsafe links, creates a protected backup of current state, verifies
 a staging tree, and switches it atomically.
 

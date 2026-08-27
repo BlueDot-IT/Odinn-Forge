@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
-import { createRunId, durableEmailProviderIdentifier, isCalendarTool, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
+import { createRunId, durableEmailProviderIdentifier, isCalendarTool, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput, projectLiveOnlySessionContent } from "@odinn/protocol";
 export { isLiveOnlyAutomationTool, projectDurableJobPayload, projectDurableToolInput } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
@@ -1195,6 +1195,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
   let structuredOutputRepairUsed = false;
   const nestedToolCalls: any[] = [];
   const childRuns: any[] = [];
+  let liveOnlyProviderReadUsed = false;
   let budgetRecoveryUsed = false;
   let budgetRecovery;
   const tokenBudget = createAgentTokenBudget(input, maxTurns);
@@ -1260,6 +1261,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
       }
       return {
         ...result,
+        ...(liveOnlyProviderReadUsed ? { durableSessionProjection: projectLiveOnlySessionContent(result.content) } : {}),
         ...(outputSchema ? { structuredOutput, structuredOutputRepair: { attempted: structuredOutputRepairUsed } } : {}),
         nestedExecutionSummary: summarizeNestedExecutions(nestedToolCalls, childRuns),
         ...(aggregateUsage ? { usage: aggregateUsage } : {}),
@@ -1282,6 +1284,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
         const args = parseAgentToolArguments(call.arguments, registry?.get?.(call.name)?.inputSchema);
         nestedDispatchStarted = true;
         nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
+        if (isEmailTool(call.name) || isCalendarTool(call.name)) liveOnlyProviderReadUsed = true;
         const nestedSummary = summarizeNestedToolCall(call, nested);
         nestedToolCalls.push(nestedSummary);
         if (["agent.run", AGENT_GRAPH_TOOL].includes(call.name)) childRuns.push(summarizeChildRun(call, nested));
@@ -1342,6 +1345,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
       if (nested.output?.type === "approval.required") {
         return {
           ...result,
+          ...(liveOnlyProviderReadUsed ? { durableSessionProjection: projectLiveOnlySessionContent(`I need your approval before I ${nested.output.summary.toLowerCase()}.`) } : {}),
           ...(aggregateUsage ? { usage: aggregateUsage } : {}),
           content: `I need your approval before I ${nested.output.summary.toLowerCase()}.`,
           pendingApproval: nested.output,
@@ -2168,6 +2172,13 @@ async function executeTaskThroughAdmission({
   const tool = registeredTool && declaredCapabilities
     ? { ...registeredTool, capability: declaredCapabilities[0], capabilities: declaredCapabilities }
     : registeredTool;
+  if ((isEmailTool(request.tool) || isCalendarTool(request.tool)) && tool?.inputSchema) {
+    // Public callers must satisfy the live semantic schema before an
+    // idempotent completed-run lookup. Otherwise persistence-only digest
+    // fields could impersonate a prior live request and obtain a false
+    // successful replay without supplying the account/query/target fields.
+    validateAgentToolSchema(request.input, tool.inputSchema, `${request.tool} input`);
+  }
   const approvalContinuation = await consumeClaimedApprovalContinuation({
     approvalStore,
     trustedApprovalId,

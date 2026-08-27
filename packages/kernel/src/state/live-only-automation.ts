@@ -12,6 +12,7 @@ import {
   workflowDefinitionDigest,
   type JsonObject
 } from "@odinn/protocol";
+import { quarantineLegacyLiveOnlySessionState } from "./live-only-sessions.ts";
 
 const CRON_MAX_BYTES = 4 * 1024 * 1024;
 const LEGACY_JOBS_MAX_BYTES = 64 * 1024 * 1024;
@@ -34,6 +35,7 @@ export type LiveOnlyAutomationQuarantineReport = Readonly<{
   cronJobs: number;
   legacyJobs: number;
   runtimeJobs: number;
+  sessionMessages: number;
   workflows: number;
 }>;
 
@@ -438,6 +440,7 @@ export async function quarantineLegacyLiveOnlyAutomationState(stateRoot: string)
   const cronJobs = await quarantineCronFile(join(stateRoot, "cron-jobs.json"), migratedAt);
   const legacy = await quarantineLegacyJobsFile(join(stateRoot, "jobs.json"), migratedAt);
   let runtimeJobs = 0;
+  const sessionMessages = quarantineLegacyLiveOnlySessionState(stateRoot);
   let workflows = 0;
   const databasePath = join(stateRoot, "db", "odinn.sqlite");
   try {
@@ -447,5 +450,5 @@ export async function quarantineLegacyLiveOnlyAutomationState(stateRoot: string)
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  return { cronJobs, legacyJobs: legacy.count, runtimeJobs, workflows };
+  return { cronJobs, legacyJobs: legacy.count, runtimeJobs, sessionMessages, workflows };
 }

@@ -1033,13 +1033,28 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
       const reply = options.tool === "job.healthcheck"
         ? "System check passed. Ódinn is working normally."
         : result.output.content;
+      const durableProjection = result.output?.durableSessionProjection;
+      const retainLiveOnly = durableProjection?.schemaVersion === 1
+        && durableProjection?.mode === "live-only-provider-read"
+        && durableProjection?.contentUnavailable === true
+        && typeof durableProjection?.content === "string"
+        && /^sha256:[a-f0-9]{64}$/.test(String(durableProjection?.contentDigest || ""))
+        && Number.isSafeInteger(durableProjection?.contentBytes)
+        && durableProjection.contentBytes >= 0;
       await api("/sessions/" + encodeURIComponent(sessionId) + "/messages", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           role: "assistant",
-          content: reply,
+          content: retainLiveOnly ? durableProjection.content : reply,
           source: "console-chat",
+          ...(retainLiveOnly ? { contentRetention: {
+            schemaVersion: 1,
+            mode: "live-only-provider-read",
+            contentUnavailable: true,
+            contentDigest: durableProjection.contentDigest,
+            contentBytes: durableProjection.contentBytes
+          } } : {}),
           ...(options.tool === "job.healthcheck" ? {} : {
             model: result.output?.model,
             provider: result.output?.provider

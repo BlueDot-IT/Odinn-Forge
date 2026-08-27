@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { JsonObject } from "@odinn/protocol";
+import { LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER, type JsonObject } from "@odinn/protocol";
 import { findMessageByExternalId, pageInput, queryRecordPage, type QueryRecord, type QueryableRecordStore } from "./record-queries.ts";
 
 export const DEFAULT_PROJECT_ID = "project_default";
@@ -100,6 +100,7 @@ export type SessionCommandInput = {
   model?: unknown;
   provider?: unknown;
   externalId?: unknown;
+  contentRetention?: unknown;
   cursor?: unknown;
   limit?: unknown;
 };
@@ -193,7 +194,10 @@ export async function appendSessionMessage(store: WorkspaceRecordStore, input: S
   const sessionId = cleanRequired(input.sessionId, "session.message requires sessionId");
   const role = cleanString(input.role, "user");
   if (!SESSION_ROLES.has(role)) throw new Error(`session role must be one of: ${Array.from(SESSION_ROLES).join(", ")}`);
-  const content = cleanRequired(input.content, "session.message requires content");
+  const contentRetention = normalizeSessionContentRetention(input.contentRetention);
+  const content = contentRetention
+    ? LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER
+    : cleanRequired(input.content, "session.message requires content");
   const externalId = cleanString(input.externalId, "");
   if (externalId) {
     const existing = await findMessageByExternalId(store, sessionId, externalId);
@@ -213,6 +217,7 @@ export async function appendSessionMessage(store: WorkspaceRecordStore, input: S
     actor: cleanString(input.actor, "local"),
     source: cleanString(input.source, "local"),
     ...(externalId ? { externalId } : {}),
+    ...(contentRetention ? { contentRetention } : {}),
     ...(model ? { model } : {}),
     ...(provider ? { provider } : {})
   });
@@ -286,7 +291,7 @@ export async function readSession(store: WorkspaceRecordStore, input: SessionCom
     ...pageInput(input as Record<string, unknown>, 100)
   });
   const messages = messagePage.records
-    .map(({ id, at, role, content, actor, source, model, provider }) => ({ id, at, role, content, actor, source, model, provider }));
+    .map(({ id, at, role, content, contentRetention, actor, source, model, provider }) => ({ id, at, role, content, contentRetention, actor, source, model, provider }));
   return {
     session,
     messages,
@@ -496,6 +501,30 @@ async function resolveGoalScope(store: WorkspaceRecordStore, input: GoalCommandI
     throw new Error(`project not found or archived: ${projectId}`);
   }
   return { scopeType: "project", scopeId: projectId, projectId };
+}
+
+function normalizeSessionContentRetention(value: unknown): JsonObject | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("session.message contentRetention must be a live-only projection");
+  }
+  const retention = value as JsonObject;
+  if (retention.schemaVersion !== 1
+    || retention.mode !== "live-only-provider-read"
+    || retention.contentUnavailable !== true
+    || typeof retention.contentDigest !== "string"
+    || !/^sha256:[a-f0-9]{64}$/u.test(retention.contentDigest)
+    || !Number.isSafeInteger(retention.contentBytes)
+    || Number(retention.contentBytes) < 0) {
+    throw new Error("session.message contentRetention must be a valid live-only projection");
+  }
+  return {
+    schemaVersion: 1,
+    mode: "live-only-provider-read",
+    contentUnavailable: true,
+    contentDigest: retention.contentDigest,
+    contentBytes: Number(retention.contentBytes)
+  };
 }
 
 function prefixedId(prefix: string): string {

@@ -88,7 +88,8 @@ operate on a staging tree, verify audit integrity, and fail closed on unknown
 future schemas.
 
 Normal `odinn backup` output excludes OAuth tokens, gateway tokens, browser
-profiles and cookies, capability signing keys, and multi-user password records.
+profiles and cookies, capability signing keys, the state-directory `.env`, and
+multi-user password records.
 It uses SQLite's backup API for the runtime database and checksums every
 included file. Restore validates the manifest and every checksum, rejects
 unsafe links and future schemas, creates a protected pre-restore backup, and

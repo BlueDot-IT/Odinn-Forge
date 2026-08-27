@@ -784,9 +784,11 @@ export class GatewayChannelHandler implements ChannelMessageHandler {
     const result = await this.#submitAndReconcile(executionKey, runBody, message, context.signal);
     const output = result.output && typeof result.output === "object" ? result.output as Record<string, unknown> : {};
     const reply = requiredString(output.content, "gateway model run returned no assistant content");
+    const durableProjection = liveOnlySessionProjection(output.durableSessionProjection);
     await this.#request(`/sessions/${encodeURIComponent(sessionId)}/messages`, {
-      role: "assistant", content: reply, source: `channel:${message.address.channel}`,
+      role: "assistant", content: durableProjection?.content ?? reply, source: `channel:${message.address.channel}`,
       externalId: channelExternalMessageId(message, "assistant"),
+      ...(durableProjection ? { contentRetention: durableProjection.retention } : {}),
       ...typeof output.model === "string" ? { model: output.model } : {},
       ...typeof output.provider === "string" ? { provider: output.provider } : {}
     }, context.signal);
@@ -954,6 +956,30 @@ function requiredString(value: unknown, message: string): string {
 function requiredRecord(value: unknown, message: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(message);
   return value as Record<string, unknown>;
+}
+
+function liveOnlySessionProjection(value: unknown): { content: string; retention: Record<string, unknown> } | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const projection = value as Record<string, unknown>;
+  if (projection.schemaVersion !== 1
+    || projection.mode !== "live-only-provider-read"
+    || projection.contentUnavailable !== true
+    || typeof projection.content !== "string"
+    || !projection.content.trim()
+    || typeof projection.contentDigest !== "string"
+    || !/^sha256:[a-f0-9]{64}$/u.test(projection.contentDigest)
+    || !Number.isSafeInteger(projection.contentBytes)
+    || Number(projection.contentBytes) < 0) return undefined;
+  return {
+    content: projection.content,
+    retention: {
+      schemaVersion: 1,
+      mode: "live-only-provider-read",
+      contentUnavailable: true,
+      contentDigest: projection.contentDigest,
+      contentBytes: Number(projection.contentBytes)
+    }
+  };
 }
 
 function isRetryableChannelError(error: unknown): boolean {

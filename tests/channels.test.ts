@@ -362,6 +362,50 @@ test("gateway channel handler submits one durable run and reconciles its result"
   assert.equal(calls.some((call) => call.headers.get("accept") === "text/event-stream"), false);
 });
 
+test("gateway channel handler delivers a live provider answer but saves its durable placeholder", async () => {
+  const input = message({ id: "live-only-session-1" });
+  const executionKey = channelExecutionKey(input);
+  const savedMessages: Record<string, any>[] = [];
+  const liveReply = "SENTINEL_LIVE_GRAPH_CHANNEL_REPLY_1d9e";
+  const durableContent = "[Live provider content is unavailable in saved session history. Run a fresh authorized read to view current content.]";
+  const projection = {
+    schemaVersion: 1,
+    mode: "live-only-provider-read",
+    content: durableContent,
+    contentUnavailable: true,
+    contentDigest: "sha256:" + "1".repeat(64),
+    contentBytes: Buffer.byteLength(liveReply, "utf8")
+  };
+  const fetch = async (inputUrl: string | URL, init: RequestInit = {}) => {
+    const url = String(inputUrl);
+    const method = init.method ?? "GET";
+    if (method === "GET" && url.endsWith("/sessions/sess_1")) return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    if (method === "POST" && url.endsWith("/sessions/sess_1/messages")) {
+      savedMessages.push(JSON.parse(String(init.body)));
+      return new Response("{}", { status: 200 });
+    }
+    if (method === "POST" && url.endsWith("/jobs")) {
+      return new Response(JSON.stringify({ ok: true, job: {
+        id: executionKey,
+        status: "completed",
+        result: { output: { content: liveReply, durableSessionProjection: projection } }
+      } }), { status: 200 });
+    }
+    throw new Error(`unexpected fake gateway request: ${method} ${url}`);
+  };
+  const handler = new GatewayChannelHandler({
+    token: "test-token",
+    bindings: { async get() { return "sess_1"; }, async set() {} },
+    fetch
+  });
+  assert.equal(await handler.handle(input, { signal: new AbortController().signal }), liveReply);
+  assert.equal(savedMessages.length, 2);
+  assert.equal(savedMessages[1]?.role, "assistant");
+  assert.equal(savedMessages[1]?.content, durableContent);
+  assert.equal(savedMessages[1]?.contentRetention?.contentUnavailable, true);
+  assert.doesNotMatch(JSON.stringify(savedMessages[1]), /SENTINEL_LIVE_GRAPH_CHANNEL_REPLY/u);
+});
+
 test("gateway channel handler safely resubmits the same key after an accepted receipt is lost", async () => {
   const input = message({ id: "receipt-lost-1" });
   const executionKey = channelExecutionKey(input);

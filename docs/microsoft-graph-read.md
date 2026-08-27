@@ -98,6 +98,15 @@ given a separate tool-aware durable projection. Its SQLite evaluation rows and
 ledger events therefore retain the same digest-and-count boundary rather than
 the query, provider targets, or time window.
 
+When an interactive agent uses one of these live reads, the authorized caller
+still receives and may display the complete answer for that live request. The
+agent response also carries a separate durable-session projection. The console
+and channel handlers save that fixed content-unavailable placeholder plus a
+digest/byte-count retention marker, never the Graph-derived tool result or the
+model answer derived from it. After reload, saved history therefore explains
+that a fresh authorized read is required instead of reconstructing old mail or
+calendar content.
+
 These tools are deliberately unavailable as durable workflow steps or cron
 targets. Workflow definitions and cron schedules are ordinary backed-up state,
 so admitting a live-only provider target there would retain private inputs or
@@ -115,6 +124,18 @@ affected workflow input/result content, and marks affected workflow/runtime
 jobs non-recoverable and `needs-review`. SQLite secure deletion, vacuum, and WAL
 truncation run before the backup boundary. The original query and Graph target
 cannot be recovered through Odinn; the operator must submit a fresh live read.
+Where a prior assistant session message has an exact session-and-content-digest
+binding to an agent run with an email/calendar child read, startup replaces the
+message and its attributable audit/ledger copies with the same unavailable
+placeholder. Ambiguous messages are not guessed at. SQLite secure deletion,
+vacuum, and WAL truncation remove the superseded pages before a new migration
+or ordinary backup is created.
+
+Backups and audit archives created before this upgrade are historical copies;
+Odinn cannot retroactively rewrite copies that are no longer the active state
+tree. Treat any such copy made while Graph reads were enabled as potentially
+containing a previously saved model answer, restrict access to it, and replace
+it with a new post-upgrade ordinary backup when retention policy permits.
 
 Reads have no provider-side effect to roll back. Cancellation, timeout, DNS or
 TLS failure, malformed data, credential loss, or restart fails closed. A later
@@ -130,7 +151,9 @@ DNS pinning, redirects, bounds, timeout/concurrency behavior, hostile provider
 responses, provider-specific untrusted account metadata, durable
 workflow/cron refusal, policy-invariant projections, immediate-parent
 cron/workflow/runtime-job quarantine, SQLite/WAL/full-state and ordinary-backup
-sentinel scans, exact immediate-base upgrade replay, durable redaction, and
+sentinel scans, attributable session/audit/ledger quarantine, live caller plus
+durable-placeholder behavior, exact immediate-base upgrade replay, pre-replay
+semantic request validation, durable redaction, and
 restart no-replay behavior. Live service
 availability, tenant consent, account permissions, throttling, and conditional
 access remain provider-dependent acceptance gates.

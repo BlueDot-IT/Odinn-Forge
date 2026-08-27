@@ -89,6 +89,7 @@ const SKILL_HYDRATE_TOOLS = new Set(["skill.hydrate"]);
 const SKILL_LIFECYCLE_TOOLS = new Set(["skill.install", "skill.lifecycle"]);
 const MCP_DISCOVER_TOOLS = new Set(["mcp.discover"]);
 const MCP_INVOKE_TOOLS = new Set(["mcp.invoke"]);
+const SESSION_MESSAGE_TOOLS = new Set(["session.message"]);
 const EMAIL_TOOLS = new Set(["email.accounts", "email.search", "email.read", "email.thread"]);
 const CALENDAR_TOOLS = new Set(["calendar.calendars", "calendar.events", "calendar.read"]);
 const GITHUB_TOOLS = new Set(["github.repository", "github.issue", "github.pull-request", "github.checks"]);
@@ -114,6 +115,34 @@ export function isReplayUnavailableTool(toolName: unknown): boolean {
   return typeof toolName === "string" && REPLAY_UNAVAILABLE_TOOLS.has(toolName);
 }
 
+export const LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER = "[Live provider content is unavailable in saved session history. Run a fresh authorized read to view current content.]";
+
+export type LiveOnlySessionContentProjection = Readonly<{
+  schemaVersion: 1;
+  mode: "live-only-provider-read";
+  content: typeof LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER;
+  contentUnavailable: true;
+  contentDigest: string;
+  contentBytes: number;
+}>;
+
+/**
+ * Return the safe session-history representation of a live provider-derived
+ * model answer. The live answer remains available to the authorized caller;
+ * only this projection may be appended to durable conversation history.
+ */
+export function projectLiveOnlySessionContent(content: unknown): LiveOnlySessionContentProjection {
+  const text = typeof content === "string" ? content : "";
+  return Object.freeze({
+    schemaVersion: 1,
+    mode: "live-only-provider-read",
+    content: LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER,
+    contentUnavailable: true,
+    contentDigest: sha256Reference(text),
+    contentBytes: Buffer.byteLength(text, "utf8")
+  });
+}
+
 /**
  * Remove workspace content-bearing request fields before durable persistence.
  * The live request remains unchanged for first dispatch; only this projection
@@ -128,6 +157,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleInput(input);
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverInput(input);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeInput(input);
+  if (SESSION_MESSAGE_TOOLS.has(toolName)) return projectSessionMessage(input);
   if (GITHUB_TOOLS.has(toolName)) return projectGitHubInput(toolName, input);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailInput(input);
   if (CALENDAR_TOOLS.has(toolName)) return projectCalendarInput(toolName, input);
@@ -182,6 +212,7 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (SKILL_LIFECYCLE_TOOLS.has(toolName)) return projectSkillLifecycleOutput(output);
   if (MCP_DISCOVER_TOOLS.has(toolName)) return projectMcpDiscoverOutput(output);
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeOutput(output);
+  if (SESSION_MESSAGE_TOOLS.has(toolName)) return projectSessionMessage(output);
   if (GITHUB_TOOLS.has(toolName)) return projectGitHubOutput(toolName, output);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailOutput(toolName, output);
   if (CALENDAR_TOOLS.has(toolName)) return projectCalendarOutput(toolName, output);
@@ -358,6 +389,37 @@ export function durableEmailProviderIdentifier(value: unknown, label = "email pr
 
 function hasOwn(record: JsonObject, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function normalizedLiveOnlySessionRetention(value: unknown): JsonObject | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as JsonObject;
+  if (record.schemaVersion !== 1
+    || record.mode !== "live-only-provider-read"
+    || record.contentUnavailable !== true
+    || typeof record.contentDigest !== "string"
+    || !/^sha256:[a-f0-9]{64}$/u.test(record.contentDigest)
+    || !Number.isSafeInteger(record.contentBytes)
+    || Number(record.contentBytes) < 0) return undefined;
+  return {
+    schemaVersion: 1,
+    mode: "live-only-provider-read",
+    contentUnavailable: true,
+    contentDigest: record.contentDigest,
+    contentBytes: Number(record.contentBytes)
+  };
+}
+
+function projectSessionMessage(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const source = value as JsonObject;
+  const retention = normalizedLiveOnlySessionRetention(source.contentRetention);
+  if (!retention) return value;
+  return {
+    ...source,
+    content: LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER,
+    contentRetention: retention
+  };
 }
 
 function projectEmailInput(value: unknown): unknown {
@@ -841,6 +903,16 @@ function projectAgentOutput(value: unknown, delegation: boolean): unknown {
   if (typeof output.content === "string") {
     projected.contentDigest = sha256Reference(output.content);
     projected.contentBytes = Buffer.byteLength(output.content, "utf8");
+  }
+  const sessionProjection = output.durableSessionProjection;
+  if (sessionProjection && typeof sessionProjection === "object" && !Array.isArray(sessionProjection)) {
+    const retention = normalizedLiveOnlySessionRetention(sessionProjection);
+    if (retention && typeof output.content === "string" && retention.contentDigest === sha256Reference(output.content)) {
+      projected.durableSessionProjection = {
+        ...retention,
+        content: LIVE_ONLY_SESSION_CONTENT_PLACEHOLDER
+      };
+    }
   }
   for (const key of ["provider", "model", "usage", "answerShape", "memory", "modelRecovery"] as const) {
     if (output[key] !== undefined) projected[key] = redactDurableValue(output[key]);
