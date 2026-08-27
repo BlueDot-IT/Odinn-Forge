@@ -112,6 +112,10 @@ record before the public job becomes terminal, so the exact bounded response
 survives a Gateway restart without reconstruction from the redacted job
 projection. Missing, substituted, or corrupted protected records quarantine
 the job as `needs-review`; process memory is never accepted as a fallback.
+The same persist-before-terminal ordering applies after an approval
+continuation: the claimed job and its lease remain authoritative until the
+protected result is committed, and persistence failure quarantines both the
+job and execution attempt instead of publishing completion.
 
 The Gateway exposes an operator control plane for this durable state:
 

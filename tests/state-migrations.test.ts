@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { cp, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { createRunLedger, createStateBackup, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, STATE_SCHEMA_TARGETS, stateLifecycleStatus } from "../packages/kernel/src/index.ts";
+import { createRunLedger, createStateBackup, ensureStateCompatibility, inspectStateSchemas, isOwnerOnlyPath, planStateMigration, restoreStateBackup, STATE_SCHEMA_TARGETS, stateLifecycleStatus } from "../packages/kernel/src/index.ts";
 import { ArtifactStore, inspectExistingSqliteSchema, RunLedger, SqliteJobStore, SqliteStore } from "../packages/store-sqlite/src/index.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -17,6 +18,17 @@ async function fixture(name: string): Promise<{ temporary: string; state: string
   const state = join(temporary, "state");
   await cp(join(fixtures, name), state, { recursive: true });
   return { temporary, state };
+}
+
+async function refreshBackupManifestFile(backup: string, relativePath: string): Promise<void> {
+  const manifestPath = join(backup, "backup-manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const bytes = await readFile(join(backup, relativePath));
+  const entry = manifest.files.find((candidate: { path?: unknown }) => candidate.path === relativePath);
+  assert.ok(entry, `backup manifest is missing ${relativePath}`);
+  entry.bytes = bytes.length;
+  entry.sha256 = createHash("sha256").update(bytes).digest("hex");
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 test("latest pre-v1 state plans, backs up, migrates atomically, and preserves stable data", async () => {
@@ -557,6 +569,118 @@ test("runtime schema v10 rejects incomplete tables, constraints, foreign keys, m
     malformedLedger.close();
     assert.throws(() => inspectExistingSqliteSchema(databasePath), /schema_migrations shape is invalid/u);
     assert.throws(() => new SqliteStore(databasePath), /schema_migrations shape is invalid/u);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("runtime schema validation rejects persisted foreign-key and CHECK corruption across open, inspection, backup, and restore", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-state-corrupt-v10-data-"));
+  const state = join(temporary, "state");
+  const databasePath = join(state, "db", "odinn.sqlite");
+  const backup = join(temporary, "valid-backup");
+  const restoredState = join(temporary, "restored-state");
+  const checkState = join(temporary, "check-state");
+  const checkDatabasePath = join(checkState, "db", "odinn.sqlite");
+  const checkBackup = join(temporary, "valid-check-backup");
+  const restoredCheckState = join(temporary, "restored-check-state");
+  const corrupt = (path: string) => {
+    const database = new DatabaseSync(path);
+    database.exec("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON");
+    database.prepare(`INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at)
+      VALUES (?, ?, ?, ?, ?)`).run("corrupt-attempt", "missing-run", 0, "invalid-state", new Date().toISOString());
+    database.close();
+  };
+  try {
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath).close();
+    await createStateBackup(state, backup);
+
+    corrupt(databasePath);
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /foreign key violations|integrity check failed/u);
+    assert.throws(() => new SqliteStore(databasePath), /foreign key violations|integrity check failed/u);
+    await assert.rejects(() => inspectStateSchemas(state), /foreign key violations|integrity check failed/u);
+    await assert.rejects(
+      () => createStateBackup(state, join(temporary, "rejected-corrupt-data-backup")),
+      /foreign key violations|integrity check failed/u
+    );
+
+    const backupDatabasePath = join(backup, "db", "odinn.sqlite");
+    corrupt(backupDatabasePath);
+    await refreshBackupManifestFile(backup, "db/odinn.sqlite");
+    await assert.rejects(
+      () => restoreStateBackup(backup, restoredState, { skipCurrentBackup: true }),
+      /foreign key violations|integrity check failed/u
+    );
+
+    const corruptCheck = (path: string) => {
+      const database = new DatabaseSync(path);
+      database.exec(`PRAGMA foreign_keys = OFF;
+        PRAGMA ignore_check_constraints = ON;
+        INSERT INTO runs(id, status, objective, workspace_root, feature_flags_json, created_at)
+          VALUES ('check-run', 'created', '', '/tmp', '{}', '2026-01-01T00:00:00.000Z');
+        INSERT INTO execution_envelopes(run_id, schema_version, principal_id, idempotency_key, envelope_digest, envelope_json, admitted_at)
+          VALUES ('check-run', 1, 'check-principal', 'check-key', 'check-digest', '{}', '2026-01-01T00:00:00.000Z');
+        INSERT INTO execution_attempts(id, run_id, attempt_number, state, created_at)
+          VALUES ('check-attempt', 'check-run', 0, 'queued', '2026-01-01T00:00:00.000Z');
+        PRAGMA ignore_check_constraints = OFF;`);
+      database.close();
+    };
+    await mkdir(dirname(checkDatabasePath), { recursive: true });
+    new SqliteStore(checkDatabasePath).close();
+    await createStateBackup(checkState, checkBackup);
+    corruptCheck(checkDatabasePath);
+    assert.throws(() => inspectExistingSqliteSchema(checkDatabasePath), /integrity check failed/u);
+    assert.throws(() => new SqliteStore(checkDatabasePath), /integrity check failed/u);
+    await assert.rejects(() => inspectStateSchemas(checkState), /integrity check failed/u);
+    await assert.rejects(
+      () => createStateBackup(checkState, join(temporary, "rejected-check-backup")),
+      /integrity check failed/u
+    );
+    const checkBackupDatabasePath = join(checkBackup, "db", "odinn.sqlite");
+    corruptCheck(checkBackupDatabasePath);
+    await refreshBackupManifestFile(checkBackup, "db/odinn.sqlite");
+    await assert.rejects(
+      () => restoreStateBackup(checkBackup, restoredCheckState, { skipCurrentBackup: true }),
+      /integrity check failed/u
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("a populated SQLite state without its migration ledger fails closed across open, inspection, backup, and restore", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-state-missing-ledger-"));
+  const state = join(temporary, "state");
+  const databasePath = join(state, "db", "odinn.sqlite");
+  const backup = join(temporary, "valid-backup");
+  const restoredState = join(temporary, "restored-state");
+  const removeLedger = (path: string) => {
+    const database = new DatabaseSync(path);
+    database.exec("DROP TABLE schema_migrations");
+    database.close();
+  };
+  try {
+    await mkdir(dirname(databasePath), { recursive: true });
+    new SqliteStore(databasePath, { targetVersion: 9 }).close();
+    await createStateBackup(state, backup);
+
+    removeLedger(databasePath);
+    assert.throws(() => inspectExistingSqliteSchema(databasePath), /migration ledger is missing/u);
+    assert.throws(() => new SqliteStore(databasePath), /migration ledger is missing/u);
+    await assert.rejects(() => inspectStateSchemas(state), /migration ledger is missing/u);
+    await assert.rejects(
+      () => createStateBackup(state, join(temporary, "rejected-missing-ledger-backup")),
+      /migration ledger is missing/u
+    );
+
+    const backupDatabasePath = join(backup, "db", "odinn.sqlite");
+    removeLedger(backupDatabasePath);
+    await refreshBackupManifestFile(backup, "db/odinn.sqlite");
+    await assert.rejects(
+      () => restoreStateBackup(backup, restoredState, { skipCurrentBackup: true }),
+      /migration ledger is missing/u
+    );
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

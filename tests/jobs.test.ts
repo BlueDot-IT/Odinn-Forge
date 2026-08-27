@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { JobSupervisor } from "../packages/kernel/src/jobs.ts";
+import { createIsolatedTaskExecutor, JobSupervisor } from "../packages/kernel/src/jobs.ts";
 import { ensureSecureStateDirectory, FileAuditStore, FileJobStore, isOwnerOnlyPath } from "../packages/store-file/src/index.ts";
 
 const execFile = promisify(execFileCallback);
@@ -115,6 +115,41 @@ test("job supervisor does not persist an approval request as a terminal channel 
   assert.equal(awaiting.result.output.type, "approval.required");
   assert.equal(persistedResults, 0);
   await supervisor.shutdown();
+});
+
+test("isolated agent continuation defers execution settlement only for its exact linked runtime job", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-deferred-approval-worker-"));
+  const workerPath = join(root, "capture-worker.mjs");
+  await writeFile(workerPath, `process.on("message", (message) => {
+    process.send({ ok: true, result: { deferExecutionSettlement: message.deferExecutionSettlement === true } });
+  });\n`);
+  const executor = createIsolatedTaskExecutor({ stateDir: root, workspaceRoot: root, taskWorkerPath: workerPath });
+  try {
+    const id = "linked-agent-approval";
+    const linked = await executor({ task: { id, tool: "agent.run", input: {} } } as any, {
+      job: {
+        id,
+        status: "running",
+        payload: { executionKey: id, task: { id, tool: "agent.run", input: {} } },
+        attempts: 1,
+        timeoutMs: 30_000
+      }
+    });
+    assert.deepEqual(linked, { deferExecutionSettlement: true });
+
+    const unrelated = await executor({ task: { id: "other", tool: "agent.run", input: {} } } as any, {
+      job: {
+        id,
+        status: "running",
+        payload: { executionKey: "different-job", task: { id, tool: "agent.run", input: {} } },
+        attempts: 1,
+        timeoutMs: 30_000
+      }
+    });
+    assert.deepEqual(unrelated, { deferExecutionSettlement: false });
+  } finally {
+    await executor.shutdown?.();
+  }
 });
 
 test("job supervisor quarantines uncertain cancellation and supports retry-safe timeout recovery", async () => {

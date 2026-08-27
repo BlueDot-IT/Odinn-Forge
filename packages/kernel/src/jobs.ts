@@ -248,13 +248,28 @@ export class JobSupervisor {
     if (current.dispatchLease?.token !== expectedLeaseToken) {
       throw new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`);
     }
-    return this.store.update(id, error === undefined ? {
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      result,
-      expectedLeaseToken,
-      dispatchLease: undefined
-    } : {
+    if (error === undefined) {
+      try {
+        await this.persistResult?.(current, result);
+      } catch (persistenceError) {
+        await this.store.update(id, {
+          status: "needs-review",
+          completedAt: new Date().toISOString(),
+          error: `approval result persistence failed: ${errorMessage(persistenceError)}`,
+          expectedLeaseToken,
+          dispatchLease: undefined
+        });
+        throw persistenceError;
+      }
+      return this.store.update(id, {
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        result,
+        expectedLeaseToken,
+        dispatchLease: undefined
+      });
+    }
+    return this.store.update(id, {
       status: "needs-review",
       completedAt: new Date().toISOString(),
       error: errorMessage(error),

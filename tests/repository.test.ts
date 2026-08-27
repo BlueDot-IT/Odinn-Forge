@@ -740,6 +740,12 @@ test("release packaging removes stale assets before creating a version", async (
   assert.match(installSmoke, /\/diagnostics/);
 });
 
+test("gateway approval continuation passes its exact claimed job into isolated execution", async () => {
+  const gateway = await read("apps/gateway/src/server.ts");
+  assert.match(gateway, /options\?: \{ signal\?: AbortSignal; job\?: any \}/u);
+  assert.match(gateway, /\}, linkedJob \? \{ job: linkedJob \} : undefined\);/u);
+});
+
 test("release soak uses a valid provider credential name and direct Node execution", async () => {
   const soak = await read("scripts/release/soak.ts");
   assert.match(soak, /providerCredentialEnv = "ODINN_SOAK_API_KEY"/u);

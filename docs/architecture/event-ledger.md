@@ -15,7 +15,7 @@ Each state directory contains:
   artifacts/sha256/<prefix>/<digest>
 ```
 
-The SQLite database enables foreign keys and WAL mode. Migrations are versioned in `schema_migrations`. The initial schema stores:
+The SQLite database enables foreign keys and WAL mode. Migrations are versioned in `schema_migrations`. A populated database without that ledger is rejected rather than treated as new state. Open, inspection, backup, and restore all share the same schema, foreign-key, and SQLite integrity checks, so malformed or constraint-violating state fails closed at every lifecycle boundary. The initial schema stores:
 
 - `runs` — durable objective, status, model/provider, workspace, and feature flags;
 - `run_steps` — ordered tool boundaries with input/output artifact digests;

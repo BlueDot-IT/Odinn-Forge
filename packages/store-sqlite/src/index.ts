@@ -709,7 +709,24 @@ function assertSqliteSchemaIntegrity(database: DatabaseSync, version: number): v
     || migrationVersions.some((candidate, index) => candidate !== expectedVersions[index])) {
     throw new Error(`SQLite migration ledger is inconsistent for schema ${version}`);
   }
+  const foreignKeyViolation = database.prepare("PRAGMA foreign_key_check").get();
+  if (foreignKeyViolation) {
+    throw new Error("SQLite state contains foreign key violations");
+  }
+  const integrityRows = database.prepare("PRAGMA integrity_check").all() as SqlRow[];
+  if (integrityRows.length !== 1 || String(integrityRows[0]?.integrity_check ?? "").toLowerCase() !== "ok") {
+    throw new Error("SQLite state integrity check failed");
+  }
   if (version < 10) return;
+  const invalidAttempt = database.prepare(`SELECT id FROM execution_attempts
+    WHERE typeof(attempt_number) != 'integer'
+      OR attempt_number <= 0
+      OR typeof(state) != 'text'
+      OR state NOT IN ('proposed', 'admitted', 'queued', 'running', 'awaiting-approval', 'cancelling', 'completed', 'failed', 'cancelled', 'needs-review')
+    LIMIT 1`).get();
+  if (invalidAttempt) {
+    throw new Error("SQLite state integrity check failed: execution attempt CHECK constraints are violated");
+  }
   const columns = database.prepare("PRAGMA table_info(execution_attempts)").all() as SqlRow[];
   const normalizedColumns = columns.map((column) => [
     String(column.name),
@@ -812,7 +829,11 @@ export function inspectExistingSqliteSchema(path: string): number {
   try {
     database.exec("PRAGMA busy_timeout = 30000");
     const table = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'").get();
-    if (!table) return 0;
+    if (!table) {
+      const runtimeTable = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get() as SqlRow | undefined;
+      if (runtimeTable) throw new Error("SQLite migration ledger is missing from a populated state database");
+      return 0;
+    }
     const row = database.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get() as SqlRow;
     const version = Number(row.version);
     if (!Number.isInteger(version) || version < 0) throw new Error(`invalid SQLite schema version: ${String(row.version)}`);

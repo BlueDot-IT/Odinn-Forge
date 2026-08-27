@@ -796,7 +796,7 @@ export async function createGatewayServer(options: any = {}) {
   const governedRegistry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: { ...runtimeConfig, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const gatewayToken = await loadGatewayToken(state);
   const rawIsolatedTaskExecutor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
-  const isolatedTaskExecutor: any = (request: any, options?: { signal?: AbortSignal }) => rawIsolatedTaskExecutor(scopeTaskRequest(request, tenantScope), options);
+  const isolatedTaskExecutor: any = (request: any, options?: { signal?: AbortSignal; job?: any }) => rawIsolatedTaskExecutor(scopeTaskRequest(request, tenantScope), options);
   isolatedTaskExecutor.shutdown = rawIsolatedTaskExecutor.shutdown?.bind(rawIsolatedTaskExecutor);
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
   const channelResultRecords = new SqliteRecordStore(join(state, "db", "records.sqlite"));
@@ -1104,7 +1104,7 @@ export async function createGatewayServer(options: any = {}) {
           actor: continuation.actor,
           reason: "explicit user approval"
         }
-      });
+      }, linkedJob ? { job: linkedJob } : undefined);
       if (linkedJob) {
         await settleClaimedGatewayApproval(linkedJob, { result });
         claimedLinkedJob = undefined;

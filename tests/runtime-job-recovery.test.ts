@@ -623,8 +623,13 @@ test("claimed approvals have one durable owner and only its lease can settle", a
   t.after(() => { leftLedger.close(); rightLedger.close(); });
   const leftStore = new SqliteJobStore(leftLedger);
   const rightStore = new SqliteJobStore(rightLedger);
-  const leftSupervisor = new JobSupervisor({ store: leftStore, execute: async () => ({ ok: true }) });
-  const rightSupervisor = new JobSupervisor({ store: rightStore, execute: async () => ({ ok: true }) });
+  let protectedPersistCalls = 0;
+  const persistResult = async () => {
+    protectedPersistCalls += 1;
+    assert.equal((await leftStore.get("approval-cancel-race"))?.status, "running");
+  };
+  const leftSupervisor = new JobSupervisor({ store: leftStore, execute: async () => ({ ok: true }), persistResult });
+  const rightSupervisor = new JobSupervisor({ store: rightStore, execute: async () => ({ ok: true }), persistResult });
   const runId = "approval-cancel-race";
   leftLedger.ensureRun({ runId, objective: "approval cancellation race" });
   const admitted = leftLedger.admitExecution(executionEnvelope(root, runId, false));
@@ -659,9 +664,43 @@ test("claimed approvals have one durable owner and only its lease can settle", a
 
   const winner = claims[0].status === "fulfilled" ? leftSupervisor : rightSupervisor;
   const settled = await winner.settleApproval(runId, { result: { applied: true }, expectedLeaseToken });
+  assert.equal(protectedPersistCalls, 1);
   assert.equal(settled.status, "completed");
   assert.equal(settled.dispatchLease, undefined);
   assert.equal(leftLedger.getExecutionAttempt(admitted.attempt.id)?.state, "completed");
+});
+
+test("approval result persistence failure quarantines before any terminal completion", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-approval-persist-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+  const supervisor = new JobSupervisor({
+    store,
+    execute: async () => ({ ok: true }),
+    persistResult: async () => { throw new Error("protected record unavailable"); }
+  });
+  const runId = "approval-persist-failure";
+  ledger.ensureRun({ runId, objective: "approval protected-result failure" });
+  const admitted = ledger.admitExecution(executionEnvelope(root, runId, false));
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+  await createRunningJob(store, runId, false);
+  ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "running", to: "awaiting-approval" });
+  await store.update(runId, { status: "awaiting-approval", dispatchLease: undefined });
+
+  const claimed = await supervisor.beginApproval(runId);
+  const expectedLeaseToken = String(claimed.dispatchLease?.token ?? "");
+  await assert.rejects(
+    () => supervisor.settleApproval(runId, { result: { applied: true }, expectedLeaseToken }),
+    /protected record unavailable/u
+  );
+  const quarantined = await store.get(runId);
+  assert.equal(quarantined?.status, "needs-review");
+  assert.equal(quarantined?.result, undefined);
+  assert.equal(quarantined?.dispatchLease, undefined);
+  assert.match(quarantined?.error ?? "", /approval result persistence failed/u);
+  assert.equal(ledger.getExecutionAttempt(admitted.attempt.id)?.state, "needs-review");
 });
 
 test("expired approval continuation leases require review without replay", async (t) => {
