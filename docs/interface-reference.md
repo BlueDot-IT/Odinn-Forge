@@ -255,7 +255,7 @@ this surface and host execution remains unavailable.
 | `POST /agent-graphs/:id/reassign` | `{ expectedRequestDigest, replacement }`; replacement is a new `kind=agent-graph` job with a new idempotency key | Atomically reserves one capability-subset successor for a terminal, lease-free incomplete graph under the original trusted tenant/principal, with signed intent/outcome evidence; exact replay is idempotent and a different successor conflicts |
 | `POST /agent-graphs/:id/checkpoint` | `{ runId, nodeId, expectedResultDigest, tool, ...governedMutation, capabilityToken? }` | Records a signed intent, then admits a digest-bound `workspace.mutate` or `workspace.patch` preview/apply through the original parent authority and normal governed-mutation boundary, followed by a signed outcome |
 | `GET /cron` | No body | `{ enabled, jobs, nextWake }` |
-| `POST /cron` | `{ name?, schedule, timezone?, tool, input?, enabled? }` | `{ ok, job }` for the created schedule |
+| `POST /cron` | `{ name?, schedule, timezone?, tool, input?, enabled? }`; live-only email/calendar tools are rejected | `{ ok, job }` for the created schedule |
 | `PATCH /cron/:id` | Any mutable schedule fields | `{ ok, job }` for the updated schedule |
 | `DELETE /cron/:id` | No body | `{ ok: true }` |
 | `POST /cron/:id/run` | No body | `{ ok, result }` for the immediate audited run |

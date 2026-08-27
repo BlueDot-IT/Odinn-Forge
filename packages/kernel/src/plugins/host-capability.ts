@@ -10,6 +10,7 @@ import { toolSafetyDescriptor } from "../tool-safety.ts";
 export type HostCapabilityTool = Record<string, unknown> & {
   execute: (input: any, context?: any) => any;
   resourceForInput?: (input: Record<string, unknown>) => Readonly<Record<string, unknown>>;
+  legacyRequestResourceForInput?: (input: Record<string, unknown>) => Readonly<Record<string, unknown>>;
 };
 
 export interface HostCapabilityPluginContext {

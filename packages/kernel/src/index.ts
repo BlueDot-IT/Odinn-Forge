@@ -5,8 +5,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
-import { createRunId, isCalendarTool, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
-export { projectDurableJobPayload } from "@odinn/protocol";
+import { createRunId, durableEmailProviderIdentifier, isCalendarTool, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
+export { isLiveOnlyAutomationTool, projectDurableJobPayload } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
@@ -67,7 +67,7 @@ export type { PluginKind, PluginManifest, PluginRuntime, PluginToolContract, Plu
 export { captureComputerScreen } from "./computer.ts";
 export type { ComputerScreenCaptureRequest, ComputerScreenProvider, ComputerScreenResult, ComputerScreenTarget } from "./computer.ts";
 export { listEmailAccounts, readEmail, searchEmail, threadEmail } from "./email.ts";
-export type { EmailAccount, EmailAttachment, EmailMessage, EmailMessageSummary, EmailProviderHealth, EmailProviderTarget, EmailReadProvider, EmailSearchResponse, EmailThreadResponse } from "./email.ts";
+export type { EmailAccount, EmailAccountMetadataTrust, EmailAttachment, EmailMessage, EmailMessageSummary, EmailProviderHealth, EmailProviderTarget, EmailReadProvider, EmailSearchResponse, EmailThreadResponse } from "./email.ts";
 export { listCalendarEvents, listCalendars, readCalendarEvent } from "./calendar.ts";
 export type { CalendarEvent, CalendarEventPage, CalendarEventSummary, CalendarProviderHealth, CalendarProviderTarget, CalendarReadProvider, CalendarSummary } from "./calendar.ts";
 export { createMicrosoftGraphReadAdapter, diagnoseMicrosoftGraphReadIntegration, normalizeMicrosoftGraphReadConfig } from "./microsoft-graph.ts";
@@ -1798,6 +1798,45 @@ function taskRequestDigest(request: any, tool?: AnyRecord): string {
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown", ...(resource ? { resource } : {}) })).digest("hex");
 }
 
+function legacyEmailRequestInput(input: Record<string, unknown>): Record<string, unknown> {
+  const projected: Record<string, unknown> = {};
+  for (const key of ["accountId", "messageId", "threadId"] as const) {
+    if (Object.prototype.hasOwnProperty.call(input, key)) {
+      projected[key] = durableEmailProviderIdentifier(input[key], `legacy email request ${key}`);
+    }
+  }
+  if (Number.isSafeInteger(input.limit)) projected.limit = input.limit;
+  for (const [sourceKey, digestKey] of [["query", "queryDigest"], ["cursor", "cursorDigest"]] as const) {
+    if (typeof input[sourceKey] === "string" && Buffer.byteLength(input[sourceKey], "utf8") <= 4_096) {
+      projected[digestKey] = `sha256:${createHash("sha256").update(input[sourceKey], "utf8").digest("hex")}`;
+      projected[`${sourceKey}Bytes`] = Buffer.byteLength(input[sourceKey], "utf8");
+    } else if (typeof input[digestKey] === "string" && Buffer.byteLength(input[digestKey], "utf8") <= 128) {
+      projected[digestKey] = input[digestKey];
+      if (Number.isSafeInteger(input[`${sourceKey}Bytes`])) projected[`${sourceKey}Bytes`] = input[`${sourceKey}Bytes`];
+    }
+  }
+  return projected;
+}
+
+function legacyEmailTaskRequestDigest(request: any, tool?: AnyRecord): string | undefined {
+  if (!isEmailTool(request.tool) || typeof tool?.legacyRequestResourceForInput !== "function") return undefined;
+  const requestInput = canonicalTaskInput(request.tool, request.input, tool);
+  const resource = tool.legacyRequestResourceForInput(requestInput);
+  if (!resource || typeof resource !== "object" || Array.isArray(resource)) return undefined;
+  return createHash("sha256").update(stableTaskValue({
+    tool: request.tool,
+    input: legacyEmailRequestInput(requestInput),
+    actor: request.actor ?? "unknown",
+    resource
+  })).digest("hex");
+}
+
+function idempotencyConflict(runId: string): NodeError {
+  const error = new Error(`run id ${runId} was already used for a different request`) as NodeError;
+  error.code = "IDEMPOTENCY_CONFLICT";
+  return error;
+}
+
 function supportsCapabilityApprovalContinuation(tool: AnyRecord, policy: RuntimePolicy): boolean {
   if (tool?.capabilityApprovalContinuation === "required") return true;
   return tool?.capabilityApprovalContinuation === "browser-policy"
@@ -2146,6 +2185,20 @@ async function executeTaskThroughAdmission({
 
   if (!auditStore) throw new Error("runTask requires an auditStore");
 
+  const prior = await auditStore.readRun(request.id);
+  const priorStarted = prior?.status === "completed"
+    ? [...prior.events].reverse().find((event: any) => event.type === "task.started")
+    : undefined;
+  const priorDigest = priorStarted?.data?.requestDigest ?? (priorStarted?.tool && priorStarted?.data && "input" in priorStarted.data
+    ? taskRequestDigest({ tool: priorStarted.tool, input: priorStarted.data.input, actor: priorStarted.actor }, tool)
+    : undefined);
+  const legacyDigest = prior?.status === "completed" && priorDigest !== requestDigest
+    ? legacyEmailTaskRequestDigest(request, tool)
+    : undefined;
+  if (prior?.status === "completed" && (!priorDigest || (priorDigest !== requestDigest && priorDigest !== legacyDigest))) {
+    throw idempotencyConflict(request.id);
+  }
+
   if (runLedger) {
     const modelRef = typeof request.input?.model === "string" ? request.input.model : "";
     const separator = modelRef.indexOf(":");
@@ -2156,20 +2209,16 @@ async function executeTaskThroughAdmission({
       modelId: separator > 0 ? modelRef.slice(separator + 1) : modelRef,
       parentRunId
     });
-    runBinding = runLedger.bindRunRequest({ runId: request.id, requestDigest });
+    if (prior?.status === "completed") {
+      const durableBinding = runLedger.readRunRequestBinding(request.id);
+      if (durableBinding && durableBinding.requestDigest !== priorDigest) throw idempotencyConflict(request.id);
+      runBinding = { replay: true };
+    } else {
+      runBinding = runLedger.bindRunRequest({ runId: request.id, requestDigest });
+    }
   }
 
-  const prior = await auditStore.readRun(request.id);
   if (prior?.status === "completed") {
-    const started = [...prior.events].reverse().find((event: any) => event.type === "task.started");
-    const priorDigest = started?.data?.requestDigest ?? (started?.tool && started?.data && "input" in started.data
-      ? taskRequestDigest({ tool: started.tool, input: started.data.input, actor: started.actor }, tool)
-      : undefined);
-    if (!priorDigest || priorDigest !== requestDigest) {
-      const error = new Error(`run id ${request.id} was already used for a different request`) as NodeError;
-      error.code = "IDEMPOTENCY_CONFLICT";
-      throw error;
-    }
     const completed = [...prior.events].reverse().find((event: any) => event.type === "task.completed");
     return {
       id: request.id,

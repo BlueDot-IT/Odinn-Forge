@@ -185,6 +185,7 @@ export function createMicrosoftGraphReadAdapter(
 
   const emailProvider: EmailReadProvider | undefined = config.resources.includes("email") ? Object.freeze({
     target,
+    accountMetadataTrust: "external-untrusted" as const,
     health,
     accounts: async ({ signal }) => {
       const raw = ordinaryObject(await request([], { "$select": "id,displayName,mail,userPrincipalName" }, signal), "Microsoft Graph account response");

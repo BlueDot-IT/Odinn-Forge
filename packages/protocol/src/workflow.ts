@@ -70,6 +70,19 @@ export type WorkflowRunRecord = {
 const IDENTIFIER = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
 const ACTION = /^[A-Za-z][A-Za-z0-9._:/-]{0,127}$/u;
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/u;
+const LIVE_ONLY_AUTOMATION_TOOLS = new Set([
+  "email.accounts",
+  "email.search",
+  "email.read",
+  "email.thread",
+  "calendar.calendars",
+  "calendar.events",
+  "calendar.read"
+]);
+
+export function isLiveOnlyAutomationTool(value: unknown): boolean {
+  return typeof value === "string" && LIVE_ONLY_AUTOMATION_TOOLS.has(value);
+}
 
 function plain(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`${label} must be an object`);
@@ -180,7 +193,11 @@ export function validateWorkflowDefinition(input: unknown): WorkflowDefinition {
     const retrySafety = step.retrySafety === "retry-safe" || step.retrySafety === "effectful" ? step.retrySafety : (() => { throw new TypeError(`workflow step ${stepId} retrySafety is invalid`); })();
     const maxAttempts = integer(step.maxAttempts, `workflow step ${stepId} maxAttempts`, 1, 8);
     const requiresApproval = typeof step.requiresApproval === "boolean" ? step.requiresApproval : (() => { throw new TypeError(`workflow step ${stepId} requiresApproval is invalid`); })();
-    return { id: stepId, actionRef: action(step.actionRef, `workflow step ${stepId} actionRef`), dependsOn, input: boundedJson(step.input ?? {}, `workflow step ${stepId} input`, WORKFLOW_MAX_INPUT_BYTES), retrySafety, maxAttempts, requiresApproval } satisfies WorkflowStepDefinition;
+    const actionRef = action(step.actionRef, `workflow step ${stepId} actionRef`);
+    if (isLiveOnlyAutomationTool(actionRef)) {
+      throw new TypeError(`workflow step ${stepId} actionRef is live-only and cannot be persisted`);
+    }
+    return { id: stepId, actionRef, dependsOn, input: boundedJson(step.input ?? {}, `workflow step ${stepId} input`, WORKFLOW_MAX_INPUT_BYTES), retrySafety, maxAttempts, requiresApproval } satisfies WorkflowStepDefinition;
   });
   for (const step of steps) for (const dependency of step.dependsOn) if (!ids.has(dependency)) throw new TypeError(`workflow step ${step.id} depends on unknown step: ${dependency}`);
   const visiting = new Set<string>();

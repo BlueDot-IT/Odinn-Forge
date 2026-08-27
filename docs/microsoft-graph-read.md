@@ -94,6 +94,15 @@ bodies, attendee names, locations, provider identifiers, or credentials. After
 a restart, an idempotent task record reports that live content is unavailable;
 it does not replay a provider request or reconstruct private content.
 
+These tools are deliberately unavailable as durable workflow steps or cron
+targets. Workflow definitions and cron schedules are ordinary backed-up state,
+so admitting a live-only provider target there would retain private inputs or
+results beyond the authorized call. Submit a new interactive authorized read
+instead. Existing completed email runs from the immediately preceding durable
+format remain recognizable for content-unavailable replay after upgrade; that
+compatibility check is limited to an exact completed-run binding and never
+replays Graph or writes a legacy identifier projection.
+
 Reads have no provider-side effect to roll back. Cancellation, timeout, DNS or
 TLS failure, malformed data, credential loss, or restart fails closed. A later
 authorized invocation is a new live read and may observe newer Microsoft 365
@@ -105,6 +114,9 @@ The retained tests use an injected Graph transport and synthetic account data;
 they never contact Microsoft or load a real credential. They cover
 configuration, capability admission, fixed-origin and account confinement,
 DNS pinning, redirects, bounds, timeout/concurrency behavior, hostile provider
-responses, durable redaction, and restart no-replay behavior. Live service
+responses, provider-specific untrusted account metadata, durable
+workflow/cron refusal, whole-state and ordinary-backup sentinel scans, exact
+immediate-base upgrade replay, durable redaction, and restart no-replay
+behavior. Live service
 availability, tenant consent, account permissions, throttling, and conditional
 access remain provider-dependent acceptance gates.

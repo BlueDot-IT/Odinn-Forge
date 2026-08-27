@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, diagnoseGitHubReadIntegration, diagnoseMicrosoftGraphReadIntegration, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeGitHubReadConfig, normalizeMicrosoftGraphReadConfig, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeChromiumEngine, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, diagnoseGitHubReadIntegration, diagnoseMicrosoftGraphReadIntegration, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isLiveOnlyAutomationTool, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeGitHubReadConfig, normalizeMicrosoftGraphReadConfig, normalizeMcpConfiguration, normalizeModelConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, ProjectContextService, probeChromiumEngine, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -179,6 +179,7 @@ export class CronStore {
   async create(input: any) {
     return this.mutate((jobs) => {
       const job = normalizeCronJob({ ...input, id: input.id || `cron_${randomBytes(8).toString("hex")}`, createdAt: new Date().toISOString() });
+      assertDurableScheduleTool(job.tool);
       if (jobs.length >= CRON_MAX_JOBS) throw new GatewayError(409, `cron state is at its ${CRON_MAX_JOBS}-job limit`);
       if (jobs.some((item) => item.id === job.id)) throw new GatewayError(409, "cron job id already exists");
       jobs.push(job);
@@ -186,6 +187,7 @@ export class CronStore {
     });
   }
   async update(id: string, patch: any) {
+    if (patch?.tool !== undefined) assertDurableScheduleTool(String(patch.tool).trim());
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
@@ -577,6 +579,12 @@ function normalizeCronJob(value: any) {
   };
 }
 
+function assertDurableScheduleTool(tool: string): void {
+  if (isLiveOnlyAutomationTool(tool)) {
+    throw new GatewayError(400, `live-only tool ${tool} cannot be persisted in cron`);
+  }
+}
+
 function cronMutationInput(value: any, creating: boolean) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new GatewayError(400, "cron request must be a JSON object");
   const allowed = new Set(creating ? ["id", "name", "schedule", "timezone", "enabled", "tool", "input"] : ["name", "schedule", "timezone", "enabled", "tool", "input"]);
@@ -656,6 +664,7 @@ export function nextCronWake(schedule: string, timezone = "UTC", after = new Dat
 async function runCronJob(store: CronStore, id: string, executor: any, tenantScope?: GatewayTenantScope) {
   const job = (await store.list()).find((item: any) => item.id === id);
   if (!job) throw new GatewayError(404, "cron job not found");
+  assertDurableScheduleTool(job.tool);
   const startedAt = new Date().toISOString();
   try {
     const task = { id: `${job.id}:${Date.now()}`, tool: job.tool, input: job.input, actor: "cron", reason: `cron:${job.id}` };
@@ -714,6 +723,10 @@ export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor
   const dispatches: Promise<void>[] = [];
   for (const job of await store.list()) {
     if (!job.enabled) continue;
+    if (isLiveOnlyAutomationTool(job.tool)) {
+      await store.update(job.id, { enabled: false, lastStatus: "error", lastError: `live-only tool ${job.tool} cannot be persisted in cron` });
+      continue;
+    }
     const claim = await store.claimDueOccurrence(job.id, now);
     if (!claim.claimed) continue;
     dispatches.push(dispatchCronOccurrence(store, supervisor, claim, job, retrySafeFor(job.tool), tenantScope));

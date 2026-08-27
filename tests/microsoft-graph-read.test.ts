@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -13,15 +13,19 @@ import {
   createBuiltInRegistry,
   createMicrosoftGraphReadAdapter,
   createRunLedger,
+  createStateBackup,
   diagnoseMicrosoftGraphReadIntegration,
+  ensureStateCompatibility,
   materializeHostCapabilityPlugin,
   normalizeMicrosoftGraphReadConfig,
   runTask,
+  SqliteWorkflowStore,
   calendarReadHostCapabilityPlugin,
   emailReadHostCapabilityPlugin,
   type MicrosoftGraphHttpRequest,
   type MicrosoftGraphHttpResponse
 } from "../packages/kernel/src/index.ts";
+import { CronStore } from "../apps/gateway/src/server.ts";
 import { createDefaultPolicy, evaluateTaskPolicy } from "../packages/policy/src/index.ts";
 import { projectDurableToolInput, projectDurableToolOutput } from "../packages/protocol/src/index.ts";
 
@@ -98,6 +102,32 @@ function adapter(requests: MicrosoftGraphHttpRequest[] = []) {
       return fixture(request);
     }
   });
+}
+
+async function initializeBackupCompatibleState(state: string): Promise<void> {
+  await mkdir(state, { recursive: true });
+  await writeFile(join(state, "config.json"), `${JSON.stringify({ version: 1, auditLog: "audit.jsonl" })}\n`);
+  await writeFile(join(state, "records.jsonl"), "");
+  await writeFile(join(state, "jobs.json"), `${JSON.stringify({ schemaVersion: 1, jobs: {} })}\n`);
+  await writeFile(join(state, "approvals.json"), `${JSON.stringify({ schemaVersion: 1, approvals: [] })}\n`);
+  await writeFile(join(state, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, status: "clear" })}\n`);
+  await writeFile(join(state, "channel-bindings.json"), `${JSON.stringify({ schemaVersion: 1, bindings: {} })}\n`);
+  await writeFile(join(state, "channel-dedupe.json"), `${JSON.stringify({ schemaVersion: 1, entries: {} })}\n`);
+  await writeFile(join(state, "audit.jsonl"), "");
+  await ensureStateCompatibility(state, { applicationVersion: "1.0.0", applicationCommit: "graph-durable-boundary" });
+}
+
+async function treePayload(rootPath: string): Promise<Buffer> {
+  const files: Buffer[] = [];
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await visit(path);
+      else if (entry.isFile()) files.push(await readFile(path));
+    }
+  };
+  await visit(rootPath);
+  return Buffer.concat(files);
 }
 
 test("Microsoft Graph adapter exposes fixed-origin bounded email and calendar reads", async () => {
@@ -186,6 +216,8 @@ test("Microsoft Graph tools bind digest-only resources and require exact capabil
 
   const emailTool = emailTools.get("email.read");
   const calendarTool = calendarTools.get("calendar.read");
+  const accounts = await emailTools.get("email.accounts")?.execute({}, {});
+  assert.equal(accounts.contentTrust, "external-untrusted");
   assert.equal(evaluateTaskPolicy({ policy: createDefaultPolicy({ allowedCapabilities: ["email.read", "network.access"] }), request: { tool: "email.read", input: { accountId, messageId: "message-1" } }, tool: emailTool }).allowed, false);
   assert.equal(evaluateTaskPolicy({ policy: createDefaultPolicy({ allowedCapabilities: ["email.read", "network.access", "secret.reference.use"] }), request: { tool: "email.read", input: { accountId, messageId: "message-1" } }, tool: emailTool }).allowed, true);
   assert.equal(evaluateTaskPolicy({ policy: createDefaultPolicy({ allowedCapabilities: ["calendar.read", "network.access", "secret.reference.use"] }), request: { tool: "calendar.read", input: { accountId, calendarId: "calendar-1", eventId: "event-1" } }, tool: calendarTool }).allowed, true);
@@ -349,6 +381,171 @@ test("Microsoft Graph content is live-only and restart replay remains digest-onl
     registry.close();
     ledger.close();
     auditStore.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("live-only email and calendar targets never enter workflow, cron, SQLite, or ordinary backups", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-durable-admission-"));
+  const stateDir = join(temporary, "state");
+  const backup = join(temporary, "backup");
+  const sentinels = [
+    "SENTINEL_GRAPH_ACCOUNT_b307",
+    "SENTINEL_GRAPH_MESSAGE_36f2",
+    "SENTINEL_GRAPH_SUBJECT_7dc1",
+    "SENTINEL_GRAPH_BODY_dd9a",
+    "SENTINEL_GRAPH_LOCATION_a13c",
+    "sentinel-attendee-1a9f@example.test",
+    "SENTINEL_GRAPH_CALENDAR_48e0",
+    "SENTINEL_GRAPH_EVENT_e816"
+  ];
+  let ledger: ReturnType<typeof createRunLedger> | undefined;
+  try {
+    await initializeBackupCompatibleState(stateDir);
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    const workflows = new SqliteWorkflowStore(ledger.database);
+    assert.throws(() => workflows.create({
+      schemaVersion: 1,
+      runId: "workflow_graph_live_only",
+      principalId: "operator",
+      idempotencyKey: "workflow_graph_live_only",
+      definition: {
+        schemaVersion: 1,
+        id: "graph_live_only",
+        revision: 1,
+        name: "Rejected Graph workflow",
+        steps: [{
+          id: "read_mail",
+          actionRef: "email.read",
+          dependsOn: [],
+          input: {
+            accountId: sentinels[0],
+            messageId: sentinels[1],
+            subject: sentinels[2],
+            body: sentinels[3],
+            location: sentinels[4],
+            attendee: sentinels[5]
+          },
+          retrySafety: "retry-safe",
+          maxAttempts: 1,
+          requiresApproval: false
+        }],
+        definitionDigest: undefined as unknown as string
+      },
+      input: {}
+    }), /live-only and cannot be persisted/u);
+
+    const cron = new CronStore(join(stateDir, "cron-jobs.json"));
+    await assert.rejects(() => cron.create({
+      id: "graph-live-only",
+      schedule: "0 9 * * 1-5",
+      timezone: "UTC",
+      tool: "calendar.read",
+      input: {
+        accountId: sentinels[0],
+        calendarId: sentinels[6],
+        eventId: sentinels[7],
+        location: sentinels[4],
+        attendee: sentinels[5]
+      }
+    }), /live-only tool calendar\.read cannot be persisted in cron/u);
+    ledger.close();
+    ledger = undefined;
+
+    await createStateBackup(stateDir, backup, {
+      applicationVersion: "1.0.0",
+      applicationCommit: "graph-durable-boundary"
+    });
+    for (const payload of [await treePayload(stateDir), await treePayload(backup)]) {
+      for (const sentinel of sentinels) assert.equal(payload.includes(sentinel), false, `durable state contains ${sentinel}`);
+    }
+  } finally {
+    ledger?.close();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("immediate-base completed email runs replay after upgrade without persisting a compatibility digest", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-graph-email-upgrade-"));
+  const stateDir = join(workspace, ".odinn");
+  const runId = "graph-email-immediate-base";
+  const legacyRequestDigest = "7d5fc5760f8825b3c92cf4d0973cf0fbcc4db2a5302c05d172127b17cbc037c9";
+  let auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  let ledger = createRunLedger({ stateDir, workspaceRoot: workspace });
+  try {
+    ledger.ensureRun({ runId, objective: "immediate-base email fixture" });
+    ledger.bindRunRequest({ runId, requestDigest: legacyRequestDigest });
+    await auditStore.append({
+      at: "2026-08-26T12:00:00.000Z",
+      runId,
+      type: "task.started",
+      actor: "graph-test",
+      tool: "email.read",
+      capability: "email.read",
+      decision: "allow",
+      data: {
+        requestDigest: legacyRequestDigest,
+        input: { accountId, messageId: "message-1" }
+      }
+    });
+    await auditStore.append({
+      at: "2026-08-26T12:00:01.000Z",
+      runId,
+      type: "task.completed",
+      actor: "graph-test",
+      tool: "email.read",
+      capability: "email.read",
+      decision: "allow",
+      data: { output: projectDurableToolOutput("email.read", { type: "email.read", accountId, messageId: "message-1", subject: message.subject, bodyText: message.body.content }) }
+    });
+    auditStore.close();
+    ledger.close();
+
+    let transportCalls = 0;
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    ledger = createRunLedger({ stateDir, workspaceRoot: workspace });
+    const registry = createBuiltInRegistry({
+      workspaceRoot: workspace,
+      stateDir,
+      auditStore,
+      config: { integrations: { microsoftGraph: config }, runLedger: ledger },
+      microsoftGraphReadAdapter: createMicrosoftGraphReadAdapter(config, {
+        environment,
+        resolveNetworkAddresses: publicResolver,
+        transport: async (request) => {
+          transportCalls += 1;
+          return fixture(request);
+        }
+      })
+    });
+    try {
+      const policy = createDefaultPolicy({ allowedCapabilities: ["email.read", "network.access", "secret.reference.use"] });
+      const replay = await runTask({
+        task: { id: runId, tool: "email.read", input: { accountId, messageId: "message-1" }, actor: "graph-test" },
+        auditStore,
+        registry,
+        runLedger: ledger,
+        policy
+      });
+      assert.equal(replay.replayed, true);
+      assert.equal(replay.contentUnavailableOnReplay, true);
+      assert.equal(transportCalls, 0);
+      assert.equal(ledger.readRunRequestBinding(runId)?.requestDigest, legacyRequestDigest);
+      await assert.rejects(() => runTask({
+        task: { id: runId, tool: "email.read", input: { accountId, messageId: "message-2" }, actor: "graph-test" },
+        auditStore,
+        registry,
+        runLedger: ledger,
+        policy
+      }), (error: any) => error?.code === "IDEMPOTENCY_CONFLICT");
+      assert.equal(transportCalls, 0);
+      assert.equal(ledger.readRunRequestBinding(runId)?.requestDigest, legacyRequestDigest);
+    } finally {
+      registry.close();
+    }
+  } finally {
+    try { ledger.close(); } catch { /* already closed */ }
+    try { auditStore.close(); } catch { /* already closed */ }
     await rm(workspace, { recursive: true, force: true });
   }
 });

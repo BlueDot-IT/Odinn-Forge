@@ -21,6 +21,8 @@ export type EmailProviderHealth = Readonly<{
   checkedAt?: string;
 }>;
 
+export type EmailAccountMetadataTrust = "operator-configured-metadata" | "external-untrusted";
+
 export type EmailAccount = Readonly<{
   accountId: string;
   address: string;
@@ -67,6 +69,7 @@ export type EmailThreadResponse = Readonly<{
 
 export type EmailReadProvider = Readonly<{
   target: EmailProviderTarget;
+  accountMetadataTrust?: EmailAccountMetadataTrust;
   health?: (request: { signal?: AbortSignal }) => Promise<EmailProviderHealth>;
   accounts: (request: { signal?: AbortSignal }) => Promise<readonly EmailAccount[]>;
   search: (request: { accountId: string; query: string; limit: number; cursor?: string; signal?: AbortSignal }) => Promise<EmailSearchResponse>;
@@ -269,12 +272,16 @@ export async function listEmailAccounts(provider: EmailReadProvider, signal?: Ab
     : Object.freeze({ status: "unknown" as const });
   throwIfAborted(signal);
   assertStableTarget(provider, target);
+  const contentTrust = provider.accountMetadataTrust ?? "operator-configured-metadata";
+  if (contentTrust !== "operator-configured-metadata" && contentTrust !== "external-untrusted") {
+    throw new Error("email provider account metadata trust classification is unsupported");
+  }
   return {
     type: "email.accounts" as const,
     providerId: target.providerId,
     health,
     accounts,
-    contentTrust: "operator-configured-metadata" as const
+    contentTrust
   };
 }
 

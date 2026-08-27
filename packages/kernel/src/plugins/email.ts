@@ -1,4 +1,4 @@
-import { hashEmailProviderIdentifier } from "@odinn/protocol";
+import { durableEmailProviderIdentifier, hashEmailProviderIdentifier } from "@odinn/protocol";
 import { listEmailAccounts, readEmail, searchEmail, threadEmail } from "../email.ts";
 import { validatePluginManifest, type PluginManifest } from "../plugin-contracts.ts";
 import type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool } from "./host-capability.ts";
@@ -60,11 +60,25 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
         generationDigest: hashEmailProviderIdentifier(target.generation, "email provider target.generation", 128)
       };
     };
+    const legacyRequestResourceForProvider = () => {
+      const target = pluginContext.emailReadProvider!.target;
+      return {
+        providerId: durableEmailProviderIdentifier(target.providerId, "email provider target.providerId", 128),
+        generation: durableEmailProviderIdentifier(target.generation, "email provider target.generation", 128)
+      };
+    };
     const resourceForAccount = (input: Record<string, unknown>) => {
       if (typeof input.accountId !== "string" || input.accountId.length === 0 || input.accountId.length > 256) throw new Error("email accountId is required for resource binding");
       return {
         ...resourceForProvider(),
         accountDigest: hashEmailProviderIdentifier(input.accountId, "email resource accountId")
+      };
+    };
+    const legacyRequestResourceForAccount = (input: Record<string, unknown>) => {
+      if (typeof input.accountId !== "string" || input.accountId.length === 0 || input.accountId.length > 256) throw new Error("email accountId is required for resource binding");
+      return {
+        ...legacyRequestResourceForProvider(),
+        accountId: durableEmailProviderIdentifier(input.accountId, "email resource accountId")
       };
     };
     return new Map([
@@ -73,6 +87,7 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
         description: "List configured email accounts and bounded provider health metadata.",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         resourceForInput: resourceForProvider,
+        legacyRequestResourceForInput: legacyRequestResourceForProvider,
         execute: async (_input: unknown, context: Record<string, any> = {}) => listEmailAccounts(pluginContext.emailReadProvider!, context.signal)
       }],
       ["email.search", {
@@ -90,6 +105,7 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
           additionalProperties: false
         },
         resourceForInput: resourceForAccount,
+        legacyRequestResourceForInput: legacyRequestResourceForAccount,
         execute: async (input: Record<string, unknown>, context: Record<string, any> = {}) => searchEmail(pluginContext.emailReadProvider!, input, context.signal)
       }],
       ["email.read", {
@@ -108,6 +124,7 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
           ...resourceForAccount(input),
           messageDigest: hashEmailProviderIdentifier(input.messageId, "email resource messageId")
         }),
+        legacyRequestResourceForInput: legacyRequestResourceForAccount,
         execute: async (input: Record<string, unknown>, context: Record<string, any> = {}) => readEmail(pluginContext.emailReadProvider!, input, context.signal)
       }],
       ["email.thread", {
@@ -127,6 +144,7 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
           ...resourceForAccount(input),
           threadDigest: hashEmailProviderIdentifier(input.threadId, "email resource threadId")
         }),
+        legacyRequestResourceForInput: legacyRequestResourceForAccount,
         execute: async (input: Record<string, unknown>, context: Record<string, any> = {}) => threadEmail(pluginContext.emailReadProvider!, input, context.signal)
       }]
     ]);
