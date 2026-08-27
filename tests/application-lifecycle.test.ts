@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { STATE_SCHEMA_TARGETS } from "../packages/kernel/src/state/schema-registry.ts";
 import { buildNativeLauncher } from "../scripts/release/native-launcher.ts";
-import { standaloneUnixLauncher } from "../scripts/release/standalone-launchers.ts";
+import {
+  HOSTILE_WINDOWS_RUNTIME_ENVIRONMENT_VARIABLES,
+  standaloneUnixLauncher
+} from "../scripts/release/standalone-launchers.ts";
 import {
   checkForUpdate,
   resolveGitHubTagCommit,
@@ -135,14 +138,19 @@ async function writeTestLauncherActivationMarker(options: {
   operation?: "upgrade" | "rollback";
   deadlineAt?: string;
   attempts?: number;
+  sourceVersionId?: string | null;
+  previousVersionId?: string | null;
 }) {
   const now = new Date().toISOString();
   await writeFile(join(options.prefix, ".launcher-activation.json"), `${JSON.stringify({
-    schemaVersion: 2,
+    schemaVersion: 3,
     token: options.token,
     operation: options.operation ?? "upgrade",
     phase: options.phase ?? "waiting",
     versionId: options.versionId,
+    sourceVersionId: options.sourceVersionId ?? null,
+    previousVersionId: options.previousVersionId ?? null,
+    activationAt: now,
     waitForPid: options.waitForPid,
     createdAt: now,
     updatedAt: now,
@@ -150,6 +158,130 @@ async function writeTestLauncherActivationMarker(options: {
     attempts: options.attempts ?? 0
   }, null, 2)}\n`, { mode: 0o600 });
 }
+
+test("ordinary Windows startup reconciles a power-loss activation with the candidate runtime", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  const candidateSource = join(fixture.temporary, "standalone-power-loss-candidate");
+  const fakeBin = join(fixture.temporary, "hostile-bin");
+  const ambientNodeSentinel = join(fixture.temporary, "ambient-node-used");
+  const waitingParent = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], {
+    cwd: root,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  try {
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      waitingParent.once("spawn", resolveSpawn);
+      waitingParent.once("error", rejectSpawn);
+    });
+    await writeFakePackage(candidateSource, "1.0.0", NEXT_COMMIT, { health: true });
+    const candidate = await makePackageStandalone(candidateSource);
+    const installerUrl = new URL("../scripts/install.ts", import.meta.url).href;
+    await writeFile(
+      join(candidateSource, "dist", "install", "install.js"),
+      `import ${JSON.stringify(installerUrl)};\n`
+    );
+    const upgrade = spawnSync(candidate.runtime, [
+      join(root, "scripts", "install.ts"),
+      "upgrade",
+      "--source",
+      candidateSource,
+      "--prefix",
+      fixture.prefix,
+      "--version",
+      "1.0.0",
+      "--commit",
+      NEXT_COMMIT,
+      "--artifact-sha256",
+      "8".repeat(64),
+      "--defer-launchers-until-pid",
+      String(waitingParent.pid)
+    ], { cwd: root, encoding: "utf8", shell: false });
+    assert.equal(upgrade.status, 0, String(upgrade.stderr || upgrade.stdout));
+
+    const markerPath = join(fixture.prefix, ".launcher-activation.json");
+    const pending = JSON.parse(await readFile(markerPath, "utf8"));
+    assert.equal(pending.phase, "waiting");
+    const generationName = (await readdir(join(fixture.prefix, "bin")))
+      .find((name) => /^odinn\.[0-9a-f-]{36}\.cmd$/iu.test(name));
+    assert.ok(generationName);
+    const generationPath = join(fixture.prefix, "bin", generationName);
+    const generationBefore = await lstat(generationPath);
+    const generationBytes = await readFile(generationPath, "utf8");
+    const powershellIndex = generationBytes.indexOf("C:\\Windows\\System32\\WindowsPowerShell");
+    assert.ok(powershellIndex > 0);
+    for (const name of HOSTILE_WINDOWS_RUNTIME_ENVIRONMENT_VARIABLES) {
+      const clearIndex = generationBytes.indexOf(`set "${name}="`);
+      assert.ok(clearIndex >= 0 && clearIndex < powershellIndex, `${name} must be cleared before PowerShell starts`);
+    }
+
+    await mkdir(fakeBin);
+    await writeFile(
+      join(fakeBin, "node.cmd"),
+      `@echo hostile>"${ambientNodeSentinel}"\r\n@exit /b 99\r\n`
+    );
+    const launched = spawnSync(join(fixture.prefix, "bin", "odinn.cmd"), ["--version"], {
+      cwd: fixture.prefix,
+      encoding: "utf8",
+      shell: true,
+      env: {
+        ...process.env,
+        PATH: `${fakeBin};${process.env.PATH ?? ""}`,
+        COR_ENABLE_PROFILING: "1",
+        COR_PROFILER_PATH: join(fixture.temporary, "hostile-profiler.dll"),
+        COMPlus_EnableProfiling: "1",
+        COMPlus_ProfilerPath: join(fixture.temporary, "hostile-complus-profiler.dll"),
+        DOTNET_STARTUP_HOOKS: join(fixture.temporary, "hostile-startup-hook.dll")
+      }
+    });
+    assert.equal(launched.status, 0, String(launched.stderr || launched.stdout));
+    assert.equal(launched.stdout.trim(), "1.0.0");
+    await assert.rejects(() => readFile(markerPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(ambientNodeSentinel, "utf8"), { code: "ENOENT" });
+    const settled = JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8"));
+    assert.equal(settled.currentVersion, "1.0.0");
+    assert.equal((await readFile(join(fixture.prefix, "current"), "utf8")).split(/\r?\n/u)[0], settled.current);
+    const generationAfter = await lstat(generationPath);
+    if (generationBefore.ino !== 0 && generationAfter.ino !== 0) {
+      assert.equal(generationAfter.ino, generationBefore.ino, "equal generation bytes must preserve the physical file");
+    }
+  } finally {
+    waitingParent.kill();
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 750));
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("Windows launcher activation attempt 100 remains a valid terminal marker", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  const markerPath = join(fixture.prefix, ".launcher-activation.json");
+  try {
+    await initializeInstallerPointer(fixture.prefix);
+    await writeTestLauncherActivationMarker({
+      prefix: fixture.prefix,
+      token: "88888888-8888-4888-8888-888888888888",
+      versionId: fixture.priorId,
+      waitForPid: 2_147_483_647,
+      phase: "applying",
+      attempts: 100
+    });
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
+    const first = JSON.parse(await readFile(markerPath, "utf8"));
+    assert.equal(first.phase, "failed");
+    assert.equal(first.attempts, 100);
+    assert.match(first.lastError, /retry limit/u);
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
+    const second = JSON.parse(await readFile(markerPath, "utf8"));
+    assert.equal(second.attempts, 100);
+    assert.equal(second.phase, "failed");
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
 
 test("Windows deferred launcher activation recovers after finalizer crash and applying-phase power loss", {
   skip: process.platform !== "win32"
@@ -812,6 +944,33 @@ test("uninstall preserves state by default and requires explicit destructive con
   }
 });
 
+test("uninstall refuses an active installer finalizer lock without deleting installation state", async () => {
+  const fixture = await lifecycleFixture();
+  const lockPath = join(fixture.prefix, ".install.lock");
+  try {
+    await mkdir(lockPath);
+    await writeFile(join(lockPath, "owner.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      pid: process.pid,
+      token: "active-finalizer-test",
+      startedAt: new Date().toISOString()
+    })}\n`);
+    await assert.rejects(
+      () => uninstallApplication({ prefix: fixture.prefix, stateDir: fixture.state }),
+      /another installer command is active/u
+    );
+    assert.equal(JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8")).current, fixture.priorId);
+    assert.equal((await lstat(join(fixture.prefix, "versions", fixture.priorId))).isDirectory(), true);
+
+    await rm(lockPath, { recursive: true, force: false });
+    const removed = await uninstallApplication({ prefix: fixture.prefix, stateDir: fixture.state });
+    assert.equal(removed.ok, true);
+    await assert.rejects(() => lstat(lockPath), { code: "ENOENT" });
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
 test("uninstall refuses a symlinked installation prefix", { skip: process.platform === "win32" }, async () => {
   const fixture = await lifecycleFixture();
   const linkedPrefix = join(fixture.temporary, "linked-install");
@@ -834,7 +993,14 @@ test("standalone lifecycle admits physical native launcher companions and reject
   try {
     const bin = join(fixture.prefix, "bin");
     await mkdir(bin, { recursive: true });
-    for (const name of ["odinn", "odinn.runtime.sh", "odinn-gateway", "odinn-gateway.runtime.sh"]) {
+    for (const name of [
+      "odinn",
+      "odinn.runtime.sh",
+      "odinn-gateway",
+      "odinn-gateway.runtime.sh",
+      "odinn.99999999-9999-4999-8999-999999999999.cmd",
+      "odinn-gateway.99999999-9999-4999-8999-999999999999.cmd"
+    ]) {
       await writeFile(join(bin, name), `${name}\n`, { mode: name.endsWith(".runtime.sh") ? 0o600 : 0o755 });
     }
     const companion = join(bin, "odinn.runtime.sh");
@@ -844,6 +1010,7 @@ test("standalone lifecycle admits physical native launcher companions and reject
       () => uninstallApplication({ prefix: fixture.prefix, stateDir: fixture.state }),
       /unexpected launcher entry: odinn\.runtime\.sh/u
     );
+    await assert.rejects(() => lstat(join(fixture.prefix, ".install.lock")), { code: "ENOENT" });
     await rm(externalLink);
     const removed = await uninstallApplication({ prefix: fixture.prefix, stateDir: fixture.state });
     assert.equal(removed.ok, true);

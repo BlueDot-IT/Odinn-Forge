@@ -123,7 +123,7 @@ $Actual = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($Actual -ne $Expected) { throw "checksum mismatch for $Archive" }
 Expand-Archive $Archive -DestinationPath . -Force
 Set-Location "odinn-$Tag-standalone-win32-x64"
-./install/install.ps1 -Prefix "$HOME/.local/share/odinn"
+./install/install.cmd --prefix "$HOME/.local/share/odinn"
 $env:Path = "$HOME/.local/share/odinn/bin;$env:Path"
 odinn.cmd --version
 odinn.cmd onboard
@@ -150,11 +150,14 @@ installs into an immutable version directory, checks migration compatibility,
 switches atomically, and runs a health check. A failed switch restores the
 previous application and any pre-update state snapshot.
 
-Windows upgrades defer only the final launcher replacement until the invoking
-batch process exits. The verified application/runtime pointer is activated
-first, and an installed finalizer replaces the launcher under the installer
-lock; a retained activation marker means finalization did not complete and the
-update must be reviewed before another lifecycle operation.
+Windows upgrades publish a new immutable launcher generation and fixed-layout
+trampoline before recording the activation marker and changing the verified
+application/runtime pointer. An installed finalizer revalidates and seals the
+bound launcher/pointer/state generation under the installer lock after the
+invoking batch process exits. If power is lost or the finalizer fails, the next
+ordinary startup verifies the candidate runtime and reconciles the same marker
+before launching; it never falls back to ambient Node for a standalone activation.
+Retries are bounded and an exhausted or invalid marker fails closed.
 
 After reviewing the check, install the latest verified release with:
 
@@ -165,6 +168,11 @@ odinn update
 If the release was installed under a non-default prefix, pass the same
 `--prefix <directory>` to `odinn update check`, `odinn update`,
 `odinn rollback`, and `odinn uninstall`.
+
+Uninstall shares the installer lock with update, rollback, and deferred Windows
+launcher finalization. It refuses an active or malformed lock before removing
+launchers or version state, so a finalizer cannot recreate launchers after a
+successful uninstall.
 
 Use these commands for local state:
 

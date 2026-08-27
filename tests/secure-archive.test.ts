@@ -170,6 +170,79 @@ test("GNU long-name metadata rejects adversarial NUL runs with linear scaling an
   }
 });
 
+test("PAX metadata stays linear across valid global headers and bounds cardinality and diagnostics", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-pax-"));
+  try {
+    const sizes = [1_000, 2_000, 4_000, 8_000];
+    const timings: number[] = [];
+    for (const size of sizes) {
+      const archive = join(temporary, `global-pax-${size}.tar.gz`);
+      const entries: ArchiveEntry[] = Array.from({ length: size }, (_, index) => ({
+        name: "pax-global",
+        type: "g",
+        data: paxRecord(`vendor.odinn.key-${index}`, "value")
+      }));
+      entries.push({ name: "pkg/file", data: "ok\n" });
+      await writeFile(archive, tarGzip(entries));
+      const started = performance.now();
+      const admitted = await inspectSecureArchive(archive, { expectedRoot: "pkg" });
+      timings.push(performance.now() - started);
+      assert.deepEqual(admitted.map((entry) => entry.name), ["pkg/file"]);
+    }
+    const smallest = timings[0]!;
+    const largest = timings.at(-1)!;
+    assert.ok(largest < 10_000, `8K valid global PAX headers took ${largest.toFixed(1)}ms`);
+    assert.ok(
+      largest < Math.max(2_500, smallest * 16),
+      `global PAX scaling was not bounded: ${timings.map((value) => value.toFixed(1)).join(", ")}ms`
+    );
+
+    const duplicateKey = "k".repeat(4_096);
+    const duplicateArchive = join(temporary, "duplicate-pax-key.tar.gz");
+    await writeFile(duplicateArchive, tarGzip([
+      {
+        name: "pax-local",
+        type: "x",
+        data: Buffer.concat([paxRecord(duplicateKey, "one"), paxRecord(duplicateKey, "two")])
+      },
+      { name: "pkg/file", data: "x" }
+    ]));
+    const duplicateError = await inspectSecureArchive(duplicateArchive, { expectedRoot: "pkg" }).then(
+      () => undefined,
+      (failure: unknown) => failure
+    );
+    assert.ok(duplicateError instanceof Error);
+    assert.match(duplicateError.message, /duplicate PAX metadata/u);
+    assert.ok(duplicateError.message.length < 512, `duplicate PAX diagnostic was ${duplicateError.message.length} characters`);
+
+    const oversizedKeyArchive = join(temporary, "oversized-pax-key.tar.gz");
+    await writeFile(oversizedKeyArchive, tarGzip([
+      { name: "pax-local", type: "x", data: paxRecord("k".repeat(4_097), "value") },
+      { name: "pkg/file", data: "x" }
+    ]));
+    await assert.rejects(
+      () => inspectSecureArchive(oversizedKeyArchive, { expectedRoot: "pkg" }),
+      /oversized PAX metadata key/u
+    );
+
+    const recordLimitArchive = join(temporary, "pax-record-limit.tar.gz");
+    await writeFile(recordLimitArchive, tarGzip([
+      {
+        name: "pax-local",
+        type: "x",
+        data: Buffer.concat(Array.from({ length: 4_097 }, (_, index) => paxRecord(`k${index}`, "v")))
+      },
+      { name: "pkg/file", data: "x" }
+    ]));
+    await assert.rejects(
+      () => inspectSecureArchive(recordLimitArchive, { expectedRoot: "pkg" }),
+      /PAX metadata exceeds its record limit/u
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("secure archive admission rejects links, devices, FIFOs, and expanded-size bombs", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-types-"));
   try {
@@ -261,6 +334,16 @@ function tarGzip(entries: ArchiveEntry[]): Buffer {
 
 function writeOctal(buffer: Buffer, offset: number, length: number, value: number): void {
   buffer.write(`${value.toString(8).padStart(length - 1, "0")}\0`, offset, length, "ascii");
+}
+
+function paxRecord(key: string, value: string): Buffer {
+  const body = ` ${key}=${value}\n`;
+  let length = Buffer.byteLength(body, "utf8") + 1;
+  for (;;) {
+    const next = Buffer.byteLength(String(length), "ascii") + Buffer.byteLength(body, "utf8");
+    if (next === length) return Buffer.from(`${length}${body}`, "utf8");
+    length = next;
+  }
 }
 
 function zip(entries: ArchiveEntry[]): Buffer {

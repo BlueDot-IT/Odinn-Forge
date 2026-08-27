@@ -6,7 +6,12 @@ import { fileURLToPath } from "node:url";
 import { acquireNodeRuntime, readRuntimePolicy, runtimePolicySha256, type RuntimeTarget } from "./node-runtime.ts";
 import { verifyNativeLauncher, type NativeLauncherTarget } from "./native-launcher.ts";
 import { createDeterministicStandaloneArchive, normalizeStandaloneTree } from "./standalone-archive.ts";
-import { standalonePowerShellInstaller, standaloneUnixLauncher, standaloneWindowsLauncher } from "./standalone-launchers.ts";
+import {
+  standalonePowerShellInstaller,
+  standaloneUnixLauncher,
+  standaloneWindowsInstaller,
+  standaloneWindowsLauncher
+} from "./standalone-launchers.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const output = join(root, "dist/release");
@@ -78,6 +83,7 @@ for (const target of targets) {
       await rm(join(packageRoot, "bin", "odinn"), { force: true });
       await rm(join(packageRoot, "bin", "odinn-gateway"), { force: true });
       await rm(join(packageRoot, "install", "install.sh"), { force: true });
+      await rm(join(packageRoot, "install", "install.ps1"), { force: true });
     } else {
       const launchers = [
         ["bin/odinn", "dist/cli/index.js", false],
@@ -98,10 +104,17 @@ for (const target of targets) {
     }
     await writeFile(join(packageRoot, "bin", "odinn.cmd"), standaloneWindowsLauncher("dist/cli/index.js", selected.executableSha256));
     await writeFile(join(packageRoot, "bin", "odinn-gateway.cmd"), standaloneWindowsLauncher("dist/gateway/server.js", selected.executableSha256));
-    await writeFile(
-      join(packageRoot, "install", "install.ps1"),
-      standalonePowerShellInstaller("dist/install/install.js", selected.executableSha256)
-    );
+    if (target === "win32-x64") {
+      await writeFile(
+        join(packageRoot, "install", "install.cmd"),
+        standaloneWindowsInstaller("dist/install/install.js", selected.executableSha256)
+      );
+    } else {
+      await writeFile(
+        join(packageRoot, "install", "install.ps1"),
+        standalonePowerShellInstaller("dist/install/install.js", selected.executableSha256)
+      );
+    }
 
     const files = await normalizeStandaloneTree(packageRoot);
     for (const path of files) {

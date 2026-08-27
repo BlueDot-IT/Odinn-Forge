@@ -288,7 +288,7 @@ for (const artifact of standaloneArtifacts) {
       "release-info.json",
       "bin/odinn.cmd",
       "bin/odinn-gateway.cmd",
-      "install/install.ps1",
+      target === "win32-x64" ? "install/install.cmd" : "install/install.ps1",
       ...(target === "win32-x64" ? [] : unixLauncherFiles)
     ].filter((path) => !path.startsWith("runtime/") || path === `runtime/${target === "win32-x64" ? "node.exe" : "node"}`)) {
       if (!files.includes(required)) throw new Error(`${artifact.name} is missing ${required}`);
@@ -311,7 +311,7 @@ for (const artifact of standaloneArtifacts) {
       throw new Error(`${artifact.name} release metadata does not bind the embedded runtime`);
     }
     const textLaunchers = target === "win32-x64"
-      ? ["bin/odinn.cmd", "bin/odinn-gateway.cmd", "install/install.ps1"]
+      ? ["bin/odinn.cmd", "bin/odinn-gateway.cmd", "install/install.cmd"]
       : ["bin/odinn.runtime.sh", "bin/odinn-gateway.runtime.sh", "install/install.sh.runtime.sh", "bin/odinn.cmd", "bin/odinn-gateway.cmd", "install/install.ps1"];
     for (const launcher of textLaunchers) {
       const content = await readFile(join(packageRoot, launcher), "utf8");
@@ -327,6 +327,7 @@ for (const artifact of standaloneArtifacts) {
       }
     }
     if (target === "win32-x64") {
+      if (files.includes("install/install.ps1")) throw new Error(`${artifact.name} contains a pre-sanitization PowerShell installer`);
       for (const path of unixLauncherFiles) {
         if (files.includes(path)) throw new Error(`${artifact.name} contains an unsupported Unix launcher: ${path}`);
       }

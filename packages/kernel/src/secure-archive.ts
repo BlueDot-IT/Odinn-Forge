@@ -28,6 +28,8 @@ const ZIP_EOCD_MAXIMUM_BYTES = 65_557;
 const ZIP_CENTRAL_DIRECTORY_MAXIMUM_BYTES = 64 * 1024 * 1024;
 const TAR_BLOCK_BYTES = 512;
 const TAR_METADATA_MAXIMUM_BYTES = 2 * 1024 * 1024;
+const TAR_PAX_MAXIMUM_RECORDS = 4_096;
+const TAR_PAX_KEY_MAXIMUM_BYTES = 4_096;
 
 type ResolvedOptions = Required<SecureArchiveOptions>;
 type ZipEntry = SecureArchiveEntry & {
@@ -65,6 +67,11 @@ function normalizeArchivePath(raw: string): string {
 }
 
 function archivePathLabel(raw: string): string {
+  const prefix = raw.slice(0, 160).replace(/[\0-\x1f\x7f]/gu, "?");
+  return `${JSON.stringify(prefix)}${raw.length > prefix.length ? `…(${raw.length} characters)` : ""}`;
+}
+
+function paxMetadataKeyLabel(raw: string): string {
   const prefix = raw.slice(0, 160).replace(/[\0-\x1f\x7f]/gu, "?");
   return `${JSON.stringify(prefix)}${raw.length > prefix.length ? `…(${raw.length} characters)` : ""}`;
 }
@@ -268,7 +275,10 @@ function parsePax(data: Buffer): Map<string, string> {
   if (data.byteLength > TAR_METADATA_MAXIMUM_BYTES) throw new Error("release tar archive metadata exceeds its limit");
   const result = new Map<string, string>();
   let offset = 0;
+  let recordCount = 0;
   while (offset < data.length) {
+    recordCount += 1;
+    if (recordCount > TAR_PAX_MAXIMUM_RECORDS) throw new Error("release tar archive PAX metadata exceeds its record limit");
     const space = data.indexOf(0x20, offset);
     if (space < 0) throw new Error("release tar archive contains malformed PAX metadata");
     const lengthText = data.subarray(offset, space).toString("ascii");
@@ -282,7 +292,10 @@ function parsePax(data: Buffer): Map<string, string> {
     const equals = record.indexOf("=");
     if (equals <= 0) throw new Error("release tar archive contains malformed PAX metadata");
     const key = record.slice(0, equals);
-    if (result.has(key)) throw new Error(`release tar archive contains duplicate PAX metadata: ${key}`);
+    if (Buffer.byteLength(key, "utf8") > TAR_PAX_KEY_MAXIMUM_BYTES) {
+      throw new Error("release tar archive contains an oversized PAX metadata key");
+    }
+    if (result.has(key)) throw new Error(`release tar archive contains duplicate PAX metadata: ${paxMetadataKeyLabel(key)}`);
     result.set(key, record.slice(equals + 1));
     offset = end;
   }
@@ -306,7 +319,6 @@ async function parseTarGzip(path: string, options: ResolvedOptions, hooks: TarHo
   let metadataChunks: Buffer[] = [];
   let metadataBytes = 0;
   let nextPax = new Map<string, string>();
-  let globalPax = new Map<string, string>();
   let longName = "";
   let ended = false;
   let headerCount = 0;
@@ -327,8 +339,11 @@ async function parseTarGzip(path: string, options: ResolvedOptions, hooks: TarHo
         if (parsed.has("size") || (metadataType === "global-pax" && parsed.has("path"))) {
           throw new Error("release tar archive contains unsupported PAX path or size metadata");
         }
-        if (metadataType === "global-pax") globalPax = new Map([...globalPax, ...parsed]);
-        else nextPax = parsed;
+        // Global PAX path and size overrides are rejected above and no other
+        // global key influences admission or extraction. Validate every record,
+        // then discard it so work remains linear in the admitted metadata bytes
+        // instead of repeatedly copying an ever-growing map.
+        if (metadataType !== "global-pax") nextPax = parsed;
       }
       metadataType = null;
       metadataChunks = [];
@@ -391,7 +406,7 @@ async function parseTarGzip(path: string, options: ResolvedOptions, hooks: TarHo
         if (remaining === 0) await finishEntry();
         continue;
       }
-      const paxPath = nextPax.get("path") ?? globalPax.get("path");
+      const paxPath = nextPax.get("path");
       const name = normalizeArchivePath(paxPath || longName || headerName);
       nextPax = new Map();
       longName = "";

@@ -88,7 +88,7 @@ __attribute__((constructor)) static void mark_loader(void) {
   if (!/missing|not executable/i.test(missing)) throw new Error("standalone launcher did not fail closed for a missing runtime");
   await rename(missingRuntime, packagedRuntime);
   const prefix = join(temporary, "installed ünicode");
-  if (process.platform === "win32") run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(packageRoot, "install", "install.ps1"), "-Prefix", prefix], packageRoot, { NODE_OPTIONS: "--require=/definitely/not/allowed.js" });
+  if (process.platform === "win32") run(join(packageRoot, "install", "install.cmd"), ["--prefix", prefix], packageRoot, hostileEnvironment);
   else run(join(packageRoot, "install", "install.sh"), ["--prefix", prefix], packageRoot, hostileEnvironment);
   await assertLoaderDidNotRun();
   const installed = join(prefix, "bin", process.platform === "win32" ? "odinn.cmd" : "odinn");
@@ -104,7 +104,7 @@ __attribute__((constructor)) static void mark_loader(void) {
   const tamperedPrefix = join(temporary, "tampered install");
   await appendFile(packagedRuntime, Buffer.from([0]));
   const tamperedInstall = process.platform === "win32"
-    ? runFailure("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(packageRoot, "install", "install.ps1"), "-Prefix", tamperedPrefix], packageRoot)
+    ? runFailure(join(packageRoot, "install", "install.cmd"), ["--prefix", tamperedPrefix], packageRoot, hostileEnvironment)
     : runFailure(join(packageRoot, "install", "install.sh"), ["--prefix", tamperedPrefix], packageRoot);
   if (!/digest|runtime|identity/i.test(tamperedInstall)) throw new Error("standalone installer did not reject a tampered runtime");
   console.log(`verified controlled standalone runtime on ${target}`);

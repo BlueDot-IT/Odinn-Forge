@@ -9,6 +9,11 @@ import {
   validateArchiveEntries,
   verifyRuntimeExecutableIdentity
 } from "../scripts/release/node-runtime.ts";
+import {
+  HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES,
+  standaloneWindowsInstaller,
+  standaloneWindowsLauncher
+} from "../scripts/release/standalone-launchers.ts";
 
 const root = resolve(import.meta.dirname, "..");
 
@@ -100,4 +105,21 @@ test("standalone launchers use only the relative embedded runtime and sanitize N
   assert.match(source, /await rename\(stagedArchive, join\(output, archiveName\)\)/u);
   assert.doesNotMatch(source, /await rename\(first, join\(output, archiveName\)\)/u);
   assert.doesNotMatch(launchers, /exec node /);
+});
+
+test("Windows launchers clear CLR and .NET loader hooks before starting trusted PowerShell", () => {
+  assert.ok(HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES.includes("COR_ENABLE_PROFILING"));
+  assert.ok(HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES.includes("COMPlus_EnableProfiling"));
+  assert.ok(HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES.includes("DOTNET_STARTUP_HOOKS"));
+  for (const generated of [
+    standaloneWindowsLauncher("dist/cli/index.js", "a".repeat(64)),
+    standaloneWindowsInstaller("dist/install/install.js", "a".repeat(64))
+  ]) {
+    const powershellIndex = generated.indexOf("C:\\Windows\\System32\\WindowsPowerShell");
+    assert.ok(powershellIndex > 0);
+    for (const name of HOSTILE_WINDOWS_DOTNET_ENVIRONMENT_VARIABLES) {
+      const clearIndex = generated.indexOf(`set "${name}="`);
+      assert.ok(clearIndex >= 0 && clearIndex < powershellIndex, `${name} must be cleared before PowerShell starts`);
+    }
+  }
 });

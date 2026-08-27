@@ -4,6 +4,7 @@ import { createWriteStream, existsSync, lstatSync, readFileSync, readdirSync, re
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
+import { kill as signalProcess } from "node:process";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -23,6 +24,7 @@ const DEFAULT_REPOSITORY_API = "https://api.github.com/repos/BlueDot-IT/Odinn-Fo
 const MAX_METADATA_BYTES = 2 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const WINDOWS_LAUNCHER_GENERATION_NAME = /^(?:odinn|odinn-gateway)\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.cmd$/iu;
 
 export type ApplicationIdentity = {
   applicationVersion: string;
@@ -369,30 +371,35 @@ export async function uninstallApplication(options: {
     join(prefix, "current"),
     join(prefix, ".launcher-activation.json")
   ];
-  await validateInstallLayout(prefix);
-  if (options.removeState) {
-    if (!options.confirmed && !options.force) {
-      throw new Error(`uninstall --remove-state requires --confirm or --force; paths: ${[...targets, stateRoot].join(", ")}`);
+  const releaseInstallLock = await acquireLifecycleInstallLock(prefix);
+  try {
+    await validateInstallLayout(prefix);
+    if (options.removeState) {
+      if (!options.confirmed && !options.force) {
+        throw new Error(`uninstall --remove-state requires --confirm or --force; paths: ${[...targets, stateRoot].join(", ")}`);
+      }
+      assertNoUnsafeOverlap(prefix, stateRoot);
+      await validateRemovableState(stateRoot);
     }
-    assertNoUnsafeOverlap(prefix, stateRoot);
-    await validateRemovableState(stateRoot);
+    for (const target of targets) await rm(target, { recursive: true, force: true });
+    let stateRemoved = false;
+    if (options.removeState) {
+      await rm(stateRoot, { recursive: true, force: true });
+      stateRemoved = true;
+    }
+    return {
+      ok: true,
+      operation: "uninstall",
+      removed: targets,
+      stateRemoved,
+      retainedState: stateRemoved ? null : stateRoot,
+      reinstall: stateRemoved
+        ? "Install Odinn again and run odinn onboard."
+        : `Install Odinn again and use the existing state at ${stateRoot}.`
+    };
+  } finally {
+    await releaseInstallLock();
   }
-  for (const target of targets) await rm(target, { recursive: true, force: true });
-  let stateRemoved = false;
-  if (options.removeState) {
-    await rm(stateRoot, { recursive: true, force: true });
-    stateRemoved = true;
-  }
-  return {
-    ok: true,
-    operation: "uninstall",
-    removed: targets,
-    stateRemoved,
-    retainedState: stateRemoved ? null : stateRoot,
-    reinstall: stateRemoved
-      ? "Install Odinn again and run odinn onboard."
-      : `Install Odinn again and use the existing state at ${stateRoot}.`
-  };
 }
 
 async function validateInstallLayout(prefix: string): Promise<void> {
@@ -431,7 +438,8 @@ async function validateInstallLayout(prefix: string): Promise<void> {
     ]);
     for (const entry of await readdir(bin, { withFileTypes: true })) {
       const metadata = await lstat(join(bin, entry.name));
-      if (!allowed.has(entry.name) || !entry.isFile() || entry.isSymbolicLink()
+      if ((!allowed.has(entry.name) && !WINDOWS_LAUNCHER_GENERATION_NAME.test(entry.name))
+        || !entry.isFile() || entry.isSymbolicLink()
         || !metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
         throw new Error(`uninstall refused an unexpected launcher entry: ${entry.name}`);
       }
@@ -457,6 +465,94 @@ async function validateInstallLayout(prefix: string): Promise<void> {
     }
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+async function acquireLifecycleInstallLock(prefix: string): Promise<() => Promise<void>> {
+  let prefixMetadata;
+  try {
+    prefixMetadata = await lstat(prefix);
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return async () => undefined;
+    throw error;
+  }
+  if (!prefixMetadata.isDirectory() || prefixMetadata.isSymbolicLink()) {
+    throw new Error("install prefix must be a physical directory");
+  }
+  assertNoLinkedAncestorsSync(prefix, "install prefix");
+
+  const lockPath = join(prefix, ".install.lock");
+  const ownerPath = join(lockPath, "owner.json");
+  const token = randomBytes(16).toString("hex");
+  try {
+    await mkdir(lockPath, { mode: 0o700 });
+    await writeFile(ownerPath, `${JSON.stringify({
+      schemaVersion: 1,
+      pid: process.pid,
+      token,
+      startedAt: new Date().toISOString()
+    })}\n`, { mode: 0o600, flag: "wx" });
+  } catch (error: any) {
+    if (error?.code === "EEXIST") {
+      const lockMetadata = await lstat(lockPath);
+      if (!lockMetadata.isDirectory() || lockMetadata.isSymbolicLink()) {
+        throw new Error("installer lock must be a physical directory");
+      }
+      const entries = await readdir(lockPath, { withFileTypes: true });
+      if (entries.length !== 1 || entries[0]?.name !== "owner.json"
+        || !entries[0].isFile() || entries[0].isSymbolicLink()) {
+        throw new Error("installer lock contains unsupported entries");
+      }
+      const ownerMetadata = await lstat(ownerPath);
+      if (!ownerMetadata.isFile() || ownerMetadata.isSymbolicLink() || ownerMetadata.nlink !== 1) {
+        throw new Error("installer lock owner must be a physical file");
+      }
+      const owner = JSON.parse(await readFile(ownerPath, "utf8"));
+      if (Number.isSafeInteger(owner?.pid) && owner.pid > 0 && lifecycleProcessIsAlive(owner.pid)) {
+        throw new Error(`another installer command is active for this prefix (pid ${owner.pid})`);
+      }
+      throw new Error("stale installer lock must be reconciled before uninstall");
+    }
+    await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+
+  return async () => {
+    const lockMetadata = await lstat(lockPath);
+    const ownerMetadata = await lstat(ownerPath);
+    if (!lockMetadata.isDirectory() || lockMetadata.isSymbolicLink()
+      || !ownerMetadata.isFile() || ownerMetadata.isSymbolicLink() || ownerMetadata.nlink !== 1) {
+      throw new Error("installer lock ownership changed before release");
+    }
+    const owner = JSON.parse(await readFile(ownerPath, "utf8"));
+    if (owner?.schemaVersion !== 1 || owner?.token !== token || owner?.pid !== process.pid) {
+      throw new Error("installer lock ownership changed before release");
+    }
+    const retiredPath = `${lockPath}.retired-${token}`;
+    await rename(lockPath, retiredPath);
+    const retiredOwnerPath = join(retiredPath, "owner.json");
+    const retiredMetadata = await lstat(retiredPath);
+    const retiredOwnerMetadata = await lstat(retiredOwnerPath);
+    if (!retiredMetadata.isDirectory() || retiredMetadata.isSymbolicLink()
+      || !retiredOwnerMetadata.isFile() || retiredOwnerMetadata.isSymbolicLink() || retiredOwnerMetadata.nlink !== 1) {
+      throw new Error("installer lock ownership changed during release");
+    }
+    const retiredOwner = JSON.parse(await readFile(retiredOwnerPath, "utf8"));
+    if (retiredOwner?.schemaVersion !== 1 || retiredOwner?.token !== token || retiredOwner?.pid !== process.pid) {
+      throw new Error("installer lock ownership changed during release");
+    }
+    await rm(retiredPath, { recursive: true, force: false });
+  };
+}
+
+function lifecycleProcessIsAlive(pid: number): boolean {
+  try {
+    signalProcess(pid, 0);
+    return true;
+  } catch (error: any) {
+    if (error?.code === "EPERM") return true;
+    if (error?.code === "ESRCH") return false;
+    throw error;
   }
 }
 

@@ -109,11 +109,15 @@ Windows runners:
 2. Installs and initializes the real `v1.0.0` binary into an isolated prefix.
 3. Creates persistent state and sessions, executing tool smoke and audit checks.
 4. Upgrades to the candidate archive via the actual `v1.0.0` update command.
-   On Windows, the candidate stages launcher activation until the invoking
-   `v1.0.0` batch process has exited, then an installed, digest-bound runtime
-   finalizes the launcher under the installer lock. The gate waits for that
-   marker to retire before executing the candidate, so an active batch file is
-   never replaced in place.
+   On Windows, the candidate publishes a new immutable launcher generation and
+   a fixed-layout trampoline before recording the source/target activation.
+   The installed, digest-bound runtime revalidates and seals the bound
+   launcher/pointer/state generation under the installer lock after the
+   invoking `v1.0.0` batch process exits. An
+   ordinary startup also reconciles a retained marker with that same runtime,
+   covering power loss or a failed detached finalizer without falling back to
+   ambient Node. The gate waits for the marker to retire before executing the
+   candidate, and equal generation bytes are never replaced in place.
 5. Exercises candidate state migration and creates candidate-only records.
 6. Asserts fail-closed refusal when rollback is attempted before restoring the backup.
 7. Restores the pre-migration backup via `odinn state restore`.
