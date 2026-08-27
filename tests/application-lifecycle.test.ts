@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { STATE_SCHEMA_TARGETS } from "../packages/kernel/src/state/schema-registry.ts";
+import { buildNativeLauncher } from "../scripts/release/native-launcher.ts";
+import { standaloneUnixLauncher } from "../scripts/release/standalone-launchers.ts";
 import {
   checkForUpdate,
   resolveGitHubTagCommit,
@@ -17,6 +19,7 @@ import {
 
 const PRIOR_COMMIT = "a".repeat(40);
 const NEXT_COMMIT = "b".repeat(40);
+const root = resolve(import.meta.dirname, "..");
 
 test("remote release tag resolution binds assets to the immutable commit", async () => {
   const annotatedTag = "c".repeat(40);
@@ -99,14 +102,234 @@ async function lifecycleFixture() {
   return { temporary, prefix, state, priorId };
 }
 
+type TestLauncherActivationPhase = "prepared" | "waiting" | "applying" | "failed";
+
+function runInstallerCommand(prefix: string, command: string, extra: string[] = []) {
+  return spawnSync(process.execPath, [
+    join(root, "scripts", "install.ts"),
+    command,
+    "--prefix",
+    prefix,
+    ...extra
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    shell: false
+  });
+}
+
+function assertInstallerSuccess(result: ReturnType<typeof spawnSync>) {
+  assert.equal(result.status, 0, String(result.stderr || result.stdout));
+}
+
+async function initializeInstallerPointer(prefix: string) {
+  assertInstallerSuccess(runInstallerCommand(prefix, "status"));
+}
+
+async function writeTestLauncherActivationMarker(options: {
+  prefix: string;
+  token: string;
+  versionId: string;
+  waitForPid: number;
+  phase?: TestLauncherActivationPhase;
+  operation?: "upgrade" | "rollback";
+  deadlineAt?: string;
+  attempts?: number;
+}) {
+  const now = new Date().toISOString();
+  await writeFile(join(options.prefix, ".launcher-activation.json"), `${JSON.stringify({
+    schemaVersion: 2,
+    token: options.token,
+    operation: options.operation ?? "upgrade",
+    phase: options.phase ?? "waiting",
+    versionId: options.versionId,
+    waitForPid: options.waitForPid,
+    createdAt: now,
+    updatedAt: now,
+    deadlineAt: options.deadlineAt ?? new Date(Date.now() + 60_000).toISOString(),
+    attempts: options.attempts ?? 0
+  }, null, 2)}\n`, { mode: 0o600 });
+}
+
+test("Windows deferred launcher activation recovers after finalizer crash and applying-phase power loss", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  const markerPath = join(fixture.prefix, ".launcher-activation.json");
+  const launcherPath = join(fixture.prefix, "bin", "odinn.cmd");
+  try {
+    await initializeInstallerPointer(fixture.prefix);
+    await writeTestLauncherActivationMarker({
+      prefix: fixture.prefix,
+      token: "11111111-1111-4111-8111-111111111111",
+      versionId: fixture.priorId,
+      waitForPid: 2_147_483_647,
+      phase: "waiting"
+    });
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
+    await assert.rejects(() => readFile(markerPath), { code: "ENOENT" });
+    assert.match(await readFile(launcherPath, "utf8"), /ODINN_CURRENT/u);
+
+    await writeFile(launcherPath, "partial launcher from interrupted activation\r\n");
+    await writeTestLauncherActivationMarker({
+      prefix: fixture.prefix,
+      token: "22222222-2222-4222-8222-222222222222",
+      versionId: fixture.priorId,
+      waitForPid: 2_147_483_647,
+      phase: "applying",
+      attempts: 1
+    });
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
+    await assert.rejects(() => readFile(markerPath), { code: "ENOENT" });
+    assert.doesNotMatch(await readFile(launcherPath, "utf8"), /partial launcher/u);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("Windows deferred launcher activation records timeout and retires stale markers", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  const markerPath = join(fixture.prefix, ".launcher-activation.json");
+  try {
+    await initializeInstallerPointer(fixture.prefix);
+    await writeTestLauncherActivationMarker({
+      prefix: fixture.prefix,
+      token: "33333333-3333-4333-8333-333333333333",
+      versionId: fixture.priorId,
+      waitForPid: process.pid,
+      phase: "waiting",
+      deadlineAt: new Date(Date.now() - 1_000).toISOString()
+    });
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
+    const timedOut = JSON.parse(await readFile(markerPath, "utf8"));
+    assert.equal(timedOut.phase, "failed");
+    assert.match(timedOut.lastError, /timed out/u);
+
+    await writeTestLauncherActivationMarker({
+      prefix: fixture.prefix,
+      token: "44444444-4444-4444-8444-444444444444",
+      versionId: "9.9.9-stale-candidate",
+      waitForPid: 2_147_483_647,
+      phase: "waiting"
+    });
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
+    await assert.rejects(() => readFile(markerPath), { code: "ENOENT" });
+    const state = JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8"));
+    assert.equal(state.current, fixture.priorId);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("Windows deferred launcher activation persists write failure and retries safely", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  const markerPath = join(fixture.prefix, ".launcher-activation.json");
+  const token = "55555555-5555-4555-8555-555555555555";
+  const bin = join(fixture.prefix, "bin");
+  const launcher = join(bin, "odinn.cmd");
+  const externalLink = join(fixture.temporary, "linked-odinn.cmd");
+  try {
+    await initializeInstallerPointer(fixture.prefix);
+    await mkdir(bin, { recursive: true });
+    await writeFile(launcher, "old launcher\r\n");
+    await link(launcher, externalLink);
+    await writeTestLauncherActivationMarker({
+      prefix: fixture.prefix,
+      token,
+      versionId: fixture.priorId,
+      waitForPid: 2_147_483_647,
+      phase: "applying",
+      attempts: 1
+    });
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "finalize-launchers", [
+      "--wait-for-pid",
+      "2147483647",
+      "--version-id",
+      fixture.priorId,
+      "--activation-token",
+      token
+    ]));
+    const failed = JSON.parse(await readFile(markerPath, "utf8"));
+    assert.equal(failed.phase, "failed");
+    assert.match(failed.lastError, /physical file/u);
+
+    await rm(externalLink);
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
+    await assert.rejects(() => readFile(markerPath), { code: "ENOENT" });
+    assert.match(await readFile(launcher, "utf8"), /ODINN_CURRENT/u);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("Windows installer cleans activation retirement debris left by power loss", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  const token = "66666666-6666-4666-8666-666666666666";
+  const retiredPath = join(fixture.prefix, `.launcher-activation.json.retired-${token}`);
+  const temporaryPath = join(fixture.prefix, ".launcher-activation.json.interrupted.tmp");
+  try {
+    await initializeInstallerPointer(fixture.prefix);
+    await writeFile(retiredPath, "retired marker\n");
+    await writeFile(temporaryPath, "partial marker\n");
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "status"));
+    await assert.rejects(() => readFile(retiredPath), { code: "ENOENT" });
+    await assert.rejects(() => readFile(temporaryPath), { code: "ENOENT" });
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("synchronous Windows health rollback cancels pending candidate launcher activation", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  const candidateId = `1.0.0-${NEXT_COMMIT.slice(0, 12)}`;
+  const candidateRoot = join(fixture.prefix, "versions", candidateId);
+  const markerPath = join(fixture.prefix, ".launcher-activation.json");
+  try {
+    await writeFakePackage(candidateRoot, "1.0.0", NEXT_COMMIT, { health: false });
+    await writeFile(join(fixture.prefix, "install-state.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      current: candidateId,
+      currentVersion: "1.0.0",
+      currentCommit: NEXT_COMMIT,
+      previous: fixture.priorId,
+      operation: "upgrade"
+    }, null, 2)}\n`);
+    await writeFile(join(fixture.prefix, "current"), `${candidateId}\r\ncompiled\r\n\r\n`);
+    await writeTestLauncherActivationMarker({
+      prefix: fixture.prefix,
+      token: "77777777-7777-4777-8777-777777777777",
+      versionId: candidateId,
+      waitForPid: process.pid,
+      phase: "waiting"
+    });
+
+    assertInstallerSuccess(runInstallerCommand(fixture.prefix, "rollback"));
+    await assert.rejects(() => readFile(markerPath), { code: "ENOENT" });
+    const state = JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8"));
+    assert.equal(state.current, fixture.priorId);
+    const [currentVersionId] = (await readFile(join(fixture.prefix, "current"), "utf8")).split(/\r?\n/u);
+    assert.equal(currentVersionId, fixture.priorId);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
 async function makePackageStandalone(packageRoot: string) {
   const installedReleaseInfoPath = join(packageRoot, "release-info.json");
   const installedReleaseInfo = JSON.parse(await readFile(installedReleaseInfoPath, "utf8"));
   const runtimeBytes = await readFile(process.execPath);
   const executableSha256 = createHash("sha256").update(runtimeBytes).digest("hex");
-  const policyBytes = Buffer.from("test runtime policy\n");
-  const runtimePolicySha256 = createHash("sha256").update(policyBytes).digest("hex");
   const target = `${process.platform}-${process.arch}`;
+  const policyBytes = runtimePolicyFixture(process.version.slice(1), target, runtimeBytes.byteLength, executableSha256);
+  const runtimePolicySha256 = createHash("sha256").update(policyBytes).digest("hex");
   const runtimeName = process.platform === "win32" ? "node.exe" : "node";
   await mkdir(join(packageRoot, "runtime"), { recursive: true });
   await writeFile(join(packageRoot, "runtime", runtimeName), runtimeBytes, { mode: 0o755 });
@@ -128,9 +351,56 @@ async function makePackageStandalone(packageRoot: string) {
     version: process.version.slice(1),
     target,
     executableSha256,
-    runtimePolicySha256
+    runtimePolicySha256,
+    runtimeBoundary: process.platform === "win32"
+      ? "win32-system-launcher"
+      : process.platform === "linux"
+        ? "linux-static-pie"
+        : "darwin-hardened-runtime"
   };
   await writeFile(installedPackagePath, `${JSON.stringify(installedPackage, null, 2)}\n`);
+  return { executableSha256, runtime: join(packageRoot, "runtime", runtimeName), target };
+}
+
+function runtimePolicyFixture(version: string, target: string, executableBytes: number, executableSha256: string, archiveSha256 = "a".repeat(64)): Buffer {
+  return Buffer.from(`${JSON.stringify({
+    schemaVersion: 1,
+    version,
+    origin: "https://nodejs.org",
+    signedManifest: {
+      sha256: "b".repeat(64),
+      cleartextSha256: "c".repeat(64)
+    },
+    keyring: {
+      sha256: "d".repeat(64),
+      allowedPrimaryFingerprints: ["E".repeat(40)]
+    },
+    targets: {
+      [target]: {
+        sha256: archiveSha256,
+        executableBytes,
+        executableSha256
+      }
+    }
+  }, null, 2)}\n`);
+}
+
+async function addNativeStandaloneLaunchers(packageRoot: string, executableSha256: string): Promise<void> {
+  const target = `${process.platform}-${process.arch}` as "linux-x64" | "darwin-x64";
+  await mkdir(join(packageRoot, "bin"), { recursive: true });
+  await mkdir(join(packageRoot, "install"), { recursive: true });
+  const launcher = join(packageRoot, "bin", "odinn");
+  await buildNativeLauncher(target, launcher);
+  const launcherBytes = await readFile(launcher);
+  await writeFile(join(packageRoot, "bin", "odinn-gateway"), launcherBytes, { mode: 0o755 });
+  await writeFile(join(packageRoot, "install", "install.sh"), launcherBytes, { mode: 0o755 });
+  await writeFile(join(packageRoot, "bin", "odinn.runtime.sh"), standaloneUnixLauncher("dist/cli/index.js", target, executableSha256));
+  await writeFile(join(packageRoot, "bin", "odinn-gateway.runtime.sh"), standaloneUnixLauncher("dist/gateway/server.js", target, executableSha256));
+  await writeFile(join(packageRoot, "install", "install.sh.runtime.sh"), standaloneUnixLauncher("dist/install/install.js", target, executableSha256));
+  const packagePath = join(packageRoot, "package.json");
+  const packageMetadata = JSON.parse(await readFile(packagePath, "utf8"));
+  packageMetadata.odinnStandalone.launcherSha256 = createHash("sha256").update(launcherBytes).digest("hex");
+  await writeFile(packagePath, `${JSON.stringify(packageMetadata, null, 2)}\n`);
 }
 
 test("verified local update installs immutably, reports identity, and remains rollbackable", async () => {
@@ -172,6 +442,105 @@ test("verified local update installs immutably, reports identity, and remains ro
     assert.equal(rolledBack.versionId, fixture.priorId);
   } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("installed standalone native lifecycle completes runtime N-to-N+1 update, rollback, and uninstall on Unix", {
+  skip: process.platform === "win32" || process.arch !== "x64"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  try {
+    await rm(fixture.prefix, { recursive: true, force: true });
+    const priorSource = join(fixture.temporary, "prior-standalone-package");
+    await writeFakePackage(priorSource, "0.9.0", PRIOR_COMMIT, { health: true });
+    const priorRuntime = await makePackageStandalone(priorSource);
+    await addNativeStandaloneLaunchers(priorSource, priorRuntime.executableSha256);
+    const installedResult = spawnSync(priorRuntime.runtime, [
+      join(root, "scripts", "install.ts"),
+      "install",
+      "--source",
+      priorSource,
+      "--prefix",
+      fixture.prefix,
+      "--artifact-sha256",
+      "1".repeat(64)
+    ], { cwd: root, encoding: "utf8", shell: false });
+    assert.equal(installedResult.status, 0, installedResult.stderr || installedResult.stdout);
+    const installedPrior = JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8"));
+    for (const name of ["odinn", "odinn.runtime.sh", "odinn-gateway", "odinn-gateway.runtime.sh"]) {
+      const metadata = await lstat(join(fixture.prefix, "bin", name));
+      assert.ok(metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1, name);
+    }
+
+    const release = await createStandaloneRelease(fixture.temporary, "1.0.0", NEXT_COMMIT, {
+      runtimeVersion: "24.20.0",
+      reportedRuntimeVersion: "24.20.0"
+    });
+    const updated = await updateApplication({
+      identity: { applicationVersion: "0.9.0", applicationCommit: PRIOR_COMMIT },
+      stateDir: fixture.state,
+      packageRoot: join(fixture.prefix, "versions", installedPrior.current),
+      prefix: fixture.prefix,
+      manifest: release.manifest,
+      checksums: release.checksums,
+      artifact: release.artifact
+    });
+    assert.equal(updated.version, "1.0.0");
+    const installedCandidate = JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8"));
+    const candidateInfo = JSON.parse(await readFile(join(fixture.prefix, "versions", installedCandidate.current, "release-info.json"), "utf8"));
+    assert.equal(candidateInfo.embeddedRuntime.version, "24.20.0");
+    assert.notEqual(candidateInfo.embeddedRuntime.version, process.version.slice(1));
+
+    const rolledBack = await rollbackApplication({
+      identity: { applicationVersion: "1.0.0", applicationCommit: NEXT_COMMIT },
+      stateDir: fixture.state,
+      packageRoot: join(fixture.prefix, "versions", installedCandidate.current),
+      prefix: fixture.prefix
+    });
+    assert.equal(rolledBack.version, "0.9.0");
+    assert.equal(rolledBack.versionId, installedPrior.current);
+
+    const removed = await uninstallApplication({ prefix: fixture.prefix, stateDir: fixture.state });
+    assert.equal(removed.ok, true);
+    assert.equal(removed.stateRemoved, false);
+    assert.equal(await readFile(join(fixture.state, "config.json"), "utf8"), "{\"version\":1}\n");
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("standalone candidate rejects authenticated policy/version mismatches before installation", {
+  skip: process.platform === "win32"
+}, async () => {
+  for (const mismatch of ["runtime-output", "policy"] as const) {
+    const fixture = await lifecycleFixture();
+    try {
+      const priorRoot = join(fixture.prefix, "versions", fixture.priorId);
+      await makePackageStandalone(priorRoot);
+      const sentinel = join(fixture.temporary, `${mismatch}-executed`);
+      const release = await createStandaloneRelease(fixture.temporary, "1.0.0", NEXT_COMMIT, {
+        runtimeVersion: "24.20.0",
+        reportedRuntimeVersion: mismatch === "runtime-output" ? "24.21.0" : "24.20.0",
+        policyVersion: mismatch === "policy" ? "24.21.0" : "24.20.0",
+        executionSentinel: mismatch === "policy" ? sentinel : undefined
+      });
+      await assert.rejects(
+        () => updateApplication({
+          identity: { applicationVersion: "0.9.0", applicationCommit: PRIOR_COMMIT },
+          stateDir: fixture.state,
+          packageRoot: priorRoot,
+          prefix: fixture.prefix,
+          manifest: release.manifest,
+          checksums: release.checksums,
+          artifact: release.artifact
+        }),
+        mismatch === "policy" ? /policy does not match authenticated runtime metadata/u : /version output does not match authenticated metadata/u
+      );
+      assert.equal(JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8")).current, fixture.priorId);
+      if (mismatch === "policy") await assert.rejects(() => readFile(sentinel), { code: "ENOENT" });
+    } finally {
+      await rm(fixture.temporary, { recursive: true, force: true });
+    }
   }
 });
 
@@ -458,6 +827,32 @@ test("uninstall refuses a symlinked installation prefix", { skip: process.platfo
   }
 });
 
+test("standalone lifecycle admits physical native launcher companions and rejects hard-linked companions", {
+  skip: process.platform === "win32"
+}, async () => {
+  const fixture = await lifecycleFixture();
+  try {
+    const bin = join(fixture.prefix, "bin");
+    await mkdir(bin, { recursive: true });
+    for (const name of ["odinn", "odinn.runtime.sh", "odinn-gateway", "odinn-gateway.runtime.sh"]) {
+      await writeFile(join(bin, name), `${name}\n`, { mode: name.endsWith(".runtime.sh") ? 0o600 : 0o755 });
+    }
+    const companion = join(bin, "odinn.runtime.sh");
+    const externalLink = join(fixture.temporary, "linked-launcher-companion");
+    await link(companion, externalLink);
+    await assert.rejects(
+      () => uninstallApplication({ prefix: fixture.prefix, stateDir: fixture.state }),
+      /unexpected launcher entry: odinn\.runtime\.sh/u
+    );
+    await rm(externalLink);
+    const removed = await uninstallApplication({ prefix: fixture.prefix, stateDir: fixture.state });
+    assert.equal(removed.ok, true);
+    assert.equal(removed.stateRemoved, false);
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
 async function createRelease(
   temporary: string,
   version: string,
@@ -491,6 +886,111 @@ async function createRelease(
   }, null, 2)}\n`);
   const checksums = join(releases, "SHA256SUMS.txt");
   await writeFile(checksums, `${digest}  ${artifactName}\n`);
+  return { artifact, manifest, checksums };
+}
+
+async function createStandaloneRelease(
+  temporary: string,
+  version: string,
+  commit: string,
+  options: {
+    runtimeVersion: string;
+    reportedRuntimeVersion: string;
+    policyVersion?: string;
+    executionSentinel?: string;
+  }
+) {
+  const target = `${process.platform}-${process.arch}`;
+  const releases = join(temporary, `standalone-release-${version}-${options.reportedRuntimeVersion}-${options.policyVersion ?? "matching"}`);
+  const packageRootName = `odinn-v${version}-standalone-${target}`;
+  const packageRoot = join(releases, packageRootName);
+  await writeFakePackage(packageRoot, version, commit, { health: true });
+  const runtimePath = join(packageRoot, "runtime", "node");
+  await mkdir(dirname(runtimePath), { recursive: true });
+  const executionMark = options.executionSentinel ? `: > ${shellQuote(options.executionSentinel)}\n` : "";
+  await writeFile(runtimePath, `#!/bin/sh\nset -eu\n${executionMark}if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then\n  printf '%s\\n' ${shellQuote(`v${options.reportedRuntimeVersion}`)}\n  exit 0\nfi\nexec ${shellQuote(process.execPath)} "$@"\n`, { mode: 0o755 });
+  const runtimeBytes = await readFile(runtimePath);
+  const executableSha256 = createHash("sha256").update(runtimeBytes).digest("hex");
+  const archiveSha256 = "9".repeat(64);
+  const policyBytes = runtimePolicyFixture(
+    options.policyVersion ?? options.runtimeVersion,
+    target,
+    runtimeBytes.byteLength,
+    executableSha256,
+    archiveSha256
+  );
+  const runtimePolicySha256 = createHash("sha256").update(policyBytes).digest("hex");
+  await mkdir(join(packageRoot, "THIRD_PARTY_NOTICES"), { recursive: true });
+  await writeFile(join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json"), policyBytes);
+  const embeddedRuntime = {
+    version: options.runtimeVersion,
+    target,
+    archiveSha256,
+    executableBytes: runtimeBytes.byteLength,
+    executableSha256,
+    runtimePolicySha256
+  };
+  const releaseInfoPath = join(packageRoot, "release-info.json");
+  const releaseInfo = JSON.parse(await readFile(releaseInfoPath, "utf8"));
+  releaseInfo.distribution = "standalone";
+  releaseInfo.embeddedRuntime = embeddedRuntime;
+  await writeFile(releaseInfoPath, `${JSON.stringify(releaseInfo, null, 2)}\n`);
+  const packagePath = join(packageRoot, "package.json");
+  const packageMetadata = JSON.parse(await readFile(packagePath, "utf8"));
+  packageMetadata.odinnStandalone = {
+    runtime: "node",
+    version: options.runtimeVersion,
+    target,
+    executableSha256,
+    runtimePolicySha256,
+    runtimeBoundary: process.platform === "linux" ? "linux-static-pie" : "darwin-hardened-runtime"
+  };
+  await writeFile(packagePath, `${JSON.stringify(packageMetadata, null, 2)}\n`);
+
+  const artifactName = `${packageRootName}.tar.gz`;
+  const artifact = join(releases, artifactName);
+  run("tar", ["-czf", artifact, "-C", releases, packageRootName], releases);
+  const artifactBytes = await readFile(artifact);
+  const artifactSha256 = createHash("sha256").update(artifactBytes).digest("hex");
+  const archiveSha256ByName: Record<string, string> = {};
+  const standaloneArtifacts = ["darwin-x64", "linux-x64", "win32-x64"].map((matrixTarget, index) => {
+    const name = `odinn-v${version}-standalone-${matrixTarget}.${matrixTarget === "win32-x64" ? "zip" : "tar.gz"}`;
+    const selected = matrixTarget === target;
+    const sha256 = selected ? artifactSha256 : String(index + 3).repeat(64);
+    archiveSha256ByName[name] = sha256;
+    return {
+      name,
+      target: matrixTarget,
+      bytes: selected ? artifactBytes.byteLength : 1,
+      sha256,
+      embeddedRuntime: selected ? embeddedRuntime : {
+        version: options.runtimeVersion,
+        target: matrixTarget,
+        archiveSha256: String(index + 6).repeat(64),
+        executableBytes: 1,
+        executableSha256: String(index + 7).repeat(64),
+        runtimePolicySha256
+      }
+    };
+  });
+  const compiledName = `odinn-v${version}.tar.gz`;
+  archiveSha256ByName[compiledName] = "1".repeat(64);
+  const manifest = join(releases, "release-manifest.json");
+  await writeFile(manifest, `${JSON.stringify({
+    name: "odinn",
+    version,
+    commit,
+    distribution: "compiled",
+    runtimeSha256: "c".repeat(64),
+    artifacts: [compiledName],
+    standaloneArtifacts,
+    nodeRuntimePolicySha256: runtimePolicySha256,
+    archiveSha256: archiveSha256ByName,
+    stateSchemas: STATE_SCHEMA_TARGETS,
+    minimumApplicationVersionForTargetState: "0.9.0"
+  }, null, 2)}\n`);
+  const checksums = join(releases, "SHA256SUMS.txt");
+  await writeFile(checksums, `${artifactSha256}  ${artifactName}\n`);
   return { artifact, manifest, checksums };
 }
 
@@ -534,8 +1034,10 @@ const [command,...args]=process.argv.slice(2);
 const option=(name)=>{const index=args.indexOf(name);return index>=0?args[index+1]:"";};
 const prefix=option("--prefix");
 const statePath=join(prefix,"install-state.json");
+const currentPath=join(prefix,"current");
 const readState=async()=>{try{return JSON.parse(await readFile(statePath,"utf8"));}catch(error){if(error.code==="ENOENT")return{schemaVersion:1,current:null,previous:null};throw error;}};
 const writeState=async(value)=>{await mkdir(prefix,{recursive:true});const temporary=statePath+".tmp";await writeFile(temporary,JSON.stringify(value,null,2)+"\\n");await rename(temporary,statePath);};
+const writeCurrent=async(id,distribution,runtimeSha256)=>{await writeFile(currentPath,id+"\\n"+distribution+"\\n"+runtimeSha256+"\\n");};
 if(command==="upgrade"||command==="install"){
   const source=option("--source");
   const pkg=JSON.parse(await readFile(join(source,"package.json"),"utf8"));
@@ -544,18 +1046,26 @@ if(command==="upgrade"||command==="install"){
   const destination=join(prefix,"versions",id);
   await mkdir(join(prefix,"versions"),{recursive:true});
   try{await cp(source,destination,{recursive:true,errorOnExist:true,force:false});}catch(error){if(error.code!=="ERR_FS_CP_EEXIST"&&error.code!=="EEXIST")throw error;}
-  await writeFile(join(destination,"install-metadata.json"),JSON.stringify({schemaVersion:2,version:pkg.version,commit:info.commit,runtimeSha256:info.runtimeSha256,artifactSha256:option("--artifact-sha256"),toolchain:{node:process.version,distribution:"compiled"}},null,2)+"\\n");
+  const distribution=info.distribution??"source";
+  const toolchain={node:process.version,distribution,...(distribution==="standalone"?{embeddedRuntime:info.embeddedRuntime}:{})};
+  await writeFile(join(destination,"install-metadata.json"),JSON.stringify({schemaVersion:2,version:pkg.version,commit:info.commit,runtimeSha256:info.runtimeSha256,artifactSha256:option("--artifact-sha256"),toolchain},null,2)+"\\n");
   const previous=await readState();
   await writeState({schemaVersion:1,current:id,currentVersion:pkg.version,currentCommit:info.commit,previous:previous.current&&previous.current!==id?previous.current:previous.previous??null,operation:command});
+  await writeCurrent(id,distribution,distribution==="standalone"?info.embeddedRuntime.executableSha256:"");
 }else if(command==="rollback"){
   const current=await readState();
   if(!current.previous)throw new Error("no previous");
   const metadata=JSON.parse(await readFile(join(prefix,"versions",current.previous,"install-metadata.json"),"utf8"));
   await writeState({...current,current:current.previous,currentVersion:metadata.version,currentCommit:metadata.commit,previous:current.current,operation:"rollback"});
+  await writeCurrent(current.previous,metadata.toolchain.distribution,metadata.toolchain.distribution==="standalone"?metadata.toolchain.embeddedRuntime.executableSha256:"");
 }else{throw new Error("unsupported fake installer command");}
 `;
 
 function run(command: string, args: string[], cwd: string) {
   const result = spawnSync(command, args, { cwd, encoding: "utf8", shell: false });
   assert.equal(result.status, 0, result.stderr || result.stdout);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }

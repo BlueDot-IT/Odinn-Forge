@@ -122,6 +122,54 @@ test("secure archive admission rejects adversarial long paths in bounded time an
   }
 });
 
+test("GNU long-name metadata rejects adversarial NUL runs with linear scaling and bounded diagnostics", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-gnu-long-name-"));
+  try {
+    const sizes = [30_000, 60_000, 120_000];
+    const timings: number[] = [];
+    for (const size of sizes) {
+      const archive = join(temporary, `gnu-long-name-${size}.tar.gz`);
+      const adversarialName = Buffer.concat([
+        Buffer.from("pkg/", "utf8"),
+        Buffer.alloc(size, 0),
+        Buffer.from("x", "utf8")
+      ]);
+      await writeFile(archive, tarGzip([
+        { name: "././@LongLink", type: "L", data: adversarialName },
+        { name: "placeholder", data: "x" }
+      ]));
+      const started = performance.now();
+      const error = await inspectSecureArchive(archive, { expectedRoot: "pkg" }).then(
+        () => undefined,
+        (failure: unknown) => failure
+      );
+      timings.push(performance.now() - started);
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /unsafe path/u);
+      assert.ok(error.message.length < 512, `GNU long-name error was ${error.message.length} characters`);
+    }
+    const smallest = timings[0]!;
+    const largest = timings.at(-1)!;
+    assert.ok(largest < 1_500, `120K GNU long-name rejection took ${largest.toFixed(1)}ms`);
+    assert.ok(
+      largest < Math.max(1_000, smallest * 8),
+      `GNU long-name scaling was not bounded: ${timings.map((value) => value.toFixed(1)).join(", ")}ms`
+    );
+
+    const oversized = join(temporary, "gnu-long-name-oversized.tar.gz");
+    await writeFile(oversized, tarGzip([
+      { name: "././@LongLink", type: "L", data: Buffer.alloc(2 * 1024 * 1024 + 1, 0xff) },
+      { name: "placeholder", data: "x" }
+    ]));
+    await assert.rejects(
+      () => inspectSecureArchive(oversized, { expectedRoot: "pkg" }),
+      /metadata exceeds its limit/u
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("secure archive admission rejects links, devices, FIFOs, and expanded-size bombs", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-types-"));
   try {

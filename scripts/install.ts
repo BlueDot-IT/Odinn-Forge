@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, type Stats } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -14,6 +14,21 @@ const prefix = resolve(option("--prefix", process.env.ODINN_INSTALL_PREFIX || jo
 const statePath = join(prefix, "install-state.json");
 const currentPath = join(prefix, "current");
 const launcherActivationPath = join(prefix, ".launcher-activation.json");
+const LAUNCHER_ACTIVATION_TIMEOUT_MS = 10 * 60 * 1000;
+type LauncherActivationPhase = "prepared" | "waiting" | "applying" | "failed";
+type LauncherActivationMarker = {
+  schemaVersion: 2;
+  token: string;
+  operation: "upgrade" | "rollback";
+  phase: LauncherActivationPhase;
+  versionId: string;
+  waitForPid: number;
+  createdAt: string;
+  updatedAt: string;
+  deadlineAt: string;
+  attempts: number;
+  lastError?: string;
+};
 // Kept separate so the TypeScript template emits the POSIX parameter-length expression verbatim.
 const RUNTIME_SHA256 = { length: "$" + "{#RUNTIME_SHA256}" } as const;
 if (command === "finalize-launchers") await finalizeDeferredLaunchers();
@@ -23,6 +38,7 @@ else {
   const releaseInstallLock = await acquireInstallLock();
   try {
     await validatePrefix(prefix);
+    await reconcileDeferredLauncherActivation();
     await cleanupStaleInstallEntries();
     if (command === "install" || command === "upgrade") await install(command);
     else if (command === "rollback") await rollback();
@@ -95,11 +111,12 @@ async function install(operation: any) {
   const next = { schemaVersion: 1, current: versionId, currentVersion: version, currentCommit: commit, previous: previous.current && previous.current !== versionId ? previous.current : previous.previous ?? null, installedAt: new Date().toISOString(), operation };
   const deferredParentPid = deferredLauncherParentPid(operation);
   const activation = deferredParentPid
-    ? await scheduleDeferredLauncherActivation(destination, standalone, versionId, deferredParentPid)
+    ? await prepareDeferredLauncherActivation(versionId, deferredParentPid, "upgrade")
     : null;
   if (!activation) await writeLaunchers(destination, standalone);
   await writeState(next);
   await writeCurrentPointer(versionId, toolchain.distribution, standalone ? releaseInfo.embeddedRuntime.executableSha256 : "");
+  if (activation) await startDeferredLauncherFinalizer(destination, standalone, activation);
   console.log(JSON.stringify({
     ok: true,
     prefix,
@@ -113,78 +130,233 @@ async function install(operation: any) {
 
 function deferredLauncherParentPid(operation: string): number | null {
   const value = option("--defer-launchers-until-pid");
-  if (process.platform !== "win32" || operation !== "upgrade") {
+  if (process.platform !== "win32" || (operation !== "upgrade" && operation !== "rollback")) {
     if (!value) return null;
-    throw new Error("deferred launcher activation is supported only for Windows upgrades");
+    throw new Error("deferred launcher activation is supported only for Windows upgrades and rollbacks");
   }
   // Older installed CLIs do not know the defer flag. The candidate installer
   // still owns launcher safety, so every Windows upgrade defaults to waiting
   // for its invoking CLI parent before replacing the active batch file.
+  if (operation === "rollback" && !value) return null;
   const pid = Number(value || process.ppid);
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("deferred launcher activation requires a valid parent process ID");
   if (!processIsAlive(pid)) throw new Error("deferred launcher activation parent process is not running");
   return pid;
 }
 
-async function scheduleDeferredLauncherActivation(
-  destination: string,
-  standalone: boolean,
+async function prepareDeferredLauncherActivation(
   versionId: string,
-  waitForPid: number
-) {
-  try {
-    await lstat(launcherActivationPath);
-    throw new Error("a deferred launcher activation is already pending");
-  } catch (error: any) {
-    if (error?.code !== "ENOENT") throw error;
-  }
+  waitForPid: number,
+  operation: "upgrade" | "rollback"
+): Promise<LauncherActivationMarker> {
+  const existing = await readLauncherActivationMarker();
+  if (existing) await retireLauncherActivation(existing.token);
   const token = randomUUID();
-  const marker = {
-    schemaVersion: 1,
+  const now = new Date();
+  const marker: LauncherActivationMarker = {
+    schemaVersion: 2,
     token,
+    operation,
+    phase: "prepared",
     versionId,
     waitForPid,
-    createdAt: new Date().toISOString()
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    deadlineAt: new Date(now.getTime() + LAUNCHER_ACTIVATION_TIMEOUT_MS).toISOString(),
+    attempts: 0
   };
+  await writeLauncherActivationMarker(marker, null);
+  return marker;
+}
+
+async function startDeferredLauncherFinalizer(
+  destination: string,
+  standalone: boolean,
+  marker: LauncherActivationMarker
+): Promise<void> {
+  const waiting = await updateLauncherActivationMarker(marker.token, {
+    phase: "waiting",
+    updatedAt: new Date().toISOString(),
+    lastError: undefined
+  });
+  const runtime = standalone ? join(destination, "runtime", "node.exe") : process.execPath;
+  const installer = join(destination, "dist", "install", "install.js");
+  try {
+    const child = spawn(runtime, [
+      installer,
+      "finalize-launchers",
+      "--prefix",
+      prefix,
+      "--wait-for-pid",
+      String(waiting.waitForPid),
+      "--version-id",
+      waiting.versionId,
+      "--activation-token",
+      waiting.token
+    ], {
+      // The upgrade caller removes its verified extraction tree immediately
+      // after the installer returns. Windows keeps a process working directory
+      // open, so the detached finalizer must remain rooted in the durable
+      // install prefix rather than inheriting that temporary package path.
+      cwd: prefix,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: {
+        SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+        TEMP: process.env.TEMP ?? tmpdir(),
+        TMP: process.env.TMP ?? tmpdir()
+      }
+    });
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      child.once("spawn", resolveSpawn);
+      child.once("error", rejectSpawn);
+    });
+    child.unref();
+  } catch (error) {
+    await recordLauncherActivationFailure(waiting.token, error);
+  }
+}
+
+async function readLauncherActivationMarker(): Promise<LauncherActivationMarker | null> {
+  try {
+    const metadata = await requirePhysicalFile(launcherActivationPath, "launcher activation marker");
+    if (metadata.size <= 0 || metadata.size > 64 * 1024) throw new Error("launcher activation marker is oversized");
+    const value = JSON.parse(await readFile(launcherActivationPath, "utf8"));
+    const legacy = value?.schemaVersion === 1;
+    const createdAt = String(value?.createdAt ?? "");
+    const created = Date.parse(createdAt);
+    const deadlineAt = legacy && Number.isFinite(created)
+      ? new Date(created + LAUNCHER_ACTIVATION_TIMEOUT_MS).toISOString()
+      : legacy
+        ? ""
+      : String(value?.deadlineAt ?? "");
+    const marker: LauncherActivationMarker = legacy ? {
+      schemaVersion: 2,
+      token: value.token,
+      operation: "upgrade",
+      phase: "waiting",
+      versionId: value.versionId,
+      waitForPid: value.waitForPid,
+      createdAt,
+      updatedAt: createdAt,
+      deadlineAt,
+      attempts: 0
+    } : value;
+    if (marker?.schemaVersion !== 2
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(String(marker.token))
+      || (marker.operation !== "upgrade" && marker.operation !== "rollback")
+      || !(["prepared", "waiting", "applying", "failed"] as LauncherActivationPhase[]).includes(marker.phase)
+      || !safeVersionId(marker.versionId)
+      || !Number.isSafeInteger(marker.waitForPid) || marker.waitForPid <= 0
+      || !Number.isFinite(created)
+      || !Number.isFinite(Date.parse(marker.updatedAt))
+      || !Number.isFinite(Date.parse(marker.deadlineAt))
+      || !Number.isSafeInteger(marker.attempts) || marker.attempts < 0 || marker.attempts > 100
+      || (marker.lastError !== undefined && (typeof marker.lastError !== "string" || marker.lastError.length > 256))) {
+      throw new Error("launcher activation marker is invalid or unsupported");
+    }
+    return marker;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function writeLauncherActivationMarker(
+  marker: LauncherActivationMarker,
+  expectedToken: string | null
+): Promise<void> {
+  const current = await readLauncherActivationMarker();
+  if (expectedToken === null ? current !== null : current?.token !== expectedToken) {
+    throw new Error("launcher activation marker changed during a guarded update");
+  }
   const temporary = `${launcherActivationPath}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporary, `${JSON.stringify(marker, null, 2)}\n`, { mode: 0o600, flag: "wx" });
   await rename(temporary, launcherActivationPath);
   await chmod(launcherActivationPath, 0o600).catch(() => undefined);
+}
 
-  const runtime = standalone ? join(destination, "runtime", "node.exe") : process.execPath;
-  const installer = join(destination, "dist", "install", "install.js");
-  const child = spawn(runtime, [
-    installer,
-    "finalize-launchers",
-    "--prefix",
-    prefix,
-    "--wait-for-pid",
-    String(waitForPid),
-    "--version-id",
-    versionId,
-    "--activation-token",
-    token
-  ], {
-    // The upgrade caller removes its verified extraction tree immediately
-    // after the installer returns. Windows keeps a process working directory
-    // open, so the detached finalizer must remain rooted in the durable
-    // install prefix rather than inheriting that temporary package path.
-    cwd: prefix,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-    env: {
-      SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
-      TEMP: process.env.TEMP ?? tmpdir(),
-      TMP: process.env.TMP ?? tmpdir()
+async function updateLauncherActivationMarker(
+  token: string,
+  patch: Partial<LauncherActivationMarker>
+): Promise<LauncherActivationMarker> {
+  const current = await readLauncherActivationMarker();
+  if (!current || current.token !== token) throw new Error("launcher activation marker was superseded");
+  const next: LauncherActivationMarker = { ...current, ...patch, schemaVersion: 2, token: current.token };
+  await writeLauncherActivationMarker(next, token);
+  return next;
+}
+
+async function retireLauncherActivation(token: string): Promise<boolean> {
+  const current = await readLauncherActivationMarker();
+  if (!current || current.token !== token) return false;
+  const retired = `${launcherActivationPath}.retired-${token}`;
+  await rename(launcherActivationPath, retired);
+  await requirePhysicalFile(retired, "retired launcher activation marker");
+  const retiredMarker = JSON.parse(await readFile(retired, "utf8"));
+  if (retiredMarker?.token !== token) throw new Error("retired launcher activation marker changed unexpectedly");
+  await rm(retired, { force: false });
+  return true;
+}
+
+async function recordLauncherActivationFailure(token: string, error: unknown): Promise<void> {
+  const current = await readLauncherActivationMarker();
+  if (!current || current.token !== token) return;
+  const message = error instanceof Error ? error.message : String(error);
+  await updateLauncherActivationMarker(token, {
+    phase: "failed",
+    updatedAt: new Date().toISOString(),
+    lastError: message.slice(0, 256)
+  });
+}
+
+async function applyLauncherActivation(marker: LauncherActivationMarker): Promise<"applied" | "stale"> {
+  const current = await readLauncherActivationMarker();
+  if (!current || current.token !== marker.token) return "stale";
+  const state = await readState();
+  const pointer = await readCurrentPointer();
+  if (state.current !== current.versionId || pointer?.versionId !== current.versionId) {
+    await retireLauncherActivation(current.token);
+    return "stale";
+  }
+  const applying = await updateLauncherActivationMarker(current.token, {
+    phase: "applying",
+    attempts: current.attempts + 1,
+    updatedAt: new Date().toISOString(),
+    lastError: undefined
+  });
+  try {
+    const metadata = await readInstalledMetadata(applying.versionId);
+    await writeLaunchers(
+      join(prefix, "versions", applying.versionId),
+      metadata.toolchain?.distribution === "standalone"
+    );
+    await retireLauncherActivation(applying.token);
+    return "applied";
+  } catch (error) {
+    await recordLauncherActivationFailure(applying.token, error);
+    throw error;
+  }
+}
+
+async function reconcileDeferredLauncherActivation(): Promise<void> {
+  const marker = await readLauncherActivationMarker();
+  if (!marker) return;
+  if (process.platform !== "win32") throw new Error("a Windows launcher activation marker exists on a non-Windows installation");
+  const state = await readState();
+  const pointer = await readCurrentPointer();
+  if (state.current !== marker.versionId || pointer?.versionId !== marker.versionId) {
+    await retireLauncherActivation(marker.token);
+    return;
+  }
+  if (marker.phase !== "applying" && processIsAlive(marker.waitForPid)) {
+    if (Date.now() >= Date.parse(marker.deadlineAt) && marker.phase !== "failed") {
+      await recordLauncherActivationFailure(marker.token, new Error("timed out waiting to finalize Windows launchers"));
     }
-  });
-  await new Promise<void>((resolveSpawn, rejectSpawn) => {
-    child.once("spawn", resolveSpawn);
-    child.once("error", rejectSpawn);
-  });
-  child.unref();
-  return marker;
+    return;
+  }
+  await applyLauncherActivation(marker);
 }
 
 async function finalizeDeferredLaunchers() {
@@ -195,9 +367,24 @@ async function finalizeDeferredLaunchers() {
   if (!Number.isSafeInteger(waitForPid) || waitForPid <= 0 || !safeVersionId(versionId) || !/^[0-9a-f-]{36}$/iu.test(token)) {
     throw new Error("deferred launcher activation arguments are invalid");
   }
-  const deadline = Date.now() + 10 * 60 * 1000;
+  const initial = await readLauncherActivationMarker();
+  if (!initial || initial.token !== token) return;
+  if (initial.versionId !== versionId || initial.waitForPid !== waitForPid) {
+    return;
+  }
+  const deadline = Date.parse(initial.deadlineAt);
   while (processIsAlive(waitForPid)) {
-    if (Date.now() >= deadline) throw new Error("timed out waiting to finalize Windows launchers");
+    if (Date.now() >= deadline) {
+      await assertNoLinkedAncestors(prefix, "install prefix");
+      await ensurePhysicalDirectory(prefix, "install prefix");
+      const timeoutLock = await acquireInstallLock();
+      try {
+        await recordLauncherActivationFailure(token, new Error("timed out waiting to finalize Windows launchers"));
+      } finally {
+        await timeoutLock();
+      }
+      return;
+    }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
   }
   // cmd.exe can execute the line after the Node child exits before releasing the
@@ -208,22 +395,16 @@ async function finalizeDeferredLaunchers() {
   await ensurePhysicalDirectory(prefix, "install prefix");
   const releaseInstallLock = await acquireInstallLock();
   try {
+    const marker = await readLauncherActivationMarker();
+    if (!marker || marker.token !== token) return;
+    if (marker.versionId !== versionId || marker.waitForPid !== waitForPid) {
+      await recordLauncherActivationFailure(token, new Error("launcher activation marker does not match the requested activation"));
+      return;
+    }
     await validatePrefix(prefix);
-    await requirePhysicalFile(launcherActivationPath, "launcher activation marker");
-    const marker = JSON.parse(await readFile(launcherActivationPath, "utf8"));
-    if (marker?.schemaVersion !== 1 || marker.token !== token || marker.versionId !== versionId || marker.waitForPid !== waitForPid) {
-      throw new Error("launcher activation marker does not match the requested activation");
-    }
-    const state = await readState();
-    const pointer = await readCurrentPointer();
-    if (state.current !== versionId || pointer?.versionId !== versionId) {
-      throw new Error("launcher activation target is no longer the active verified release");
-    }
-    await writeLaunchers();
-    const retired = `${launcherActivationPath}.retired-${token}`;
-    await rename(launcherActivationPath, retired);
-    await requirePhysicalFile(retired, "retired launcher activation marker");
-    await rm(retired, { force: false });
+    await applyLauncherActivation(marker);
+  } catch (error) {
+    await recordLauncherActivationFailure(token, error);
   } finally {
     await releaseInstallLock();
   }
@@ -234,10 +415,35 @@ async function rollback() {
   if (!current.previous) throw new Error("no previous Odinn Forge installation is available for rollback");
   const priorMetadata = await readInstalledMetadata(current.previous);
   const next = { ...current, current: current.previous, currentVersion: priorMetadata.version, currentCommit: priorMetadata.commit, previous: current.current, rolledBackAt: new Date().toISOString(), operation: "rollback" };
-  await writeLaunchers(join(prefix, "versions", current.previous), priorMetadata.toolchain?.distribution === "standalone");
+  const deferredParentPid = deferredLauncherParentPid("rollback");
+  const activation = deferredParentPid
+    ? await prepareDeferredLauncherActivation(current.previous, deferredParentPid, "rollback")
+    : null;
+  if (!activation) {
+    // A synchronous rollback can be entered by an older CLI that does not know
+    // the deferred-activation flag. Retire any pending upgrade activation before
+    // changing launchers so its detached finalizer cannot later overwrite the
+    // rollback launchers after the health-recovery path has completed.
+    const pendingActivation = await readLauncherActivationMarker();
+    if (pendingActivation) await retireLauncherActivation(pendingActivation.token);
+    await writeLaunchers(join(prefix, "versions", current.previous), priorMetadata.toolchain?.distribution === "standalone");
+  }
   await writeState(next);
   await writeCurrentPointer(next.current, priorMetadata.toolchain?.distribution ?? "compiled", priorMetadata.toolchain?.embeddedRuntime?.executableSha256 ?? "");
-  console.log(JSON.stringify({ ok: true, prefix, current: next.current, previous: next.previous }, null, 2));
+  if (activation) {
+    await startDeferredLauncherFinalizer(
+      join(prefix, "versions", current.previous),
+      priorMetadata.toolchain?.distribution === "standalone",
+      activation
+    );
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    prefix,
+    current: next.current,
+    previous: next.previous,
+    launcherActivation: activation ? "deferred" : "complete"
+  }, null, 2));
 }
 
 async function readState() {
@@ -389,7 +595,7 @@ async function validateDistributionRuntime(
   const policyDirectory = join(root, "THIRD_PARTY_NOTICES");
   const policyPath = join(policyDirectory, "node-runtime-policy.json");
   if (!evidence || !standalone
-    || evidence.version !== process.version.slice(1)
+    || !/^24\.\d+\.\d+$/u.test(String(evidence.version ?? ""))
     || evidence.target !== expectedTarget
     || standalone.runtime !== "node"
     || standalone.version !== evidence.version
@@ -421,6 +627,33 @@ async function validateDistributionRuntime(
   }
   if (await digestIfPresent(policyPath) !== evidence.runtimePolicySha256) {
     throw new Error("embedded runtime policy digest does not match signed release metadata");
+  }
+  const runtimePolicy = JSON.parse(await readFile(policyPath, "utf8"));
+  const targetPolicy = runtimePolicy?.targets?.[expectedTarget];
+  if (runtimePolicy?.schemaVersion !== 1
+    || runtimePolicy?.version !== evidence.version
+    || runtimePolicy?.origin !== "https://nodejs.org"
+    || !/^[a-f0-9]{64}$/u.test(String(runtimePolicy?.signedManifest?.sha256 ?? ""))
+    || !/^[a-f0-9]{64}$/u.test(String(runtimePolicy?.signedManifest?.cleartextSha256 ?? ""))
+    || !/^[a-f0-9]{64}$/u.test(String(runtimePolicy?.keyring?.sha256 ?? ""))
+    || !Array.isArray(runtimePolicy?.keyring?.allowedPrimaryFingerprints)
+    || runtimePolicy.keyring.allowedPrimaryFingerprints.length === 0
+    || !runtimePolicy.keyring.allowedPrimaryFingerprints.every((value: unknown) => /^[A-F0-9]{40}$/u.test(String(value)))
+    || targetPolicy?.executableBytes !== evidence.executableBytes
+    || targetPolicy?.executableSha256 !== evidence.executableSha256
+    || (evidence.archiveSha256 !== undefined && targetPolicy?.sha256 !== evidence.archiveSha256)) {
+    throw new Error("embedded runtime policy does not match signed release metadata");
+  }
+  const versionProbe = spawnSync(runtimeExecutable, ["--version"], {
+    cwd: root,
+    encoding: "utf8",
+    shell: false,
+    env: {
+      ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows" } : {})
+    }
+  });
+  if (versionProbe.status !== 0 || versionProbe.stdout.trim() !== `v${evidence.version}`) {
+    throw new Error("embedded runtime version output does not match signed release metadata");
   }
   if (process.platform !== "win32") {
     const nativeTarget = expectedTarget as NativeLauncherTarget;
@@ -618,7 +851,10 @@ async function cleanupStaleInstallEntries() {
   const candidates: string[] = [];
   try {
     for (const entry of await readdir(prefix, { withFileTypes: true })) {
-      if (/^(?:\.install-state-|current\.|\.launcher-activation\.).+\.tmp$/u.test(entry.name)) candidates.push(join(prefix, entry.name));
+      if (/^(?:\.install-state-|current\.|\.launcher-activation\.).+\.tmp$/u.test(entry.name)
+        || /^\.launcher-activation\.json\.retired-[0-9a-f-]{36}$/iu.test(entry.name)) {
+        candidates.push(join(prefix, entry.name));
+      }
     }
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;

@@ -243,11 +243,18 @@ function tarString(block: Buffer, offset: number, length: number): string {
 function tarNumber(block: Buffer, offset: number, length: number, label: string): number {
   const field = block.subarray(offset, offset + length);
   if ((field[0]! & 0x80) !== 0) throw new Error(`release tar archive uses an unsupported base-256 ${label}`);
-  const text = field.toString("ascii").replace(/\0.*$/u, "").trim();
+  const terminator = field.indexOf(0);
+  const text = field.subarray(0, terminator < 0 ? field.length : terminator).toString("ascii").trim();
   if (!/^[0-7]*$/u.test(text)) throw new Error(`release tar archive has an invalid ${label}`);
   const value = text ? Number.parseInt(text, 8) : 0;
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`release tar archive has an invalid ${label}`);
   return value;
+}
+
+function withoutTrailingNulBytes(data: Buffer): Buffer {
+  let end = data.length;
+  while (end > 0 && data[end - 1] === 0) end -= 1;
+  return data.subarray(0, end);
 }
 
 function tarChecksum(block: Buffer): void {
@@ -314,7 +321,7 @@ async function parseTarGzip(path: string, options: ResolvedOptions, hooks: TarHo
     if (metadataType) {
       const data = Buffer.concat(metadataChunks, metadataBytes);
       if (metadataType === "long-name") {
-        longName = new TextDecoder("utf-8", { fatal: true }).decode(data).replace(/\0+$/u, "");
+        longName = new TextDecoder("utf-8", { fatal: true }).decode(withoutTrailingNulBytes(data));
       } else {
         const parsed = parsePax(data);
         if (parsed.has("size") || (metadataType === "global-pax" && parsed.has("path"))) {
@@ -379,6 +386,7 @@ async function parseTarGzip(path: string, options: ResolvedOptions, hooks: TarHo
       remaining = size;
       padding = (TAR_BLOCK_BYTES - (size % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES;
       if (type === "x" || type === "g" || type === "L") {
+        if (size > TAR_METADATA_MAXIMUM_BYTES) throw new Error("release tar archive metadata exceeds its limit");
         metadataType = type === "x" ? "pax" : type === "g" ? "global-pax" : "long-name";
         if (remaining === 0) await finishEntry();
         continue;

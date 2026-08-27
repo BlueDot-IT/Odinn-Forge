@@ -256,7 +256,12 @@ export async function updateApplication(options: UpdateCheckOptions) {
       try {
         const current = await readInstallState(prefix);
         const currentRoot = join(prefix, "versions", String(current.current));
-        runPackageNode(currentRoot, installerEntry(currentRoot), ["rollback", "--prefix", prefix]);
+        runPackageNode(currentRoot, installerEntry(currentRoot), [
+          "rollback",
+          "--prefix",
+          prefix,
+          ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
+        ]);
         if (recoveryBackup) {
           await restoreStateBackup(recoveryBackup, options.stateDir, {
             applicationVersion: options.identity.applicationVersion,
@@ -304,7 +309,12 @@ export async function rollbackApplication(options: {
     );
   }
   const currentRoot = join(prefix, "versions", String(installed.current));
-  runPackageNode(currentRoot, installerEntry(currentRoot), ["rollback", "--prefix", prefix]);
+  runPackageNode(currentRoot, installerEntry(currentRoot), [
+    "rollback",
+    "--prefix",
+    prefix,
+    ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
+  ]);
   const rolledBack = await readInstallState(prefix);
   try {
     const priorRoot = join(prefix, "versions", String(rolledBack.current));
@@ -316,7 +326,12 @@ export async function rollbackApplication(options: {
     if (!health.ok) throw new Error("rolled-back application failed its health check");
   } catch (error) {
     const priorRoot = join(prefix, "versions", String(rolledBack.current));
-    runPackageNode(priorRoot, installerEntry(priorRoot), ["rollback", "--prefix", prefix]);
+    runPackageNode(priorRoot, installerEntry(priorRoot), [
+      "rollback",
+      "--prefix",
+      prefix,
+      ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
+    ]);
     throw error;
   }
   await appendLifecycleHistory(prefix, {
@@ -351,7 +366,8 @@ export async function uninstallApplication(options: {
     join(prefix, "versions"),
     join(prefix, "bin"),
     join(prefix, "install-state.json"),
-    join(prefix, "current")
+    join(prefix, "current"),
+    join(prefix, ".launcher-activation.json")
   ];
   await validateInstallLayout(prefix);
   if (options.removeState) {
@@ -391,15 +407,32 @@ async function validateInstallLayout(prefix: string): Promise<void> {
   const state = await readInstallState(prefix);
   if (state.current !== null && typeof state.current !== "string") throw new Error("install state current pointer is invalid");
   if (state.previous !== null && typeof state.previous !== "string") throw new Error("install state previous pointer is invalid");
+  try {
+    const activation = await lstat(join(prefix, ".launcher-activation.json"));
+    if (!activation.isFile() || activation.isSymbolicLink() || activation.nlink !== 1) {
+      throw new Error("launcher activation marker must be a physical file");
+    }
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
   const bin = join(prefix, "bin");
   try {
     const binMetadata = await lstat(bin);
     if (!binMetadata.isDirectory() || binMetadata.isSymbolicLink()) {
       throw new Error("launcher root must be a physical directory");
     }
-    const allowed = new Set(["odinn", "odinn.cmd", "odinn-gateway", "odinn-gateway.cmd"]);
+    const allowed = new Set([
+      "odinn",
+      "odinn.runtime.sh",
+      "odinn.cmd",
+      "odinn-gateway",
+      "odinn-gateway.runtime.sh",
+      "odinn-gateway.cmd"
+    ]);
     for (const entry of await readdir(bin, { withFileTypes: true })) {
-      if (!allowed.has(entry.name) || !entry.isFile() || entry.isSymbolicLink()) {
+      const metadata = await lstat(join(bin, entry.name));
+      if (!allowed.has(entry.name) || !entry.isFile() || entry.isSymbolicLink()
+        || !metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
         throw new Error(`uninstall refused an unexpected launcher entry: ${entry.name}`);
       }
     }
@@ -834,7 +867,7 @@ function validatedPackageRuntime(packageRoot: string): {
   const expectedDigest = String(releaseInfo.embeddedRuntime?.executableSha256 ?? "");
   const expectedPolicyDigest = String(releaseInfo.embeddedRuntime?.runtimePolicySha256 ?? "");
   if (releaseInfo.embeddedRuntime?.target !== expectedTarget
-    || releaseInfo.embeddedRuntime?.version !== process.version.slice(1)
+    || !/^24\.\d+\.\d+$/u.test(String(releaseInfo.embeddedRuntime?.version ?? ""))
     || packageMetadata.odinnStandalone?.target !== expectedTarget
     || packageMetadata.odinnStandalone?.version !== releaseInfo.embeddedRuntime?.version
     || packageMetadata.odinnStandalone?.runtime !== "node"
@@ -865,12 +898,43 @@ function validatedPackageRuntime(packageRoot: string): {
   const policy = join(packageRoot, "THIRD_PARTY_NOTICES", "node-runtime-policy.json");
   const reviewedPolicyAliasAncestor = assertNoLinkedAncestorsSync(dirname(policy), "standalone runtime policy directory");
   const policyMetadata = lstatSync(policy);
+  const policyBytes = readFileSync(policy);
   if (!policyMetadata.isFile() || policyMetadata.isSymbolicLink() || policyMetadata.nlink !== 1
     || !hasStablePhysicalPathSync(policy, policyMetadata, reviewedPolicyAliasAncestor)
-    || createHash("sha256").update(readFileSync(policy)).digest("hex") !== expectedPolicyDigest) {
+    || createHash("sha256").update(policyBytes).digest("hex") !== expectedPolicyDigest) {
     throw new Error("standalone embedded runtime policy digest mismatch");
   }
+  validateEmbeddedRuntimePolicy(policyBytes, expectedTarget, releaseInfo.embeddedRuntime);
+  const reportedVersion = runCommand(runtime, ["--version"], packageRoot).stdout.trim();
+  if (reportedVersion !== `v${releaseInfo.embeddedRuntime.version}`) {
+    throw new Error("standalone embedded runtime version output does not match authenticated metadata");
+  }
   return { distribution, runtime };
+}
+
+function validateEmbeddedRuntimePolicy(policyBytes: Buffer, expectedTarget: string, evidence: Record<string, any>): void {
+  let policy: any;
+  try {
+    policy = JSON.parse(policyBytes.toString("utf8"));
+  } catch {
+    throw new Error("standalone embedded runtime policy is invalid");
+  }
+  const target = policy?.targets?.[expectedTarget];
+  if (policy?.schemaVersion !== 1
+    || policy?.version !== evidence.version
+    || policy?.origin !== "https://nodejs.org"
+    || !SHA256.test(String(policy?.signedManifest?.sha256 ?? ""))
+    || !SHA256.test(String(policy?.signedManifest?.cleartextSha256 ?? ""))
+    || !SHA256.test(String(policy?.keyring?.sha256 ?? ""))
+    || !Array.isArray(policy?.keyring?.allowedPrimaryFingerprints)
+    || policy.keyring.allowedPrimaryFingerprints.length === 0
+    || !policy.keyring.allowedPrimaryFingerprints.every((value: unknown) => /^[A-F0-9]{40}$/u.test(String(value)))
+    || !target
+    || target.executableBytes !== evidence.executableBytes
+    || target.executableSha256 !== evidence.executableSha256
+    || (evidence.archiveSha256 !== undefined && target.sha256 !== evidence.archiveSha256)) {
+    throw new Error("standalone embedded runtime policy does not match authenticated runtime metadata");
+  }
 }
 
 function assertNoLinkedAncestorsSync(path: string, label: string): boolean {

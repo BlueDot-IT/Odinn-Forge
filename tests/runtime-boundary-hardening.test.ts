@@ -53,7 +53,12 @@ test("packaged and installed launchers remove hostile TLS settings and ignore PA
     await chmod(runtime, 0o755);
     const runtimeBytes = await readFile(runtime);
     const executableSha256 = createHash("sha256").update(runtimeBytes).digest("hex");
-    const policyBytes = Buffer.from("test controlled runtime policy\n");
+    const policyBytes = runtimePolicyFixture(
+      process.version.slice(1),
+      `${process.platform}-${process.arch}`,
+      runtimeBytes.byteLength,
+      executableSha256
+    );
     const runtimePolicySha256 = createHash("sha256").update(policyBytes).digest("hex");
     await writeFile(policyPath, policyBytes);
     const launcher = join(packageRoot, "bin", "odinn");
@@ -269,4 +274,27 @@ async function run(command: string, args: string[], cwd: string, env: NodeJS.Pro
     child.once("close", resolveStatus);
   });
   return { status, stdout: stdout.trim(), stderr: stderr.trim() };
+}
+
+function runtimePolicyFixture(version: string, target: string, executableBytes: number, executableSha256: string): Buffer {
+  return Buffer.from(`${JSON.stringify({
+    schemaVersion: 1,
+    version,
+    origin: "https://nodejs.org",
+    signedManifest: {
+      sha256: "b".repeat(64),
+      cleartextSha256: "c".repeat(64)
+    },
+    keyring: {
+      sha256: "d".repeat(64),
+      allowedPrimaryFingerprints: ["E".repeat(40)]
+    },
+    targets: {
+      [target]: {
+        sha256: "a".repeat(64),
+        executableBytes,
+        executableSha256
+      }
+    }
+  }, null, 2)}\n`);
 }
