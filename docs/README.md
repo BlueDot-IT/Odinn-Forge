@@ -93,6 +93,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
 - [Bounded Microsoft Graph reads](microsoft-graph-read.md) — one-account,
   read-only email and calendar access with a fixed origin, credential
   references, bounded live content, and no-replay durable evidence.
+- [Authenticated remote-node reads](remote-node-read.md) — explicitly routed,
+  TLS-verified status and diagnostics with no DNS or mutation surface.
 
 ## Advanced capability notes
 

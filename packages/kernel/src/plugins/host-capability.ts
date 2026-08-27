@@ -4,6 +4,7 @@ import type { ComputerScreenProvider } from "../computer.ts";
 import type { CalendarReadProvider } from "../calendar.ts";
 import type { EmailReadProvider } from "../email.ts";
 import type { GitHubReadClient } from "../github.ts";
+import type { RemoteNodeReadClient } from "../remote-node.ts";
 import { validatePluginManifest, type PluginManifest } from "../plugin-contracts.ts";
 import { toolSafetyDescriptor } from "../tool-safety.ts";
 
@@ -21,6 +22,7 @@ export interface HostCapabilityPluginContext {
   readonly calendarReadProvider?: CalendarReadProvider;
   readonly emailReadProvider?: EmailReadProvider;
   readonly githubReadClient?: GitHubReadClient;
+  readonly remoteNodeReadClient?: RemoteNodeReadClient;
 }
 
 export interface HostCapabilityPlugin {

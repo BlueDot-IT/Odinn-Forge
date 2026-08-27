@@ -105,6 +105,7 @@ export type {
   GatewayStatusSnapshotV1,
   GitHubReadDiagnosticV1,
   MicrosoftGraphReadDiagnosticV1,
+  RemoteNodeReadDiagnosticV1,
   JobTotalsV1,
   PendingApprovalSummaryV1,
   PlatformSummaryV1,

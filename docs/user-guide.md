@@ -198,6 +198,9 @@ allowlist; see [Bounded GitHub reads](github-read.md). Optional Microsoft Graph
 email and calendar reads send authenticated requests only to the fixed Graph
 origin for one configured account and selected resources; see
 [Bounded Microsoft Graph reads](microsoft-graph-read.md).
+Optional [authenticated remote-node reads](remote-node-read.md) send only the
+two fixed status/diagnostics requests to exact operator-configured HTTPS
+authorities and pinned addresses.
 
 Model providers receive the prompts, recalled context, and tool results sent to their configured API. Websites receive normal browser or fetch traffic. Imported skills, MCP servers, extensions, and browser pages are untrusted input. Review them before enabling them and never post `.odinn`, OAuth files, gateway tokens, browser profiles, or raw diagnostic bundles publicly. External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
@@ -217,7 +220,7 @@ The diagnostic report includes the Odinn version and commit, platform and Node
 version, provider mode without credentials, experimental flags, audit status,
 pending approvals, path-free Chromium candidate and configuration state,
 browser recovery, job counts, and optional path-free GitHub and Microsoft Graph
-read health. A
+read health, and credential-safe remote-node readiness counts. A
 configured `ODINN_CHROMIUM_PATH` is reported as unverified without dereferencing
 or executing it; browser execution performs
 the normal policy-bound validation only when a browser tool is requested. If no
