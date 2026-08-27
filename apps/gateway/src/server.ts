@@ -1206,29 +1206,30 @@ export async function createGatewayServer(options: any = {}) {
         throw new GatewayError(409, "the originating job is no longer awaiting approval");
       }
       if (linkedJob) {
+        const requestSignal = signal;
         let result: unknown;
         try {
           result = await supervisor.runApproval(linkedJob.id, async ({ signal: approvalSignal, job, markDispatched }) => {
             claimedLinkedJob = job;
-            const continuationSignal = signal
-              ? AbortSignal.any([signal, approvalSignal])
+            const signal = requestSignal
+              ? AbortSignal.any([requestSignal, approvalSignal])
               : approvalSignal;
-            assertGatewayRequestActive(continuationSignal);
+            assertGatewayRequestActive(signal);
             await testHooks?.afterApprovalJobClaimed?.({ approvalId: id, jobId: job.id });
             let pending: any;
             try {
-              pending = await claimGatewayApproval(id, continuationSignal);
+              pending = await claimGatewayApproval(id, signal);
             } catch (error) {
               throw approvalSettlementError(error);
             }
-            assertGatewayRequestActive(continuationSignal);
+            assertGatewayRequestActive(signal);
             if (!pending) throw new GatewayError(404, "approval not found or expired");
             if (pending.type === "skill-lifecycle") {
               markDispatched();
-              await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal: continuationSignal });
-              assertGatewayRequestActive(continuationSignal);
+              await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
+              assertGatewayRequestActive(signal);
               return skillLifecycle.applyApproved(id, pending, {
-                signal: continuationSignal,
+                signal,
                 __testOnlyAfterLockAcquired: testHooks?.afterControlPlaneMutationLockAcquired
                   ? () => testHooks.afterControlPlaneMutationLockAcquired!({ surface: "skill.approved-enable" })
                   : undefined
@@ -1237,10 +1238,10 @@ export async function createGatewayServer(options: any = {}) {
             const linkedTask = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task)
               ? job.payload.task as Record<string, unknown>
               : undefined;
-            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask, continuationSignal);
+            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask, signal);
             markDispatched();
-            await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal: continuationSignal });
-            assertGatewayRequestActive(continuationSignal);
+            await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
+            assertGatewayRequestActive(signal);
             return isolatedTaskExecutor({
               approvalId: id,
               approvalRunId: continuation.runId,
@@ -1252,7 +1253,7 @@ export async function createGatewayServer(options: any = {}) {
                 actor: continuation.actor,
                 reason: "explicit user approval"
               }
-            }, { signal: continuationSignal, job });
+            }, { signal, job });
           });
         } catch (error) {
           if (!claimedLinkedJob) {
