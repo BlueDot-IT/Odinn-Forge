@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
 import { createRunId, durableEmailProviderIdentifier, isCalendarTool, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
-export { isLiveOnlyAutomationTool, projectDurableJobPayload } from "@odinn/protocol";
+export { isLiveOnlyAutomationTool, projectDurableJobPayload, projectDurableToolInput } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
@@ -987,6 +987,10 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
       get target() {
         if (!active) throw new Error("email provider is closed");
         return selectedEmailReadProvider.target;
+      },
+      get accountMetadataTrust() {
+        if (!active) throw new Error("email provider is closed");
+        return selectedEmailReadProvider.accountMetadataTrust;
       },
       accounts(request) {
         if (!active) throw new Error("email provider is closed");
@@ -2302,6 +2306,7 @@ async function executeTaskThroughAdmission({
         stepId: ledgerStep?.stepId,
         toolName: request.tool,
         input: request.input,
+        durableInput: durableRequestInput,
         policy: { id: policy.id, version: 1, invariants: policy.invariants },
         workspaceRoot: runLedger.workspaceRoot
       });

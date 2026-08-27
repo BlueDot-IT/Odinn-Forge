@@ -19,6 +19,7 @@ import {
   materializeHostCapabilityPlugin,
   normalizeMicrosoftGraphReadConfig,
   runTask,
+  SqliteJobStore,
   SqliteWorkflowStore,
   calendarReadHostCapabilityPlugin,
   emailReadHostCapabilityPlugin,
@@ -27,7 +28,7 @@ import {
 } from "../packages/kernel/src/index.ts";
 import { CronStore } from "../apps/gateway/src/server.ts";
 import { createDefaultPolicy, evaluateTaskPolicy } from "../packages/policy/src/index.ts";
-import { projectDurableToolInput, projectDurableToolOutput } from "../packages/protocol/src/index.ts";
+import { projectDurableToolInput, projectDurableToolOutput, workflowDefinitionDigest } from "../packages/protocol/src/index.ts";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const accountId = "11111111-1111-4111-8111-111111111111";
@@ -166,6 +167,37 @@ test("Microsoft Graph adapter exposes fixed-origin bounded email and calendar re
   assert.equal(requests[1]?.headers["consistency-level"], "eventual");
   assert.equal(requests[3]?.url.searchParams.get("$filter"), "conversationId eq 'conversation-1'");
   assert.equal(requests[5]?.url.searchParams.get("$top"), "2");
+});
+
+test("the built-in Graph registry preserves external-untrusted account metadata trust", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-graph-registry-trust-"));
+  const stateDir = join(workspace, ".odinn");
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const ledger = createRunLedger({ stateDir, workspaceRoot: workspace });
+  const registry = createBuiltInRegistry({
+    workspaceRoot: workspace,
+    stateDir,
+    auditStore,
+    config: { integrations: { microsoftGraph: config }, runLedger: ledger },
+    microsoftGraphReadAdapter: adapter()
+  });
+  try {
+    const policy = createDefaultPolicy({ allowedCapabilities: ["email.read", "network.access", "secret.reference.use"] });
+    const result = await runTask({
+      task: { id: "graph-account-trust", tool: "email.accounts", input: {}, actor: "graph-test" },
+      auditStore,
+      registry,
+      runLedger: ledger,
+      policy
+    });
+    assert.equal(result.output.contentTrust, "external-untrusted");
+    assert.equal(result.output.accounts[0]?.address, "operator@example.test");
+  } finally {
+    registry.close();
+    ledger.close();
+    auditStore.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
 
 test("Microsoft Graph configuration and diagnostics contain only references, booleans, and counts", () => {
@@ -385,6 +417,79 @@ test("Microsoft Graph content is live-only and restart replay remains digest-onl
   }
 });
 
+test("Sentinel evaluates live Graph input while persisting only the tool-aware projection", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-sentinel-projection-"));
+  const stateDir = join(temporary, "state");
+  const backup = join(temporary, "backup");
+  const querySentinel = "SENTINEL_GRAPH_POLICY_QUERY_64c18f";
+  let observedSearch: string | undefined;
+  let auditStore: ReturnType<typeof createAuditStore> | undefined;
+  let ledger: ReturnType<typeof createRunLedger> | undefined;
+  let registry: ReturnType<typeof createBuiltInRegistry> | undefined;
+  try {
+    await initializeBackupCompatibleState(stateDir);
+    auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    registry = createBuiltInRegistry({
+      workspaceRoot: temporary,
+      stateDir,
+      auditStore,
+      config: { integrations: { microsoftGraph: config }, runLedger: ledger },
+      microsoftGraphReadAdapter: createMicrosoftGraphReadAdapter(config, {
+        environment,
+        resolveNetworkAddresses: publicResolver,
+        transport: async (request) => {
+          observedSearch = request.url.searchParams.get("$search") ?? undefined;
+          return jsonResponse({ value: [] });
+        }
+      })
+    });
+    const policy = {
+      ...createDefaultPolicy({ allowedCapabilities: ["email.read", "network.access", "secret.reference.use"] }),
+      invariants: [{ id: "deny-unrelated-command", type: "command.deny-pattern", values: ["rm -rf"], enforcement: "block" }]
+    };
+    const result = await runTask({
+      task: {
+        id: "graph-policy-projection",
+        tool: "email.search",
+        input: { accountId, query: querySentinel, limit: 1 },
+        actor: "graph-test"
+      },
+      auditStore,
+      registry,
+      runLedger: ledger,
+      policy
+    });
+    assert.equal(result.ok, true);
+    assert.equal(observedSearch, JSON.stringify(querySentinel), "the provider must receive the live query");
+    const row = ledger.database.db.prepare("SELECT input_json FROM policy_evaluations WHERE run_id=?").get("graph-policy-projection") as { input_json: string };
+    const durableInput = JSON.parse(row.input_json);
+    assert.equal(durableInput.toolName, "email.search");
+    assert.deepEqual(Object.keys(durableInput.input).sort(), ["limit", "queryBytes", "queryDigest", "targetDigest"]);
+    assert.doesNotMatch(row.input_json, new RegExp(querySentinel, "u"));
+    assert.equal(ledger.verify("graph-policy-projection").valid, true);
+
+    registry.close();
+    registry = undefined;
+    ledger.close();
+    ledger = undefined;
+    auditStore.close();
+    auditStore = undefined;
+    await createStateBackup(stateDir, backup, {
+      applicationVersion: "1.0.0",
+      applicationCommit: "graph-sentinel-projection"
+    });
+    for (const payload of [await treePayload(stateDir), await treePayload(backup)]) {
+      assert.equal(payload.includes(querySentinel), false, "Graph policy input crossed a durable state boundary");
+    }
+  } finally {
+    registry?.close();
+    ledger?.close();
+    auditStore?.close();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("live-only email and calendar targets never enter workflow, cron, SQLite, or ordinary backups", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-durable-admission-"));
   const stateDir = join(temporary, "state");
@@ -458,6 +563,192 @@ test("live-only email and calendar targets never enter workflow, cron, SQLite, o
     });
     for (const payload of [await treePayload(stateDir), await treePayload(backup)]) {
       for (const sentinel of sentinels) assert.equal(payload.includes(sentinel), false, `durable state contains ${sentinel}`);
+    }
+  } finally {
+    ledger?.close();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("startup quarantines immediate-parent cron, workflow, and runtime-job Graph inputs before backup", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-graph-live-only-upgrade-"));
+  const stateDir = join(temporary, "state");
+  const backup = join(temporary, "ordinary-backup");
+  const sentinels = {
+    account: "SENTINEL_LEGACY_GRAPH_ACCOUNT_2f81",
+    message: "SENTINEL_LEGACY_GRAPH_MESSAGE_4ac2",
+    query: "SENTINEL_LEGACY_GRAPH_QUERY_8d17",
+    result: "SENTINEL_LEGACY_GRAPH_RESULT_4bb9"
+  };
+  let ledger: ReturnType<typeof createRunLedger> | undefined;
+  try {
+    await initializeBackupCompatibleState(stateDir);
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    const workflows = new SqliteWorkflowStore(ledger.database);
+    const safeDefinitionBase = {
+      schemaVersion: 1 as const,
+      id: "legacy_graph_workflow",
+      revision: 1,
+      name: "Immediate-parent fixture",
+      steps: [{
+        id: "read_mail",
+        actionRef: "text.echo",
+        dependsOn: [],
+        input: { text: "safe fixture" },
+        retrySafety: "retry-safe" as const,
+        maxAttempts: 1,
+        requiresApproval: false
+      }]
+    };
+    workflows.create({
+      schemaVersion: 1,
+      runId: "legacy_graph_workflow_run",
+      principalId: "operator",
+      idempotencyKey: "legacy_graph_workflow_run",
+      definition: { ...safeDefinitionBase, definitionDigest: workflowDefinitionDigest(safeDefinitionBase) },
+      input: {}
+    });
+    const legacyDefinitionBase = {
+      ...safeDefinitionBase,
+      name: "Immediate-parent Graph workflow",
+      steps: [{
+        ...safeDefinitionBase.steps[0],
+        actionRef: "email.read",
+        input: { accountId: sentinels.account, messageId: sentinels.message, query: sentinels.query }
+      }]
+    };
+    const legacyDefinitionDigest = workflowDefinitionDigest(legacyDefinitionBase);
+    const database = ledger.database.db;
+    database.prepare("UPDATE workflow_definitions SET definition_digest=?,definition_json=? WHERE id=? AND revision=?").run(
+      legacyDefinitionDigest,
+      JSON.stringify({ ...legacyDefinitionBase, definitionDigest: legacyDefinitionDigest }),
+      legacyDefinitionBase.id,
+      legacyDefinitionBase.revision
+    );
+    database.prepare("UPDATE workflow_runs SET definition_digest=?,input_json=?,input_digest=?,recovery_input_available=1 WHERE run_id=?").run(
+      legacyDefinitionDigest,
+      JSON.stringify({ query: sentinels.query }),
+      "legacy-run-input-digest",
+      "legacy_graph_workflow_run"
+    );
+    database.prepare("UPDATE workflow_steps SET action_ref='email.read',input_json=?,input_digest=?,recovery_input_available=1,result_json=?,result_digest=? WHERE run_id=? AND step_id=?").run(
+      JSON.stringify({ accountId: sentinels.account, messageId: sentinels.message, query: sentinels.query }),
+      "legacy-step-input-digest",
+      JSON.stringify({ type: "email.read", bodyText: sentinels.result, messageId: sentinels.message }),
+      "legacy-step-result-digest",
+      "legacy_graph_workflow_run",
+      "read_mail"
+    );
+
+    const runtimeJobs = new SqliteJobStore(ledger);
+    await runtimeJobs.create({
+      id: "legacy_graph_runtime_job",
+      status: "queued",
+      payload: { task: { id: "legacy_graph_runtime_job", tool: "text.echo", input: { text: "safe fixture" } } },
+      attempts: 0,
+      timeoutMs: 120_000,
+      retrySafe: true,
+      requestHash: "legacy-runtime-request-hash"
+    });
+    await runtimeJobs.create({
+      id: "current_safe_graph_runtime_job",
+      status: "completed",
+      payload: { task: { id: "current_safe_graph_runtime_job", tool: "email.read", input: { accountId: sentinels.account, messageId: sentinels.message } } },
+      attempts: 1,
+      timeoutMs: 120_000,
+      retrySafe: false,
+      requestHash: "current-safe-runtime-request-hash",
+      result: {
+        id: "current_safe_graph_runtime_job",
+        tool: "email.read",
+        capability: "email.read",
+        capabilities: ["email.read", "network.access", "secret.reference.use"],
+        ok: true,
+        output: { type: "email.read", accountId: sentinels.account, messageId: sentinels.message, bodyText: sentinels.result }
+      }
+    });
+    database.prepare("UPDATE runtime_jobs SET payload_json=?,payload_recoverable=1,retry_safe=1,result_json=? WHERE id=?").run(
+      JSON.stringify({ task: { id: "legacy_graph_runtime_job", tool: "email.search", input: { accountId: sentinels.account, query: sentinels.query } } }),
+      JSON.stringify({ output: { type: "email.search", messages: [{ subject: sentinels.result, messageId: sentinels.message }] } }),
+      "legacy_graph_runtime_job"
+    );
+
+    await writeFile(join(stateDir, "jobs.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      jobs: {
+        legacy_graph_file_job: {
+          schemaVersion: 1,
+          id: "legacy_graph_file_job",
+          status: "queued",
+          payload: { task: { id: "legacy_graph_file_job", tool: "calendar.read", input: { accountId: sentinels.account, calendarId: sentinels.query, eventId: sentinels.message } } },
+          attempts: 0,
+          timeoutMs: 120_000,
+          retrySafe: true,
+          createdAt: "2026-08-26T12:00:00.000Z",
+          updatedAt: "2026-08-26T12:00:00.000Z"
+        }
+      }
+    })}\n`, { mode: 0o600 });
+    await runtimeJobs.importLegacy();
+    await writeFile(join(stateDir, "cron-jobs.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      jobs: [{
+        id: "legacy_graph_cron",
+        name: "Immediate-parent Graph cron",
+        schedule: "0 9 * * 1-5",
+        timezone: "UTC",
+        enabled: true,
+        tool: "email.search",
+        input: { accountId: sentinels.account, query: sentinels.query }
+      }]
+    })}\n`, { mode: 0o600 });
+    ledger.close();
+    ledger = undefined;
+
+    const migration = await ensureStateCompatibility(stateDir, {
+      applicationVersion: "1.1.2",
+      applicationCommit: "graph-live-only-quarantine"
+    });
+    assert.ok(migration?.backupLocation, "the schema-v1 cron fixture must create a protected upgrade backup");
+
+    const cronState = JSON.parse(await readFile(join(stateDir, "cron-jobs.json"), "utf8"));
+    assert.equal(cronState.schemaVersion, 2);
+    assert.equal(cronState.jobs[0].enabled, false);
+    assert.equal(cronState.jobs[0].liveOnlyQuarantine.code, "LIVE_ONLY_AUTOMATION_INPUT_REMOVED");
+    assert.equal(typeof cronState.jobs[0].input.targetDigest, "string");
+
+    ledger = createRunLedger({ stateDir, workspaceRoot: temporary });
+    const upgradedWorkflows = new SqliteWorkflowStore(ledger.database);
+    assert.equal(upgradedWorkflows.get("legacy_graph_workflow_run")?.status, "needs-review");
+    assert.equal(upgradedWorkflows.claimNext("legacy_graph_workflow_run"), undefined);
+    const workflowStep = ledger.database.db.prepare("SELECT action_ref,recovery_input_available,error_code FROM workflow_steps WHERE run_id=? AND step_id=?").get(
+      "legacy_graph_workflow_run",
+      "read_mail"
+    ) as Record<string, unknown>;
+    assert.equal(workflowStep.action_ref, "automation.quarantined");
+    assert.equal(workflowStep.recovery_input_available, 0);
+    assert.equal(workflowStep.error_code, "WORKFLOW_LIVE_INPUT_QUARANTINED");
+    const upgradedJobs = new SqliteJobStore(ledger, { legacyPath: join(stateDir, "jobs.json") });
+    assert.equal((await upgradedJobs.get("legacy_graph_runtime_job"))?.status, "needs-review");
+    assert.equal((await upgradedJobs.get("legacy_graph_runtime_job"))?.recoveryInputAvailable, false);
+    assert.equal((await upgradedJobs.get("current_safe_graph_runtime_job"))?.status, "completed");
+    await upgradedJobs.importLegacy();
+    await upgradedJobs.recover();
+    const legacyFileJob = await upgradedJobs.get("legacy_graph_file_job");
+    assert.equal(legacyFileJob?.status, "needs-review");
+    assert.equal(legacyFileJob?.recoveryInputAvailable, false);
+    ledger.close();
+    ledger = undefined;
+
+    await createStateBackup(stateDir, backup, {
+      applicationVersion: "1.1.2",
+      applicationCommit: "graph-live-only-quarantine"
+    });
+    for (const rootPath of [stateDir, migration.backupLocation!, backup]) {
+      const payload = await treePayload(rootPath);
+      for (const sentinel of Object.values(sentinels)) {
+        assert.equal(payload.includes(sentinel), false, `${rootPath} retained ${sentinel}`);
+      }
     }
   } finally {
     ledger?.close();

@@ -93,6 +93,10 @@ item counts, and categorical outcomes—not addresses, subjects, snippets,
 bodies, attendee names, locations, provider identifiers, or credentials. After
 a restart, an idempotent task record reports that live content is unavailable;
 it does not replay a provider request or reconstruct private content.
+Policy invariants still evaluate the live authorized request, but Sentinel is
+given a separate tool-aware durable projection. Its SQLite evaluation rows and
+ledger events therefore retain the same digest-and-count boundary rather than
+the query, provider targets, or time window.
 
 These tools are deliberately unavailable as durable workflow steps or cron
 targets. Workflow definitions and cron schedules are ordinary backed-up state,
@@ -102,6 +106,15 @@ instead. Existing completed email runs from the immediately preceding durable
 format remain recognizable for content-unavailable replay after upgrade; that
 compatibility check is limited to an exact completed-run binding and never
 replays Graph or writes a legacy identifier projection.
+
+Startup also handles state written by the immediately preceding build before
+this live-only admission rule existed. Before compatibility migration can make
+a backup, Odinn replaces affected cron and legacy-job inputs with tool-aware
+digest projections, disables and marks those schedules for review, tombstones
+affected workflow input/result content, and marks affected workflow/runtime
+jobs non-recoverable and `needs-review`. SQLite secure deletion, vacuum, and WAL
+truncation run before the backup boundary. The original query and Graph target
+cannot be recovered through Odinn; the operator must submit a fresh live read.
 
 Reads have no provider-side effect to roll back. Cancellation, timeout, DNS or
 TLS failure, malformed data, credential loss, or restart fails closed. A later
@@ -115,8 +128,9 @@ they never contact Microsoft or load a real credential. They cover
 configuration, capability admission, fixed-origin and account confinement,
 DNS pinning, redirects, bounds, timeout/concurrency behavior, hostile provider
 responses, provider-specific untrusted account metadata, durable
-workflow/cron refusal, whole-state and ordinary-backup sentinel scans, exact
-immediate-base upgrade replay, durable redaction, and restart no-replay
-behavior. Live service
+workflow/cron refusal, policy-invariant projections, immediate-parent
+cron/workflow/runtime-job quarantine, SQLite/WAL/full-state and ordinary-backup
+sentinel scans, exact immediate-base upgrade replay, durable redaction, and
+restart no-replay behavior. Live service
 availability, tenant consent, account permissions, throttling, and conditional
 access remain provider-dependent acceptance gates.

@@ -9,6 +9,7 @@ import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SC
 import { withStateMutationLock } from "../state-mutation.ts";
 import { auditFilenameFromConfig } from "./audit-path.ts";
 import { relocateLegacyBrowserProfiles } from "../browser-profile-state.ts";
+import { quarantineLegacyLiveOnlyAutomationState } from "./live-only-automation.ts";
 
 const MARKER_SCHEMA_VERSION = 1;
 const MANIFEST_FILENAME = "state-schema.json";
@@ -228,7 +229,18 @@ export async function ensureStateCompatibility(
   return withStateMutationLock(stateRoot, async () => {
     await assertNoPendingSandboxRecovery(stateRoot, "migration");
     recoveredInterruptedMigration = await recoverInterruptedStateMigrationUnlocked(stateRoot);
-    const plan = await planStateMigrationUnlocked(stateRoot, options);
+    if (await exists(stateRoot)) {
+      await validatePhysicalTree(stateRoot);
+    }
+    let plan = await planStateMigrationUnlocked(stateRoot, options);
+    if (plan.blockingIncompatibilities.length) throw new Error(plan.blockingIncompatibilities.join("; "));
+    if (await exists(stateRoot)) {
+      await quarantineLegacyLiveOnlyAutomationState(stateRoot);
+      // Quarantine can rewrite supported state before a migration backup is
+      // created. Reinspect that exact tree, but never mutate state whose
+      // schema is newer than this application understands.
+      plan = await planStateMigrationUnlocked(stateRoot, options);
+    }
     if (plan.blockingIncompatibilities.length) throw new Error(plan.blockingIncompatibilities.join("; "));
     if (!plan.steps.length) return undefined;
     return applyStateMigrationPlanUnlocked(plan, { ...options, recoveredInterruptedMigration });

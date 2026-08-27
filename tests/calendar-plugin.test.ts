@@ -81,6 +81,7 @@ test("calendar read tools are bounded, scoped, live-only, and capability declare
   }) as Record<string, unknown>;
   const durableOutput = projectDurableToolOutput("calendar.read", read) as Record<string, unknown>;
   assert.deepEqual(Object.keys(durableInput).sort(), ["limit", "targetDigest"]);
+  assert.deepEqual(projectDurableToolInput("calendar.events", durableInput), durableInput);
   assert.match(String(durableInput.targetDigest), /^sha256:/u);
   assert.match(String(durableOutput.payloadDigest), /^sha256:/u);
   assert.equal(durableOutput.contentUnavailableOnReplay, true);

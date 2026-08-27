@@ -435,14 +435,23 @@ function projectEmailOutput(toolName: string, value: unknown): unknown {
 function projectCalendarInput(toolName: string, value: unknown): JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const source = value as JsonObject;
-  const target = [toolName, ...["accountId", "calendarId", "eventId"].map((key) => hasOwn(source, key)
-    ? hashCalendarProviderIdentifier(source[key], `calendar input ${key}`)
-    : null)];
+  let hasLiveTarget = false;
+  const target = [toolName, ...["accountId", "calendarId", "eventId"].map((key) => {
+    if (!hasOwn(source, key)) return null;
+    hasLiveTarget = true;
+    return hashCalendarProviderIdentifier(source[key], `calendar input ${key}`);
+  })];
   for (const key of ["start", "end"] as const) {
     const timestamp = boundedEmailString(source[key], 64);
+    if (timestamp !== undefined) hasLiveTarget = true;
     target.push(timestamp === undefined ? null : sha256Reference(timestamp));
   }
-  const projected: JsonObject = { targetDigest: sha256Reference(JSON.stringify(target)) };
+  const existingTargetDigest = boundedEmailString(source.targetDigest, 128);
+  const projected: JsonObject = {
+    targetDigest: hasLiveTarget
+      ? sha256Reference(JSON.stringify(target))
+      : existingTargetDigest ?? sha256Reference(JSON.stringify(target))
+  };
   if (Number.isSafeInteger(source.limit)) projected.limit = source.limit;
   return projected;
 }

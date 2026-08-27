@@ -8,6 +8,7 @@ import { Unzip, UnzipInflate, zipSync } from "fflate";
 import { createRunLedger, redact } from "./run-ledger.ts";
 import { ProofVerifier, proofEvidenceView } from "./proof.ts";
 import { evaluatePolicyInvariants, normalizePolicyInvariants } from "@odinn/policy";
+import { projectDurableToolInput } from "@odinn/protocol";
 import { ODINN_ERROR_CODES, OdinnRuntimeError } from "./runtime-errors.ts";
 import { capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins } from "./plugins/index.ts";
 import { sanitizedChildEnvironment } from "./environment.ts";
@@ -384,7 +385,7 @@ export class ProofEngine {
 export class Sentinel {
   [key: string]: any;
   constructor({ ledger, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
-  evaluate({ runId, stepId, toolName, input, policy, workspaceRoot = currentWorkingDirectory() }: AnyRecord) {
+  evaluate({ runId, stepId, toolName, input, durableInput = projectDurableToolInput(toolName, input), policy, workspaceRoot = currentWorkingDirectory() }: AnyRecord) {
     const normalizedPolicy = validatePolicy(policy);
     const policyId = policy.id ?? `policy_${runId}_${hash(json(redact(policy))).slice(0, 16)}`;
     const evaluations = evaluatePolicyInvariants({
@@ -392,7 +393,7 @@ export class Sentinel {
       request: { tool: toolName, input },
       workspaceRoot
     }).map((result) => {
-      return { id: randomUUID(), runId, stepId, policyId, ...result, input: redact({ toolName, input }), createdAt: now() };
+      return { id: randomUUID(), runId, stepId, policyId, ...result, input: redact({ toolName, input: durableInput }), createdAt: now() };
     });
     this.ledger.database.transaction((db: AnyRecord) => {
       db.prepare("INSERT OR IGNORE INTO policies(id, run_id, policy_json, created_at) VALUES (?, ?, ?, ?)").run(policyId, runId, json(redact(policy)), now());
