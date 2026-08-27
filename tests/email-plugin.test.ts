@@ -86,7 +86,9 @@ test("email read tools are bounded, account-scoped, and redact durable content",
   const serialized = JSON.stringify(durableOutput);
   const durableAccounts = projectDurableToolOutput("email.accounts", accounts) as Record<string, any>;
   assert.equal(durableOutput.contentUnavailableOnReplay, true);
-  assert.match(durableOutput.bodyDigest, /^sha256:/u);
+  assert.match(durableOutput.targetDigest, /^sha256:/u);
+  assert.match(durableOutput.payloadDigest, /^sha256:/u);
+  assert.equal(typeof durableOutput.payloadBytes, "number");
   assert.equal("bodyText" in durableOutput, false);
   assert.equal("subject" in durableOutput, false);
   assert.equal("from" in durableOutput, false);
@@ -98,12 +100,12 @@ test("email read tools are bounded, account-scoped, and redact durable content",
 test("email read resources bind provider generation and account identity", async () => {
   const tools = materializeHostCapabilityPlugin(emailReadHostCapabilityPlugin, context(provider()));
   assert.deepEqual(tools.get("email.search")?.resourceForInput({ accountId: "account-1" }), {
-    providerId: target.providerId,
-    generation: target.generation,
-    accountId: "account-1"
+    providerDigest: hashEmailProviderIdentifier(target.providerId, "email provider target.providerId", 128),
+    generationDigest: hashEmailProviderIdentifier(target.generation, "email provider target.generation", 128),
+    accountDigest: hashEmailProviderIdentifier("account-1")
   });
   const piiResource = tools.get("email.search")?.resourceForInput?.({ accountId: "operator@example.test" });
-  assert.equal(piiResource?.accountId, hashEmailProviderIdentifier("operator@example.test"));
+  assert.equal(piiResource?.accountDigest, hashEmailProviderIdentifier("operator@example.test"));
   assert.throws(
     () => tools.get("email.search")?.resourceForInput({ accountId: "unsafe\u0000identifier" }),
     /bounded visible provider identifier/u
@@ -150,7 +152,8 @@ test("email provider target rotation is rejected and close revokes the seam", as
     const tool = registry.get("email.read");
     assert.equal(typeof tool?.execute, "function");
     assert.equal(evaluateTaskPolicy({ policy: createDefaultPolicy(), request: { tool: "email.read", input: { accountId: "account-1", messageId: "message-1" } }, tool }).allowed, false);
-    assert.equal(evaluateTaskPolicy({ policy: createDefaultPolicy({ allowedCapabilities: ["email.read", "network.access"] }), request: { tool: "email.read", input: { accountId: "account-1", messageId: "message-1" } }, tool }).allowed, true);
+    assert.equal(evaluateTaskPolicy({ policy: createDefaultPolicy({ allowedCapabilities: ["email.read", "network.access"] }), request: { tool: "email.read", input: { accountId: "account-1", messageId: "message-1" } }, tool }).allowed, false);
+    assert.equal(evaluateTaskPolicy({ policy: createDefaultPolicy({ allowedCapabilities: ["email.read", "network.access", "secret.reference.use"] }), request: { tool: "email.read", input: { accountId: "account-1", messageId: "message-1" } }, tool }).allowed, true);
     assert.deepEqual(EMAIL_READ_PLUGIN_MANIFEST.tools.map((entry) => entry.name), ["email.accounts", "email.search", "email.read", "email.thread"]);
     registry.close();
     assert.equal(closed, true);
@@ -179,14 +182,13 @@ test("email durable projections hash provider identifiers and reject unsafe valu
     accounts: [{ accountId, provider: "gmail", status: "ready" }]
   }) as Record<string, any>;
 
-  assert.equal(input.accountId, hashEmailProviderIdentifier(accountId));
-  assert.equal(input.messageId, hashEmailProviderIdentifier(messageId));
-  assert.equal(output.providerId, hashEmailProviderIdentifier("provider-for-operator@example.test"));
-  assert.equal(output.accountId, hashEmailProviderIdentifier(accountId));
-  assert.equal(output.threadId, hashEmailProviderIdentifier(threadId));
-  assert.equal(output.messages[0].messageId, hashEmailProviderIdentifier(messageId));
-  assert.equal(output.messages[0].threadId, hashEmailProviderIdentifier(threadId));
-  assert.equal(accounts.accounts[0].accountId, hashEmailProviderIdentifier(accountId));
+  assert.deepEqual(Object.keys(input), ["targetDigest"]);
+  assert.match(input.targetDigest, /^sha256:/u);
+  assert.match(output.targetDigest, /^sha256:/u);
+  assert.match(output.payloadDigest, /^sha256:/u);
+  assert.equal(output.messageCount, 1);
+  assert.match(accounts.targetDigest, /^sha256:/u);
+  assert.equal(accounts.accountCount, 1);
   assert.doesNotMatch(JSON.stringify({ input, output, accounts }), /operator@example\.test/u);
   assert.equal(durableEmailProviderIdentifier("account-1"), "account-1");
   assert.equal(durableEmailProviderIdentifier("message-1"), "message-1");
@@ -203,6 +205,6 @@ test("email durable projections hash provider identifiers and reject unsafe valu
       messageId: 42,
       threadId
     }),
-    /email message\.messageId must be a bounded visible provider identifier/u
+    /email email\.read output\.messageId must be a bounded visible provider identifier/u
   );
 });

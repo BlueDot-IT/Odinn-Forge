@@ -5,14 +5,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
-import { createRunId, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
+import { createRunId, isCalendarTool, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput } from "@odinn/protocol";
 export { projectDurableJobPayload } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isAllowedCredentialEnvironmentKey, isCredentialEnvironmentName, isPhysicalPathInside, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile, ParsedEnvironmentFiles } from "./environment.ts";
-export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 export type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool, LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
@@ -25,10 +25,13 @@ import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryC
 import { approvalActionForExecution, createApprovalStore, isApprovalStoreContentionError, normalizeApprovalExecutionInput } from "./approvals.ts";
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
 import { closeBrowserManagers } from "./browser.ts";
-import { browserHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+import { browserHostCapabilityPlugin, calendarReadHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+import type { CalendarReadProvider } from "./calendar.ts";
 import type { EmailReadProvider } from "./email.ts";
 import { createGitHubReadClient, normalizeGitHubReadConfig } from "./github.ts";
 import type { GitHubReadClient } from "./github.ts";
+import { createMicrosoftGraphReadAdapter, normalizeMicrosoftGraphReadConfig } from "./microsoft-graph.ts";
+import type { MicrosoftGraphReadAdapter } from "./microsoft-graph.ts";
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, ensureMainAgent, loadAgent, type AgentExecutionBinding } from "./agents.ts";
@@ -65,6 +68,10 @@ export { captureComputerScreen } from "./computer.ts";
 export type { ComputerScreenCaptureRequest, ComputerScreenProvider, ComputerScreenResult, ComputerScreenTarget } from "./computer.ts";
 export { listEmailAccounts, readEmail, searchEmail, threadEmail } from "./email.ts";
 export type { EmailAccount, EmailAttachment, EmailMessage, EmailMessageSummary, EmailProviderHealth, EmailProviderTarget, EmailReadProvider, EmailSearchResponse, EmailThreadResponse } from "./email.ts";
+export { listCalendarEvents, listCalendars, readCalendarEvent } from "./calendar.ts";
+export type { CalendarEvent, CalendarEventPage, CalendarEventSummary, CalendarProviderHealth, CalendarProviderTarget, CalendarReadProvider, CalendarSummary } from "./calendar.ts";
+export { createMicrosoftGraphReadAdapter, diagnoseMicrosoftGraphReadIntegration, normalizeMicrosoftGraphReadConfig } from "./microsoft-graph.ts";
+export type { MicrosoftGraphHttpRequest, MicrosoftGraphHttpResponse, MicrosoftGraphHttpTransport, MicrosoftGraphReadAdapter, MicrosoftGraphReadConfig, MicrosoftGraphReadDiagnostic, MicrosoftGraphReadTarget, MicrosoftGraphResource } from "./microsoft-graph.ts";
 export { DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, normalizeSandboxConfig, summarizeSandboxRisk, validateSandboxConfig } from "./sandbox-config.ts";
 export type { SandboxConfig, SandboxConfigInput, SandboxRiskSummary } from "./sandbox-config.ts";
 export { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, attestContainerConfiguration, buildNetworkDeniedOciArgs, compileSandboxProfile, detectOciBackend, probeOciBackend, reconcileSandboxRecovery, selectOciBackend, validateDigestPinnedOciImage, validateTrustedOciExecutable } from "./sandbox-backend.ts";
@@ -139,7 +146,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, githubReadClient }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, calendarReadProvider, enableCalendar = false, githubReadClient, microsoftGraphReadAdapter }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -927,6 +934,20 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
     });
     closeGitHubRead = () => { active = false; };
   }
+  const microsoftGraphConfig = normalizeMicrosoftGraphReadConfig(config?.integrations?.microsoftGraph ?? {});
+  const configuredMicrosoftGraph: MicrosoftGraphReadAdapter | undefined = microsoftGraphConfig.enabled
+    ? microsoftGraphReadAdapter ?? createMicrosoftGraphReadAdapter(microsoftGraphConfig, { resolveNetworkAddresses })
+    : undefined;
+  if (configuredMicrosoftGraph?.emailProvider && enableEmail === true && emailReadProvider) {
+    throw new Error("Microsoft Graph email reads cannot be combined with another email read provider");
+  }
+  if (configuredMicrosoftGraph?.calendarProvider && enableCalendar === true && calendarReadProvider) {
+    throw new Error("Microsoft Graph calendar reads cannot be combined with another calendar read provider");
+  }
+  const selectedEmailReadProvider: EmailReadProvider | undefined = configuredMicrosoftGraph?.emailProvider
+    ?? (enableEmail === true ? emailReadProvider : undefined);
+  const selectedCalendarReadProvider: CalendarReadProvider | undefined = configuredMicrosoftGraph?.calendarProvider
+    ?? (enableCalendar === true ? calendarReadProvider : undefined);
   let closeComputerScreen = () => {};
   if (enableComputerScreen === true && computerScreenProvider) {
     let active = true;
@@ -960,33 +981,33 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
     };
   }
   let closeEmailRead = () => {};
-  if (enableEmail === true && emailReadProvider) {
+  if (selectedEmailReadProvider) {
     let active = true;
     const guardedEmailReadProvider: EmailReadProvider = {
       get target() {
         if (!active) throw new Error("email provider is closed");
-        return emailReadProvider.target;
+        return selectedEmailReadProvider.target;
       },
       accounts(request) {
         if (!active) throw new Error("email provider is closed");
-        return emailReadProvider.accounts.call(emailReadProvider, request);
+        return selectedEmailReadProvider.accounts.call(selectedEmailReadProvider, request);
       },
       search(request) {
         if (!active) throw new Error("email provider is closed");
-        return emailReadProvider.search.call(emailReadProvider, request);
+        return selectedEmailReadProvider.search.call(selectedEmailReadProvider, request);
       },
       read(request) {
         if (!active) throw new Error("email provider is closed");
-        return emailReadProvider.read.call(emailReadProvider, request);
+        return selectedEmailReadProvider.read.call(selectedEmailReadProvider, request);
       },
       thread(request) {
         if (!active) throw new Error("email provider is closed");
-        return emailReadProvider.thread.call(emailReadProvider, request);
+        return selectedEmailReadProvider.thread.call(selectedEmailReadProvider, request);
       },
-      ...(typeof emailReadProvider.health === "function" ? {
+      ...(typeof selectedEmailReadProvider.health === "function" ? {
         health(request: { signal?: AbortSignal }) {
           if (!active) throw new Error("email provider is closed");
-          return emailReadProvider.health!.call(emailReadProvider, request);
+          return selectedEmailReadProvider.health!.call(selectedEmailReadProvider, request);
         }
       } : {})
     };
@@ -998,10 +1019,56 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
     closeEmailRead = () => {
       if (!active) return;
       active = false;
-      const close = emailReadProvider.close;
+      const close = selectedEmailReadProvider.close;
       if (typeof close === "function") {
         try {
-          const result = close.call(emailReadProvider);
+          const result = close.call(selectedEmailReadProvider);
+          if (result && typeof result.then === "function") void result.catch(() => undefined);
+        } catch {
+          // Provider shutdown is best-effort; the guarded provider is already closed.
+        }
+      }
+    };
+  }
+  let closeCalendarRead = () => {};
+  if (selectedCalendarReadProvider) {
+    let active = true;
+    const guardedCalendarReadProvider: CalendarReadProvider = {
+      get target() {
+        if (!active) throw new Error("calendar provider is closed");
+        return selectedCalendarReadProvider.target;
+      },
+      calendars(request) {
+        if (!active) throw new Error("calendar provider is closed");
+        return selectedCalendarReadProvider.calendars.call(selectedCalendarReadProvider, request);
+      },
+      events(request) {
+        if (!active) throw new Error("calendar provider is closed");
+        return selectedCalendarReadProvider.events.call(selectedCalendarReadProvider, request);
+      },
+      read(request) {
+        if (!active) throw new Error("calendar provider is closed");
+        return selectedCalendarReadProvider.read.call(selectedCalendarReadProvider, request);
+      },
+      ...(typeof selectedCalendarReadProvider.health === "function" ? {
+        health(request: { signal?: AbortSignal }) {
+          if (!active) throw new Error("calendar provider is closed");
+          return selectedCalendarReadProvider.health!.call(selectedCalendarReadProvider, request);
+        }
+      } : {})
+    };
+    registerHostCapabilityPlugin(registry, calendarReadHostCapabilityPlugin, {
+      stateDir,
+      approvalStore,
+      calendarReadProvider: guardedCalendarReadProvider
+    });
+    closeCalendarRead = () => {
+      if (!active) return;
+      active = false;
+      const close = selectedCalendarReadProvider.close;
+      if (typeof close === "function") {
+        try {
+          const result = close.call(selectedCalendarReadProvider);
           if (result && typeof result.then === "function") void result.catch(() => undefined);
         } catch {
           // Provider shutdown is best-effort; the guarded provider is already closed.
@@ -1018,6 +1085,7 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
       closeGitHubRead();
       closeComputerScreen();
       closeEmailRead();
+      closeCalendarRead();
       void ownedMcpRuntime?.close();
       recordStore.close();
     }
@@ -1723,10 +1791,10 @@ async function consumeClaimedApprovalContinuation({
 
 function taskRequestDigest(request: any, tool?: AnyRecord): string {
   const requestInput = canonicalTaskInput(request.tool, request.input, tool);
-  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke" || isEmailTool(request.tool) || isGitHubTool(request.tool)
+  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool)
     ? projectDurableToolInput(request.tool, requestInput)
     : requestInput;
-  const resource = request.tool === "computer.screen" || isEmailTool(request.tool) || isGitHubTool(request.tool) ? executionResourceForRequest(request.tool, requestInput, tool) : undefined;
+  const resource = request.tool === "computer.screen" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool) ? executionResourceForRequest(request.tool, requestInput, tool) : undefined;
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown", ...(resource ? { resource } : {}) })).digest("hex");
 }
 

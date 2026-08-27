@@ -1,6 +1,7 @@
 import type { ApprovalStore } from "../approvals.ts";
 import { capabilitiesForTool } from "@odinn/policy";
 import type { ComputerScreenProvider } from "../computer.ts";
+import type { CalendarReadProvider } from "../calendar.ts";
 import type { EmailReadProvider } from "../email.ts";
 import type { GitHubReadClient } from "../github.ts";
 import { validatePluginManifest, type PluginManifest } from "../plugin-contracts.ts";
@@ -16,6 +17,7 @@ export interface HostCapabilityPluginContext {
   readonly approvalStore: ApprovalStore;
   readonly resolveNetworkAddresses?: (...args: any[]) => any;
   readonly computerScreenProvider?: ComputerScreenProvider;
+  readonly calendarReadProvider?: CalendarReadProvider;
   readonly emailReadProvider?: EmailReadProvider;
   readonly githubReadClient?: GitHubReadClient;
 }

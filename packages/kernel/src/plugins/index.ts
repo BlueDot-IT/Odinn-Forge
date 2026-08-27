@@ -1,5 +1,6 @@
 export { capabilityTokensPlugin } from "./capability-tokens.ts";
 export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin } from "./browser.ts";
+export { CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin } from "./calendar.ts";
 export { COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin } from "./computer.ts";
 export { EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin } from "./email.ts";
 export { GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin } from "./github.ts";

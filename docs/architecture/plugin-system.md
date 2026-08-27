@@ -230,13 +230,21 @@ audit events, or durable approval projections. Providers receive an opaque
 host-managed secret reference through a narrow port. The adapter owns token
 refresh and redaction; the plugin never receives the Forge state-directory key.
 
-The shipped read seam is implemented by `packages/kernel/src/email.ts` and
-`packages/kernel/src/plugins/email.ts`. It is provider-neutral and activates
-only with an injected provider plus `enableEmail: true`. Provider identity and
-generation, together with the selected account, bind the execution resource;
-read results are live-only and durable audit/ledger projections retain bounded
-metadata and digests rather than message bodies, snippets, subjects, or
-addresses. No Gmail, Graph, or IMAP implementation is bundled yet.
+The shipped read seams are implemented by `packages/kernel/src/email.ts`,
+`packages/kernel/src/calendar.ts`, and their host-capability plugins. They are
+provider-neutral and activate only with an explicit provider. Provider identity
+and generation, together with the selected account and resource identifiers,
+bind the execution resource; read results are live-only and durable
+audit/ledger projections retain bounded counts, sizes, and digests rather than
+message bodies, snippets, subjects, addresses, event bodies, attendees, or
+locations.
+
+The first concrete adapter is the optional, read-only Microsoft Graph slice.
+It is disabled by default, binds one explicit account and selected email and/or
+calendar resources, uses an environment-only token reference, and permits only
+bounded `GET` requests beneath the fixed Graph origin. It installs no mutation
+surface and is rejected by the TLS multi-user host. See
+[Bounded Microsoft Graph reads](../microsoft-graph-read.md).
 
 ## Activation and lifecycle
 
@@ -299,9 +307,10 @@ The following are non-negotiable for every plugin:
    supplied; it does not use ambient desktop access as a fallback.
 4. **Computer mutation path:** add `computer.act` with approval, after-frame,
    timeout, and needs-review recovery semantics.
-5. **Email read path (contract shipped):** choose the first provider (Gmail,
-   Microsoft Graph, or IMAP) and implement account-scoped OAuth/secret-reference
-   handling without sending mail. The Forge seam remains disabled until then.
+5. **Email/calendar read path (shipped, experimental):** the Microsoft Graph
+   adapter provides one-account, credential-reference-only, bounded reads
+   without sending mail or mutating calendars. Live tenant behavior remains
+   provider-dependent.
 6. **Email mutation path:** add drafts and send only after the provider's
    idempotency and uncertain-outcome behavior have live-tested evidence.
 7. **Third-party connector path:** expose the narrow provider/MCP contract to

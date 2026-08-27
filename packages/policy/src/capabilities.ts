@@ -16,6 +16,7 @@ export const CAPABILITY_REGISTRY = Object.freeze([
   capability("browser.mutate", "Change browser or remote page state."),
   capability("computer.read", "Inspect a paired computer display."),
   capability("email.read", "Read bounded content from explicitly selected email accounts."),
+  capability("calendar.read", "Read bounded events from explicitly selected calendar accounts."),
   capability("agent.delegate", "Delegate bounded work to a child agent."),
   capability("mcp.discover", "Discover tools from a configured MCP server."),
   capability("mcp.invoke", "Invoke a tool on a configured MCP server."),
@@ -214,7 +215,17 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
       retrySafe: false
     })
   }),
-  ...["email.accounts", "email.search", "email.read", "email.thread"].map((name) => tool(name, ["email.read", "network.access"], [], {
+  ...["email.accounts", "email.search", "email.read", "email.thread"].map((name) => tool(name, ["email.read", "network.access", "secret.reference.use"], [], {
+    approval: "not-required",
+    safety: Object.freeze({
+      effects: Object.freeze(["read", "network", "credential"] as const),
+      reversibility: "pure",
+      requiresCapability: true,
+      requiresApproval: false,
+      retrySafe: false
+    })
+  })),
+  ...["calendar.calendars", "calendar.events", "calendar.read"].map((name) => tool(name, ["calendar.read", "network.access", "secret.reference.use"], [], {
     approval: "not-required",
     safety: Object.freeze({
       effects: Object.freeze(["read", "network", "credential"] as const),

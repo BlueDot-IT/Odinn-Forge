@@ -121,6 +121,18 @@ resolution, and persists digests rather than remote content. See
 [Bounded GitHub reads](github-read.md) for configuration, credentials,
 diagnostics, replay, and recovery behavior.
 
+### Microsoft Graph email and calendar read contract
+
+`email.accounts`, `email.search`, `email.read`, `email.thread`,
+`calendar.calendars`, `calendar.events`, and `calendar.read` provide bounded
+live reads from one explicitly configured Microsoft 365 account under separate
+`email.read` or `calendar.read`, `network.access`, and
+`secret.reference.use` capabilities. The integration is disabled by default,
+uses only the fixed Microsoft Graph origin, refuses redirects and private
+network resolution, and persists digests rather than provider content. See
+[Bounded Microsoft Graph reads](microsoft-graph-read.md) for configuration,
+credential references, diagnostics, replay, and recovery behavior.
+
 ### `workspace.readText` compatibility contract
 
 `workspace.readText` reads one UTF-8 text file beneath the assigned workspace

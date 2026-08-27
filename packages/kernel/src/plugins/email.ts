@@ -1,4 +1,4 @@
-import { durableEmailProviderIdentifier } from "@odinn/protocol";
+import { hashEmailProviderIdentifier } from "@odinn/protocol";
 import { listEmailAccounts, readEmail, searchEmail, threadEmail } from "../email.ts";
 import { validatePluginManifest, type PluginManifest } from "../plugin-contracts.ts";
 import type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool } from "./host-capability.ts";
@@ -15,33 +15,33 @@ const emailReadManifest = {
     {
       name: "email.accounts",
       description: "List configured email accounts and bounded provider health metadata.",
-      capabilities: ["email.read", "network.access"],
+      capabilities: ["email.read", "network.access", "secret.reference.use"],
       safety: { effects: ["read", "network", "credential"], reversibility: "pure", requiresCapability: true, requiresApproval: false, retrySafe: false },
-      resourceFields: ["providerId", "generation"],
+      resourceFields: ["providerDigest", "generationDigest"],
       modelVisible: true
     },
     {
       name: "email.search",
       description: "Search messages in one explicitly selected email account.",
-      capabilities: ["email.read", "network.access"],
+      capabilities: ["email.read", "network.access", "secret.reference.use"],
       safety: { effects: ["read", "network", "credential"], reversibility: "pure", requiresCapability: true, requiresApproval: false, retrySafe: false },
-      resourceFields: ["providerId", "generation", "accountId"],
+      resourceFields: ["providerDigest", "generationDigest", "accountDigest"],
       modelVisible: true
     },
     {
       name: "email.read",
       description: "Read one message from one explicitly selected email account.",
-      capabilities: ["email.read", "network.access"],
+      capabilities: ["email.read", "network.access", "secret.reference.use"],
       safety: { effects: ["read", "network", "credential"], reversibility: "pure", requiresCapability: true, requiresApproval: false, retrySafe: false },
-      resourceFields: ["providerId", "generation", "accountId"],
+      resourceFields: ["providerDigest", "generationDigest", "accountDigest", "messageDigest"],
       modelVisible: true
     },
     {
       name: "email.thread",
       description: "Read a bounded message thread from one explicitly selected email account.",
-      capabilities: ["email.read", "network.access"],
+      capabilities: ["email.read", "network.access", "secret.reference.use"],
       safety: { effects: ["read", "network", "credential"], reversibility: "pure", requiresCapability: true, requiresApproval: false, retrySafe: false },
-      resourceFields: ["providerId", "generation", "accountId"],
+      resourceFields: ["providerDigest", "generationDigest", "accountDigest", "threadDigest"],
       modelVisible: true
     }
   ]
@@ -56,15 +56,15 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
     const resourceForProvider = () => {
       const target = pluginContext.emailReadProvider!.target;
       return {
-        providerId: durableEmailProviderIdentifier(target.providerId, "email provider target.providerId", 128),
-        generation: durableEmailProviderIdentifier(target.generation, "email provider target.generation", 128)
+        providerDigest: hashEmailProviderIdentifier(target.providerId, "email provider target.providerId", 128),
+        generationDigest: hashEmailProviderIdentifier(target.generation, "email provider target.generation", 128)
       };
     };
     const resourceForAccount = (input: Record<string, unknown>) => {
       if (typeof input.accountId !== "string" || input.accountId.length === 0 || input.accountId.length > 256) throw new Error("email accountId is required for resource binding");
       return {
         ...resourceForProvider(),
-        accountId: durableEmailProviderIdentifier(input.accountId, "email resource accountId")
+        accountDigest: hashEmailProviderIdentifier(input.accountId, "email resource accountId")
       };
     };
     return new Map([
@@ -104,7 +104,10 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
           required: ["accountId", "messageId"],
           additionalProperties: false
         },
-        resourceForInput: resourceForAccount,
+        resourceForInput: (input: Record<string, unknown>) => ({
+          ...resourceForAccount(input),
+          messageDigest: hashEmailProviderIdentifier(input.messageId, "email resource messageId")
+        }),
         execute: async (input: Record<string, unknown>, context: Record<string, any> = {}) => readEmail(pluginContext.emailReadProvider!, input, context.signal)
       }],
       ["email.thread", {
@@ -120,7 +123,10 @@ export const emailReadHostCapabilityPlugin: HostCapabilityPlugin = {
           required: ["accountId", "threadId"],
           additionalProperties: false
         },
-        resourceForInput: resourceForAccount,
+        resourceForInput: (input: Record<string, unknown>) => ({
+          ...resourceForAccount(input),
+          threadDigest: hashEmailProviderIdentifier(input.threadId, "email resource threadId")
+        }),
         execute: async (input: Record<string, unknown>, context: Record<string, any> = {}) => threadEmail(pluginContext.emailReadProvider!, input, context.signal)
       }]
     ]);

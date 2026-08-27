@@ -58,6 +58,12 @@ provider-dependent. Slack, Microsoft Teams, WhatsApp Business, and the shared
 channel plugin interface remain experimental; see
 [`docs/channels.md`](docs/channels.md).
 
+An optional read-only Microsoft Graph slice can inspect one explicitly
+configured Microsoft 365 account's email and calendar data. It is disabled by
+default, local single-user only, fixed-origin, capability-gated, bounded, and
+content-free in durable evidence. It cannot send mail or mutate calendars; see
+[`docs/microsoft-graph-read.md`](docs/microsoft-graph-read.md).
+
 Ódinn is not a finished industry-specific business suite. It is a general
 assistant you can connect to the models and tools that make sense for your
 work.
@@ -269,9 +275,11 @@ the [surface matrix](docs/surface-matrix.md) says otherwise:
   require explicit operator activation and do not enlarge the stable local
   single-user promise.
 - **Host-capability plugin seams** govern paired `computer.screen` and
-  provider-injected read-only email integrations. The current foundation
-  does not bundle ambient desktop access, desktop mutation, or a concrete
-  email provider. See the [plugin system notes](docs/architecture/plugin-system.md).
+  provider-injected read-only email/calendar integrations. The current
+  foundation does not bundle ambient desktop access or desktop mutation. The
+  optional Microsoft Graph adapter supplies the first concrete read-only
+  email/calendar slice. See the
+  [plugin system notes](docs/architecture/plugin-system.md).
 
 Use **Advanced** in the console or read the notes under
 [docs/features](docs/features/). Core placement does not make an advanced API
