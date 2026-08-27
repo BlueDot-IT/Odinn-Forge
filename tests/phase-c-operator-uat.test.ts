@@ -2,21 +2,42 @@ process.env.ODINN_GATEWAY_AUTH = "off";
 process.env.ODINN_BROWSER_HEADLESS = "1";
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  beginPhaseCUncertainEffect,
   createPhaseCHarness,
+  humanUatExitCode,
   jsonRequest,
   launchPinnedChromium,
+  PHASE_C_POST_RESTART_PROMPT,
+  runHumanPhaseCUat,
   seedPhaseCRecovery,
   setPhaseCCapabilityAdmission,
+  waitForJob,
   type PhaseCHarness,
+  type PhaseCHarnessSetupPhase,
   type PinnedBrowser,
 } from "../scripts/uat/phase-c-harness.ts";
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function exactUserMessage(request: any, content: string) {
+  return request.messages?.some((message: any) => message.role === "user" && message.content === content) === true;
+}
+
+async function assertPathMissing(path: string | undefined) {
+  if (!path) return;
+  await assert.rejects(() => access(path), (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT");
+}
+
+async function assertPortClosed(port: number | undefined) {
+  if (!port) return;
+  await assert.rejects(() => fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1_000) }));
 }
 
 function attachBrowserEvidence(page: any, pageErrors: string[], expectedDialogs: string[], unexpectedDialogs: string[]) {
@@ -59,6 +80,128 @@ async function openAdvancedNavigation(page: any) {
   }
   assert.equal(await advanced.evaluate((element: HTMLDetailsElement) => element.open), true);
 }
+
+test("Phase C harness rolls back every staged setup resource", async () => {
+  const phases: PhaseCHarnessSetupPhase[] = ["state-dir-created", "workspace-created", "provider-listening", "gateway-listening"];
+  const originalAuth = process.env.ODINN_GATEWAY_AUTH;
+  const originalHeadless = process.env.ODINN_BROWSER_HEADLESS;
+  process.env.ODINN_GATEWAY_AUTH = "restore-auth-after-adversarial-setup";
+  process.env.ODINN_BROWSER_HEADLESS = "restore-headless-after-adversarial-setup";
+  try {
+    for (const injectedPhase of phases) {
+      let captured: { stateDir?: string; workspaceRoot?: string; browserProfileDir?: string; providerPort?: number; gatewayPort?: number } = {};
+      await assert.rejects(
+        () => createPhaseCHarness({
+          testHooks: {
+            afterSetupPhase: async (phase, resources) => {
+              if (phase !== injectedPhase) return;
+              captured = resources;
+              throw new Error(`injected setup failure at ${phase}`);
+            },
+          },
+        }),
+        (error: unknown) => {
+          const nested = error instanceof AggregateError ? error.errors : [error];
+          return nested.some((entry) => String(entry).includes(`injected setup failure at ${injectedPhase}`));
+        },
+      );
+      await assertPathMissing(captured.stateDir);
+      await assertPathMissing(captured.workspaceRoot);
+      await assertPathMissing(captured.browserProfileDir);
+      await assertPortClosed(captured.providerPort);
+      await assertPortClosed(captured.gatewayPort);
+      assert.equal(process.env.ODINN_GATEWAY_AUTH, "restore-auth-after-adversarial-setup");
+      assert.equal(process.env.ODINN_BROWSER_HEADLESS, "restore-headless-after-adversarial-setup");
+    }
+  } finally {
+    if (originalAuth === undefined) delete process.env.ODINN_GATEWAY_AUTH;
+    else process.env.ODINN_GATEWAY_AUTH = originalAuth;
+    if (originalHeadless === undefined) delete process.env.ODINN_BROWSER_HEADLESS;
+    else process.env.ODINN_BROWSER_HEADLESS = originalHeadless;
+  }
+});
+
+test("Phase C Gateway bind failure closes the partial server and remains restartable", async () => {
+  const blocker = createHttpServer((_request, response) => response.end("occupied"));
+  await new Promise<void>((resolveListen, rejectListen) => {
+    blocker.once("error", rejectListen);
+    blocker.listen(0, "127.0.0.1", () => {
+      blocker.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  const address = blocker.address();
+  if (!address || typeof address === "string") throw new Error("port blocker did not bind");
+  const harness = await createPhaseCHarness();
+  try {
+    await harness.stopGateway();
+    await assert.rejects(() => harness.startGateway(address.port), /EADDRINUSE/u);
+    await harness.startGateway();
+    const status = await jsonRequest(harness.base, "/status");
+    assert.equal(status.ok, true);
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => blocker.close((error) => error ? rejectClose(error) : resolveClose()));
+    await harness.close();
+  }
+});
+
+test("pinned Chromium closes when post-launch validation fails", async () => {
+  let closes = 0;
+  const fakeBrowser = { version: () => "123.0.0", close: async () => { closes += 1; } };
+  await assert.rejects(() => launchPinnedChromium({
+    headless: true,
+    testHooks: {
+      chromium: { executablePath: () => "/controlled/chromium", launch: async () => fakeBrowser },
+      pinnedChromium: { browserVersion: "123.0.0", revision: "controlled-revision" },
+      access: async () => undefined,
+      realpath: async () => { throw new Error("injected realpath failure"); },
+    },
+  }), /injected realpath failure/u);
+  assert.equal(closes, 1);
+});
+
+test("human setup failure closes readline, Chromium, context, and harness", async () => {
+  const closed: string[] = [];
+  const page = { on: () => undefined };
+  const context = {
+    addInitScript: async () => undefined,
+    newPage: async () => page,
+    close: async () => { closed.push("context"); },
+  };
+  const pinned = {
+    browser: {
+      newContext: async () => context,
+      close: async () => { closed.push("chromium"); },
+    },
+    executablePath: "/controlled/chromium",
+    browserVersion: "123.0.0",
+    playwrightVersion: "1.62.1",
+    revision: "controlled-revision",
+  };
+  const harness = { close: async () => { closed.push("harness"); } } as unknown as PhaseCHarness;
+  await assert.rejects(() => runHumanPhaseCUat({
+    commitIdentity: async () => ({ commit: "a".repeat(40), tree: "b".repeat(40), dirty: false }),
+    createHarness: async () => harness,
+    seedRecovery: async () => ({ approvalId: "approval", checkpointId: "checkpoint", durableJobId: "job", durableJobCapabilityToken: "token", graphJobId: "graph-job", graphRunId: "graph-run" }),
+    setCapabilityAdmission: async () => undefined,
+    launchBrowser: async () => pinned,
+    createReadline: () => ({ close: () => { closed.push("readline"); } }),
+    afterReadlineCreated: async () => { throw new Error("injected failure after readline setup"); },
+  }), /injected failure after readline setup/u);
+  assert.deepEqual(closed, ["readline", "context", "chromium", "harness"]);
+});
+
+test("human HOLD, blocked, and unattested reports exit nonzero", () => {
+  const passing = {
+    pass: true,
+    results: [{ result: "pass" }],
+    attestations: { nonDeveloper: true, sourceBlind: true, browserOnly: true, keyboardOnlyNarrowSegment: true },
+  };
+  assert.equal(humanUatExitCode(passing), 0);
+  assert.equal(humanUatExitCode({ ...passing, pass: false }), 1);
+  assert.equal(humanUatExitCode({ ...passing, results: [{ result: "blocked" }] }), 1);
+  assert.equal(humanUatExitCode({ ...passing, attestations: { ...passing.attestations, sourceBlind: false } }), 1);
+});
 
 test("a source-blind operator completes Phase C against durable state across a real Gateway restart", { timeout: 180_000 }, async () => {
   let harness: PhaseCHarness | undefined;
@@ -122,15 +265,9 @@ test("a source-blind operator completes Phase C against durable state across a r
     await first.page.getByText("recovery-notes.md", { exact: true }).waitFor({ state: "hidden" });
     const progress = await first.page.evaluate(() => (window as any).__phaseCProgress as string[]);
     assert.ok(progress.some((value) => /Drafting the answer/u.test(value)), JSON.stringify(progress));
-    const toolPresentation = first.page.locator("#chat-tool-progress");
-    await toolPresentation.getByText("browser.open", { exact: true }).waitFor();
-    assert.match(await toolPresentation.innerText(), /Page opened and snapshot captured/u);
     const selectedModelRequest = harness.providerRequests.find((request) => request.model === "daily-driver-b" && JSON.stringify(request.messages).includes("BEGIN UNTRUSTED LOCAL FILE"));
     assert.ok(selectedModelRequest, "the selected model and bounded attachment reached the real local provider adapter");
     assert.ok(selectedModelRequest.tools?.some((tool: any) => tool.function?.name === "browser_x2e_open"), "the real agent loop offered the bounded browser tool");
-    assert.ok(harness.providerRequests.some((request) => request.model === "daily-driver-b" && request.messages?.some((message: any) => message.role === "tool")), "the real browser result returned to the selected model");
-    const chatAudit = await jsonRequest(harness.base, "/audit/query?pageSize=100");
-    assert.ok(chatAudit.events.some((event: any) => event.type === "task.completed" && event.tool === "browser.open"), "browser.open completed through the governed task boundary");
 
     await navigateWithKeyboard(first.page, /^Schedules$/u);
     await first.page.getByRole("heading", { name: "Schedules", exact: true }).waitFor();
@@ -177,8 +314,8 @@ test("a source-blind operator completes Phase C against durable state across a r
     assert.match(await first.page.locator("#agent-graph-detail").innerText(), /checkpoint-reader/u);
 
     await first.page.setViewportSize({ width: 375, height: 812 });
-    const responsive = await first.page.evaluate(() => ({ viewport: innerWidth, document: document.documentElement.scrollWidth }));
-    assert.ok(responsive.document <= responsive.viewport, JSON.stringify(responsive));
+    const responsive = await first.page.evaluate(() => ({ viewport: innerWidth, document: document.documentElement.scrollWidth, body: document.body.scrollWidth }));
+    assert.ok(responsive.document <= responsive.viewport && responsive.body <= responsive.viewport, JSON.stringify(responsive));
     const navigationToggle = first.page.getByRole("button", { name: /Open navigation/u });
     await navigationToggle.focus();
     await first.page.keyboard.press("Enter");
@@ -189,16 +326,57 @@ test("a source-blind operator completes Phase C against durable state across a r
     await firstBrowser.browser.close();
     firstBrowser = undefined;
 
+    const providerRequestRestartBoundary = harness.providerRequests.length;
+    const uncertainEffect = await beginPhaseCUncertainEffect(harness);
+    assert.equal(harness.controlledEffectRequests.length, 1, "the controlled local effect must cross its physical POST boundary before restart");
     const originalPort = harness.port;
     await harness.stopGateway();
+    await uncertainEffect.approvalCompletion;
     await harness.startGateway(originalPort);
     assert.equal(await readFile(join(harness.workspaceRoot, "recovery-state.txt"), "utf8"), "interrupted-after-checkpoint\n", "startup must not replay a retained checkpoint");
+    const recoveredUncertainEffect = await waitForJob(harness.base, uncertainEffect.jobId);
+    assert.equal(recoveredUncertainEffect.status, "needs-review");
+    assert.equal(recoveredUncertainEffect.attempts, 1);
+    const uncertainReplay = await jsonRequest(harness.base, "/jobs", {
+      method: "POST",
+      headers: { "idempotency-key": uncertainEffect.jobId },
+      body: JSON.stringify(uncertainEffect.requestBody),
+    });
+    assert.equal(uncertainReplay.replayed, true);
+    assert.equal(uncertainReplay.job.status, "needs-review");
+    assert.equal(uncertainReplay.job.attempts, 1);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+    assert.equal(harness.controlledEffectRequests.length, 1, "restart and an identical idempotent submission must not dispatch the uncertain effect again");
+    assert.equal(await readFile(join(harness.workspaceRoot, "controlled-effect-count.txt"), "utf8"), "1\n");
+    const browserRecovery = await jsonRequest(harness.base, "/run", {
+      method: "POST",
+      body: JSON.stringify({ id: "phase-c-browser-recovery-evidence", tool: "browser.recovery.status", input: {} }),
+    });
+    assert.ok(["unknown", "executing"].includes(browserRecovery.output.recovery.status), JSON.stringify(browserRecovery));
 
     secondBrowser = await launchPinnedChromium({ headless: true });
     assert.equal(secondBrowser.browserVersion, requiredBrowserVersion);
     const second = await openConsole(secondBrowser, harness.base);
     attachBrowserEvidence(second.page, pageErrors, expectedDialogs, unexpectedDialogs);
     await second.page.getByText("Recovery notes verified. The durable checkpoint remains operator-controlled.").waitFor();
+    await second.page.getByLabel("Model", { exact: true }).selectOption("uat:daily-driver-b");
+    const restartedComposer = second.page.getByLabel("Message Ódinn Forge");
+    await restartedComposer.fill(PHASE_C_POST_RESTART_PROMPT);
+    await restartedComposer.press("Enter");
+    await second.page.getByText("Post-restart provider and model request verified.", { exact: true }).waitFor({ timeout: 15_000 });
+    const restartedToolPresentation = second.page.locator("#chat-tool-progress");
+    await restartedToolPresentation.getByText("browser.open", { exact: true }).waitFor();
+    assert.match(await restartedToolPresentation.innerText(), /Page opened and snapshot captured/u);
+    const exactPostRestartRequests = harness.providerRequests.slice(providerRequestRestartBoundary)
+      .filter((request) => request.model === "daily-driver-b"
+        && exactUserMessage(request, PHASE_C_POST_RESTART_PROMPT)
+        && !request.messages?.some((message: any) => message.role === "tool"));
+    assert.equal(exactPostRestartRequests.length, 1, JSON.stringify(harness.providerRequests.slice(providerRequestRestartBoundary)));
+    assert.ok(harness.providerRequests.slice(providerRequestRestartBoundary).some((request) => request.model === "daily-driver-b"
+      && exactUserMessage(request, PHASE_C_POST_RESTART_PROMPT)
+      && request.messages?.some((message: any) => message.role === "tool")), "the post-restart browser result returned to the exact selected-model request");
+    const restartedChatAudit = await jsonRequest(harness.base, "/audit/query?pageSize=100");
+    assert.ok(restartedChatAudit.events.some((event: any) => event.type === "task.completed" && event.tool === "browser.open"), "post-restart browser.open completed through the governed task boundary");
 
     await navigateWithKeyboard(second.page, /^Schedules$/u);
     await second.page.getByText("Daily recovery check").waitFor();
