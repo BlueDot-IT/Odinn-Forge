@@ -263,7 +263,7 @@ export class CronStore {
       return updated;
     }, options);
   }
-  async quarantineLiveOnly(id: string) {
+  async quarantineLiveOnly(id: string, options: GatewayMutationOptions = {}) {
     return this.mutate((jobs) => {
       const index = jobs.findIndex((item) => item.id === id);
       if (index < 0) throw new GatewayError(404, "cron job not found");
@@ -294,7 +294,7 @@ export class CronStore {
       });
       jobs[index] = updated;
       return updated;
-    });
+    }, options);
   }
   async remove(id: string, options: GatewayMutationOptions = {}) {
     return this.mutate((jobs) => {
@@ -828,7 +828,8 @@ export async function runDueCronJobs(store: CronStore, supervisor: JobSupervisor
   for (const job of await store.list()) {
     assertGatewayRequestActive(signal);
     if (isLiveOnlyAutomationTool(job.tool)) {
-      await store.quarantineLiveOnly(job.id);
+      await store.quarantineLiveOnly(job.id, { signal });
+      assertGatewayRequestActive(signal);
       continue;
     }
     if (!job.enabled) continue;

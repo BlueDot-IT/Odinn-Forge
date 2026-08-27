@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,6 +29,46 @@ test("cron admission enforces five-field ranges, positive steps, and IANA timezo
   assert.equal(valid.schemaVersion, 2);
   assert.equal(valid.timezone, "America/New_York");
   assert.ok(valid.nextRunAt);
+});
+
+test("legacy live-only cron quarantine carries cancellation through the state lock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-cron-live-only-shutdown-"));
+  const path = join(root, "cron-jobs.json");
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const controller = new AbortController();
+  try {
+    await writeFile(path, `${JSON.stringify({
+      schemaVersion: 2,
+      jobs: [{
+        id: "legacy-live-only",
+        name: "Legacy live-only schedule",
+        schedule: "0 9 * * 1-5",
+        timezone: "UTC",
+        enabled: true,
+        tool: "email.search",
+        input: { queryDigest: "sha256:fixture" }
+      }]
+    }, null, 2)}\n`, { mode: 0o600 });
+    const store = new CronStore(path);
+    const quarantine = store.quarantineLiveOnly("legacy-live-only", {
+      signal: controller.signal,
+      __testOnlyAfterLockAcquired: async () => {
+        entered.resolve();
+        await release.promise;
+      }
+    });
+    await entered.promise;
+    controller.abort();
+    release.resolve();
+    await assert.rejects(quarantine, /aborted|shutdown/u);
+    const persisted = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(persisted.jobs[0].enabled, true);
+    assert.equal(persisted.jobs[0].liveOnlyQuarantine, undefined);
+  } finally {
+    release.resolve();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("two cron store instances claim one occurrence and recover the same stale lease", async () => {
