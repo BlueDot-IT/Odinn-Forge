@@ -491,6 +491,88 @@ test("computer.act capability authority is broker-only and exact approval contin
   assert.equal(actions, 1, "a changed node/display/pairing target must fail before provider dispatch");
 });
 
+test("computer.act refuses pairing rotation between capability consumption and provider dispatch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-computer-dispatch-race-"));
+  const stateDir = join(root, ".odinn");
+  const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const runtime = createDifferentiatedRuntime({
+    stateDir,
+    workspaceRoot: root,
+    featureFlags: { capabilities: true, capsules: false, counterfactual: false }
+  });
+  let currentTarget = target;
+  let continuationTargetReads = 0;
+  let rotateDuringContinuation = false;
+  let actions = 0;
+  const paired = {
+    ...controlProvider(),
+    get target() {
+      if (rotateDuringContinuation && ++continuationTargetReads === 2) {
+        currentTarget = { ...target, pairingGeneration: "pair-rotated-before-dispatch" };
+      }
+      return currentTarget;
+    },
+    act: async (request: Record<string, any>) => {
+      actions += 1;
+      return controlProvider().act(request);
+    }
+  };
+  const registry = createBuiltInRegistry({
+    workspaceRoot: root,
+    stateDir,
+    approvalStore,
+    auditStore,
+    enableComputerScreen: true,
+    computerControlProvider: paired
+  });
+  t.after(async () => {
+    registry.close();
+    auditStore.close();
+    runtime.ledger.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const runId = "computer-capability-dispatch-race";
+  const actor = "desktop-operator";
+  const businessInput = { frameId: "frame-1", action: "click", x: 0, y: 0 };
+  runtime.ledger.ensureRun({ runId, objective: "reject pairing rotation before provider dispatch" });
+  const issued = runtime.capabilities.issue({
+    runId,
+    stepId: "desktop-action",
+    toolName: "computer.act",
+    resourceConstraints: { ...target, frameId: businessInput.frameId },
+    maxUses: 1
+  });
+  const input = { ...businessInput, capabilityToken: issued.token };
+  const options = {
+    auditStore,
+    approvalStore,
+    policy: createDefaultPolicy({ allowedCapabilities: ["computer.read", "computer.mutate"] }),
+    registry,
+    runLedger: runtime.ledger,
+    durableExecution: true
+  };
+  const first = await runTask({ ...options, task: { id: runId, tool: "computer.act", input, actor } });
+  const approvalId = first.output.approvalId as string;
+  assert.ok(approvalStore.claim(approvalId));
+  rotateDuringContinuation = true;
+  continuationTargetReads = 0;
+
+  await assert.rejects(
+    runTask({
+      ...options,
+      task: { id: runId, tool: "computer.act", input, actor },
+      trustedApprovalId: approvalId,
+      trustedApprovalRunId: runId
+    }),
+    /pairing target changed before provider dispatch/u
+  );
+  assert.equal(continuationTargetReads, 2, "the target is captured once and checked once immediately before dispatch");
+  assert.equal(actions, 0, "a rotated target must never receive the approved action");
+  assert.equal(runtime.capabilities.list(runId)[0].uses, 1, "the one-use capability is consumed before the final dispatch fence");
+});
+
 test("uncertain computer actions quarantine the durable attempt until operator resolution", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-computer-recovery-"));
   const stateDir = join(root, ".odinn");

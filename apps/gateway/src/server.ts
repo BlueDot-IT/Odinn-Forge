@@ -3766,6 +3766,7 @@ function validateHostedProviderConfig(config: any) {
   if (config?.integrations?.computer?.enabled === true) {
     throw new GatewayError(400, "multi-user host does not allow shared local computer control");
   }
+  }
   for (const [name, provider] of Object.entries(config?.providers ?? {}) as Array<[string, any]>) {
     const auth = provider?.auth && typeof provider.auth === "object" && !Array.isArray(provider.auth) ? provider.auth : {};
     if (provider?.type === "cli" || String(provider?.transport ?? "").startsWith("cli-") || auth.mode === "cli") {
@@ -3902,6 +3903,7 @@ function validateGatewayConfig(config: any) {
     if (config.integrations.remoteNode !== undefined) {
       try { normalizeRemoteNodeReadConfig(config.integrations.remoteNode); }
       catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.integrations.remoteNode is invalid"); }
+    }
     if (config.integrations.computer !== undefined) {
       try { normalizeMacOSComputerConfig(config.integrations.computer); }
       catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.integrations.computer is invalid"); }

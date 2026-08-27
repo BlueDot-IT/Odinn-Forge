@@ -75,7 +75,11 @@ export const computerScreenHostCapabilityPlugin: HostCapabilityPlugin = {
           const target = pluginContext.computerScreenProvider!.target;
           return { nodeId: target.nodeId, displayId: target.displayId, pairingGeneration: target.pairingGeneration };
         },
-        execute: async (_input: unknown, context: Record<string, any> = {}) => captureComputerScreen(pluginContext.computerScreenProvider!, context.signal)
+        execute: async (_input: unknown, context: Record<string, any> = {}) => captureComputerScreen(
+          pluginContext.computerScreenProvider!,
+          context.signal,
+          context.trustedExecutionResource
+        )
       }]
     ]);
   }
@@ -143,7 +147,12 @@ export const computerControlHostCapabilityPlugin: HostCapabilityPlugin = {
             input: exactInput
           }, { signal: context.signal });
           if (!authorized) throw new Error("computer action approval is missing, expired, already used, or does not match this exact frame action");
-          return performComputerAction(pluginContext.computerControlProvider!, authorized.input ?? exactInput, context.signal);
+          return performComputerAction(
+            pluginContext.computerControlProvider!,
+            authorized.input ?? exactInput,
+            context.signal,
+            context.trustedExecutionResource
+          );
         }
       }],
       ["computer.recovery.status", {
@@ -151,7 +160,10 @@ export const computerControlHostCapabilityPlugin: HostCapabilityPlugin = {
         description: "Inspect an unresolved paired-computer action.",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         resourceForInput: () => providerTarget(pluginContext),
-        execute: async () => inspectComputerRecovery(pluginContext.computerControlProvider!)
+        execute: async (_input: unknown, context: Record<string, any> = {}) => inspectComputerRecovery(
+          pluginContext.computerControlProvider!,
+          context.trustedExecutionResource
+        )
       }],
       ["computer.recovery.resolve", {
         capability: "computer.mutate",
@@ -166,7 +178,12 @@ export const computerControlHostCapabilityPlugin: HostCapabilityPlugin = {
           additionalProperties: false
         },
         resourceForInput: (input: Record<string, unknown>) => ({ ...providerTarget(pluginContext), recoveryId: input.recoveryId, outcome: input.outcome }),
-        execute: async (input: unknown, context: Record<string, any> = {}) => resolveComputerRecovery(pluginContext.computerControlProvider!, input, context.signal)
+        execute: async (input: unknown, context: Record<string, any> = {}) => resolveComputerRecovery(
+          pluginContext.computerControlProvider!,
+          input,
+          context.signal,
+          context.trustedExecutionResource
+        )
       }]
     ]);
   }

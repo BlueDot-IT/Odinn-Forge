@@ -178,6 +178,25 @@ function sameTarget(left: ComputerScreenTarget, right: ComputerScreenTarget): bo
   return left.nodeId === right.nodeId && left.displayId === right.displayId && left.pairingGeneration === right.pairingGeneration;
 }
 
+function executionTarget(provider: ComputerScreenProvider, resource: unknown, label: string): ComputerScreenTarget {
+  return resource === undefined
+    ? normalizeTarget(provider.target, `${label} provider.target`)
+    : normalizeTarget(resource, `${label} trusted execution resource`);
+}
+
+function assertProviderTarget(provider: ComputerScreenProvider, expected: ComputerScreenTarget, label: string): void {
+  const current = normalizeTarget(provider.target, `${label} provider.target`);
+  if (!sameTarget(current, expected)) throw new Error(`${label} pairing target changed before provider dispatch`);
+}
+
+function assertExecutionField(resource: unknown, field: string, expected: string, label: string): void {
+  if (resource === undefined) return;
+  const source = plainObject(resource, `${label} trusted execution resource`);
+  if (boundedIdentifier(source[field], `${label} trusted execution resource.${field}`) !== expected) {
+    throw new Error(`${label} trusted execution resource does not match the approved ${field}`);
+  }
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("computer screen capture aborted");
 }
@@ -255,10 +274,11 @@ function normalizeFrame(value: unknown, target: ComputerScreenTarget): ComputerS
   });
 }
 
-export async function captureComputerScreen(provider: ComputerScreenProvider, signal?: AbortSignal): Promise<ComputerScreenResult> {
+export async function captureComputerScreen(provider: ComputerScreenProvider, signal?: AbortSignal, trustedExecutionResource?: unknown): Promise<ComputerScreenResult> {
   if (!provider || typeof provider.capture !== "function") throw new Error("computer screen provider is unavailable");
-  const target = normalizeTarget(provider.target, "computer screen provider.target");
+  const target = executionTarget(provider, trustedExecutionResource, "computer screen");
   throwIfAborted(signal);
+  if (trustedExecutionResource !== undefined) assertProviderTarget(provider, target, "computer screen");
   const frame = await provider.capture({ target, signal });
   throwIfAborted(signal);
   const currentTarget = normalizeTarget(provider.target, "computer screen provider.target");
@@ -292,20 +312,26 @@ function normalizeActResult(value: unknown, target: ComputerScreenTarget, input:
   throw new Error("computer action result status is unsupported");
 }
 
-export async function performComputerAction(provider: ComputerControlProvider, value: unknown, signal?: AbortSignal): Promise<ComputerActResult> {
+export async function performComputerAction(provider: ComputerControlProvider, value: unknown, signal?: AbortSignal, trustedExecutionResource?: unknown): Promise<ComputerActResult> {
   if (!provider || typeof provider.act !== "function") throw new Error("computer control provider is unavailable");
-  const target = normalizeTarget(provider.target, "computer control provider.target");
+  const target = executionTarget(provider, trustedExecutionResource, "computer control");
   const input = normalizeComputerActionInput(value);
+  assertExecutionField(trustedExecutionResource, "frameId", input.frameId, "computer control");
   throwIfAborted(signal);
+  if (trustedExecutionResource !== undefined) assertProviderTarget(provider, target, "computer control");
   const result = await provider.act({ target, frameId: input.frameId, action: input.action, signal });
   const currentTarget = normalizeTarget(provider.target, "computer control provider.target");
   if (!sameTarget(currentTarget, target)) throw new Error("computer control pairing target changed during action");
   return normalizeActResult(result, currentTarget, input);
 }
 
-export async function inspectComputerRecovery(provider: ComputerControlProvider): Promise<ComputerRecoveryStatus> {
+export async function inspectComputerRecovery(provider: ComputerControlProvider, trustedExecutionResource?: unknown): Promise<ComputerRecoveryStatus> {
   if (typeof provider.recoveryStatus !== "function") return Object.freeze({ type: "computer.recovery.status", unresolved: false });
+  const target = executionTarget(provider, trustedExecutionResource, "computer recovery status");
+  if (trustedExecutionResource !== undefined) assertProviderTarget(provider, target, "computer recovery status");
   const source = plainObject(await provider.recoveryStatus(), "computer recovery status");
+  const currentTarget = normalizeTarget(provider.target, "computer recovery status provider.target");
+  if (!sameTarget(currentTarget, target)) throw new Error("computer recovery status pairing target changed during provider dispatch");
   if (typeof source.unresolved !== "boolean") throw new Error("computer recovery status.unresolved must be boolean");
   if (!source.unresolved) return Object.freeze({ type: "computer.recovery.status", unresolved: false });
   const action = source.action;
@@ -326,14 +352,20 @@ export async function inspectComputerRecovery(provider: ComputerControlProvider)
   });
 }
 
-export async function resolveComputerRecovery(provider: ComputerControlProvider, value: unknown, signal?: AbortSignal): Promise<Readonly<{ type: "computer.recovery.resolve"; status: "resolved"; recoveryId: string; outcome: ComputerRecoveryResolution }>> {
+export async function resolveComputerRecovery(provider: ComputerControlProvider, value: unknown, signal?: AbortSignal, trustedExecutionResource?: unknown): Promise<Readonly<{ type: "computer.recovery.resolve"; status: "resolved"; recoveryId: string; outcome: ComputerRecoveryResolution }>> {
   if (typeof provider.resolveRecovery !== "function") throw new Error("computer recovery resolution is unavailable");
   const source = plainObject(value, "computer recovery resolution");
   assertOnlyKeys(source, ["recoveryId", "outcome"], "computer recovery resolution");
   const recoveryId = boundedIdentifier(source.recoveryId, "computer recovery resolution.recoveryId");
   const outcome = source.outcome;
   if (outcome !== "confirmed-applied" && outcome !== "confirmed-not-applied") throw new Error("computer recovery resolution.outcome is unsupported");
+  const target = executionTarget(provider, trustedExecutionResource, "computer recovery resolution");
+  assertExecutionField(trustedExecutionResource, "recoveryId", recoveryId, "computer recovery resolution");
+  assertExecutionField(trustedExecutionResource, "outcome", outcome, "computer recovery resolution");
   throwIfAborted(signal);
+  if (trustedExecutionResource !== undefined) assertProviderTarget(provider, target, "computer recovery resolution");
   await provider.resolveRecovery({ recoveryId, outcome, signal });
+  const currentTarget = normalizeTarget(provider.target, "computer recovery resolution provider.target");
+  if (!sameTarget(currentTarget, target)) throw new Error("computer recovery resolution pairing target changed during provider dispatch");
   return Object.freeze({ type: "computer.recovery.resolve", status: "resolved", recoveryId, outcome });
 }

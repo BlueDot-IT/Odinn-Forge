@@ -12,7 +12,6 @@ import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isAllowedCredentialEnvironmentKey, isCredentialEnvironmentName, isPhysicalPathInside, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile, ParsedEnvironmentFiles } from "./environment.ts";
-export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, REMOTE_NODE_READ_PLUGIN_MANIFEST, remoteNodeReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin, COMPUTER_CONTROL_PLUGIN_MANIFEST, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerControlHostCapabilityPlugin, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, REMOTE_NODE_READ_PLUGIN_MANIFEST, remoteNodeReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 export type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool, LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
@@ -27,7 +26,6 @@ import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryC
 import { approvalActionForExecution, createApprovalStore, isApprovalStoreContentionError, normalizeApprovalExecutionInput } from "./approvals.ts";
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
 import { closeBrowserManagers } from "./browser.ts";
-import { browserHostCapabilityPlugin, calendarReadHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, remoteNodeReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 import { browserHostCapabilityPlugin, calendarReadHostCapabilityPlugin, computerControlHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, remoteNodeReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 import type { CalendarReadProvider } from "./calendar.ts";
 import type { EmailReadProvider } from "./email.ts";
@@ -156,8 +154,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, calendarReadProvider, enableCalendar = false, githubReadClient, microsoftGraphReadAdapter, remoteNodeReadClient }: any = {}): BuiltInRegistry {
-export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, computerControlProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, calendarReadProvider, enableCalendar = false, githubReadClient, microsoftGraphReadAdapter, remoteNodeReadClient }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, computerControlProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, calendarReadProvider, enableCalendar = false, githubReadClient, microsoftGraphReadAdapter, remoteNodeReadClient }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -1905,12 +1902,11 @@ async function consumeClaimedApprovalContinuation({
   }
 }
 
-function taskRequestDigest(request: any, tool?: AnyRecord, trustedResource?: Record<string, unknown>): string {
+function taskRequestDigest(request: any, tool?: AnyRecord, trustedResource?: Readonly<Record<string, unknown>>): string {
   const requestInput = canonicalTaskInput(request.tool, request.input, tool);
   const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool) || isRemoteNodeTool(request.tool)
     ? projectDurableToolInput(request.tool, requestInput)
     : requestInput;
-  const resource = trustedResource ?? (request.tool === "computer.screen" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool) || isRemoteNodeTool(request.tool)
   const resource = trustedResource ?? (request.tool.startsWith("computer.") || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool) || isRemoteNodeTool(request.tool)
     ? executionResourceForRequest(request.tool, requestInput, tool)
     : undefined);
@@ -2291,7 +2287,7 @@ async function executeTaskThroughAdmission({
     ? { ...registeredTool, capability: declaredCapabilities[0], capabilities: declaredCapabilities }
     : registeredTool;
   const liveOnlyInputSchema = liveOnlyProviderInputSchema(request.tool);
-  let trustedLiveOnlyResource: Record<string, unknown> | undefined;
+  let trustedExecutionResource: Readonly<Record<string, unknown>> | undefined;
   if (liveOnlyInputSchema) {
     // Public callers must satisfy the live semantic schema before an
     // idempotent completed-run lookup. Otherwise persistence-only digest
@@ -2301,7 +2297,9 @@ async function executeTaskThroughAdmission({
     // Resource identity is integration-owned. Resolve it before any completed
     // run lookup so an unavailable integration cannot accept caller-supplied
     // persistence metadata as an authority-bearing replay binding.
-    trustedLiveOnlyResource = executionResourceForRequest(request.tool, request.input, tool);
+    trustedExecutionResource = Object.freeze({ ...executionResourceForRequest(request.tool, request.input, tool) });
+  } else if (request.tool.startsWith("computer.")) {
+    trustedExecutionResource = Object.freeze({ ...executionResourceForRequest(request.tool, request.input, tool) });
   }
   const approvalContinuation = await consumeClaimedApprovalContinuation({
     approvalStore,
@@ -2319,7 +2317,7 @@ async function executeTaskThroughAdmission({
     error.code = "APPROVAL_CONTINUATION_DENIED";
     throw error;
   }
-  const requestDigest = taskRequestDigest(request, tool, trustedLiveOnlyResource);
+  const requestDigest = taskRequestDigest(request, tool, trustedExecutionResource);
   let runBinding: { replay?: boolean } | undefined;
 
   if (!auditStore) throw new Error("runTask requires an auditStore");
@@ -2329,7 +2327,7 @@ async function executeTaskThroughAdmission({
     ? [...prior.events].reverse().find((event: any) => event.type === "task.started")
     : undefined;
   const priorDigest = priorStarted?.data?.requestDigest ?? (priorStarted?.tool && priorStarted?.data && "input" in priorStarted.data
-    ? taskRequestDigest({ tool: priorStarted.tool, input: priorStarted.data.input, actor: priorStarted.actor }, tool, trustedLiveOnlyResource)
+    ? taskRequestDigest({ tool: priorStarted.tool, input: priorStarted.data.input, actor: priorStarted.actor }, tool, trustedExecutionResource)
     : undefined);
   const legacyDigest = prior?.status === "completed" && priorDigest !== requestDigest
     ? legacyEmailTaskRequestDigest(request, tool)
@@ -2457,7 +2455,7 @@ async function executeTaskThroughAdmission({
       const capabilityRequest = {
         runId: request.id,
         toolName: request.tool,
-        resource: executionResourceForRequest(request.tool, request.input, tool)
+        resource: trustedExecutionResource ?? executionResourceForRequest(request.tool, request.input, tool)
       };
       const deferUntilApprovedDispatch = Boolean(approvalContinuation);
       if (capabilityApprovalContinuationPending(tool, policy, trustedApprovalId) || deferUntilApprovedDispatch) {
@@ -2532,6 +2530,7 @@ async function executeTaskThroughAdmission({
       },
       runLedger,
       capability: capabilityClaims,
+      trustedExecutionResource,
       trustedApprovalId,
       trustedApprovalRunId,
       trustedApprovalContinuation: approvalContinuation,
