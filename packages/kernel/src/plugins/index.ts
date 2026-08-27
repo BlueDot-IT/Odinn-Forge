@@ -4,6 +4,7 @@ export { CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin } from 
 export { COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin } from "./computer.ts";
 export { EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin } from "./email.ts";
 export { GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin } from "./github.ts";
+export { REMOTE_NODE_READ_PLUGIN_MANIFEST, remoteNodeReadHostCapabilityPlugin } from "./remote-node.ts";
 export { capsulesPlugin } from "./capsules.ts";
 export { counterfactualPlugin } from "./counterfactual.ts";
 export { materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./host-capability.ts";

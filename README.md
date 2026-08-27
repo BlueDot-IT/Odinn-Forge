@@ -282,6 +282,11 @@ the [surface matrix](docs/surface-matrix.md) says otherwise:
   optional Microsoft Graph adapter supplies the first concrete read-only
   email/calendar slice. See the
   [plugin system notes](docs/architecture/plugin-system.md).
+- **Authenticated remote-node reads** expose only `node.status` and
+  `node.diagnostics` for exact operator-allowlisted HTTPS nodes. Model input
+  cannot choose routing or credentials, and durable evidence retains only
+  digests, counts, and fixed statuses. See
+  [remote-node reads](docs/remote-node-read.md).
 
 Use **Advanced** in the console or read the notes under
 [docs/features](docs/features/). Core placement does not make an advanced API

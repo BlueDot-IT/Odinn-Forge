@@ -8,6 +8,7 @@ export const CAPABILITY_REGISTRY = Object.freeze([
   capability("workspace.patch", "Apply a bounded, reviewable workspace patch."),
   capability("git.read", "Inspect bounded status, diffs, and history from the assigned local Git worktree."),
   capability("github.read", "Read bounded metadata and content from explicitly allowed GitHub repositories."),
+  capability("node.read", "Read bounded status and diagnostics from explicitly allowed authenticated nodes."),
   capability("process.execute", "Execute a bounded process without an implicit shell."),
   capability("process.interactive", "Control an interactive process or terminal session."),
   capability("process.shell", "Interpret shell syntax; separate from argument-array process execution."),
@@ -178,6 +179,16 @@ export const TOOL_CAPABILITY_REGISTRY = Object.freeze([
       requiresCapability: true,
       requiresApproval: false,
       retrySafe: true
+    })
+  })),
+  ...["node.status", "node.diagnostics"].map((name) => tool(name, ["node.read", "network.access", "secret.reference.use"], [], {
+    approval: "not-required",
+    safety: Object.freeze({
+      effects: Object.freeze(["read", "network", "credential"] as const),
+      reversibility: "pure",
+      requiresCapability: true,
+      requiresApproval: false,
+      retrySafe: false
     })
   })),
   tool("restore.create", ["restore.create"], []),

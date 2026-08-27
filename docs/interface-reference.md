@@ -132,6 +132,16 @@ uses only the fixed Microsoft Graph origin, refuses redirects and private
 network resolution, and persists digests rather than provider content. See
 [Bounded Microsoft Graph reads](microsoft-graph-read.md) for configuration,
 credential references, diagnostics, replay, and recovery behavior.
+### Remote-node read contract
+
+`node.status` and `node.diagnostics` accept exactly `{ nodeId }` and perform a
+live authenticated read against the matching operator-configured HTTPS node.
+They require `node.read`, `network.access`, and `secret.reference.use`; pure
+reads require no approval. Origins, pinned IP allowlists, fixed paths, and
+credential references remain outside model input. Durable evidence contains
+only digests, bounded counts, and fixed status values, so replay cannot recover
+live node output. See [Authenticated remote-node reads](remote-node-read.md)
+for schemas, onboarding, TLS routing, responder, diagnostics, and recovery.
 
 ### `workspace.readText` compatibility contract
 

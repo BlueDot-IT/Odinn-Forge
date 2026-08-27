@@ -429,6 +429,20 @@ export interface MicrosoftGraphReadDiagnosticV1 {
   readonly mutationsAvailable: false;
   readonly redirectsAllowed: false;
 }
+export interface RemoteNodeReadDiagnosticV1 {
+  readonly enabled: boolean;
+  readonly configured: boolean;
+  readonly nodeCount: number;
+  readonly readyNodeCount: number;
+  readonly addressCount: number;
+  readonly protocolVersion: 1;
+  readonly fixedEndpointCount: 2;
+  readonly readOnly: true;
+  readonly mutationsAvailable: false;
+  readonly redirectsAllowed: false;
+  readonly runtimeDnsAllowed: false;
+  readonly tlsVerificationRequired: true;
+}
 
 /** Versioned, explicitly redacted diagnostics read model. */
 export interface DiagnosticsReportV1 {
@@ -451,6 +465,7 @@ export interface DiagnosticsReportV1 {
   readonly githubRead?: GitHubReadDiagnosticV1;
   readonly microsoftGraphRead?: MicrosoftGraphReadDiagnosticV1;
   readonly telemetry?: TelemetryStatusSummaryV1;
+  readonly remoteNodeRead?: RemoteNodeReadDiagnosticV1;
   readonly state: DiagnosticStateSummaryV1;
 }
 
@@ -621,7 +636,7 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
   object(
     input,
     "diagnostics report",
-    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "microsoftGraphRead", "telemetry", "state"],
+    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "microsoftGraphRead", "telemetry", "remoteNodeRead", "state"],
     ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserRecovery", "jobs", "sandbox", "processRecovery", "state"]
   );
   bool(input.ok, "diagnostics report.ok");
@@ -669,6 +684,12 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
     if (![0, 1].includes(Number(graph.accountCount))) throw new ApplicationContractValidationError("diagnostics report.microsoftGraphRead.accountCount must be 0 or 1");
   }
   if (input.telemetry !== undefined) validateTelemetryStatus(input.telemetry, "diagnostics report.telemetry");
+  if (input.remoteNodeRead !== undefined) {
+    const node = object(input.remoteNodeRead, "diagnostics report.remoteNodeRead", ["enabled", "configured", "nodeCount", "readyNodeCount", "addressCount", "protocolVersion", "fixedEndpointCount", "readOnly", "mutationsAvailable", "redirectsAllowed", "runtimeDnsAllowed", "tlsVerificationRequired"]);
+    bool(node.enabled, "diagnostics report.remoteNodeRead.enabled"); bool(node.configured, "diagnostics report.remoteNodeRead.configured"); count(node.nodeCount, "diagnostics report.remoteNodeRead.nodeCount"); count(node.readyNodeCount, "diagnostics report.remoteNodeRead.readyNodeCount"); count(node.addressCount, "diagnostics report.remoteNodeRead.addressCount");
+    literal(node.protocolVersion, "diagnostics report.remoteNodeRead.protocolVersion", 1); literal(node.fixedEndpointCount, "diagnostics report.remoteNodeRead.fixedEndpointCount", 2); literal(node.readOnly, "diagnostics report.remoteNodeRead.readOnly", true); literal(node.mutationsAvailable, "diagnostics report.remoteNodeRead.mutationsAvailable", false); literal(node.redirectsAllowed, "diagnostics report.remoteNodeRead.redirectsAllowed", false); literal(node.runtimeDnsAllowed, "diagnostics report.remoteNodeRead.runtimeDnsAllowed", false); literal(node.tlsVerificationRequired, "diagnostics report.remoteNodeRead.tlsVerificationRequired", true);
+    if (Number(node.readyNodeCount) > Number(node.nodeCount)) throw new ApplicationContractValidationError("diagnostics report.remoteNodeRead ready node count exceeds node count");
+  }
   const state = object(input.state, "diagnostics report.state", ["ownerOnly", "runtimeStateOutsideSourceCheckout", "secretsExcludedFromDiagnostics"]);
   bool(state.ownerOnly, "diagnostics report.state.ownerOnly"); bool(state.runtimeStateOutsideSourceCheckout, "diagnostics report.state.runtimeStateOutsideSourceCheckout"); literal(state.secretsExcludedFromDiagnostics, "diagnostics report.state.secretsExcludedFromDiagnostics", true);
   return input as unknown as DiagnosticsReportV1;

@@ -93,7 +93,8 @@ const SESSION_MESSAGE_TOOLS = new Set(["session.message"]);
 const EMAIL_TOOLS = new Set(["email.accounts", "email.search", "email.read", "email.thread"]);
 const CALENDAR_TOOLS = new Set(["calendar.calendars", "calendar.events", "calendar.read"]);
 const GITHUB_TOOLS = new Set(["github.repository", "github.issue", "github.pull-request", "github.checks"]);
-const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", ...EMAIL_TOOLS, ...CALENDAR_TOOLS, ...GITHUB_TOOLS]);
+const REMOTE_NODE_TOOLS = new Set(["node.status", "node.diagnostics"]);
+const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", ...EMAIL_TOOLS, ...CALENDAR_TOOLS, ...GITHUB_TOOLS, ...REMOTE_NODE_TOOLS]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -109,6 +110,10 @@ export function isCalendarTool(toolName: unknown): boolean {
 
 export function isGitHubTool(toolName: unknown): boolean {
   return typeof toolName === "string" && GITHUB_TOOLS.has(toolName);
+}
+
+export function isRemoteNodeTool(toolName: unknown): boolean {
+  return typeof toolName === "string" && REMOTE_NODE_TOOLS.has(toolName);
 }
 
 export function isReplayUnavailableTool(toolName: unknown): boolean {
@@ -159,6 +164,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeInput(input);
   if (SESSION_MESSAGE_TOOLS.has(toolName)) return projectSessionMessage(input);
   if (GITHUB_TOOLS.has(toolName)) return projectGitHubInput(toolName, input);
+  if (REMOTE_NODE_TOOLS.has(toolName)) return projectRemoteNodeInput(toolName, input);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailInput(input);
   if (CALENDAR_TOOLS.has(toolName)) return projectCalendarInput(toolName, input);
   if (toolName.startsWith("git.")) return projectGitInput(input);
@@ -214,6 +220,7 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (MCP_INVOKE_TOOLS.has(toolName)) return projectMcpInvokeOutput(output);
   if (SESSION_MESSAGE_TOOLS.has(toolName)) return projectSessionMessage(output);
   if (GITHUB_TOOLS.has(toolName)) return projectGitHubOutput(toolName, output);
+  if (REMOTE_NODE_TOOLS.has(toolName)) return projectRemoteNodeOutput(toolName, output);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailOutput(toolName, output);
   if (CALENDAR_TOOLS.has(toolName)) return projectCalendarOutput(toolName, output);
   if (toolName.startsWith("git.")) return projectGitOutput(toolName, output);
@@ -296,6 +303,37 @@ function projectGitHubOutput(toolName: string, output: unknown): JsonObject {
   base.payloadBytes = Buffer.byteLength(encoded, "utf8");
   if (Array.isArray(record.checks)) base.itemCount = record.checks.length;
   if (Array.isArray(record.labels)) base.itemCount = record.labels.length;
+  return base;
+}
+
+function projectRemoteNodeInput(toolName: string, input: unknown): JsonObject {
+  const source = input && typeof input === "object" && !Array.isArray(input) ? input as JsonObject : {};
+  return {
+    targetDigest: sha256Reference(JSON.stringify([
+      toolName,
+      typeof source.nodeId === "string" ? source.nodeId : null
+    ]))
+  };
+}
+
+function projectRemoteNodeOutput(toolName: string, output: unknown): JsonObject {
+  const base: JsonObject = { type: toolName, schemaVersion: 1, contentUnavailableOnReplay: true };
+  if (!output || typeof output !== "object" || Array.isArray(output)) return base;
+  const record = output as JsonObject;
+  base.targetDigest = sha256Reference(JSON.stringify([
+    toolName,
+    typeof record.nodeId === "string" ? record.nodeId : null
+  ]));
+  const encoded = JSON.stringify(output) ?? "null";
+  base.payloadDigest = sha256Reference(encoded);
+  base.payloadBytes = Buffer.byteLength(encoded, "utf8");
+  if (toolName === "node.status" && ["ready", "degraded", "unavailable"].includes(String(record.status))) {
+    base.status = record.status;
+  }
+  if (toolName === "node.diagnostics" && ["healthy", "degraded", "unavailable"].includes(String(record.status))) {
+    base.status = record.status;
+  }
+  if (Array.isArray(record.checks)) base.itemCount = record.checks.length;
   return base;
 }
 

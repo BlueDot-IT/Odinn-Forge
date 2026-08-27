@@ -5,14 +5,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { assertCapabilityIds, capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy, previewGatewatchDecision, assertAllowed, type CapabilityId, type RuntimePolicy } from "@odinn/policy";
-import { createRunId, durableEmailProviderIdentifier, isCalendarTool, isEmailTool, isGitHubTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput, projectLiveOnlySessionContent } from "@odinn/protocol";
+import { createRunId, durableEmailProviderIdentifier, isCalendarTool, isEmailTool, isGitHubTool, isRemoteNodeTool, isReplayUnavailableTool, isWorkspaceContentTool, normalizeTaskRequest, projectDurableToolInput, projectDurableToolOutput, projectLiveOnlySessionContent } from "@odinn/protocol";
 export { isLiveOnlyAutomationTool, projectDurableJobPayload, projectDurableToolInput } from "@odinn/protocol";
 import { legacyRecordMigrationStatus, migrateLegacyRecordsToSqlite, SqliteRecordStore, SqliteAuditStore, auditMigrationStatus, migrateLegacyAuditToSqlite } from "@odinn/store-sqlite";
 import { MAX_BOUNDED_UTF8_BYTES } from "./skill-packages.ts";
 export { MAX_BOUNDED_UTF8_BYTES, SkillPackageStore, readUtf8Prefix, validateSkillPackage } from "./skill-packages.ts";
 export { applyEnvironmentValues, assertPhysicalDirectory, configuredCredentialEnvironmentKeys, isAllowedCredentialEnvironmentKey, isCredentialEnvironmentName, isPhysicalPathInside, loadEnvironmentFiles, OPERATOR_ONLY_ENVIRONMENT_KEYS, readEnvironmentFiles, sanitizedChildEnvironment } from "./environment.ts";
 export type { EnvironmentLoadOptions, LoadedEnvironmentFile, ParsedEnvironmentFiles } from "./environment.ts";
-export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+export { BROWSER_PLUGIN_MANIFEST, browserHostCapabilityPlugin, CALENDAR_READ_PLUGIN_MANIFEST, calendarReadHostCapabilityPlugin, COMPUTER_SCREEN_PLUGIN_MANIFEST, computerScreenHostCapabilityPlugin, EMAIL_READ_PLUGIN_MANIFEST, emailReadHostCapabilityPlugin, GITHUB_READ_PLUGIN_MANIFEST, githubReadHostCapabilityPlugin, REMOTE_NODE_READ_PLUGIN_MANIFEST, remoteNodeReadHostCapabilityPlugin, capabilityTokensPlugin, capsulesPlugin, counterfactualPlugin, loadRuntimePlugins, materializeHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 export type { HostCapabilityPlugin, HostCapabilityPluginContext, HostCapabilityTool, LoadedRuntimePlugin, RuntimePlugin, RuntimePluginContext } from "./plugins/index.ts";
 import { ADVANCED_FEATURE_BRANDS, CORE_ADVANCED_FEATURES, createRunLedger, EXPERIMENTAL_FEATURES, SqliteJobStore, advancedFeatureLabel, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
@@ -26,13 +26,15 @@ import { browseMemory, compactMemory, correctMemory, curateMemory, decideMemoryC
 import { approvalActionForExecution, createApprovalStore, isApprovalStoreContentionError, normalizeApprovalExecutionInput } from "./approvals.ts";
 import { fetchWebPage, searchWeb, withWebRequestSlot, dnsLookupAll } from "./web.ts";
 import { closeBrowserManagers } from "./browser.ts";
-import { browserHostCapabilityPlugin, calendarReadHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
+import { browserHostCapabilityPlugin, calendarReadHostCapabilityPlugin, computerScreenHostCapabilityPlugin, emailReadHostCapabilityPlugin, githubReadHostCapabilityPlugin, remoteNodeReadHostCapabilityPlugin, registerHostCapabilityPlugin } from "./plugins/index.ts";
 import type { CalendarReadProvider } from "./calendar.ts";
 import type { EmailReadProvider } from "./email.ts";
 import { createGitHubReadClient, normalizeGitHubReadConfig } from "./github.ts";
 import type { GitHubReadClient } from "./github.ts";
 import { createMicrosoftGraphReadAdapter, normalizeMicrosoftGraphReadConfig } from "./microsoft-graph.ts";
 import type { MicrosoftGraphReadAdapter } from "./microsoft-graph.ts";
+import { createRemoteNodeReadClient, normalizeRemoteNodeReadConfig } from "./remote-node.ts";
+import type { RemoteNodeReadClient } from "./remote-node.ts";
 import { chatWithModel, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, mergeUsage, normalizeModelConfig, normalizeProviderAuth, normalizeUsage, oauthTokenPath, saveOAuthToken } from "./providers/runtime.ts";
 import { decideImprovement, learnImprovements, listImprovements, normalizeSelfImprovementConfig, proposeImprovement, rollbackImprovement } from "./improvements.ts";
 import { DEFAULT_AGENT_ID, ensureMainAgent, loadAgent, type AgentExecutionBinding } from "./agents.ts";
@@ -56,6 +58,8 @@ export { diagnoseGitWorkspace, gitDiff, gitLog, gitResourceBinding, gitStatus } 
 export type { GitDiagnostic } from "./git.ts";
 export { createGitHubReadClient, diagnoseGitHubReadIntegration, normalizeGitHubReadConfig } from "./github.ts";
 export type { GitHubHttpRequest, GitHubHttpResponse, GitHubHttpTransport, GitHubReadClient, GitHubReadConfig, GitHubReadDiagnostic, GitHubReadTarget } from "./github.ts";
+export { createRemoteNodeReadClient, createRemoteNodeResponder, diagnoseRemoteNodeReadIntegration, normalizeRemoteNodeDiagnosticsResponse, normalizeRemoteNodeReadConfig, normalizeRemoteNodeStatusResponse, REMOTE_NODE_DIAGNOSTICS_PATH, REMOTE_NODE_PROTOCOL_VERSION, REMOTE_NODE_STATUS_PATH } from "./remote-node.ts";
+export type { RemoteNodeCheckName, RemoteNodeDiagnosticCheck, RemoteNodeDiagnosticsResponse, RemoteNodeDiagnosticsSnapshot, RemoteNodeEndpointConfig, RemoteNodeHttpRequest, RemoteNodeHttpResponse, RemoteNodeHttpTransport, RemoteNodeReadClient, RemoteNodeReadConfig, RemoteNodeReadDiagnostic, RemoteNodeReadKind, RemoteNodeReadTarget, RemoteNodeResponderOptions, RemoteNodeStatusResponse, RemoteNodeStatusSnapshot } from "./remote-node.ts";
 import type { SandboxProcessInput } from "./sandbox-process.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
@@ -147,7 +151,7 @@ function workspaceTraversalSchema(search: boolean) {
   };
 }
 
-export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, calendarReadProvider, enableCalendar = false, githubReadClient, microsoftGraphReadAdapter }: any = {}): BuiltInRegistry {
+export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll, channelAgentTools = new Map(), processExecutor, skillDisclosure, mcpRuntime, writeConfig, computerScreenProvider, enableComputerScreen = false, emailReadProvider, enableEmail = false, calendarReadProvider, enableCalendar = false, githubReadClient, microsoftGraphReadAdapter, remoteNodeReadClient }: any = {}): BuiltInRegistry {
   const root = resolve(workspaceRoot);
   const stateRoot = resolve(stateDir);
   const legacyRecordPath = join(stateRoot, "records.jsonl");
@@ -951,6 +955,33 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
     ?? (enableEmail === true ? emailReadProvider : undefined);
   const selectedCalendarReadProvider: CalendarReadProvider | undefined = configuredMicrosoftGraph?.calendarProvider
     ?? (enableCalendar === true ? calendarReadProvider : undefined);
+  let closeRemoteNodeRead = () => {};
+  const remoteNodeConfig = normalizeRemoteNodeReadConfig(config?.integrations?.remoteNode ?? {});
+  if (remoteNodeConfig.enabled) {
+    const configuredClient: RemoteNodeReadClient = remoteNodeReadClient ?? createRemoteNodeReadClient(remoteNodeConfig);
+    let active = true;
+    const ensureActive = () => {
+      if (!active) throw new Error("remote node read client is closed");
+    };
+    const guardedRemoteNodeReadClient: RemoteNodeReadClient = {
+      get target() { ensureActive(); return configuredClient.target; },
+      get diagnostic() { ensureActive(); return configuredClient.diagnostic; },
+      resourceFor(kind, input) { ensureActive(); return configuredClient.resourceFor(kind, input); },
+      status(input, signal) { ensureActive(); return configuredClient.status(input, signal); },
+      diagnostics(input, signal) { ensureActive(); return configuredClient.diagnostics(input, signal); },
+      close() { ensureActive(); }
+    };
+    registerHostCapabilityPlugin(registry, remoteNodeReadHostCapabilityPlugin, {
+      stateDir,
+      approvalStore,
+      remoteNodeReadClient: guardedRemoteNodeReadClient
+    });
+    closeRemoteNodeRead = () => {
+      if (!active) return;
+      active = false;
+      configuredClient.close();
+    };
+  }
   let closeComputerScreen = () => {};
   if (enableComputerScreen === true && computerScreenProvider) {
     let active = true;
@@ -1090,6 +1121,7 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
       if (closed) return;
       closed = true;
       closeGitHubRead();
+      closeRemoteNodeRead();
       closeComputerScreen();
       closeEmailRead();
       closeCalendarRead();
@@ -1833,10 +1865,10 @@ async function consumeClaimedApprovalContinuation({
 
 function taskRequestDigest(request: any, tool?: AnyRecord, trustedResource?: Record<string, unknown>): string {
   const requestInput = canonicalTaskInput(request.tool, request.input, tool);
-  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool)
+  const input = request.tool === "mcp.discover" || request.tool === "mcp.invoke" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool) || isRemoteNodeTool(request.tool)
     ? projectDurableToolInput(request.tool, requestInput)
     : requestInput;
-  const resource = trustedResource ?? (request.tool === "computer.screen" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool)
+  const resource = trustedResource ?? (request.tool === "computer.screen" || isEmailTool(request.tool) || isCalendarTool(request.tool) || isGitHubTool(request.tool) || isRemoteNodeTool(request.tool)
     ? executionResourceForRequest(request.tool, requestInput, tool)
     : undefined);
   return createHash("sha256").update(stableTaskValue({ tool: request.tool, input, actor: request.actor ?? "unknown", ...(resource ? { resource } : {}) })).digest("hex");

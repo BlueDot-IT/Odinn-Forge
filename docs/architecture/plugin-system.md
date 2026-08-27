@@ -4,10 +4,10 @@ _Status: design baseline plus the first shipped host-capability seam._
 
 This document defines the boundary for plugins that give Ódinn Forge access to
 the browser, a local desktop, or external services such as email. The browser
-host-capability seam, conditional `computer.screen` node-host contract, and
-conditional read-only email provider contract are shipped; computer mutation
-and a concrete email provider remain design targets until their adapters and
-security tests land.
+host-capability seam, conditional `computer.screen` node-host contract,
+conditional read-only email provider contract, and authenticated two-tool
+remote-node read contract are shipped; computer mutation and a concrete email
+provider remain design targets until their adapters and security tests land.
 
 ## Decision summary
 
@@ -202,6 +202,18 @@ also requires explicit `enableComputerScreen` opt-in.
 This follows the useful OpenClaw split between a model-facing computer tool,
 screen capture, and a dangerous node-host command while keeping Forge's
 execution admission and audit ledger authoritative.
+
+### Remote-node status
+
+The shipped remote-node host capability is deliberately separate from
+computer use. It exposes only `node.status` and `node.diagnostics`, with exact
+`{ nodeId }` input, the `node.read`/network/credential-reference capability
+intersection, and no approval because both operations are pure reads. The
+operator owns the exact HTTPS authority, literal pinned-address allowlist, and
+environment credential reference. Paths and response schemas are fixed by the
+kernel; neither plugin metadata nor model input can add an endpoint or return
+logs and arbitrary content. See
+[Authenticated remote-node reads](../remote-node-read.md).
 
 ### Email
 
