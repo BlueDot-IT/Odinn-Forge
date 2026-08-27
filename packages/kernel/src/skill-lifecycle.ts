@@ -8,6 +8,7 @@ import {
   type RuntimePolicy
 } from "@odinn/policy";
 import type { ApprovalAction, ApprovalStore } from "./approvals.ts";
+import { withStateMutationLock } from "./state-mutation.ts";
 import {
   SkillPackageStore,
   validateSkillPackage,
@@ -18,6 +19,9 @@ export type SkillLifecycleContext = {
   operationId?: string;
   actor?: string;
   idempotencyKey?: string;
+  signal?: AbortSignal;
+  /** @internal Test-only barrier after the managed-skill state lock is held. */
+  __testOnlyAfterLockAcquired?: () => void | Promise<void>;
 };
 
 export type SkillLifecycleTransition = SkillTransitionPreconditions & {
@@ -88,6 +92,7 @@ export class SkillLifecycleService {
   }
 
   async create(input: unknown, context: SkillLifecycleContext = {}) {
+    throwIfSkillLifecycleAborted(context.signal);
     this.assertWritable();
     const operation = operationContext(context);
     const validated = validateSkillPackage(input);
@@ -100,7 +105,11 @@ export class SkillLifecycleService {
       requestDigest: digest({ action: "create", manifest: validated.manifest, integrity: validated.integrity })
     });
     try {
-      const installed = await this.store.install(input);
+      const installed = await this.store.install(input, {
+        signal: context.signal,
+        __testOnlyAfterLockAcquired: context.__testOnlyAfterLockAcquired
+      });
+      throwIfSkillLifecycleAborted(context.signal);
       await this.audit("skill.lifecycle.completed", operation, {
         action: "create",
         skillId: installed.id,
@@ -112,12 +121,15 @@ export class SkillLifecycleService {
       });
       return safeRecord(installed);
     } catch (error) {
-      await this.auditFailure(operation, "create", validated.manifest.id, validated.manifest.version, validated.integrity);
+      if (!context.signal?.aborted) {
+        await this.auditFailure(operation, "create", validated.manifest.id, validated.manifest.version, validated.integrity);
+      }
       throw error;
     }
   }
 
   async transition(request: SkillLifecycleTransition, context: SkillLifecycleContext = {}) {
+    throwIfSkillLifecycleAborted(context.signal);
     this.assertWritable();
     const operation = operationContext(context);
     const action = request?.action;
@@ -148,6 +160,7 @@ export class SkillLifecycleService {
       expectedIntegrity: request.integrity
     });
     if (action === "enable") {
+      throwIfSkillLifecycleAborted(context.signal);
       const summary = `Enable skill package ${request.id}@${request.version} after digest-bound review`;
       const approvalId = this.approvalStore.create({
         type: "skill-lifecycle",
@@ -161,7 +174,8 @@ export class SkillLifecycleService {
           integrity: request.integrity,
           requestDigest
         }
-      });
+      }, { signal: context.signal });
+      throwIfSkillLifecycleAborted(context.signal);
       await this.audit("skill.lifecycle.approval_required", operation, {
         action,
         skillId: request.id,
@@ -183,7 +197,11 @@ export class SkillLifecycleService {
       const transitioned = await this.store.transition(request.id, action, {
         version: request.version,
         integrity: request.integrity
+      }, {
+        signal: context.signal,
+        __testOnlyAfterLockAcquired: context.__testOnlyAfterLockAcquired
       });
+      throwIfSkillLifecycleAborted(context.signal);
       await this.audit("skill.lifecycle.completed", operation, {
         action,
         skillId: request.id,
@@ -195,16 +213,19 @@ export class SkillLifecycleService {
       });
       return safeRecord(transitioned);
     } catch (error) {
-      await this.auditFailure(operation, action, request.id, String(request.version), String(request.integrity), requestDigest);
+      if (!context.signal?.aborted) {
+        await this.auditFailure(operation, action, request.id, String(request.version), String(request.integrity), requestDigest);
+      }
       throw error;
     }
   }
 
-  async applyApproved(approvalId: string, pending?: ApprovalAction) {
+  async applyApproved(approvalId: string, pending?: ApprovalAction, context: SkillLifecycleContext = {}) {
+    throwIfSkillLifecycleAborted(context.signal);
     this.assertWritable();
     const candidate = pending ?? (typeof this.approvalStore.claimAsync === "function"
-      ? await this.approvalStore.claimAsync(approvalId)
-      : this.approvalStore.claim(approvalId));
+      ? await this.approvalStore.claimAsync(approvalId, { signal: context.signal })
+      : this.approvalStore.claim(approvalId, { signal: context.signal }));
     if (!candidate || candidate.tool !== "skill.lifecycle" || candidate.type !== "skill-lifecycle") {
       throw new SkillLifecycleError("SKILL_APPROVAL_INVALID", "skill lifecycle approval is missing or has the wrong type", 409);
     }
@@ -225,9 +246,10 @@ export class SkillLifecycleService {
       runId: candidate.runId,
       input
     };
+    throwIfSkillLifecycleAborted(context.signal);
     const consumed = typeof this.approvalStore.consumeAsync === "function"
-      ? await this.approvalStore.consumeAsync(approvalId, expectedApproval)
-      : this.approvalStore.consume(approvalId, expectedApproval);
+      ? await this.approvalStore.consumeAsync(approvalId, expectedApproval, { signal: context.signal })
+      : this.approvalStore.consume(approvalId, expectedApproval, { signal: context.signal });
     if (!consumed) throw new SkillLifecycleError("SKILL_APPROVAL_CONSUMED", "skill lifecycle approval is expired, already used, or does not match", 409);
     const record = await this.findRecord(expected.id);
     if (!record || record.version !== expected.version || record.integrity !== expected.integrity) {
@@ -237,10 +259,15 @@ export class SkillLifecycleService {
     const validated = validateSkillPackage(record);
     validateSkillDeclarations(validated.manifest, true);
     try {
+      throwIfSkillLifecycleAborted(context.signal);
       const enabled = await this.store.transition(expected.id, "enable", {
         version: expected.version,
         integrity: expected.integrity
+      }, {
+        signal: context.signal,
+        __testOnlyAfterLockAcquired: context.__testOnlyAfterLockAcquired
       });
+      throwIfSkillLifecycleAborted(context.signal);
       await this.audit("skill.lifecycle.completed", {
         operationId: candidate.runId || randomUUID(),
         actor: "approval-executor"
@@ -256,12 +283,15 @@ export class SkillLifecycleService {
       });
       return safeRecord(enabled);
     } catch (error) {
-      await this.auditFailure({ operationId: candidate.runId || randomUUID(), actor: "approval-executor" }, "enable", expected.id, expected.version, expected.integrity, expected.requestDigest);
+      if (!context.signal?.aborted) {
+        await this.auditFailure({ operationId: candidate.runId || randomUUID(), actor: "approval-executor" }, "enable", expected.id, expected.version, expected.integrity, expected.requestDigest);
+      }
       throw error;
     }
   }
 
   async saveDraft(input: any, context: SkillLifecycleContext = {}) {
+    throwIfSkillLifecycleAborted(context.signal);
     this.assertWritable();
     const operation = operationContext(context);
     const name = String(input?.name ?? "").trim();
@@ -278,15 +308,23 @@ export class SkillLifecycleService {
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
     await this.audit("skill.lifecycle.admitted", operation, { action: "save-draft", skillId: name, requestDigest: digestValue, bytes });
     try {
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await writeFile(temporary, content, { mode: 0o600 });
-      await rename(temporary, path);
-      await chmod(path, 0o600);
+      await withStateMutationLock(this.store.stateDir, async () => {
+        throwIfSkillLifecycleAborted(context.signal);
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        await writeFile(temporary, content, { mode: 0o600 });
+        throwIfSkillLifecycleAborted(context.signal);
+        await rename(temporary, path);
+        await chmod(path, 0o600);
+      }, {
+        signal: context.signal,
+        __testOnlyAfterLockAcquired: context.__testOnlyAfterLockAcquired
+      });
+      throwIfSkillLifecycleAborted(context.signal);
       await this.audit("skill.lifecycle.completed", operation, { action: "save-draft", skillId: name, requestDigest: digestValue, bytes, status: "draft" });
       return { path, digest: digestValue, status: "draft" };
     } catch (error) {
       await rm(temporary, { force: true }).catch(() => undefined);
-      await this.auditFailure(operation, "save-draft", name, "draft", digestValue);
+      if (!context.signal?.aborted) await this.auditFailure(operation, "save-draft", name, "draft", digestValue);
       throw error;
     }
   }
@@ -318,6 +356,12 @@ export class SkillLifecycleService {
       ...(requestDigest ? { requestDigest } : {})
     }).catch(() => undefined);
   }
+}
+
+function throwIfSkillLifecycleAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("skill lifecycle mutation was aborted");
 }
 
 function operationContext(context: SkillLifecycleContext) {

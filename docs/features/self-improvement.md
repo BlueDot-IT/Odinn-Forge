@@ -29,3 +29,10 @@ pnpm odinn improve rollback --improvement <id>
 No embedded model is currently bundled with Ódinn, so the loop uses the configured provider. Model output can improve the title, explanation, and priority of an observation, but it cannot choose or invent a configuration change.
 
 Autonomy is deliberately narrow. The controller may tune only explicitly allowlisted reliability settings. It cannot disable safeguards, expand network domains, grant permissions, install extensions, change credentials, edit source code, or apply arbitrary model-generated actions. Every application, failure, and rollback is persisted in the record and audit stores.
+
+Gateway shutdown closes this loop cooperatively: it aborts the active provider
+request, prevents model-unavailable fallback after cancellation, and drains the
+cycle within the shared shutdown deadline. Configuration writes recheck that
+signal at the state lock and immediately before atomic activation. An effect
+that already crossed its atomic boundary completes only the bounded durable
+settlement needed to keep the configuration and improvement record coherent.

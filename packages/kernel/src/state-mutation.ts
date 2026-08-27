@@ -8,6 +8,9 @@ const POLL_INTERVAL_MS = 50;
 
 export type StateMutationLockOptions = {
   timeoutMs?: number;
+  signal?: AbortSignal;
+  /** @internal Test-only barrier after this process owns the mutation lock. */
+  __testOnlyAfterLockAcquired?: () => void | Promise<void>;
   __testOnlyAfterLockRead?: () => void | Promise<void>;
   __testOnlyWindowsFileSemantics?: boolean;
   __testOnlyBeforeReleaseFileOperation?: (
@@ -31,11 +34,13 @@ export async function withStateMutationLock<T>(
   operation: () => Promise<T>,
   options: StateMutationLockOptions = {}
 ): Promise<T> {
+  throwIfStateMutationAborted(options.signal);
   const root = resolve(stateDir);
   const parent = dirname(root);
   const lockPath = join(parent, `.${basename(root)}.state-mutation.lock`);
   const timeoutMs = positiveTimeout(options.timeoutMs);
   await mkdir(parent, { recursive: true });
+  throwIfStateMutationAborted(options.signal);
 
   const token = randomBytes(18).toString("hex");
   const deadline = Date.now() + timeoutMs;
@@ -54,11 +59,13 @@ export async function withStateMutationLock<T>(
       if (Date.now() >= deadline) {
         throw new Error("Odinn state is busy in another process. Wait for that operation to finish, then try again.");
       }
-      await wait(POLL_INTERVAL_MS);
+      await wait(POLL_INTERVAL_MS, options.signal);
     }
   }
 
   try {
+    await options.__testOnlyAfterLockAcquired?.();
+    throwIfStateMutationAborted(options.signal);
     return await operation();
   } finally {
     await removeOwnedLock(lockPath, token, options);
@@ -310,6 +317,31 @@ function isCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+function throwIfStateMutationAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("state mutation was aborted");
+}
+
+function wait(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+  throwIfStateMutationAborted(signal);
+  return new Promise((resolveWait, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolveWait();
+    }, milliseconds);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      try { throwIfStateMutationAborted(signal); }
+      catch (error) { reject(error); }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }

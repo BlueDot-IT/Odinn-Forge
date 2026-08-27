@@ -26,6 +26,7 @@ export type WorkflowRuntimeOptions = {
 };
 
 export type WorkflowSubmission = Omit<WorkflowRunRequest, "schemaVersion"> & { schemaVersion?: 1 };
+export type WorkflowRuntimeMutationOptions = { signal?: AbortSignal };
 
 export class DurableWorkflowRuntime {
   readonly store: SqliteWorkflowStore;
@@ -61,7 +62,8 @@ export class DurableWorkflowRuntime {
     await this.drain();
   }
 
-  async submit(input: WorkflowSubmission): Promise<WorkflowRunRecord> {
+  async submit(input: WorkflowSubmission, options: WorkflowRuntimeMutationOptions = {}): Promise<WorkflowRunRecord> {
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
     const request: WorkflowRunRequest = {
       schemaVersion: 1,
       runId: input.runId || createRunId(),
@@ -70,8 +72,10 @@ export class DurableWorkflowRuntime {
       definition: input.definition,
       input: input.input
     };
-    const run = this.store.create(request);
+    const run = this.store.create(request, { signal: options.signal });
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
     await this.emit(run.runId, "workflow.accepted", { definitionDigest: run.definitionDigest });
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
     await this.drain();
     return this.store.get(run.runId)!;
   }
@@ -82,30 +86,37 @@ export class DurableWorkflowRuntime {
   counts(): { total: number; attention: number } { return this.store.counts(); }
   events(runId: string, limit?: number) { return this.store.events(runId, limit); }
 
-  async cancel(runId: string): Promise<WorkflowRunRecord> {
+  async cancel(runId: string, options: WorkflowRuntimeMutationOptions = {}): Promise<WorkflowRunRecord> {
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
     const deadlineAt = new Date(Date.now() + this.cancellationGraceMs).toISOString();
-    const requested = this.store.requestCancellation(runId, deadlineAt);
+    const requested = this.store.requestCancellation(runId, deadlineAt, { signal: options.signal });
     if (requested.status !== "cancelling") return requested;
     this.scheduleLeaseRecovery(deadlineAt);
     const active = [...this.#active.values()].filter((entry) => entry.runId === runId);
     for (const entry of active) entry.controller.abort(new Error("workflow cancelled by operator"));
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
     void this.emit(runId, "workflow.cancellation-requested", { deadlineAt }).catch(() => undefined);
     let timer: NodeJS.Timeout | undefined;
     if (active.length) {
-      await Promise.race([
+      await waitForWorkflowMutation([
         Promise.allSettled(active.map(({ promise }) => promise)),
         new Promise<void>((resolve) => { timer = setTimeout(resolve, this.cancellationGraceMs); })
-      ]);
+      ], options.signal);
       if (timer) clearTimeout(timer);
     }
-    const result = this.store.finalizeCancellation(runId, { quarantineRunning: true });
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
+    const result = this.store.finalizeCancellation(runId, { quarantineRunning: true }, { signal: options.signal });
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
     void this.emit(runId, result.status === "cancelled" ? "workflow.cancelled" : "workflow.cancellation-needs-review", {}).catch(() => undefined);
     return result;
   }
 
-  async resume(runId: string): Promise<WorkflowRunRecord> {
-    const result = this.store.resume(runId);
+  async resume(runId: string, options: WorkflowRuntimeMutationOptions = {}): Promise<WorkflowRunRecord> {
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
+    const result = this.store.resume(runId, { signal: options.signal });
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
     await this.emit(runId, "workflow.resumed", {});
+    throwIfWorkflowRuntimeMutationAborted(options.signal);
     await this.drain();
     return result;
   }
@@ -324,6 +335,39 @@ export class DurableWorkflowRuntime {
   private async emit(runId: string, type: string, data: Record<string, unknown>): Promise<void> {
     await this.onEvent?.({ runId, type, data });
   }
+}
+
+function throwIfWorkflowRuntimeMutationAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("workflow mutation was aborted");
+}
+
+async function waitForWorkflowMutation<T>(operations: Array<Promise<T> | Promise<unknown>>, signal?: AbortSignal): Promise<unknown> {
+  if (!signal) return Promise.race(operations);
+  throwIfWorkflowRuntimeMutationAborted(signal);
+  return new Promise((resolveWait, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      try { throwIfWorkflowRuntimeMutationAborted(signal); }
+      catch (error) { reject(error); }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.race(operations).then((value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolveWait(value);
+    }, (error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+  });
 }
 
 export function createDurableWorkflowRuntime({ stateDir = ".odinn", workspaceRoot = currentWorkingDirectory(), dispatch, onEvent, concurrency = 1, cancellationGraceMs, leaseMs }: Omit<WorkflowRuntimeOptions, "store"> & { stateDir?: string; workspaceRoot?: string }): DurableWorkflowRuntime {

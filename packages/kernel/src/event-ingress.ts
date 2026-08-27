@@ -19,6 +19,7 @@ type DeliveryStatus = "queued" | "completed" | "failed" | "needs-review";
 
 export type EventIngressDispatch = (candidate: AutomationCandidate, context: { signal: AbortSignal; renewLease: () => boolean }) => Promise<"completed" | "failed" | "needs-review">;
 export type EventIngressOptions = { database: SqliteStore; dispatch?: EventIngressDispatch; maxWatches?: number; dispatchLeaseMs?: number };
+export type EventIngressMutationOptions = { signal?: AbortSignal };
 
 type ActiveDispatch = {
   controller: AbortController;
@@ -126,13 +127,15 @@ export class DurableEventIngress {
     this.recoverTokenlessDeliveries();
   }
 
-  registerSource({ source, authDigest, oldestSequence = 0, enabled = true }: { source: string; authDigest: string; oldestSequence?: number; enabled?: boolean }): Source {
+  registerSource({ source, authDigest, oldestSequence = 0, enabled = true }: { source: string; authDigest: string; oldestSequence?: number; enabled?: boolean }, options: EventIngressMutationOptions = {}): Source {
+    throwIfEventIngressMutationAborted(options.signal);
     const normalizedSource = validSource(source);
     const normalizedAuth = validAuth(authDigest);
     if (!Number.isSafeInteger(oldestSequence) || oldestSequence < 0) throw new Error("oldestSequence must be a non-negative integer");
     const existing = this.database.db.prepare("SELECT * FROM event_sources WHERE source=?").get(normalizedSource) as Row | undefined;
     if (existing && String(existing.auth_digest) !== normalizedAuth) throw new Error("event source authentication identity cannot be replaced implicitly");
     const updatedAt = timestamp();
+    throwIfEventIngressMutationAborted(options.signal);
     this.database.db.prepare(`INSERT INTO event_sources(source, auth_digest, oldest_sequence, newest_sequence, enabled, updated_at)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(source) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at`).run(normalizedSource, normalizedAuth, oldestSequence, existing ? Number(existing.newest_sequence) : oldestSequence - 1, enabled ? 1 : 0, updatedAt);
@@ -144,7 +147,8 @@ export class DurableEventIngress {
     return row ? { source: String(row.source), authDigest: String(row.auth_digest), oldestSequence: Number(row.oldest_sequence), newestSequence: Number(row.newest_sequence), enabled: Number(row.enabled) === 1, updatedAt: String(row.updated_at) } : undefined;
   }
 
-  registerWatch(watchId: string, declarationInput: unknown): AutomationDeclaration {
+  registerWatch(watchId: string, declarationInput: unknown, options: EventIngressMutationOptions = {}): AutomationDeclaration {
+    throwIfEventIngressMutationAborted(options.signal);
     if (!WATCH_ID.test(watchId)) throw new Error("event watch id is invalid");
     const declaration = validateAutomationDeclaration(declarationInput);
     if (!declaration.enabled) throw new Error("disabled automation declarations cannot be activated as watches");
@@ -153,13 +157,15 @@ export class DurableEventIngress {
     const count = Number((this.database.db.prepare("SELECT count(*) AS count FROM event_watches WHERE enabled=1").get() as Row).count);
     if (count >= this.maxWatches && (!existing || Number(existing.enabled) !== 1)) throw new Error("event watch capacity reached");
     const at = timestamp();
+    throwIfEventIngressMutationAborted(options.signal);
     this.database.db.prepare(`INSERT INTO event_watches(watch_id, declaration_json, declaration_digest, enabled, created_at, updated_at)
       VALUES (?, ?, ?, 1, ?, ?)
       ON CONFLICT(watch_id) DO UPDATE SET enabled=1, updated_at=excluded.updated_at`).run(watchId, JSON.stringify(declaration), declaration.declarationDigest, at, at);
     return declaration;
   }
 
-  disableWatch(watchId: string): void {
+  disableWatch(watchId: string, options: EventIngressMutationOptions = {}): void {
+    throwIfEventIngressMutationAborted(options.signal);
     if (!WATCH_ID.test(watchId)) throw new Error("event watch id is invalid");
     this.database.db.prepare("UPDATE event_watches SET enabled=0, updated_at=? WHERE watch_id=?").run(timestamp(), watchId);
   }
@@ -361,7 +367,8 @@ export class DurableEventIngress {
     return this.delivery(idempotencyKey)?.status ?? "needs-review";
   }
 
-  private async dispatchCandidate(candidate: AutomationCandidate): Promise<DeliveryStatus | undefined> {
+  private async dispatchCandidate(candidate: AutomationCandidate, requestSignal?: AbortSignal): Promise<DeliveryStatus | undefined> {
+    throwIfEventIngressMutationAborted(requestSignal);
     if (!this.dispatch || this.#closed) return undefined;
     const token = this.claimDelivery(candidate.idempotencyKey);
     if (!token) return this.delivery(candidate.idempotencyKey)?.status;
@@ -377,6 +384,9 @@ export class DurableEventIngress {
       controller.abort(new Error(errorCode));
       forceOutcome({ status: "needs-review", errorCode });
     };
+    const abortForRequest = () => force("EVENT_REQUEST_ABORTED");
+    requestSignal?.addEventListener("abort", abortForRequest, { once: true });
+    if (requestSignal?.aborted) abortForRequest();
     this.#active.set(token, { controller, force, settled });
     const dispatch = Promise.resolve()
       .then(() => this.dispatch!(candidate, {
@@ -397,6 +407,7 @@ export class DurableEventIngress {
       if (this.#closed) return "needs-review";
       return this.settleDelivery(candidate.idempotencyKey, token, outcome.status, outcome.errorCode);
     } finally {
+      requestSignal?.removeEventListener("abort", abortForRequest);
       this.#active.delete(token);
       settleActive();
     }
@@ -432,7 +443,8 @@ export class DurableEventIngress {
     this.#recoveryTimer.unref?.();
   }
 
-  async ingest(input: unknown, authDigest: string): Promise<{ event: AutomationEvent; candidates: AutomationCandidate[]; deliveries: Array<{ idempotencyKey: string; status: DeliveryStatus }> }> {
+  async ingest(input: unknown, authDigest: string, options: EventIngressMutationOptions = {}): Promise<{ event: AutomationEvent; candidates: AutomationCandidate[]; deliveries: Array<{ idempotencyKey: string; status: DeliveryStatus }> }> {
+    throwIfEventIngressMutationAborted(options.signal);
     const event = validateAutomationEvent(input);
     const source = this.source(event.source);
     if (!source || !source.enabled) throw new Error("event source is unknown or disabled");
@@ -445,7 +457,9 @@ export class DurableEventIngress {
     const replayWindow = event.sequence === source.oldestSequence ? window : { ...window, afterCursor: formatAutomationCursor(source.source, event.sequence - 1) };
     const candidates = watches.map((watch) => matchAutomationEvent(watch.declaration, event, replayWindow)).filter((candidate): candidate is AutomationCandidate => Boolean(candidate));
     const deliveries: Array<{ idempotencyKey: string; status: DeliveryStatus }> = [];
+    throwIfEventIngressMutationAborted(options.signal);
     this.database.transaction((db) => {
+      throwIfEventIngressMutationAborted(options.signal);
       if (!duplicate) {
         const updated = db.prepare("UPDATE event_sources SET newest_sequence=?, updated_at=? WHERE source=? AND newest_sequence=?").run(event.sequence, timestamp(), source.source, source.newestSequence);
         if (Number(updated.changes) !== 1) {
@@ -460,11 +474,16 @@ export class DurableEventIngress {
         }
       }
     });
-    for (const candidate of candidates) this.startDispatch(candidate);
+    throwIfEventIngressMutationAborted(options.signal);
+    for (const candidate of candidates) {
+      throwIfEventIngressMutationAborted(options.signal);
+      this.startDispatch(candidate);
+    }
     return { event, candidates, deliveries };
   }
 
-  async heartbeat(nowUnixMs = Date.now()): Promise<AutomationCandidate[]> {
+  async heartbeat(nowUnixMs = Date.now(), options: EventIngressMutationOptions = {}): Promise<AutomationCandidate[]> {
+    throwIfEventIngressMutationAborted(options.signal);
     if (!Number.isSafeInteger(nowUnixMs) || nowUnixMs < 0) throw new Error("heartbeat time is invalid");
     const candidates: AutomationCandidate[] = [];
     for (const watch of this.listActiveWatches("schedule")) {
@@ -474,13 +493,16 @@ export class DurableEventIngress {
       if (occurrence === null || occurrence > nowUnixMs) continue;
       const candidate = createScheduleCandidate(watch.declaration, occurrence);
       if (!candidate) continue;
+      throwIfEventIngressMutationAborted(options.signal);
       this.database.transaction((db) => {
+        throwIfEventIngressMutationAborted(options.signal);
         this.persistCandidate(db, candidate, { watchId: watch.watchId, source: "heartbeat" });
         db.prepare(`INSERT INTO heartbeat_checkpoints(name, last_tick_unix_ms, updated_at) VALUES (?, ?, ?)
           ON CONFLICT(name) DO UPDATE SET last_tick_unix_ms=excluded.last_tick_unix_ms, updated_at=excluded.updated_at
           WHERE heartbeat_checkpoints.last_tick_unix_ms < excluded.last_tick_unix_ms`).run(watch.watchId, occurrence, timestamp());
       });
       candidates.push(candidate);
+      throwIfEventIngressMutationAborted(options.signal);
       this.startDispatch(candidate);
     }
     return candidates;
@@ -524,4 +546,10 @@ function positiveDuration(value: number | undefined, fallback: number, label: st
   const duration = value ?? fallback;
   if (!Number.isInteger(duration) || duration < 1) throw new Error(`${label} must be a positive integer`);
   return duration;
+}
+
+function throwIfEventIngressMutationAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("event ingress mutation was aborted");
 }

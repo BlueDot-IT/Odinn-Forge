@@ -43,6 +43,7 @@ interface ProofVerifierOptions {
   allowExternalHttp?: boolean; allowedCommands?: string[][]; commandEnvironment?: NodeJS.ProcessEnv;
   includeRawEvidence?: boolean;
 }
+export interface ProofVerificationOptions { signal?: AbortSignal }
 
 const RAW_EVIDENCE_KEYS = new Set(["stdout", "stderr", "content", "body", "evidence"]);
 
@@ -77,6 +78,14 @@ export function proofEvidenceView<T>(value: T, includeRawEvidence = false): T {
 
 const asObject = (value: unknown): JsonObject => value as JsonObject;
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
+
+function proofAbortReason(signal?: AbortSignal): Error {
+  return signal?.reason instanceof Error ? signal.reason : new Error("proof verification was cancelled");
+}
+
+function assertProofActive(signal?: AbortSignal): void {
+  if (signal?.aborted) throw proofAbortReason(signal);
+}
 
 function isPlainObject(value: unknown): value is JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -257,14 +266,17 @@ function isWithin(root: string, target: string) {
   return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }
 
-async function resolveAllowedPath(root: string, candidate: string): Promise<{ path: string; exists: boolean }> {
+async function resolveAllowedPath(root: string, candidate: string, signal?: AbortSignal): Promise<{ path: string; exists: boolean }> {
+  assertProofActive(signal);
   const lexical = resolve(root, candidate);
   if (!isWithin(root, lexical)) throw new Error(`path escapes allowed root: ${candidate}`);
   try {
     const physical = await realpath(lexical);
+    assertProofActive(signal);
     if (!isWithin(root, physical)) throw new Error(`path escapes allowed root through a symbolic link: ${candidate}`);
     return { path: physical, exists: true };
   } catch (error) {
+    assertProofActive(signal);
     if (!['ENOENT', 'ENOTDIR'].includes((error as NodeError | undefined)?.code ?? "")) throw error;
   }
 
@@ -272,10 +284,13 @@ async function resolveAllowedPath(root: string, candidate: string): Promise<{ pa
   while (true) {
     try {
       await lstat(ancestor);
+      assertProofActive(signal);
       const physicalAncestor = await realpath(ancestor);
+      assertProofActive(signal);
       if (!isWithin(root, physicalAncestor)) throw new Error(`path escapes allowed root through a symbolic link: ${candidate}`);
       return { path: lexical, exists: false };
     } catch (error) {
+      assertProofActive(signal);
       if (!['ENOENT', 'ENOTDIR'].includes((error as NodeError | undefined)?.code ?? "")) throw error;
       const parent = dirname(ancestor);
       if (parent === ancestor) throw new Error(`cannot resolve path within allowed root: ${candidate}`);
@@ -284,10 +299,11 @@ async function resolveAllowedPath(root: string, candidate: string): Promise<{ pa
   }
 }
 
-async function matchesText(actual: string, matcher: Matcher) {
+async function matchesText(actual: string, matcher: Matcher, signal?: AbortSignal) {
+  assertProofActive(signal);
   if ("equals" in matcher) return actual === matcher.equals;
   if ("contains" in matcher) return actual.includes(matcher.contains);
-  return await new Promise<boolean>((resolveMatch, rejectMatch) => {
+  const matched = await new Promise<boolean>((resolveMatch, rejectMatch) => {
     const worker = new Worker(
       `const { parentPort, workerData } = require("node:worker_threads");
        try { parentPort.postMessage({ match: new RegExp(workerData.pattern, workerData.flags).test(workerData.actual) }); }
@@ -296,11 +312,13 @@ async function matchesText(actual: string, matcher: Matcher) {
     );
     let settled = false;
     let executionDeadline: NodeJS.Timeout | undefined;
+    let abortMatch: (() => void) | undefined;
     const finish = (error?: Error, matched?: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(startupDeadline);
       if (executionDeadline) clearTimeout(executionDeadline);
+      if (abortMatch) signal?.removeEventListener("abort", abortMatch);
       void worker.terminate();
       if (error) rejectMatch(error);
       else resolveMatch(matched === true);
@@ -309,6 +327,8 @@ async function matchesText(actual: string, matcher: Matcher) {
       () => finish(new Error(`proof regular expression worker exceeded ${REGEX_WORKER_STARTUP_TIMEOUT_MS}ms startup limit`)),
       REGEX_WORKER_STARTUP_TIMEOUT_MS
     );
+    abortMatch = () => finish(proofAbortReason(signal));
+    signal?.addEventListener("abort", abortMatch, { once: true });
     worker.once("online", () => {
       clearTimeout(startupDeadline);
       executionDeadline = setTimeout(
@@ -329,6 +349,8 @@ async function matchesText(actual: string, matcher: Matcher) {
       if (!settled && code !== 0) finish(new Error(`proof regular expression worker exited with code ${code}`));
     });
   });
+  assertProofActive(signal);
+  return matched;
 }
 
 function isLoopbackUrl(value: string) {
@@ -347,8 +369,9 @@ function terminateProcessTree(child: { pid?: number; kill(signal?: NodeJS.Signal
   try { killProcess(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
 }
 
-function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes, environment }: { cwd: string; timeoutMs: number; maxOutputBytes: number; environment: NodeJS.ProcessEnv }): Promise<ProcessResult> {
-  return new Promise<ProcessResult>((resolveResult) => {
+function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes, environment, signal }: { cwd: string; timeoutMs: number; maxOutputBytes: number; environment: NodeJS.ProcessEnv; signal?: AbortSignal }): Promise<ProcessResult> {
+  assertProofActive(signal);
+  return new Promise<ProcessResult>((resolveResult, rejectResult) => {
     const startedAt = new Date().toISOString();
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -366,6 +389,20 @@ function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes, env
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true
     });
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (error: Error | undefined, result?: ProcessResult) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", abortProcess);
+      if (error) rejectResult(error);
+      else resolveResult(result!);
+    };
+    const abortProcess = () => {
+      terminateProcessTree(child);
+      finish(proofAbortReason(signal));
+    };
+    signal?.addEventListener("abort", abortProcess, { once: true });
     const collect = (chunks: Buffer[], chunk: Buffer, stream: "stdout" | "stderr") => {
       const used = stream === "stdout" ? stdoutBytes : stderrBytes;
       const available = Math.max(0, maxOutputBytes - used);
@@ -380,15 +417,12 @@ function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes, env
     child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk, "stdout"));
     child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk, "stderr"));
     child.once("error", (error) => { spawnError = error; });
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       timedOut = true;
       terminateProcessTree(child);
     }, timeoutMs);
     child.once("close", (exitCode, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolveResult({
+      finish(undefined, {
         startedAt,
         completedAt: new Date().toISOString(),
         exitCode,
@@ -452,15 +486,19 @@ export class ProofVerifier {
     };
   }
 
-  async verify(input: unknown) {
+  async verify(input: unknown, { signal }: ProofVerificationOptions = {}) {
+    assertProofActive(signal);
     const contract = validateVerificationContract(input);
     const root = await realpath(this.allowedRoot);
+    assertProofActive(signal);
     if (!this.runLedger.getRun(contract.runId)) throw new Error(`run not found for verification contract: ${contract.runId}`);
     const existing = this.runLedger.database.db.prepare("SELECT id FROM verification_contracts WHERE id = ?").get(contract.id);
     if (existing) throw new Error(`verification contract already exists: ${contract.id}`);
 
     const startedAt = new Date().toISOString();
+    assertProofActive(signal);
     const contractArtifact = this.runLedger.artifacts.putJson(contract);
+    assertProofActive(signal);
     this.runLedger.database.transaction((db) => {
       registerArtifact(db, contractArtifact, startedAt);
       db.prepare(`INSERT INTO verification_contracts
@@ -473,6 +511,7 @@ export class ProofVerifier {
         startedAt
       );
     });
+    assertProofActive(signal);
     this.runLedger.appendEvent({
       runId: contract.runId,
       type: "verification-started",
@@ -481,22 +520,27 @@ export class ProofVerifier {
 
     const results: AssertionResult[] = [];
     for (let sequence = 0; sequence < contract.assertions.length; sequence += 1) {
+      assertProofActive(signal);
       const assertion = contract.assertions[sequence];
       let result;
       try {
         result = assertion.type === "command"
-          ? await this.verifyCommand(assertion, root)
+          ? await this.verifyCommand(assertion, root, signal)
           : assertion.type === "file"
-            ? await this.verifyFile(assertion, root)
+            ? await this.verifyFile(assertion, root, signal)
             : assertion.type === "http"
-              ? await this.verifyHttp(assertion)
-              : await this.verifyGit(assertion, root);
+              ? await this.verifyHttp(assertion, signal)
+              : await this.verifyGit(assertion, root, signal);
+        assertProofActive(signal);
       } catch (error) {
+        assertProofActive(signal);
         result = this.failedResult(assertion, `assertion execution failed: ${errorMessage(error)}`, {});
       }
-      this.persistAssertion(contract.id, assertion, result, sequence + 1);
+      assertProofActive(signal);
+      this.persistAssertion(contract.id, assertion, result, sequence + 1, signal);
       const visibleResult = proofEvidenceView(result, this.includeRawEvidence) as AssertionResult;
       results.push(visibleResult);
+      assertProofActive(signal);
       this.runLedger.appendEvent({
         runId: contract.runId,
         type: "assertion-result",
@@ -508,18 +552,21 @@ export class ProofVerifier {
     const status = passed ? "passed" : "failed";
     const completedAt = new Date().toISOString();
     const modelObservationIds = (this.runLedger.database.db.prepare("SELECT id FROM model_observations WHERE run_id = ? ORDER BY created_at").all(contract.runId) as Array<{ id: string }>).map((row) => row.id);
+    assertProofActive(signal);
     this.runLedger.database.transaction((db) => {
       db.prepare("UPDATE runs SET status = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?")
         .run(passed ? "verified" : "failed", completedAt, contract.runId);
       db.prepare("UPDATE model_observations SET verified = ?, partially_verified = 0 WHERE run_id = ?")
         .run(passed ? 1 : 0, contract.runId);
     });
+    assertProofActive(signal);
     this.runLedger.appendEvent({
       runId: contract.runId,
       type: "verification-completed",
       payload: { contractId: contract.id, status, passed: results.filter((result) => result.passed).length, failed: results.filter((result) => !result.passed).length }
     });
     if (modelObservationIds.length) {
+      assertProofActive(signal);
       this.runLedger.appendEvent({
         runId: contract.runId,
         type: "model-observation-verification",
@@ -529,21 +576,25 @@ export class ProofVerifier {
     return { contractId: contract.id, runId: contract.runId, status, passed, startedAt, completedAt, assertions: results };
   }
 
-  async verifyCommand(assertion: CommandAssertion, root: string): Promise<AssertionResult> {
+  async verifyCommand(assertion: CommandAssertion, root: string, signal?: AbortSignal): Promise<AssertionResult> {
+    assertProofActive(signal);
     const approved = this.allowedCommands.some((command) => command.length === assertion.command.length && command.every((part, index) => part === assertion.command[index]));
     if (!approved) {
       return this.failedResult(assertion, "command assertion is not present in the operator-controlled exact command allowlist", { command: assertion.command });
     }
     let cwdResult;
     try {
-      cwdResult = await resolveAllowedPath(root, assertion.cwd ?? ".");
+      cwdResult = await resolveAllowedPath(root, assertion.cwd ?? ".", signal);
+      assertProofActive(signal);
     } catch (error) {
+      assertProofActive(signal);
       return this.failedResult(assertion, errorMessage(error), { cwd: assertion.cwd ?? "." });
     }
     if (!cwdResult.exists) {
       return this.failedResult(assertion, `command working directory does not exist: ${assertion.cwd ?? "."}`, { cwd: assertion.cwd ?? "." });
     }
     const cwdStat = await stat(cwdResult.path);
+    assertProofActive(signal);
     if (!cwdStat.isDirectory()) {
       return this.failedResult(assertion, `command working directory is not a directory: ${assertion.cwd ?? "."}`, { cwd: assertion.cwd ?? "." });
     }
@@ -551,15 +602,25 @@ export class ProofVerifier {
       cwd: cwdResult.path,
       timeoutMs: assertion.timeoutMs,
       maxOutputBytes: this.maxOutputBytes,
-      environment: this.commandEnvironment
+      environment: this.commandEnvironment,
+      signal
     });
+    assertProofActive(signal);
     const failures: string[] = [];
     if (actual.error) failures.push(`command could not start: ${actual.error}`);
     if (actual.timedOut) failures.push(`command timed out after ${assertion.timeoutMs}ms`);
     if (actual.outputLimitExceeded) failures.push(`command output exceeded ${this.maxOutputBytes} bytes`);
     if (actual.exitCode !== assertion.expect.exitCode) failures.push(`expected exit code ${assertion.expect.exitCode}, received ${actual.exitCode ?? "none"}`);
-    if (assertion.expect.stdout && !await matchesText(actual.stdout, assertion.expect.stdout)) failures.push("stdout did not match expectation");
-    if (assertion.expect.stderr && !await matchesText(actual.stderr, assertion.expect.stderr)) failures.push("stderr did not match expectation");
+    if (assertion.expect.stdout) {
+      const matched = await matchesText(actual.stdout, assertion.expect.stdout, signal);
+      assertProofActive(signal);
+      if (!matched) failures.push("stdout did not match expectation");
+    }
+    if (assertion.expect.stderr) {
+      const matched = await matchesText(actual.stderr, assertion.expect.stderr, signal);
+      assertProofActive(signal);
+      if (!matched) failures.push("stderr did not match expectation");
+    }
     return {
       id: assertion.id,
       type: assertion.type,
@@ -573,11 +634,14 @@ export class ProofVerifier {
     };
   }
 
-  async verifyFile(assertion: FileAssertion, root: string): Promise<AssertionResult> {
+  async verifyFile(assertion: FileAssertion, root: string, signal?: AbortSignal): Promise<AssertionResult> {
+    assertProofActive(signal);
     let target;
     try {
-      target = await resolveAllowedPath(root, assertion.path);
+      target = await resolveAllowedPath(root, assertion.path, signal);
+      assertProofActive(signal);
     } catch (error) {
+      assertProofActive(signal);
       return this.failedResult(assertion, errorMessage(error), { exists: false, path: assertion.path });
     }
     if (target.exists !== assertion.expect.exists) {
@@ -591,6 +655,7 @@ export class ProofVerifier {
       return this.passedResult(assertion, "file absence assertion passed", { exists: false, path: assertion.path });
     }
     const metadata = await stat(target.path);
+    assertProofActive(signal);
     if (!metadata.isFile()) return this.failedResult(assertion, `path is not a regular file: ${assertion.path}`, { exists: true, path: assertion.path });
     const actual: JsonObject = { exists: true, path: assertion.path, sizeBytes: metadata.size };
     if (assertion.expect.content) {
@@ -598,41 +663,72 @@ export class ProofVerifier {
         return this.failedResult(assertion, `file exceeds content assertion limit of ${this.maxFileBytes} bytes`, actual);
       }
       const content = await readFile(target.path, "utf8");
+      assertProofActive(signal);
       actual.content = content;
-      if (!await matchesText(content, assertion.expect.content)) return this.failedResult(assertion, "file content did not match expectation", actual);
+      const matched = await matchesText(content, assertion.expect.content, signal);
+      assertProofActive(signal);
+      if (!matched) return this.failedResult(assertion, "file content did not match expectation", actual);
     }
     return this.passedResult(assertion, "file assertion passed", actual);
   }
 
-  async verifyHttp(assertion: HttpAssertion): Promise<AssertionResult> {
+  async verifyHttp(assertion: HttpAssertion, signal?: AbortSignal): Promise<AssertionResult> {
+    assertProofActive(signal);
     if (!this.allowExternalHttp && !isLoopbackUrl(assertion.url)) return this.failedResult(assertion, "external HTTP verification is disabled by default", { url: assertion.url });
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), assertion.timeoutMs);
+    let timedOut = false;
+    const abortRequest = () => controller.abort(proofAbortReason(signal));
+    signal?.addEventListener("abort", abortRequest, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new Error(`HTTP assertion timed out after ${assertion.timeoutMs}ms`));
+    }, assertion.timeoutMs);
     const startedAt = new Date().toISOString();
     try {
       const response = await fetch(assertion.url, { method: assertion.method, redirect: "error", signal: controller.signal });
-      const body = assertion.method === "HEAD" ? "" : (await response.text()).slice(0, this.maxOutputBytes);
+      assertProofActive(signal);
+      let body = "";
+      if (assertion.method !== "HEAD") {
+        body = (await response.text()).slice(0, this.maxOutputBytes);
+        assertProofActive(signal);
+      }
       const failures: string[] = [];
       if (response.status !== assertion.expect.status) failures.push(`expected HTTP status ${assertion.expect.status}, received ${response.status}`);
-      if (assertion.expect.body && !await matchesText(body, assertion.expect.body)) failures.push("HTTP response body did not match expectation");
+      if (assertion.expect.body) {
+        const matched = await matchesText(body, assertion.expect.body, signal);
+        assertProofActive(signal);
+        if (!matched) failures.push("HTTP response body did not match expectation");
+      }
       return { id: assertion.id, type: assertion.type, status: failures.length ? "failed" : "passed", passed: failures.length === 0, message: failures.length ? failures.join("; ") : "HTTP assertion passed", expected: assertion.expect, actual: { status: response.status, body }, startedAt, completedAt: new Date().toISOString() };
     } catch (error) {
+      assertProofActive(signal);
       const failure = error instanceof Error ? error : new Error(String(error));
-      return this.failedResult(assertion, `HTTP assertion failed: ${failure.name === "AbortError" ? `timed out after ${assertion.timeoutMs}ms` : failure.message}`, { url: assertion.url });
-    } finally { clearTimeout(timer); }
+      return this.failedResult(assertion, `HTTP assertion failed: ${timedOut ? `timed out after ${assertion.timeoutMs}ms` : failure.message}`, { url: assertion.url });
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abortRequest);
+    }
   }
 
-  async verifyGit(assertion: GitAssertion, root: string): Promise<AssertionResult> {
+  async verifyGit(assertion: GitAssertion, root: string, signal?: AbortSignal): Promise<AssertionResult> {
+    assertProofActive(signal);
     let cwdResult;
-    try { cwdResult = await resolveAllowedPath(root, assertion.cwd ?? "."); }
-    catch (error) { return this.failedResult(assertion, errorMessage(error), { cwd: assertion.cwd ?? "." }); }
+    try {
+      cwdResult = await resolveAllowedPath(root, assertion.cwd ?? ".", signal);
+      assertProofActive(signal);
+    } catch (error) {
+      assertProofActive(signal);
+      return this.failedResult(assertion, errorMessage(error), { cwd: assertion.cwd ?? "." });
+    }
     if (!cwdResult.exists) return this.failedResult(assertion, `git working directory does not exist: ${assertion.cwd ?? "."}`, { cwd: assertion.cwd ?? "." });
     const actual = await captureProcess(["git", "status", "--porcelain"], {
       cwd: cwdResult.path,
       timeoutMs: DEFAULT_TIMEOUT_MS,
       maxOutputBytes: this.maxOutputBytes,
-      environment: this.commandEnvironment
+      environment: this.commandEnvironment,
+      signal
     });
+    assertProofActive(signal);
     const clean = actual.exitCode === 0 && actual.stdout.trim() === "";
     const passed = clean === assertion.expect.clean && actual.exitCode === 0;
     return { id: assertion.id, type: assertion.type, status: passed ? "passed" : "failed", passed, message: passed ? "git assertion passed" : `expected clean=${assertion.expect.clean}, received clean=${clean}`, expected: assertion.expect, actual, startedAt: actual.startedAt, completedAt: actual.completedAt };
@@ -648,23 +744,27 @@ export class ProofVerifier {
     return { id: assertion.id, type: assertion.type, status: "failed", passed: false, message, expected: assertion.expect, actual, startedAt: now, completedAt: now };
   }
 
-  persistAssertion(contractId: string, assertion: ProofAssertion, result: AssertionResult, sequence: number) {
+  persistAssertion(contractId: string, assertion: ProofAssertion, result: AssertionResult, sequence: number, signal?: AbortSignal) {
     const createdAt = result.startedAt ?? new Date().toISOString();
     const completedAt = result.completedAt ?? new Date().toISOString();
     const stdout = result.actual.stdout;
     const stderr = result.actual.stderr;
     const content = result.actual.content;
+    assertProofActive(signal);
     const stdoutArtifact = this.includeRawEvidence && typeof stdout === "string"
       ? this.runLedger.artifacts.put(String(redact(stdout)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
+    assertProofActive(signal);
     const stderrArtifact = this.includeRawEvidence && typeof stderr === "string"
       ? this.runLedger.artifacts.put(String(redact(stderr)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
+    assertProofActive(signal);
     const contentArtifact = this.includeRawEvidence && typeof content === "string"
       ? this.runLedger.artifacts.put(String(redact(content)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
     const evidenceArtifactIds = [stdoutArtifact?.digest, stderrArtifact?.digest, contentArtifact?.digest].filter(Boolean);
     const safeResult = proofEvidenceView({ sequence, type: assertion.type, expected: assertionExpectation(assertion), actual: result.actual }, this.includeRawEvidence);
+    assertProofActive(signal);
     this.runLedger.database.transaction((db) => {
       if (stdoutArtifact) registerArtifact(db, stdoutArtifact, completedAt);
       if (stderrArtifact) registerArtifact(db, stderrArtifact, completedAt);
@@ -690,8 +790,8 @@ export class ProofVerifier {
   }
 }
 
-export function verifyContract(contract: unknown, options: ProofVerifierOptions) {
-  return new ProofVerifier(options).verify(contract);
+export function verifyContract(contract: unknown, options: ProofVerifierOptions, verificationOptions: ProofVerificationOptions = {}) {
+  return new ProofVerifier(options).verify(contract, verificationOptions);
 }
 
 export const verifyProof = verifyContract;

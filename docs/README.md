@@ -69,7 +69,9 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
 - [Progressive skill disclosure](progressive-skill-disclosure.md) — bounded
   skill discovery and loading.
 - [Optional asynchronous telemetry foundation](async-telemetry.md) — local
-  telemetry buffering design and boundaries.
+  telemetry buffering, OTLP/HTTP export, and privacy boundaries.
+- [Operational telemetry and SLOs](observability-slos.md) — exact acceptance
+  targets and measurement rules for Phase F.
 - [Executable agent manifests and run graphs](agent-run-graphs.md) — bounded
   agent graph primitives.
 - [Demand-loaded automation primitives](automation-primitives.md) — inert

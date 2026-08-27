@@ -86,6 +86,8 @@ export interface ApprovalExecutionContext extends JobExecutionContext {
   markDispatched(): void;
 }
 
+export type JobMutationOptions = { signal?: AbortSignal };
+
 export type JobExecute = (payload: JsonObject, context: JobExecutionContext) => Promise<unknown>;
 
 export interface JobSupervisorOptions {
@@ -111,6 +113,11 @@ interface ActiveJob {
 }
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
+const throwIfJobMutationAborted = (signal?: AbortSignal): void => {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("job mutation was aborted");
+};
 const PROCESS_WORKER_ABORT_GRACE_MS = 30_000;
 
 export class JobSupervisor {
@@ -170,7 +177,8 @@ export class JobSupervisor {
       scheduledFor,
       nextRunAt,
       idempotent = false,
-      creationControl
+      creationControl,
+      signal
     }: {
       id?: string;
       timeoutMs?: number;
@@ -181,13 +189,16 @@ export class JobSupervisor {
       nextRunAt?: string | null;
       idempotent?: boolean;
       creationControl?: JobCreationControl;
+      signal?: AbortSignal;
     } = {}
   ): Promise<JobRecord> {
+    throwIfJobMutationAborted(signal);
     const normalizedPayload = payload.task && typeof payload.task === "object" && !Array.isArray(payload.task)
       ? { ...payload, task: { ...payload.task, id } }
       : payload;
     let job: JobRecord;
     try {
+      throwIfJobMutationAborted(signal);
       job = await this.store.create({
         id,
         payload: normalizedPayload,
@@ -200,6 +211,7 @@ export class JobSupervisor {
         ...(nextRunAt !== undefined ? { nextRunAt } : {})
       }, creationControl);
       this.volatilePayloads.set(id, normalizedPayload);
+      throwIfJobMutationAborted(signal);
     } catch (error) {
       if (!idempotent) throw error;
       const existing = await this.store.get(id);
@@ -208,17 +220,21 @@ export class JobSupervisor {
         || (requestHash !== undefined && existing.requestHash !== requestHash)) throw error;
       return existing;
     }
+    throwIfJobMutationAborted(signal);
     await this.drain();
     return job;
   }
 
-  async cancel(id: string): Promise<JobRecord> {
+  async cancel(id: string, options: JobMutationOptions = {}): Promise<JobRecord> {
+    throwIfJobMutationAborted(options.signal);
     const job = await this.store.get(id);
+    throwIfJobMutationAborted(options.signal);
     if (!job) throw new Error(`job not found: ${id}`);
     if (["completed", "failed", "cancelled", "needs-review"].includes(job.status)) return job;
     const running = this.active.get(id);
     try {
       await this.onCancel?.(job);
+      throwIfJobMutationAborted(options.signal);
     } catch (error) {
       const quarantined = await this.store.update(id, {
         status: "needs-review",
@@ -273,7 +289,8 @@ export class JobSupervisor {
     result?: unknown;
     error?: unknown;
     expectedLeaseToken: string;
-  }): Promise<JobRecord> {
+  }, options: JobMutationOptions = {}): Promise<JobRecord> {
+    throwIfJobMutationAborted(options.signal);
     if (!expectedLeaseToken) throw new Error(`runtime job ${id} approval settlement requires its claim lease`);
     const active = this.active.get(id);
     if (!active?.approval || active.approval.leaseToken !== expectedLeaseToken) {
@@ -281,6 +298,7 @@ export class JobSupervisor {
     }
     try {
       const current = await this.store.get(id);
+      throwIfJobMutationAborted(options.signal);
       if (!current || !["running", "cancelling"].includes(current.status)) {
         throw new Error(`runtime job ${id} has no claimed approval execution`);
       }
@@ -358,7 +376,8 @@ export class JobSupervisor {
     }
   }
 
-  async beginApproval(id: string): Promise<JobRecord> {
+  async beginApproval(id: string, options: JobMutationOptions = {}): Promise<JobRecord> {
+    throwIfJobMutationAborted(options.signal);
     if (!this.store.claimApproval) throw new Error("runtime job store does not support approval claims");
     if (this.active.has(id)) throw new Error(`runtime job ${id} already has an active execution`);
     const controller = new AbortController();
@@ -385,6 +404,7 @@ export class JobSupervisor {
           expiresAt: new Date(Date.now() + Math.max(this.defaultTimeoutMs + 30_000, 120_000)).toISOString()
         }
       });
+      throwIfJobMutationAborted(options.signal);
       if (!claimed) throw new Error(`runtime job ${id} is no longer awaiting approval`);
       const leaseToken = typeof claimed.dispatchLease?.token === "string" ? claimed.dispatchLease.token : undefined;
       if (!leaseToken) throw new Error(`runtime job ${id} approval claim did not return its dispatch lease`);

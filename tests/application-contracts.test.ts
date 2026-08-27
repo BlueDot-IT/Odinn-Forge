@@ -1033,6 +1033,39 @@ test("status output contract rejects missing, extra, mistyped, accessor, and lea
   assert.throws(() => validateStatusSnapshotV1(missing), /missing required field: allowedTools/u);
   assert.throws(() => validateStatusSnapshotV1({ ...fixture, kernelRegistry: {} }), /unknown field: kernelRegistry/u);
   assert.throws(() => validateStatusSnapshotV1({ ...fixture, ok: "yes" }), /status snapshot\.ok must be true/u);
+  const telemetry = {
+    enabled: true,
+    state: "running",
+    exporterState: "idle",
+    queued: 1,
+    accepted: 3,
+    exported: 2,
+    dropped: 1,
+    rejectedInvalid: 1,
+    rejectedAfterShutdown: 0,
+    exportFailures: 0
+  };
+  assert.doesNotThrow(() => validateStatusSnapshotV1({ ...fixture, telemetry }));
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, telemetry: { ...telemetry, enabled: false } }),
+    /inconsistent with disabled telemetry/u
+  );
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, telemetry: { ...telemetry, exported: 4 } }),
+    /cannot exceed accepted/u
+  );
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, telemetry: { ...telemetry, accepted: 2, queued: 1, exported: 2 } }),
+    /queued plus exported cannot exceed accepted/u
+  );
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, telemetry: { ...telemetry, exportFailures: 2, dropped: 1 } }),
+    /exportFailures cannot exceed dropped/u
+  );
+  assert.throws(
+    () => validateStatusSnapshotV1({ ...fixture, telemetry: { ...telemetry, enabled: false, state: "disabled", exporterState: "idle", queued: 0, exported: 0, dropped: 0, rejectedInvalid: 0, rejectedAfterShutdown: 0, exportFailures: 0 } }),
+    /accepted must be zero when telemetry is disabled/u
+  );
   const cliFixture: any = structuredClone(readContractFixtures.statusCli);
   assert.throws(
     () => validateStatusSnapshotV1({ ...cliFixture, providers: [{ ...cliFixture.providers[0], apiKeyEnv: "opaquecredentialvalue1234" }] }),
@@ -1103,6 +1136,21 @@ test("diagnostics output contract rejects unstable fields and unredacted materia
       /browserEngine fields are inconsistent/u
     );
   }
+  assert.doesNotThrow(() => validateDiagnosticsReportV1({
+    ...fixture,
+    telemetry: {
+      enabled: false,
+      state: "disabled",
+      exporterState: "idle",
+      queued: 0,
+      accepted: 0,
+      exported: 0,
+      dropped: 0,
+      rejectedInvalid: 0,
+      rejectedAfterShutdown: 0,
+      exportFailures: 0
+    }
+  }));
   assert.throws(
     () => validateDiagnosticsReportV1({ ...fixture, privateKey: "-----BEGIN PRIVATE KEY-----" }),
     (error: any) => error instanceof ApplicationContractValidationError && error.code === "UNREDACTED_APPLICATION_METADATA"

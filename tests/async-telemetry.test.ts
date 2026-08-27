@@ -35,6 +35,7 @@ test("disabled telemetry has no exporter, queue, timer, or validation behavior",
     exported: 0,
     droppedOverflow: 0,
     droppedExportFailure: 0,
+    rejectedInvalid: 0,
     rejectedAfterShutdown: 0,
     exportFailures: 0,
     consecutiveFailures: 0,
@@ -72,6 +73,7 @@ test("recording is synchronous, bounded, immutable, and exports only after the s
     exported: 1,
     droppedOverflow: 0,
     droppedExportFailure: 0,
+    rejectedInvalid: 0,
     rejectedAfterShutdown: 0,
     exportFailures: 0,
     consecutiveFailures: 0,
@@ -136,6 +138,7 @@ test("privacy boundary rejects arbitrary names, keys, structures, content fields
     name: "odinn.task",
     prompt: "private input"
   } as any), /unknown field: prompt/u);
+  assert.equal(telemetry.status().rejectedInvalid, 17);
   await telemetry.shutdown();
 });
 
@@ -245,6 +248,25 @@ test("exporter failures are isolated, retried with backoff, and never reject rec
   assert.equal(status.consecutiveFailures, 0);
   assert.equal(status.lastFailure, undefined);
   assert.doesNotMatch(JSON.stringify(status), /secret|destination/u);
+  await telemetry.shutdown();
+});
+
+test("partial exporter settlement counts accepted and rejected records exactly", async () => {
+  const telemetry = createBufferedTelemetry({
+    enabled: true,
+    exporter: { export: () => ({ exported: 1, rejected: 1 }) },
+    maxBatch: 2,
+    autoPump: false
+  });
+  telemetry.recordEvent({ name: "odinn.task", attributes: { operation: "accepted" } });
+  telemetry.recordEvent({ name: "odinn.task", attributes: { operation: "rejected" } });
+  assert.equal(await telemetry.flush(), false);
+  assert.deepEqual({
+    exported: telemetry.status().exported,
+    dropped: telemetry.status().droppedExportFailure,
+    failures: telemetry.status().exportFailures,
+    lastFailure: telemetry.status().lastFailure
+  }, { exported: 1, dropped: 1, failures: 1, lastFailure: "exporter-error" });
   await telemetry.shutdown();
 });
 
@@ -510,22 +532,25 @@ test("constants and exporter batches are immutable", async () => {
   await telemetry.shutdown();
 });
 
-test("async telemetry is package-resolvable and absent from active imports", async () => {
+test("telemetry modules are package-resolvable and activation remains gateway-only", async () => {
   const root = join(import.meta.dirname, "..");
   const packageJson = JSON.parse(await readFile(join(root, "packages/kernel/package.json"), "utf8"));
   assert.equal(packageJson.exports["./async-telemetry"], "./src/async-telemetry.ts");
+  assert.equal(packageJson.exports["./otlp-http-exporter"], "./src/otlp-http-exporter.ts");
   for (const path of [
     "packages/kernel/src/index.ts",
     "packages/kernel/src/providers/runtime.ts",
-    "apps/cli/src/cli.ts",
-    "apps/gateway/src/server.ts"
+    "apps/cli/src/cli.ts"
   ]) {
     const source = await readFile(join(root, path), "utf8");
     assert.doesNotMatch(source, /async-telemetry/u, `${path} must not import the optional telemetry module`);
   }
+  const gatewaySource = await readFile(join(root, "apps/gateway/src/telemetry.ts"), "utf8");
+  assert.match(gatewaySource, /@odinn\/kernel\/async-telemetry/u);
+  assert.match(gatewaySource, /@odinn\/kernel\/otlp-http-exporter/u);
   const packageConsumer = spawnSync(
     process.execPath,
-    ["--input-type=module", "--eval", "import('@odinn/kernel/async-telemetry').then((value) => { if (value.TELEMETRY_SCHEMA_VERSION !== 1) process.exit(2); })"],
+    ["--input-type=module", "--eval", "Promise.all([import('@odinn/kernel/async-telemetry'), import('@odinn/kernel/otlp-http-exporter')]).then(([telemetry, otlp]) => { if (telemetry.TELEMETRY_SCHEMA_VERSION !== 1 || typeof otlp.createOtlpHttpExporter !== 'function') process.exit(2); })"],
     { cwd: join(root, "apps/cli"), encoding: "utf8" }
   );
   assert.equal(packageConsumer.status, 0, packageConsumer.stderr || packageConsumer.stdout);

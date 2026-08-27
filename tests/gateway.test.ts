@@ -5,11 +5,11 @@ process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
@@ -20,6 +20,11 @@ import { createApprovalStore, createRunLedger, loadAgent } from "../packages/ker
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const normalizedRoot = resolve(root);
+
+function isPathWithin(parent: string, candidate: string) {
+  const relativePath = relative(resolve(parent), resolve(candidate));
+  return relativePath === "" || (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
+}
 
 test("gateway rejects a symbolic-link state root", { skip: process.platform === "win32" }, async () => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-state-root-"));
@@ -1953,7 +1958,9 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
       }]
     });
     assert.equal(branch.candidates.length, 2);
-    assert.ok(branch.candidates.every((candidate: any) => candidate.workspaceRoot.startsWith(`${join(workspaceRoot, ".odinn-worktrees")}${sep}`)));
+    const canonicalStateDir = await realpath(stateDir);
+    assert.ok(branch.candidates.every((candidate: any) => isPathWithin(join(canonicalStateDir, "worktrees", branch.groupId), candidate.workspaceRoot)));
+    assert.ok(branch.candidates.every((candidate: any) => !isPathWithin(workspaceRoot, candidate.workspaceRoot)));
     assert.equal((await getJson(`${base}/counterfactual/${branch.groupId}`)).candidates.length, 2);
     await rm(join(workspaceRoot, "branch-evidence.txt"));
     const executed = await postJson(`${base}/counterfactual/${branch.groupId}/execute`, {});

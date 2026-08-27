@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { test } from "node:test";
 import { unzipSync } from "fflate";
 import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, OdinnRuntimeError, ProofVerifier, SnapshotManager, runTask } from "../packages/kernel/src/index.ts";
@@ -16,6 +16,12 @@ async function fixture() {
   const workspace = join(root, "workspace");
   await writeFile(join(root, "seed.txt"), "before\n");
   return { root, state, workspace, runtime: createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags }) };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
 }
 
 test("Sentinel blocks a denied command before execution and records the decision", async () => {
@@ -317,6 +323,340 @@ test("counterfactual candidates receive isolated workspaces", async () => {
   } finally { runtime.ledger.close(); }
 });
 
+test("counterfactual execution rejects a substituted candidate workspace before dispatch", async (t) => {
+  const { root, runtime } = await fixture();
+  const attackerRoot = await mkdtemp(join(tmpdir(), "odinn-counterfactual-attacker-"));
+  let candidateRoot = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (candidateRoot) await rm(dirname(candidateRoot), { recursive: true, force: true });
+    await rm(attackerRoot, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-root-substitution", objective: "reject substituted branch roots" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-root-substitution",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{
+      id: "candidate",
+      title: "Candidate",
+      summary: "must remain bound to its isolated root",
+      tasks: [{ tool: "text.echo", input: { text: "never dispatch" }, readOnly: true }]
+    }]
+  });
+  const candidate = group.candidates[0];
+  candidateRoot = candidate.workspaceRoot;
+  runtime.ledger.database.db.prepare("UPDATE runs SET workspace_root = ? WHERE id = ?").run(attackerRoot, candidate.runId);
+  let dispatches = 0;
+  await assert.rejects(
+    runtime.counterfactual.execute(group.groupId, { executor: async () => { dispatches += 1; } }),
+    (error: any) => error instanceof OdinnRuntimeError && error.code === "WORKSPACE_CONFLICT"
+  );
+  assert.equal(dispatches, 0);
+});
+
+test("counterfactual creation excludes protected components and an arbitrarily nested state root", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-counterfactual-nested-state-"));
+  const state = join(root, "config", "private-runtime-state");
+  const protectedFiles = [
+    join(root, "nested", ".git", "credential.txt"),
+    join(root, "nested", ".odinn", "credential.txt"),
+    join(root, "nested", ".odinn-worktrees", "credential.txt"),
+    join(root, "nested", "node_modules", "generated.txt"),
+    join(state, "credential.txt")
+  ];
+  for (const path of protectedFiles) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `private:${path}\n`);
+  }
+  await mkdir(join(root, "nested", "ordinary"), { recursive: true });
+  await writeFile(join(root, "nested", "ordinary", "copied.txt"), "copied\n");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
+  let candidateRoot = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (candidateRoot) await rm(dirname(dirname(candidateRoot)), { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-nested-state-create", objective: "exclude nested runtime state" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-nested-state-create",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{ id: "isolated", title: "Isolated", summary: "copy only workspace data" }]
+  });
+  candidateRoot = group.candidates[0].workspaceRoot;
+  const candidateRelative = relative(root, candidateRoot);
+  assert.ok(candidateRelative === ".." || candidateRelative.startsWith(`..${sep}`), "candidate copy must not be a descendant of its source");
+  assert.equal(await readFile(join(candidateRoot, "nested", "ordinary", "copied.txt"), "utf8"), "copied\n");
+  for (const path of [
+    join(candidateRoot, "nested", ".git", "credential.txt"),
+    join(candidateRoot, "nested", ".odinn", "credential.txt"),
+    join(candidateRoot, "nested", ".odinn-worktrees", "credential.txt"),
+    join(candidateRoot, "nested", "node_modules", "generated.txt"),
+    join(candidateRoot, "config", "private-runtime-state", "credential.txt")
+  ]) {
+    await assert.rejects(readFile(path, "utf8"), (error: any) => error?.code === "ENOENT");
+  }
+});
+
+test("counterfactual creation canonicalizes a symlinked workspace before excluding nested physical state", async (t) => {
+  if (process.platform === "win32") return t.skip("directory symlink creation requires elevated Windows privileges");
+  const parent = await mkdtemp(join(tmpdir(), "odinn-counterfactual-workspace-alias-"));
+  const physicalRoot = join(parent, "physical-workspace");
+  const workspaceAlias = join(parent, "workspace-alias");
+  const state = join(physicalRoot, "opaque", "runtime-state");
+  await mkdir(state, { recursive: true });
+  await mkdir(join(physicalRoot, "ordinary"), { recursive: true });
+  await writeFile(join(physicalRoot, "ordinary", "copied.txt"), "copied\n");
+  await writeFile(join(state, "must-not-copy.txt"), "private runtime state\n");
+  await symlink(physicalRoot, workspaceAlias, "dir");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: workspaceAlias, featureFlags: flags });
+  let candidateRoot = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (candidateRoot) await rm(dirname(dirname(candidateRoot)), { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-workspace-alias", objective: "exclude state through an aliased root" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-workspace-alias",
+    sourceStepId: "step-1",
+    workspaceRoot: workspaceAlias,
+    plans: [{ id: "isolated", title: "Isolated", summary: "copy only ordinary workspace data" }]
+  });
+  candidateRoot = group.candidates[0].workspaceRoot;
+  const candidateRelative = relative(physicalRoot, candidateRoot);
+  assert.ok(candidateRelative === ".." || candidateRelative.startsWith(`..${sep}`), "candidate must remain outside the physical workspace");
+  assert.equal(await readFile(join(candidateRoot, "ordinary", "copied.txt"), "utf8"), "copied\n");
+  await assert.rejects(
+    readFile(join(candidateRoot, "opaque", "runtime-state", "must-not-copy.txt"), "utf8"),
+    (error: any) => error?.code === "ENOENT"
+  );
+});
+
+test("counterfactual activation and rollback preserve nested state and protected workspace components", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-counterfactual-nested-state-select-"));
+  const state = join(root, "config", "private-runtime-state");
+  const protectedRoots = [
+    join(root, "nested", ".git"),
+    join(root, "nested", ".odinn"),
+    join(root, "nested", ".odinn-worktrees")
+  ];
+  for (const protectedRoot of protectedRoots) {
+    await mkdir(protectedRoot, { recursive: true });
+    await writeFile(join(protectedRoot, "preserved.txt"), "source-private\n");
+  }
+  await mkdir(state, { recursive: true });
+  await writeFile(join(state, "credential.txt"), "state-private\n");
+  await writeFile(join(root, "ordinary.txt"), "source\n");
+  if (process.platform !== "win32") {
+    await writeFile(join(root, "symlink-target.txt"), "source-link-target\n");
+    await symlink("symlink-target.txt", join(root, "preserved-link.txt"));
+    await writeFile(join(root, "late-link.txt"), "pre-snapshot regular file\n");
+    await writeFile(join(root, "late-link-target.txt"), "late-link-target\n");
+  }
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
+  let candidateRoot = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (candidateRoot) await rm(dirname(dirname(candidateRoot)), { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-nested-state-select", objective: "preserve nested state during selection" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-nested-state-select",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{
+      id: "candidate",
+      title: "Candidate",
+      summary: "activate without copying state",
+      tasks: [{ tool: "text.echo", input: { text: "candidate" }, readOnly: true }]
+    }]
+  });
+  const candidate = group.candidates[0];
+  candidateRoot = candidate.workspaceRoot;
+  if (process.platform !== "win32") {
+    await rm(join(root, "late-link.txt"));
+    await symlink("late-link-target.txt", join(root, "late-link.txt"));
+  }
+  await runtime.counterfactual.execute(group.groupId, { executor: async () => ({ output: { text: "completed" } }) });
+  await writeFile(join(candidateRoot, "ordinary.txt"), "candidate\n");
+  for (const protectedRoot of [
+    join(candidateRoot, "nested", ".git"),
+    join(candidateRoot, "nested", ".odinn"),
+    join(candidateRoot, "nested", ".odinn-worktrees"),
+    join(candidateRoot, "config", "private-runtime-state")
+  ]) {
+    await mkdir(protectedRoot, { recursive: true });
+    await writeFile(join(protectedRoot, "must-not-activate.txt"), "candidate-private\n");
+  }
+
+  await assert.rejects(runtime.counterfactual.select(group.groupId, candidate.runId, {
+    apply: true,
+    __testOnlyAfterActivation: () => { throw new Error("injected activation settlement failure"); }
+  }), /injected activation settlement failure/u);
+  assert.equal(await readFile(join(root, "ordinary.txt"), "utf8"), "source\n");
+  assert.equal(await readFile(join(state, "credential.txt"), "utf8"), "state-private\n");
+  for (const protectedRoot of protectedRoots) {
+    assert.equal(await readFile(join(protectedRoot, "preserved.txt"), "utf8"), "source-private\n");
+    await assert.rejects(readFile(join(protectedRoot, "must-not-activate.txt"), "utf8"), (error: any) => error?.code === "ENOENT");
+  }
+  if (process.platform !== "win32") {
+    assert.equal((await lstat(join(root, "preserved-link.txt"))).isSymbolicLink(), true);
+    assert.equal(await readlink(join(root, "preserved-link.txt")), "symlink-target.txt");
+    assert.equal((await lstat(join(root, "late-link.txt"))).isSymbolicLink(), true);
+    assert.equal(await readlink(join(root, "late-link.txt")), "late-link-target.txt");
+  }
+
+  const selected = await runtime.counterfactual.select(group.groupId, candidate.runId, { apply: true });
+  assert.equal(selected.applied, true);
+  assert.equal(await readFile(join(root, "ordinary.txt"), "utf8"), "candidate\n");
+  assert.equal(await readFile(join(state, "credential.txt"), "utf8"), "state-private\n");
+  await assert.rejects(readFile(join(state, "must-not-activate.txt"), "utf8"), (error: any) => error?.code === "ENOENT");
+  for (const protectedRoot of protectedRoots) {
+    assert.equal(await readFile(join(protectedRoot, "preserved.txt"), "utf8"), "source-private\n");
+  }
+  if (process.platform !== "win32") {
+    assert.equal((await lstat(join(root, "preserved-link.txt"))).isSymbolicLink(), true);
+    assert.equal(await readlink(join(root, "preserved-link.txt")), "symlink-target.txt");
+    assert.equal((await lstat(join(root, "late-link.txt"))).isSymbolicLink(), true);
+    assert.equal(await readlink(join(root, "late-link.txt")), "late-link-target.txt");
+  }
+});
+
+test("counterfactual rollback failure retains durable recovery material and publishes recovery-required", async (t) => {
+  if (process.platform === "win32") return t.skip("directory symlink creation requires elevated Windows privileges");
+  const parent = await mkdtemp(join(tmpdir(), "odinn-counterfactual-rollback-failure-"));
+  const root = join(parent, "workspace");
+  const state = join(parent, "state");
+  const attacker = join(parent, "attacker");
+  await mkdir(join(root, "nested"), { recursive: true });
+  await mkdir(attacker, { recursive: true });
+  await writeFile(join(root, "nested", "original.txt"), "original\n");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
+  let recoveryPath = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (recoveryPath) await rm(recoveryPath, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-rollback-failure", objective: "retain recovery backup" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-rollback-failure",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{
+      id: "candidate",
+      title: "Candidate",
+      summary: "exercise rollback recovery",
+      tasks: [{ tool: "text.echo", input: { text: "candidate" }, readOnly: true }]
+    }]
+  });
+  const candidate = group.candidates[0];
+  await runtime.counterfactual.execute(group.groupId, { executor: async () => ({ output: { text: "completed" } }) });
+  await writeFile(join(candidate.workspaceRoot, "nested", "original.txt"), "candidate\n");
+  let failure: any;
+  await assert.rejects(runtime.counterfactual.select(group.groupId, candidate.runId, {
+    apply: true,
+    __testOnlyAfterActivation: async () => {
+      await rm(join(root, "nested"), { recursive: true, force: true });
+      await symlink(attacker, join(root, "nested"), "dir");
+      throw new Error("injected activation settlement failure");
+    }
+  }), (error: any) => {
+    failure = error;
+    return error instanceof AggregateError
+      && error.code === "ROLLBACK_CONFLICT"
+      && error.details?.recoveryRequired === true
+      && error.details?.manifestWritten === true
+      && error.details?.journaled === true;
+  });
+
+  recoveryPath = failure.details.recoveryPath;
+  assert.equal((await stat(recoveryPath)).mode & 0o777, 0o700);
+  assert.equal(await readFile(join(recoveryPath, "workspace", "nested", "original.txt"), "utf8"), "original\n");
+  const recovery = JSON.parse(await readFile(join(recoveryPath, "recovery.json"), "utf8"));
+  assert.equal(recovery.status, "recovery-required");
+  assert.equal(recovery.groupId, group.groupId);
+  assert.equal(recovery.runId, candidate.runId);
+  assert.equal(runtime.counterfactual.compare(group.groupId).status, "recovery-required");
+  assert.equal(runtime.counterfactual.compare(group.groupId).candidates[0].status, "recovery-required");
+  const recoveryEvent = runtime.ledger.getRun("counterfactual-rollback-failure").events.find((event: any) => event.type === "branch-recovery-required");
+  assert.equal(recoveryEvent?.payload?.recoveryPath, recoveryPath);
+  assert.equal((await lstat(join(root, "nested"))).isSymbolicLink(), true, "failed rollback must not claim that the source was restored");
+});
+
+test("counterfactual recovery retains its manifest and original rollback error when journaling fails", async (t) => {
+  if (process.platform === "win32") return t.skip("directory symlink creation requires elevated Windows privileges");
+  const parent = await mkdtemp(join(tmpdir(), "odinn-counterfactual-recovery-journal-"));
+  const root = join(parent, "workspace");
+  const state = join(parent, "state");
+  const attacker = join(parent, "attacker");
+  await mkdir(join(root, "nested"), { recursive: true });
+  await mkdir(attacker, { recursive: true });
+  await writeFile(join(root, "nested", "original.txt"), "original\n");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
+  let recoveryPath = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (recoveryPath) await rm(recoveryPath, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-journal-failure", objective: "retain recovery evidence" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-journal-failure",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{
+      id: "candidate",
+      title: "Candidate",
+      summary: "exercise recovery journal failure",
+      tasks: [{ tool: "text.echo", input: { text: "candidate" }, readOnly: true }]
+    }]
+  });
+  const candidate = group.candidates[0];
+  await runtime.counterfactual.execute(group.groupId, { executor: async () => ({ output: { text: "completed" } }) });
+  await writeFile(join(candidate.workspaceRoot, "nested", "original.txt"), "candidate\n");
+
+  const database = runtime.ledger.database as any;
+  database.transaction = () => { throw new Error("injected recovery journal failure"); };
+  let failure: any;
+  await assert.rejects(runtime.counterfactual.select(group.groupId, candidate.runId, {
+    apply: true,
+    __testOnlyAfterActivation: async () => {
+      await rm(join(root, "nested"), { recursive: true, force: true });
+      await symlink(attacker, join(root, "nested"), "dir");
+      throw new Error("injected activation settlement failure");
+    }
+  }), (error: any) => {
+    failure = error;
+    const messages = error instanceof AggregateError
+      ? error.errors.map((entry: any) => entry instanceof Error ? entry.message : String(entry))
+      : [];
+    return error instanceof AggregateError
+      && error.code === "ROLLBACK_CONFLICT"
+      && error.details?.manifestWritten === true
+      && error.details?.journaled === false
+      && messages.some((message: string) => message.includes("recovery verification"))
+      && messages.includes("injected recovery journal failure");
+  });
+
+  recoveryPath = failure.details.recoveryPath;
+  assert.equal((await stat(recoveryPath)).mode & 0o777, 0o700);
+  assert.equal(await readFile(join(recoveryPath, "workspace", "nested", "original.txt"), "utf8"), "original\n");
+  assert.equal(JSON.parse(await readFile(join(recoveryPath, "recovery.json"), "utf8")).status, "recovery-required");
+  assert.equal((await lstat(join(root, "nested"))).isSymbolicLink(), true);
+});
+
 test("counterfactual execution runs real audited tasks and supports selection preview", async () => {
   const { root, state, runtime } = await fixture();
   const auditStore = createAuditStore(join(state, "audit.jsonl"));
@@ -345,6 +685,157 @@ test("counterfactual execution runs real audited tasks and supports selection pr
     assert.match(preview.warning, /--apply/);
     assert.equal(runtime.counterfactual.compare(group.groupId).candidates.filter((candidate: any) => candidate.status === "completed").length, 2);
   } finally { runtime.ledger.close(); }
+});
+
+test("counterfactual creation removes copied workspaces and durable rows when cancelled before activation", async (t) => {
+  const { root, runtime } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const entered = deferred();
+  const release = deferred();
+  const controller = new AbortController();
+  try {
+    runtime.ledger.ensureRun({ runId: "counterfactual-create-cancel", objective: "cancel branch creation" });
+    const creation = runtime.counterfactual.create({
+      sourceRunId: "counterfactual-create-cancel",
+      sourceStepId: "step-1",
+      workspaceRoot: root,
+      plans: [{ id: "cancelled", title: "Cancelled", summary: "must not activate" }],
+      signal: controller.signal,
+      __testOnlyAfterWorkspaceCopy: async () => {
+        entered.resolve();
+        await release.promise;
+      }
+    });
+    await entered.promise;
+    controller.abort(new Error("gateway shutdown is in progress"));
+    release.resolve();
+    await assert.rejects(creation, /gateway shutdown is in progress/u);
+
+    const database = runtime.ledger.database.db;
+    assert.equal(Number((database.prepare("SELECT COUNT(*) AS count FROM counterfactual_groups").get() as any).count), 0);
+    assert.equal(Number((database.prepare("SELECT COUNT(*) AS count FROM counterfactual_candidates").get() as any).count), 0);
+    assert.equal(Number((database.prepare("SELECT COUNT(*) AS count FROM run_branches").get() as any).count), 0);
+    assert.equal(runtime.ledger.getRun("counterfactual-create-cancel").events.some((event: any) => event.type === "branch-created"), false);
+    const retainedWorktrees = await readdir(join(root, ".odinn-worktrees")).catch((error: any) => {
+      if (error?.code === "ENOENT") return [];
+      throw error;
+    });
+    assert.deepEqual(retainedWorktrees, []);
+  } finally {
+    release.resolve();
+    runtime.ledger.close();
+  }
+});
+
+test("counterfactual execution quarantines an in-flight task without failure or final group settlement", async (t) => {
+  const { root, runtime } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const entered = deferred();
+  const release = deferred();
+  const controller = new AbortController();
+  let startedRunId = "";
+  try {
+    runtime.ledger.ensureRun({ runId: "counterfactual-execute-cancel", objective: "cancel branch execution" });
+    const group = await runtime.counterfactual.create({
+      sourceRunId: "counterfactual-execute-cancel",
+      sourceStepId: "step-1",
+      workspaceRoot: root,
+      plans: ["first", "second"].map((id) => ({
+        id,
+        title: id,
+        summary: `${id} candidate`,
+        tasks: [{ tool: "text.echo", input: { text: id }, readOnly: true }]
+      }))
+    });
+    const execution = runtime.counterfactual.execute(group.groupId, {
+      signal: controller.signal,
+      executor: async (task: any, context: any) => {
+        assert.equal(context.signal, controller.signal);
+        startedRunId = String(task.id).split(":task:")[0];
+        entered.resolve();
+        await release.promise;
+        return { output: { text: "must not settle" } };
+      }
+    });
+    await entered.promise;
+    const waitingRunId = group.candidates.find((candidate: any) => candidate.runId !== startedRunId)?.runId;
+    assert.ok(startedRunId);
+    assert.ok(waitingRunId);
+    const eventsBeforeAbort = runtime.ledger.getRun(startedRunId).events.length;
+    controller.abort(new Error("gateway shutdown is in progress"));
+    release.resolve();
+    await assert.rejects(execution, /gateway shutdown is in progress/u);
+
+    const database = runtime.ledger.database.db;
+    assert.equal((database.prepare("SELECT status FROM counterfactual_groups WHERE id = ?").get(group.groupId) as any).status, "created");
+    assert.equal((database.prepare("SELECT status FROM counterfactual_candidates WHERE run_id = ?").get(startedRunId) as any).status, "executing");
+    assert.equal((database.prepare("SELECT status FROM counterfactual_candidates WHERE run_id = ?").get(waitingRunId) as any).status, "created");
+    const firstEvents = runtime.ledger.getRun(startedRunId).events;
+    assert.equal(firstEvents.length, eventsBeforeAbort);
+    assert.equal(firstEvents.some((event: any) => ["counterfactual-completed", "counterfactual-failed"].includes(event.type)), false);
+    assert.equal(runtime.ledger.getRun(waitingRunId).events.some((event: any) => event.type === "counterfactual-started"), false);
+  } finally {
+    release.resolve();
+    runtime.ledger.close();
+  }
+});
+
+test("counterfactual selection cancelled after backup leaves the workspace and durable selection unchanged", async (t) => {
+  const { root, state, runtime } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const entered = deferred();
+  const release = deferred();
+  const controller = new AbortController();
+  try {
+    runtime.ledger.ensureRun({ runId: "counterfactual-select-cancel", objective: "cancel branch selection" });
+    const group = await runtime.counterfactual.create({
+      sourceRunId: "counterfactual-select-cancel",
+      sourceStepId: "step-1",
+      workspaceRoot: root,
+      plans: [{
+        id: "candidate",
+        title: "Candidate",
+        summary: "candidate selection",
+        tasks: [{ tool: "text.echo", input: { text: "candidate" }, readOnly: true }]
+      }]
+    });
+    await runtime.counterfactual.execute(group.groupId, {
+      executor: async () => ({ output: { text: "completed" } })
+    });
+    const candidate = group.candidates[0];
+    await writeFile(join(candidate.workspaceRoot, "seed.txt"), "candidate\n");
+    const sourceIdentity = await stat(join(root, "seed.txt"));
+    const selection = runtime.counterfactual.select(group.groupId, candidate.runId, {
+      apply: true,
+      signal: controller.signal,
+      __testOnlyAfterBackup: async () => {
+        entered.resolve();
+        await release.promise;
+      }
+    });
+    await entered.promise;
+    const sourceEventsBeforeAbort = runtime.ledger.getRun("counterfactual-select-cancel").events.length;
+    controller.abort(new Error("gateway shutdown is in progress"));
+    release.resolve();
+    await assert.rejects(selection, /gateway shutdown is in progress/u);
+
+    assert.equal(await readFile(join(root, "seed.txt"), "utf8"), "before\n");
+    assert.equal((await stat(join(root, "seed.txt"))).ino, sourceIdentity.ino, "abort before activation must not replace source files");
+    const database = runtime.ledger.database.db;
+    assert.equal((database.prepare("SELECT status FROM counterfactual_groups WHERE id = ?").get(group.groupId) as any).status, "executed");
+    assert.equal((database.prepare("SELECT status FROM counterfactual_candidates WHERE run_id = ?").get(candidate.runId) as any).status, "completed");
+    const sourceEvents = runtime.ledger.getRun("counterfactual-select-cancel").events;
+    assert.equal(sourceEvents.length, sourceEventsBeforeAbort);
+    assert.equal(sourceEvents.some((event: any) => event.type === "branch-selected"), false);
+    const retainedBackups = await readdir(join(state, "worktrees")).catch((error: any) => {
+      if (error?.code === "ENOENT") return [];
+      throw error;
+    });
+    assert.deepEqual(retainedBackups, []);
+  } finally {
+    release.resolve();
+    runtime.ledger.close();
+  }
 });
 
 test("kernel execution enforces Sentinel and capability tokens at the real tool boundary", async () => {

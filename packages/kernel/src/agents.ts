@@ -81,6 +81,9 @@ export type AgentRegistry = {
 };
 
 export type AgentRegistryMutationOptions = {
+  signal?: AbortSignal;
+  /** @internal Test-only barrier after this process owns the registry lock. */
+  __testOnlyAfterLockAcquired?: () => void | Promise<void>;
   __testOnlyAfterRead?: (registry: AgentRegistry) => void | Promise<void>;
 };
 
@@ -118,12 +121,15 @@ export class AgentRegistryStore {
 
   async mutate<T>(operation: (agents: any[], registry: AgentRegistry) => T | Promise<T>, options: AgentRegistryMutationOptions = {}): Promise<T> {
     const pending = this.writeChain.then(() => withStateMutationLock(dirname(this.path), async () => {
+      throwIfAgentMutationAborted(options.signal);
       const registry = await this.read();
       await reconcileAgentInstallStateUnlocked(dirname(this.path), registry.agents);
       await options.__testOnlyAfterRead?.(registry);
+      throwIfAgentMutationAborted(options.signal);
       try {
         const result = await operation(registry.agents, registry);
-        await atomicWrite(this.path, `${JSON.stringify(registry, null, 2)}\n`);
+        throwIfAgentMutationAborted(options.signal);
+        await atomicWrite(this.path, `${JSON.stringify(registry, null, 2)}\n`, options.signal);
         // A successful registry publication commits a staged runtime-agent
         // install. Cleanup is deliberately best-effort: if the process dies
         // after the registry rename, startup reconciliation can prove the
@@ -137,6 +143,9 @@ export class AgentRegistryStore {
         try { await reconcileAgentInstallStateUnlocked(dirname(this.path), (await this.read()).agents); } catch { /* startup will fail closed if recovery remains uncertain */ }
         throw error;
       }
+    }, {
+      signal: options.signal,
+      __testOnlyAfterLockAcquired: options.__testOnlyAfterLockAcquired
     }));
     this.writeChain = pending.catch(() => undefined);
     return pending;
@@ -312,16 +321,18 @@ export type RuntimeAgentProvisionOptions = {
   assumeLocked?: boolean;
   previousRecord?: any;
   nextRecord?: any;
+  signal?: AbortSignal;
   __testOnlyAfterPhase?: (phase: AgentInstallJournal["phase"]) => void | Promise<void>;
 };
 
 export async function provisionRuntimeAgent(stateDir: string, input: unknown, options: RuntimeAgentProvisionOptions = {}): Promise<AgentManifest & { integrity: string }> {
   const state = resolve(stateDir);
   const execute = () => provisionRuntimeAgentUnlocked(state, input, options);
-  return options.assumeLocked ? execute() : withStateMutationLock(state, execute);
+  return options.assumeLocked ? execute() : withStateMutationLock(state, execute, { signal: options.signal });
 }
 
 async function provisionRuntimeAgentUnlocked(state: string, input: unknown, options: RuntimeAgentProvisionOptions): Promise<AgentManifest & { integrity: string }> {
+  throwIfAgentMutationAborted(options.signal);
   const manifest = validateAgentManifest(input);
   if (manifest.id === DEFAULT_AGENT_ID) throw new Error("the primary main agent cannot be provisioned through the runtime package path");
   if (manifest.kind !== "runtime" || manifest.primary) throw new Error("secondary runtime agents must use kind=runtime and primary=false");
@@ -335,8 +346,10 @@ async function provisionRuntimeAgentUnlocked(state: string, input: unknown, opti
   assertInside(resolve(state, "agents"), backupDirectory);
   await mkdir(stagingDirectory, { recursive: true, mode: 0o700 });
   await chmod(stagingDirectory, 0o700);
-  await atomicWrite(join(stagingDirectory, "agent.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  throwIfAgentMutationAborted(options.signal);
+  await atomicWrite(join(stagingDirectory, "agent.json"), `${JSON.stringify(manifest, null, 2)}\n`, options.signal);
   for (const file of manifest.identity.files) {
+    throwIfAgentMutationAborted(options.signal);
     await writeExclusive(join(stagingDirectory, file), "");
   }
 
@@ -352,20 +365,25 @@ async function provisionRuntimeAgentUnlocked(state: string, input: unknown, opti
     nextIntegrity: manifest.integrity,
     createdAt: new Date().toISOString()
   };
-  await atomicWrite(journalPath, `${JSON.stringify(journal, null, 2)}\n`);
+  await atomicWrite(journalPath, `${JSON.stringify(journal, null, 2)}\n`, options.signal);
   await options.__testOnlyAfterPhase?.("staged");
+  throwIfAgentMutationAborted(options.signal);
 
   if (await pathExists(directory)) {
     await mkdir(dirname(backupDirectory), { recursive: true, mode: 0o700 });
+    throwIfAgentMutationAborted(options.signal);
     await rename(directory, backupDirectory);
     const oldMoved = { ...journal, phase: "old-moved" as const };
-    await atomicWrite(journalPath, `${JSON.stringify(oldMoved, null, 2)}\n`);
+    await atomicWrite(journalPath, `${JSON.stringify(oldMoved, null, 2)}\n`, options.signal);
     await options.__testOnlyAfterPhase?.("old-moved");
+    throwIfAgentMutationAborted(options.signal);
   }
+  throwIfAgentMutationAborted(options.signal);
   await rename(stagingDirectory, directory);
   const newInstalled = { ...journal, phase: "new-installed" as const };
-  await atomicWrite(journalPath, `${JSON.stringify(newInstalled, null, 2)}\n`);
+  await atomicWrite(journalPath, `${JSON.stringify(newInstalled, null, 2)}\n`, options.signal);
   await options.__testOnlyAfterPhase?.("new-installed");
+  throwIfAgentMutationAborted(options.signal);
   return manifest;
 }
 
@@ -539,12 +557,24 @@ async function writeExclusive(path: string, content: string): Promise<void> {
   await chmod(path, 0o600);
 }
 
-async function atomicWrite(path: string, content: string): Promise<void> {
+async function atomicWrite(path: string, content: string, signal?: AbortSignal): Promise<void> {
+  throwIfAgentMutationAborted(signal);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
-  await rename(temporary, path);
-  await chmod(path, 0o600);
+  try {
+    await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
+    throwIfAgentMutationAborted(signal);
+    await rename(temporary, path);
+    await chmod(path, 0o600);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+function throwIfAgentMutationAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("agent mutation was aborted");
 }
 
 async function anyFileExists(paths: string[]): Promise<boolean> {
