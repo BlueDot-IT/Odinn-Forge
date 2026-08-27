@@ -1165,14 +1165,35 @@ test("gateway persists a bound channel result before completion and serves it af
     // public runtime job did not reach its terminal update before the process
     // died. Startup must adopt the bound result without replaying the model.
     const interrupted = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    const interruptedLease = interrupted.database.db.prepare(`SELECT token, owner, epoch, acquired_at
+      FROM runtime_job_leases WHERE job_id = ? ORDER BY acquired_at DESC LIMIT 1`)
+      .get(executionKey) as { token: string; owner: string; epoch: string; acquired_at: string };
+    const interruptedAt = new Date().toISOString();
+    const interruptedLeaseExpiry = new Date(Date.now() + 120_000).toISOString();
+    interrupted.database.db.prepare(`UPDATE runtime_job_leases
+      SET expires_at = ?, released_at = NULL, release_reason = NULL WHERE token = ?`)
+      .run(interruptedLeaseExpiry, interruptedLease.token);
     interrupted.database.db.prepare(`UPDATE runtime_jobs
-      SET status = 'running', result_json = NULL, completed_at = NULL
-      WHERE id = ?`).run(executionKey);
+      SET status = 'running', result_json = NULL, completed_at = NULL, updated_at = ?, recovered_at = NULL,
+        lease_token = ?, lease_owner = ?, lease_epoch = ?, lease_acquired_at = ?, lease_expires_at = ?
+      WHERE id = ?`).run(
+        interruptedAt,
+        interruptedLease.token,
+        interruptedLease.owner,
+        interruptedLease.epoch,
+        interruptedLease.acquired_at,
+        interruptedLeaseExpiry,
+        executionKey
+      );
     interrupted.database.db.prepare(`UPDATE execution_attempts
       SET state = 'running', settled_at = NULL, outcome_digest = NULL, error_code = NULL,
         owner_released_at = NULL, owner_heartbeat_at = ?
       WHERE id = (SELECT execution_attempt_id FROM runtime_jobs WHERE id = ?)`)
-      .run(new Date().toISOString(), executionKey);
+      .run(interruptedAt, executionKey);
+    interrupted.database.db.prepare(`UPDATE cancellation_controls
+      SET requested_at = NULL, requested_by = NULL, reason = NULL,
+        acknowledged_at = NULL, settled_at = NULL WHERE run_id = ?`)
+      .run(executionKey);
     interrupted.close();
     server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -1217,6 +1238,168 @@ test("gateway persists a bound channel result before completion and serves it af
     assert.equal(missingJob.status, "needs-review");
     assert.match(missingJob.error, /protected channel result is unavailable/u);
     assert.equal(providerCalls, 3, "missing-result quarantine must not replay the provider");
+  } finally {
+    await closeGateway();
+    await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
+    if (previousKey === undefined) delete process.env.ODINN_STAGE7_CHANNEL_API_KEY;
+    else process.env.ODINN_STAGE7_CHANNEL_API_KEY = previousKey;
+  }
+});
+
+test("gateway restart preserves a winning cancellation over a persisted channel result", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-channel-cancel-restart-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  let providerCalls = 0;
+  const provider = createServer(async (request, response) => {
+    if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+      response.writeHead(404).end();
+      return;
+    }
+    providerCalls += 1;
+    for await (const _chunk of request) {
+      // Consume the complete bounded request before writing the deterministic response.
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "cancelled-channel-response",
+      choices: [{ message: { role: "assistant", content: "CANCELLED_PROTECTED_OUTPUT" } }],
+      usage: { total_tokens: 2 }
+    }));
+  });
+  await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  const providerPort = (provider.address() as any).port;
+  const previousKey = process.env.ODINN_STAGE7_CHANNEL_API_KEY;
+  process.env.ODINN_STAGE7_CHANNEL_API_KEY = "stage7-channel-key";
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
+    version: 1,
+    defaultModel: "test:test-model",
+    providers: { test: { type: "openai-compatible", baseUrl: `http://127.0.0.1:${providerPort}/v1`, apiKeyEnv: "ODINN_STAGE7_CHANNEL_API_KEY", models: ["test-model"] } },
+    channels: {}
+  }, null, 2)}\n`, { mode: 0o600 });
+
+  let server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let base = `http://127.0.0.1:${(server.address() as any).port}`;
+  const closeGateway = async () => {
+    if (!server.listening) return;
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  };
+  try {
+    const executionKey = "stage7-channel-cancelled-before-terminal";
+    const sessionResponse = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Cancellation restart fence" })
+    });
+    assert.equal(sessionResponse.status, 200);
+    const sessionId = String((await sessionResponse.json()).id);
+    const submission = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": executionKey },
+      body: JSON.stringify({
+        executionKey,
+        task: { tool: "agent.run", input: { sessionId, model: "test:test-model", prompt: "cancel restart", maxTurns: 1, maxTokens: 128 } }
+      })
+    });
+    assert.equal(submission.status, 202);
+    let completed: any;
+    const completionDeadline = Date.now() + 20_000;
+    while (Date.now() < completionDeadline) {
+      completed = await (await fetch(`${base}/jobs/${executionKey}`)).json();
+      if (["completed", "failed", "needs-review"].includes(completed.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(completed.status, "completed");
+    assert.equal(providerCalls, 1);
+
+    const records = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    const protectedResult = (await records.queryRecords({ types: ["channel.result.persisted"] }))
+      .find((record: any) => record.jobId === executionKey) as any;
+    assert.equal(protectedResult.result.output.content, "CANCELLED_PROTECTED_OUTPUT");
+    records.close();
+    await closeGateway();
+
+    // Recreate the exact durable crash boundary after protected persistence
+    // and before the public terminal transaction, then use the production
+    // cancellation transaction so the cancellation wins before restart.
+    const crashedLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    const crashedStore = new SqliteJobStore(crashedLedger);
+    const historicalLease = crashedLedger.database.db.prepare(`SELECT token, owner, epoch, acquired_at
+      FROM runtime_job_leases WHERE job_id = ? ORDER BY acquired_at DESC LIMIT 1`)
+      .get(executionKey) as { token: string; owner: string; epoch: string; acquired_at: string };
+    assert.ok(historicalLease?.token);
+    const crashAt = new Date().toISOString();
+    const crashLeaseExpiry = new Date(Date.now() + 120_000).toISOString();
+    crashedLedger.database.db.prepare(`UPDATE runtime_job_leases
+      SET expires_at = ?, released_at = NULL, release_reason = NULL WHERE token = ?`)
+      .run(crashLeaseExpiry, historicalLease.token);
+    crashedLedger.database.db.prepare(`UPDATE runtime_jobs
+      SET status = 'running', result_json = NULL, error = NULL, completed_at = NULL, recovered_at = NULL,
+        updated_at = ?, lease_token = ?, lease_owner = ?, lease_epoch = ?, lease_acquired_at = ?, lease_expires_at = ?
+      WHERE id = ?`).run(
+        crashAt,
+        historicalLease.token,
+        historicalLease.owner,
+        historicalLease.epoch,
+        historicalLease.acquired_at,
+        crashLeaseExpiry,
+        executionKey
+      );
+    crashedLedger.database.db.prepare(`UPDATE execution_attempts
+      SET state = 'running', settled_at = NULL, outcome_digest = NULL, error_code = NULL,
+        owner_released_at = NULL, owner_heartbeat_at = ?
+      WHERE id = (SELECT execution_attempt_id FROM runtime_jobs WHERE id = ?)`)
+      .run(crashAt, executionKey);
+    crashedLedger.database.db.prepare(`UPDATE cancellation_controls
+      SET requested_at = NULL, requested_by = NULL, reason = NULL,
+        acknowledged_at = NULL, settled_at = NULL WHERE run_id = ?`)
+      .run(executionKey);
+    const cancelling = await crashedStore.cancel(executionKey, {
+      requestedBy: "restart-regression",
+      reason: "cancel after protected persistence"
+    });
+    assert.equal(cancelling.status, "cancelling");
+    assert.equal(crashedLedger.getExecutionAttempt(cancelling.executionAttemptId!)?.state, "cancelling");
+    const pendingCancellation = crashedLedger.database.db.prepare(`SELECT requested_at, acknowledged_at, settled_at
+      FROM cancellation_controls WHERE run_id = ?`).get(executionKey) as any;
+    assert.ok(pendingCancellation.requested_at);
+    assert.ok(pendingCancellation.acknowledged_at);
+    assert.equal(pendingCancellation.settled_at, null);
+    crashedLedger.close();
+
+    server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    base = `http://127.0.0.1:${(server.address() as any).port}`;
+    const recovered = await (await fetch(`${base}/jobs/${executionKey}`)).json();
+    assert.equal(recovered.status, "needs-review");
+    assert.equal(recovered.result, undefined);
+    assert.equal(recovered.dispatchLease, undefined);
+    assert.match(recovered.error, /cannot override a cancellation/u);
+    const inaccessibleResult = await fetch(`${base}/jobs/${executionKey}/result`);
+    assert.equal(inaccessibleResult.status, 409);
+    assert.doesNotMatch(await inaccessibleResult.text(), /CANCELLED_PROTECTED_OUTPUT/u);
+    assert.equal(providerCalls, 1, "restart must not replay the provider after cancellation won");
+
+    const recoveredLedger = createRunLedger({ stateDir, workspaceRoot: stateDir });
+    try {
+      const recoveredAttempt = recoveredLedger.getExecutionAttempt(recovered.executionAttemptId);
+      assert.equal(recoveredAttempt?.state, "needs-review");
+      assert.equal(recoveredAttempt?.errorCode, "PROTECTED_RESULT_CANCELLATION_OUTCOME_UNCERTAIN");
+      const cancellation = recoveredLedger.database.db.prepare(`SELECT requested_at, requested_by, reason,
+        acknowledged_at, settled_at FROM cancellation_controls WHERE run_id = ?`).get(executionKey) as any;
+      assert.ok(cancellation.requested_at);
+      assert.equal(cancellation.requested_by, "restart-regression");
+      assert.equal(cancellation.reason, "cancel after protected persistence");
+      assert.ok(cancellation.acknowledged_at);
+      assert.ok(cancellation.settled_at);
+      const lease = recoveredLedger.database.db.prepare(`SELECT released_at, release_reason
+        FROM runtime_job_leases WHERE token = ?`).get(historicalLease.token) as any;
+      assert.ok(lease.released_at);
+      assert.equal(lease.release_reason, "needs-review");
+    } finally {
+      recoveredLedger.close();
+    }
   } finally {
     await closeGateway();
     await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));

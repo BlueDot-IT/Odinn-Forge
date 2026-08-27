@@ -58,6 +58,14 @@ export interface RuntimeJobRecord {
   dispatchLease?: JsonObject;
 }
 
+type ProtectedResultRecoveryExpectation = {
+  updatedAt: string;
+  requestHash: string;
+  executionRunId?: string;
+  executionAttemptId?: string;
+  leaseToken?: string;
+};
+
 type NormalizedRuntimeJob = RuntimeJobRecord & {
   resultJson: string | null;
   payloadJson: string;
@@ -547,6 +555,128 @@ export class SqliteJobStore {
         auditCorrelationId: linked.auditCorrelationId,
         cancellationControlReference: linked.cancellationControlReference
       }, current);
+      writeJob(db, normalized);
+      return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow);
+    });
+  }
+
+  async adoptProtectedResult(id: string, {
+    result,
+    expected
+  }: {
+    result: unknown;
+    expected: ProtectedResultRecoveryExpectation;
+  }): Promise<RuntimeJobRecord> {
+    return this.ledger.database.transaction((db) => {
+      const row = db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow | undefined;
+      if (!row) throw new Error(`job not found: ${id}`);
+      const current = hydrate(row);
+
+      const linked = correlation(this.ledger, current.executionRunId);
+      const cancellation = current.executionRunId
+        ? db.prepare(`SELECT id, requested_at, acknowledged_at, settled_at
+          FROM cancellation_controls WHERE run_id = ?`).get(current.executionRunId) as SqlRow | undefined
+        : undefined;
+      const lease = current.dispatchLease?.token
+        ? db.prepare("SELECT * FROM runtime_job_leases WHERE token = ? AND job_id = ?")
+            .get(String(current.dispatchLease.token), current.id) as SqlRow | undefined
+        : undefined;
+
+      // The protected record lives in a separate access-controlled store, so
+      // bind the already-verified record to the exact runtime-job snapshot
+      // that was used to verify it. The remaining job, attempt, lease, and
+      // cancellation checks and all state changes share this transaction.
+      const snapshotMatches = current.updatedAt === expected.updatedAt
+        && current.requestHash === expected.requestHash
+        && current.executionRunId === expected.executionRunId
+        && current.executionAttemptId === expected.executionAttemptId
+        && current.dispatchLease?.token === expected.leaseToken;
+      const executionIdentityMatches = Boolean(
+        current.executionRunId
+        && linked?.attemptId
+        && (!current.executionAttemptId || current.executionAttemptId === linked.attemptId)
+        && (!current.envelopeDigest || current.envelopeDigest === linked.envelopeDigest)
+        && (!current.auditCorrelationId || current.auditCorrelationId === linked.auditCorrelationId)
+        && (!current.cancellationControlReference
+          || current.cancellationControlReference === linked.cancellationControlReference)
+      );
+      const cancellationControlMatches = Boolean(
+        cancellation
+        && linked
+        && String(cancellation.id) === linked.cancellationControlReference
+      );
+      const cancellationObserved = Boolean(cancellation?.requested_at || cancellation?.acknowledged_at);
+      const leaseMatches = Boolean(
+        expected.leaseToken
+        && current.dispatchLease
+        && lease
+        && lease.released_at === null
+        && String(lease.owner) === current.dispatchLease.owner
+        && String(lease.epoch) === current.dispatchLease.epoch
+        && String(lease.acquired_at) === current.dispatchLease.acquiredAt
+        && String(lease.expires_at) === current.dispatchLease.expiresAt
+        && (lease.occurrence_key === null ? current.occurrenceKey === undefined : String(lease.occurrence_key) === current.occurrenceKey)
+      );
+      const compatibleAttempt = linked?.attemptState === "running" || linked?.attemptState === "completed";
+      const canAdopt = current.status === "running"
+        && snapshotMatches
+        && executionIdentityMatches
+        && cancellationControlMatches
+        && !cancellationObserved
+        && leaseMatches
+        && compatibleAttempt;
+      const now = new Date().toISOString();
+      const targetStatus = canAdopt ? "completed" : "needs-review";
+      const recoveryError = canAdopt
+        ? undefined
+        : current.status === "cancelling" || cancellationObserved || linked?.attemptState === "cancelling"
+          ? "protected channel result cannot override a cancellation; external outcome requires operator review"
+          : "protected channel result could not be atomically bound to its execution state; external outcome requires operator review";
+
+      if (current.dispatchLease?.token) {
+        db.prepare(`UPDATE runtime_job_leases
+          SET released_at = COALESCE(released_at, ?), release_reason = COALESCE(release_reason, ?)
+          WHERE token = ? AND job_id = ?`)
+          .run(now, targetStatus, String(current.dispatchLease.token), current.id);
+      }
+      if (canAdopt && linked?.attemptState === "running") {
+        transitionAttempt(db, linked.attemptId, "running", "completed", undefined, this.executionOwnershipEnabled);
+      } else if (!canAdopt && linked?.attemptState
+        && !TERMINAL_ATTEMPT_STATES.has(linked.attemptState)) {
+        transitionAttempt(
+          db,
+          linked.attemptId,
+          linked.attemptState,
+          "needs-review",
+          cancellationObserved || current.status === "cancelling" || linked.attemptState === "cancelling"
+            ? "PROTECTED_RESULT_CANCELLATION_OUTCOME_UNCERTAIN"
+            : "PROTECTED_RESULT_RECOVERY_STATE_UNCERTAIN",
+          this.executionOwnershipEnabled
+        );
+      }
+      if (current.executionRunId && cancellationControlMatches) {
+        db.prepare("UPDATE cancellation_controls SET settled_at = COALESCE(settled_at, ?) WHERE run_id = ?")
+          .run(now, current.executionRunId);
+      }
+      const normalized = normalizeJob({
+        ...current,
+        status: targetStatus,
+        completedAt: now,
+        result: canAdopt ? result : undefined,
+        error: recoveryError,
+        recoveredAt: now,
+        dispatchLease: undefined,
+        ...(linked ? {
+          executionAttemptId: linked.attemptId,
+          envelopeDigest: linked.envelopeDigest,
+          auditCorrelationId: linked.auditCorrelationId,
+          cancellationControlReference: linked.cancellationControlReference
+        } : {})
+      }, current);
+      if (!canAdopt) {
+        normalized.result = undefined;
+        normalized.resultJson = null;
+      }
       writeJob(db, normalized);
       return hydrate(db.prepare("SELECT * FROM runtime_jobs WHERE id = ?").get(id) as SqlRow);
     });

@@ -3066,12 +3066,15 @@ async function recoverPersistedChannelResults(store: SqliteJobStore, records: Sq
       }
       if (result === undefined) continue;
       if (status === "completed") continue;
-      await store.update(job.id, {
-        status: "completed",
-        completedAt: new Date().toISOString(),
+      await store.adoptProtectedResult(job.id, {
         result,
-        expectedLeaseToken: job.dispatchLease?.token,
-        dispatchLease: undefined
+        expected: {
+          updatedAt: job.updatedAt,
+          requestHash: job.requestHash ?? "",
+          executionRunId: job.executionRunId,
+          executionAttemptId: job.executionAttemptId,
+          leaseToken: typeof job.dispatchLease?.token === "string" ? job.dispatchLease.token : undefined
+        }
       });
     }
   }

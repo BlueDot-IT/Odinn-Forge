@@ -266,6 +266,77 @@ test("SQLite runtime jobs atomically claim leases and bind terminal execution id
   assert.equal(leaseRow.release_reason, "completed");
 });
 
+test("protected result recovery atomically fences cancellation, lease drift, and incompatible attempts", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-protected-result-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = join(root, ".odinn");
+  const ledger = createRunLedger({ stateDir, workspaceRoot: root });
+  t.after(() => ledger.close());
+  const store = new SqliteJobStore(ledger);
+
+  const seed = async (id: string) => {
+    ledger.ensureRun({ runId: id, objective: "protected result recovery" });
+    const admitted = ledger.admitExecution(executionEnvelope(root, id, false));
+    ledger.transitionExecutionAttempt({ attemptId: admitted.attempt.id, from: "queued", to: "running" });
+    await createRunningJob(store, id, false, true);
+    const job = await store.update(id, { requestHash: "b".repeat(64) });
+    assert.ok(job?.dispatchLease?.token);
+    return { admitted, job };
+  };
+  const recover = (job: NonNullable<Awaited<ReturnType<typeof store.get>>>) => store.adoptProtectedResult(job.id, {
+    result: { output: { text: `protected:${job.id}` } },
+    expected: {
+      updatedAt: job.updatedAt,
+      requestHash: job.requestHash ?? "",
+      executionRunId: job.executionRunId,
+      executionAttemptId: job.executionAttemptId,
+      leaseToken: typeof job.dispatchLease?.token === "string" ? job.dispatchLease.token : undefined
+    }
+  });
+
+  const safe = await seed("protected-safe");
+  const adopted = await recover(safe.job);
+  assert.equal(adopted.status, "completed");
+  assert.equal(ledger.getExecutionAttempt(safe.admitted.attempt.id)?.state, "completed");
+
+  const cancelled = await seed("protected-cancelled");
+  const cancelling = await store.cancel(cancelled.job.id, { requestedBy: "test", reason: "cancel protected result" });
+  const quarantinedCancellation = await recover(cancelling);
+  assert.equal(quarantinedCancellation.status, "needs-review");
+  assert.equal(quarantinedCancellation.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(cancelled.admitted.attempt.id)?.state, "needs-review");
+
+  const cancellationControlOnly = await seed("protected-control-only");
+  const cancellationAt = new Date().toISOString();
+  ledger.database.db.prepare(`UPDATE cancellation_controls
+    SET requested_at = ?, requested_by = 'test', reason = 'control-only cancellation', acknowledged_at = ?
+    WHERE run_id = ?`).run(cancellationAt, cancellationAt, cancellationControlOnly.job.id);
+  const quarantinedControl = await recover(cancellationControlOnly.job);
+  assert.equal(quarantinedControl.status, "needs-review");
+  assert.equal(quarantinedControl.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(cancellationControlOnly.admitted.attempt.id)?.errorCode, "PROTECTED_RESULT_CANCELLATION_OUTCOME_UNCERTAIN");
+
+  const leaseDrift = await seed("protected-lease-drift");
+  ledger.database.db.prepare("UPDATE runtime_job_leases SET epoch = 'different-epoch' WHERE token = ?")
+    .run(String(leaseDrift.job.dispatchLease?.token));
+  const quarantinedLease = await recover(leaseDrift.job);
+  assert.equal(quarantinedLease.status, "needs-review");
+  assert.equal(quarantinedLease.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(leaseDrift.admitted.attempt.id)?.errorCode, "PROTECTED_RESULT_RECOVERY_STATE_UNCERTAIN");
+
+  const incompatible = await seed("protected-incompatible-attempt");
+  ledger.transitionExecutionAttempt({
+    attemptId: incompatible.admitted.attempt.id,
+    from: "running",
+    to: "failed",
+    errorCode: "EXECUTION_FAILED_BEFORE_ADOPTION"
+  });
+  const quarantinedAttempt = await recover(incompatible.job);
+  assert.equal(quarantinedAttempt.status, "needs-review");
+  assert.equal(quarantinedAttempt.result, undefined);
+  assert.equal(ledger.getExecutionAttempt(incompatible.admitted.attempt.id)?.state, "failed");
+});
+
 test("restart recovery classifies every crash boundary without replaying unsafe work", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-runtime-job-recovery-"));
   t.after(() => rm(root, { recursive: true, force: true }));
