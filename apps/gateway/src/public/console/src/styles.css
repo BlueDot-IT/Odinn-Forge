@@ -873,6 +873,24 @@
     .chat-status {
       font-size: 12px;
     }
+    .chat-tool-progress {
+      padding: 0 18px 8px;
+    }
+    .chat-tool-progress .tool-call {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 11px;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .chat-tool-progress .tool-call strong {
+      color: var(--text);
+    }
     .runtime-grid {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 360px;

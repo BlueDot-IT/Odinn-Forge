@@ -434,6 +434,13 @@ test("delegation remains operable across responsive boundaries and clears checkp
     await page.locator('.agent-graph-row[aria-current="true"]').waitFor({ state: "visible" });
     assert.equal(await page.locator('.agent-graph-row[aria-current="true"]').count(), 1);
 
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await page.locator("#sidebar-toggle").getAttribute("aria-label"), "Collapse navigation");
+    await page.setViewportSize({ width: 375, height: 900 });
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await page.locator("#sidebar-toggle").getAttribute("aria-label"), "Open navigation", "desktop-to-mobile resize must expose the collapsed navigation action");
+
     const responsiveWidths = [375, 600, 601, 980, 981, 1440];
     for (const width of responsiveWidths) {
       await page.setViewportSize({ width, height: 900 });
