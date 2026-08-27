@@ -403,6 +403,42 @@ test("counterfactual creation excludes protected components and an arbitrarily n
   }
 });
 
+test("counterfactual creation canonicalizes a symlinked workspace before excluding nested physical state", async (t) => {
+  if (process.platform === "win32") return t.skip("directory symlink creation requires elevated Windows privileges");
+  const parent = await mkdtemp(join(tmpdir(), "odinn-counterfactual-workspace-alias-"));
+  const physicalRoot = join(parent, "physical-workspace");
+  const workspaceAlias = join(parent, "workspace-alias");
+  const state = join(physicalRoot, "opaque", "runtime-state");
+  await mkdir(state, { recursive: true });
+  await mkdir(join(physicalRoot, "ordinary"), { recursive: true });
+  await writeFile(join(physicalRoot, "ordinary", "copied.txt"), "copied\n");
+  await writeFile(join(state, "must-not-copy.txt"), "private runtime state\n");
+  await symlink(physicalRoot, workspaceAlias, "dir");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: workspaceAlias, featureFlags: flags });
+  let candidateRoot = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (candidateRoot) await rm(dirname(dirname(candidateRoot)), { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-workspace-alias", objective: "exclude state through an aliased root" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-workspace-alias",
+    sourceStepId: "step-1",
+    workspaceRoot: workspaceAlias,
+    plans: [{ id: "isolated", title: "Isolated", summary: "copy only ordinary workspace data" }]
+  });
+  candidateRoot = group.candidates[0].workspaceRoot;
+  const candidateRelative = relative(physicalRoot, candidateRoot);
+  assert.ok(candidateRelative === ".." || candidateRelative.startsWith(`..${sep}`), "candidate must remain outside the physical workspace");
+  assert.equal(await readFile(join(candidateRoot, "ordinary", "copied.txt"), "utf8"), "copied\n");
+  await assert.rejects(
+    readFile(join(candidateRoot, "opaque", "runtime-state", "must-not-copy.txt"), "utf8"),
+    (error: any) => error?.code === "ENOENT"
+  );
+});
+
 test("counterfactual activation and rollback preserve nested state and protected workspace components", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-counterfactual-nested-state-select-"));
   const state = join(root, "config", "private-runtime-state");
@@ -493,6 +529,132 @@ test("counterfactual activation and rollback preserve nested state and protected
     assert.equal((await lstat(join(root, "late-link.txt"))).isSymbolicLink(), true);
     assert.equal(await readlink(join(root, "late-link.txt")), "late-link-target.txt");
   }
+});
+
+test("counterfactual rollback failure retains durable recovery material and publishes recovery-required", async (t) => {
+  if (process.platform === "win32") return t.skip("directory symlink creation requires elevated Windows privileges");
+  const parent = await mkdtemp(join(tmpdir(), "odinn-counterfactual-rollback-failure-"));
+  const root = join(parent, "workspace");
+  const state = join(parent, "state");
+  const attacker = join(parent, "attacker");
+  await mkdir(join(root, "nested"), { recursive: true });
+  await mkdir(attacker, { recursive: true });
+  await writeFile(join(root, "nested", "original.txt"), "original\n");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
+  let recoveryPath = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (recoveryPath) await rm(recoveryPath, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-rollback-failure", objective: "retain recovery backup" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-rollback-failure",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{
+      id: "candidate",
+      title: "Candidate",
+      summary: "exercise rollback recovery",
+      tasks: [{ tool: "text.echo", input: { text: "candidate" }, readOnly: true }]
+    }]
+  });
+  const candidate = group.candidates[0];
+  await runtime.counterfactual.execute(group.groupId, { executor: async () => ({ output: { text: "completed" } }) });
+  await writeFile(join(candidate.workspaceRoot, "nested", "original.txt"), "candidate\n");
+  let failure: any;
+  await assert.rejects(runtime.counterfactual.select(group.groupId, candidate.runId, {
+    apply: true,
+    __testOnlyAfterActivation: async () => {
+      await rm(join(root, "nested"), { recursive: true, force: true });
+      await symlink(attacker, join(root, "nested"), "dir");
+      throw new Error("injected activation settlement failure");
+    }
+  }), (error: any) => {
+    failure = error;
+    return error instanceof AggregateError
+      && error.code === "ROLLBACK_CONFLICT"
+      && error.details?.recoveryRequired === true
+      && error.details?.manifestWritten === true
+      && error.details?.journaled === true;
+  });
+
+  recoveryPath = failure.details.recoveryPath;
+  assert.equal((await stat(recoveryPath)).mode & 0o777, 0o700);
+  assert.equal(await readFile(join(recoveryPath, "workspace", "nested", "original.txt"), "utf8"), "original\n");
+  const recovery = JSON.parse(await readFile(join(recoveryPath, "recovery.json"), "utf8"));
+  assert.equal(recovery.status, "recovery-required");
+  assert.equal(recovery.groupId, group.groupId);
+  assert.equal(recovery.runId, candidate.runId);
+  assert.equal(runtime.counterfactual.compare(group.groupId).status, "recovery-required");
+  assert.equal(runtime.counterfactual.compare(group.groupId).candidates[0].status, "recovery-required");
+  const recoveryEvent = runtime.ledger.getRun("counterfactual-rollback-failure").events.find((event: any) => event.type === "branch-recovery-required");
+  assert.equal(recoveryEvent?.payload?.recoveryPath, recoveryPath);
+  assert.equal((await lstat(join(root, "nested"))).isSymbolicLink(), true, "failed rollback must not claim that the source was restored");
+});
+
+test("counterfactual recovery retains its manifest and original rollback error when journaling fails", async (t) => {
+  if (process.platform === "win32") return t.skip("directory symlink creation requires elevated Windows privileges");
+  const parent = await mkdtemp(join(tmpdir(), "odinn-counterfactual-recovery-journal-"));
+  const root = join(parent, "workspace");
+  const state = join(parent, "state");
+  const attacker = join(parent, "attacker");
+  await mkdir(join(root, "nested"), { recursive: true });
+  await mkdir(attacker, { recursive: true });
+  await writeFile(join(root, "nested", "original.txt"), "original\n");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: flags });
+  let recoveryPath = "";
+  t.after(async () => {
+    runtime.ledger.close();
+    if (recoveryPath) await rm(recoveryPath, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  runtime.ledger.ensureRun({ runId: "counterfactual-journal-failure", objective: "retain recovery evidence" });
+  const group = await runtime.counterfactual.create({
+    sourceRunId: "counterfactual-journal-failure",
+    sourceStepId: "step-1",
+    workspaceRoot: root,
+    plans: [{
+      id: "candidate",
+      title: "Candidate",
+      summary: "exercise recovery journal failure",
+      tasks: [{ tool: "text.echo", input: { text: "candidate" }, readOnly: true }]
+    }]
+  });
+  const candidate = group.candidates[0];
+  await runtime.counterfactual.execute(group.groupId, { executor: async () => ({ output: { text: "completed" } }) });
+  await writeFile(join(candidate.workspaceRoot, "nested", "original.txt"), "candidate\n");
+
+  const database = runtime.ledger.database as any;
+  database.transaction = () => { throw new Error("injected recovery journal failure"); };
+  let failure: any;
+  await assert.rejects(runtime.counterfactual.select(group.groupId, candidate.runId, {
+    apply: true,
+    __testOnlyAfterActivation: async () => {
+      await rm(join(root, "nested"), { recursive: true, force: true });
+      await symlink(attacker, join(root, "nested"), "dir");
+      throw new Error("injected activation settlement failure");
+    }
+  }), (error: any) => {
+    failure = error;
+    const messages = error instanceof AggregateError
+      ? error.errors.map((entry: any) => entry instanceof Error ? entry.message : String(entry))
+      : [];
+    return error instanceof AggregateError
+      && error.code === "ROLLBACK_CONFLICT"
+      && error.details?.manifestWritten === true
+      && error.details?.journaled === false
+      && messages.some((message: string) => message.includes("recovery verification"))
+      && messages.includes("injected recovery journal failure");
+  });
+
+  recoveryPath = failure.details.recoveryPath;
+  assert.equal((await stat(recoveryPath)).mode & 0o777, 0o700);
+  assert.equal(await readFile(join(recoveryPath, "workspace", "nested", "original.txt"), "utf8"), "original\n");
+  assert.equal(JSON.parse(await readFile(join(recoveryPath, "recovery.json"), "utf8")).status, "recovery-required");
+  assert.equal((await lstat(join(root, "nested"))).isSymbolicLink(), true);
 });
 
 test("counterfactual execution runs real audited tasks and supports selection preview", async () => {

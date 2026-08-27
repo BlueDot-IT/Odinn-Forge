@@ -925,7 +925,7 @@ export async function createGatewayServer(options: any = {}) {
   const mcpRuntime = config.runtime?.enableMcp === true
     ? createGovernedMcpRuntime({ enabled: true, config: config.mcp, extensionRegistry, extensionExecutor, auditStore, runLedger: runtime.ledger })
     : undefined;
-  const writeSelfImprovementConfig = (nextConfig: any, expectedFingerprint: string) => writeEditableConfig(state, { config: nextConfig, fingerprint: expectedFingerprint }, { hosted });
+  const writeSelfImprovementConfig = (nextConfig: any, expectedFingerprint: string, options: { signal?: AbortSignal } = {}) => writeEditableConfig(state, { config: nextConfig, fingerprint: expectedFingerprint }, { hosted, signal: options.signal });
   const registry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: runtimeConfig, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const governedRegistry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: { ...runtimeConfig, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const gatewayToken = await loadGatewayToken(state);
@@ -1057,14 +1057,17 @@ export async function createGatewayServer(options: any = {}) {
     : undefined;
   eventHeartbeatTimer?.unref?.();
   const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
+  const improvementAbort = new AbortController();
   let improvementCycle: Promise<any> | undefined;
   const runImprovementCycle = () => {
+    if (improvementAbort.signal.aborted) return Promise.resolve(undefined);
     if (improvementCycle) return improvementCycle;
     improvementCycle = runControlTask({
       tool: "improve.learn",
       input: { limit: 1000 },
       actor: "autonomous-improvement"
-    }).catch(async () => {
+    }, { signal: improvementAbort.signal }).catch(async () => {
+      if (improvementAbort.signal.aborted) return undefined;
       await auditStore.append({
         runId: `improvement-cycle:${Date.now()}`,
         type: "improvement.cycle_failed",
@@ -1078,7 +1081,11 @@ export async function createGatewayServer(options: any = {}) {
     return improvementCycle;
   };
   const automaticImprovement = selfImprovement.enabled && selfImprovement.mode === "auto";
-  const improvementStartupTimer = automaticImprovement ? setTimeout(runImprovementCycle, 2_000) : undefined;
+  const requestedImprovementStartupDelayMs = Number(testHooks?.improvementStartupDelayMs ?? 2_000);
+  const improvementStartupDelayMs = Number.isFinite(requestedImprovementStartupDelayMs)
+    ? Math.max(0, Math.min(30_000, requestedImprovementStartupDelayMs))
+    : 2_000;
+  const improvementStartupTimer = automaticImprovement ? setTimeout(runImprovementCycle, improvementStartupDelayMs) : undefined;
   improvementStartupTimer?.unref?.();
   const improvementTimer = automaticImprovement
     ? setInterval(runImprovementCycle, selfImprovement.intervalMs)
@@ -3277,9 +3284,12 @@ export async function createGatewayServer(options: any = {}) {
       recordGatewayEvent(telemetry, { name: "odinn.runtime.lifecycle", attributes: { component: "gateway", operation: "shutdown", outcome: "stopping" } });
       const quarantinedMutations = mutationBarrier.close();
       if (activeCronDispatches.size) quarantinedMutations.push("scheduled cron dispatch");
+      const activeImprovementCycle = improvementCycle;
+      if (activeImprovementCycle) quarantinedMutations.push("automatic improvement cycle");
       const shutdownAbort = new GatewayError(503, "gateway shutdown is in progress");
       for (const controller of activeRequests) controller.abort(shutdownAbort);
       cronDispatchAbort.abort(shutdownAbort);
+      improvementAbort.abort(shutdownAbort);
       if (improvementStartupTimer) clearTimeout(improvementStartupTimer);
       if (improvementTimer) clearInterval(improvementTimer);
       clearInterval(cronTimer);
@@ -3317,6 +3327,7 @@ export async function createGatewayServer(options: any = {}) {
         try {
           componentResults = await beforeDeadline(Promise.allSettled([
             Promise.allSettled([...activeCronDispatches]),
+            activeImprovementCycle ?? Promise.resolve(),
             channelSupervisor.stop(),
             supervisor.shutdown(),
             workflowRuntime?.shutdown(),
@@ -4185,7 +4196,7 @@ async function writeEditableConfig(state: string, input: any, { hosted = false, 
       await rm(temporary, { force: true }).catch(() => undefined);
     }
     return { config: input.config, fingerprint: configFingerprint(serialized) };
-  });
+  }, { signal });
 }
 
 async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES, signal = request?.[REQUEST_ABORT_SIGNAL] }: any = {}) {

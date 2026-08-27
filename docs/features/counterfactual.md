@@ -6,8 +6,10 @@ and SDK names remain compatibility identifiers. It recursively copies a
 workspace into separate candidate directories outside the source workspace,
 under a runtime-owned worktree root such as
 `<state>/worktrees/<group>/<plan>`. If the configured state path overlaps the
-source workspace, Ódinn Forge selects a disjoint sibling or temporary root
-instead. The candidates create independent run records, ledger relationships,
+source workspace, Ódinn Forge selects a disjoint owner-private sibling root
+instead. Workspace, state, candidate, and recovery roots are bound to their
+canonical physical identities before copying; symlinked aliases cannot bypass
+state exclusion, and symbolic links are never copied. The candidates create independent run records, ledger relationships,
 and plans. They are filesystem copies, not Git worktrees or operating-system
 sandboxes. Generated and cache-heavy roots
 (`.git`, `node_modules`, `dist`, `build`, `coverage`, `.next`, `.cache`,
@@ -29,6 +31,10 @@ candidate independently through the normal audited tool boundary, then runs
 the candidate contract when present. Plans without `--execute` remain dry-run
 branch creation only. Selection is also a dry-run unless `--apply` is supplied;
 applying replaces only files outside `.git`, `.odinn`, and
-`.odinn-worktrees`, with a temporary source backup for recovery. Irreversible
+`.odinn-worktrees`, with an owner-private source backup under the runtime
+worktree recovery root. A verified rollback removes that backup. If rollback
+cannot be verified, Ódinn retains the backup and a `recovery.json` manifest,
+marks both the candidate and group `recovery-required`, and journals the stable
+recovery path for operator handling. Irreversible
 external actions remain approval-gated and are not silently made safe by
 branching.

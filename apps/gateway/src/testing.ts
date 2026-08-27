@@ -17,6 +17,7 @@ export type GatewayTestHooks = {
   afterControlPlaneMutationLockAcquired?: (event: { surface: string }) => void | Promise<void>;
   beforeControlPlaneMutationCommit?: (event: { surface: string }) => void | Promise<void>;
   onRequestError?: (event: { pathname: string; error: unknown }) => void | Promise<void>;
+  improvementStartupDelayMs?: number;
   shutdownTimeoutMs?: number;
 };
 

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createGatewayServer } from "../apps/gateway/src/server.ts";
 import { withGatewayTestHooks } from "../apps/gateway/src/testing.ts";
-import { createRunLedger, sourceAuthDigest, workflowDefinitionFromSteps } from "../packages/kernel/src/index.ts";
+import { createAuditStore, createRunLedger, sourceAuthDigest, SqliteRecordStore, workflowDefinitionFromSteps } from "../packages/kernel/src/index.ts";
 
 type Deferred = { promise: Promise<void>; resolve(): void };
 type PreparedShutdownRequest = { path?: string; body?: unknown };
@@ -426,6 +426,78 @@ test("Gateway shutdown aborts a stalled loopback Proof assertion without post-ba
   } finally {
     assertionServer.closeAllConnections?.();
     if (assertionServer.listening) await new Promise<void>((resolveClose) => assertionServer.close(() => resolveClose()));
+    if (gateway?.listening) await new Promise<void>((resolveClose) => gateway.close(() => resolveClose()));
+    if (previousAuth === undefined) delete process.env.ODINN_GATEWAY_AUTH;
+    else process.env.ODINN_GATEWAY_AUTH = previousAuth;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Gateway shutdown aborts a stalled automatic improvement before durable or config effects", async () => {
+  const previousAuth = process.env.ODINN_GATEWAY_AUTH;
+  process.env.ODINN_GATEWAY_AUTH = "off";
+  const root = await mkdtemp(join(tmpdir(), "odinn-shutdown-improvement-"));
+  const stateDir = join(root, "state");
+  const providerEntered = deferred();
+  let providerCalls = 0;
+  const provider: any = createHttpServer(async (request, _response) => {
+    providerCalls += 1;
+    for await (const _chunk of request) {}
+    providerEntered.resolve();
+    // Deliberately never settle. Gateway shutdown must abort the provider
+    // request and drain the active improvement cycle without local fallback.
+  });
+  let gateway: any;
+  try {
+    await mkdir(stateDir, { recursive: true });
+    const providerBase = await listen(provider);
+    const config = {
+      version: 1,
+      defaultModel: "test:advisor",
+      providers: {
+        test: {
+          type: "openai-compatible",
+          baseUrl: `${providerBase}/v1`,
+          models: ["advisor"]
+        }
+      },
+      runtime: { modelRetries: 1 },
+      selfImprovement: {
+        enabled: true,
+        mode: "auto",
+        intervalMs: 30_000,
+        maxChangesPerCycle: 1,
+        rollbackOnFailure: true
+      }
+    };
+    await writeFile(join(stateDir, "config.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    const seedAudit = createAuditStore(join(stateDir, "audit.jsonl"));
+    await seedAudit.append({ runId: "stalled-improvement-a", type: "task.failed", actor: "test", tool: "model.chat", message: "model provider returned 429: rate limit" });
+    await seedAudit.append({ runId: "stalled-improvement-b", type: "task.failed", actor: "test", tool: "model.chat", message: "model provider returned 429: rate limit" });
+    seedAudit.close?.();
+
+    gateway = await createGatewayServer(withGatewayTestHooks({ stateDir, workspaceRoot: root }, {
+      improvementStartupDelayMs: 0,
+      shutdownTimeoutMs: 1_500
+    }));
+    await listen(gateway);
+    await providerEntered.promise;
+
+    const closeError = await new Promise<Error | undefined>((resolveClose) => gateway.close((error?: Error) => resolveClose(error)));
+    assert.equal(closeError, undefined, "stalled improvement did not cooperatively drain before the shutdown deadline");
+    assert.equal(providerCalls, 1);
+    assert.equal(JSON.parse(await readFile(join(stateDir, "config.json"), "utf8")).runtime.modelRetries, 1);
+
+    const records = new SqliteRecordStore(join(stateDir, "db", "records.sqlite"));
+    try {
+      const improvements = await records.queryRecordsPage({ typePrefix: "improvement.", limit: 100 });
+      assert.deepEqual(improvements.records, [], "cancelled automatic improvement persisted a proposal or settlement");
+    } finally {
+      records.close();
+    }
+  } finally {
+    provider.closeAllConnections?.();
+    if (provider.listening) await new Promise<void>((resolveClose) => provider.close(() => resolveClose()));
     if (gateway?.listening) await new Promise<void>((resolveClose) => gateway.close(() => resolveClose()));
     if (previousAuth === undefined) delete process.env.ODINN_GATEWAY_AUTH;
     else process.env.ODINN_GATEWAY_AUTH = previousAuth;

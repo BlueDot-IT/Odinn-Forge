@@ -6,11 +6,21 @@ import { withStateMutationLock } from "./state-mutation.ts";
 import { queryRecordPage } from "./record-queries.ts";
 
 type AnyRecord = Record<string, any>;
+type ImprovementWriteConfig = (config: any, expectedFingerprint: string, options?: { signal?: AbortSignal }) => Promise<unknown>;
 
 const IMPROVEMENT_DECISIONS = new Set(["approved", "rejected", "applied"]);
 
-export async function proposeImprovement(store: any, input: any = {}) {
-  return store.append({
+function assertImprovementActive(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error("self-improvement cycle was cancelled");
+  error.name = "AbortError";
+  throw error;
+}
+
+export async function proposeImprovement(store: any, input: any = {}, { signal }: { signal?: AbortSignal } = {}) {
+  assertImprovementActive(signal);
+  const proposal = await store.append({
     id: prefixedId("imp"),
     type: "improvement.proposed",
     status: "proposed",
@@ -24,6 +34,7 @@ export async function proposeImprovement(store: any, input: any = {}) {
     ...(input.advisor ? { advisor: input.advisor } : {}),
     ...(input.action ? { action: input.action } : {})
   });
+  return proposal;
 }
 
 export async function learnImprovements(store: any, auditStore: any, input: any = {}, {
@@ -31,11 +42,14 @@ export async function learnImprovements(store: any, auditStore: any, input: any 
   config = {},
   modelConfig = normalizeModelConfig(config),
   runModel,
-  writeConfig
+  writeConfig,
+  signal
 }: any = {}) {
+  assertImprovementActive(signal);
   if (stateDir) {
-    const recover = () => recoverInterruptedImprovements(store, { stateDir, config, writeConfig });
-    await (typeof writeConfig === "function" ? recover() : withStateMutationLock(stateDir, recover));
+    const recover = () => recoverInterruptedImprovements(store, { stateDir, config, writeConfig, signal });
+    await (typeof writeConfig === "function" ? recover() : withStateMutationLock(stateDir, recover, { signal }));
+    assertImprovementActive(signal);
   }
   const limit = normalizeLimit(input.limit, 1000);
   if (!auditStore || typeof auditStore.readFailurePage !== "function") return { generated: [], message: "bounded audit observation source unavailable" };
@@ -44,10 +58,12 @@ export async function learnImprovements(store: any, auditStore: any, input: any 
     event.type === "task.blocked" ||
     (event.type === "task.policy" && event.decision === "deny")
   ).filter((event: any) => !String(event.actor || "").includes("improvement"));
+  assertImprovementActive(signal);
   const settings = normalizeSelfImprovementConfig(config.selfImprovement);
   const rolledBack = settings.enabled && settings.mode === "auto" && settings.rollbackOnFailure
-    ? await evaluateAppliedImprovements(store, auditStore, failures, { stateDir, config, settings, writeConfig })
+    ? await evaluateAppliedImprovements(store, auditStore, failures, { stateDir, config, settings, writeConfig, signal })
     : [];
+  assertImprovementActive(signal);
   const groups = new Map();
   for (const event of failures) {
     const key = `${event.type}:${event.tool ?? "unknown"}:${event.message ?? event.decision ?? ""}`;
@@ -64,13 +80,16 @@ export async function learnImprovements(store: any, auditStore: any, input: any 
       observationKey: createHash("sha256").update(group.key).digest("hex"),
       advisorKey: `observation-${index + 1}`
     }));
-  const advisor = await adviseImprovementGroups(repeated, modelConfig, { runModel });
+  const advisor = await adviseImprovementGroups(repeated, modelConfig, { runModel, signal });
+  assertImprovementActive(signal);
   const generated = [];
   for (const group of repeated) {
+    assertImprovementActive(signal);
     const guidance = advisor.guidance.get(group.advisorKey);
     const title = guidance?.title || `Improve reliability for ${friendlyToolName(group.tool)}`;
     const target = `runtime/${group.tool}`;
     const existing = await queryRecordPage(store, { types: ["improvement.proposed"], observationKey: group.observationKey, limit: 1 });
+    assertImprovementActive(signal);
     if (existing.records.length) continue;
     const action = deriveAutonomousAction(group, config);
     const proposal = await proposeImprovement(store, {
@@ -87,14 +106,17 @@ export async function learnImprovements(store: any, auditStore: any, input: any 
         summary: guidance?.summary || ""
       },
       action
-    });
+    }, { signal });
+    assertImprovementActive(signal);
     generated.push(proposal);
   }
   const applied = [];
   if (settings.enabled && settings.mode === "auto") {
     for (const proposal of generated.slice(0, settings.maxChangesPerCycle)) {
+      assertImprovementActive(signal);
       if (!proposal.action) continue;
-      applied.push(await applyImprovement(store, proposal, { stateDir, config, settings, writeConfig }));
+      applied.push(await applyImprovement(store, proposal, { stateDir, config, settings, writeConfig, signal }));
+      assertImprovementActive(signal);
     }
   }
   return {
@@ -150,8 +172,10 @@ export function normalizeSelfImprovementConfig(value: any = {}) {
 }
 
 async function adviseImprovementGroups(groups: any[], modelConfig: any, {
-  runModel
+  runModel,
+  signal
 }: any = {}) {
+  assertImprovementActive(signal);
   const model = modelConfig?.defaultModel || "";
   const empty = { source: model ? "configured-provider" : "waiting-for-provider", model, status: model ? "idle" : "waiting", message: model ? "" : "Connect a model provider so automatic learning can interpret recurring problems.", guidance: new Map() };
   if (!groups.length || !model || typeof runModel !== "function") return empty;
@@ -182,6 +206,7 @@ async function adviseImprovementGroups(groups: any[], modelConfig: any, {
         }
       ]
     });
+    assertImprovementActive(signal);
     const parsed = parseImprovementAdvice(result.content, new Set(groups.map((group: any) => group.advisorKey)));
     return {
       source: "configured-provider",
@@ -191,6 +216,10 @@ async function adviseImprovementGroups(groups: any[], modelConfig: any, {
       guidance: parsed
     };
   } catch (error) {
+    // Cancellation is a stop barrier, not provider unavailability. Falling
+    // back to the local autonomous action after abort would let a stalled
+    // provider resume into a durable config write during Gateway shutdown.
+    assertImprovementActive(signal);
     return {
       ...empty,
       status: "temporarily-unavailable",
@@ -258,25 +287,32 @@ function deriveAutonomousAction(group: any, config: any) {
   return { type: "config.set", path: "runtime.modelRetries", previousValue: current, value: current + 1 };
 }
 
-async function evaluateAppliedImprovements(store: any, auditStore: any, failures: any[], { stateDir, config, settings, writeConfig }: any) {
+async function evaluateAppliedImprovements(store: any, auditStore: any, failures: any[], { stateDir, config, settings, writeConfig, signal }: any) {
+  assertImprovementActive(signal);
   if (!stateDir || typeof store?.queryRecordsPage !== "function" || typeof auditStore?.readFailurePage !== "function") return [];
   const appliedPage = await queryRecordPage(store, { types: ["improvement.applied"], order: "desc", limit: 50 });
+  assertImprovementActive(signal);
   const rolledBack: string[] = [];
   for (const applied of appliedPage.records) {
+    assertImprovementActive(signal);
     const improvementId = String(applied.improvementId || "");
     const observationKey = String(applied.observationKey || "");
     const appliedAt = Date.parse(String(applied.at || ""));
     const baselineCount = Number(applied.baselineCount || 0);
     if (!improvementId || !observationKey || !Number.isFinite(appliedAt) || baselineCount < 1 || Date.now() - appliedAt < settings.intervalMs) continue;
     const history = await queryRecordPage(store, { improvementId, order: "desc", limit: 50 });
+    assertImprovementActive(signal);
     if (history.records.some((record: any) => record.decision === "rolled-back" || record.decision === "recovery_failed")) continue;
     const postChangeFailures = failures.filter((event: any) => Date.parse(String(event.at || "")) > appliedAt && failureObservationKey(event) === observationKey);
     if (postChangeFailures.length < baselineCount) continue;
     await store.append({ id: prefixedId("imp_evt"), type: "improvement.regression_detected", improvementId, decision: "regression", note: "The bounded post-change observation window met the prior failure baseline; restoring the captured configuration.", source: "autonomous-controller", postChangeFailures: postChangeFailures.length, baselineCount });
+    assertImprovementActive(signal);
     try {
-      await rollbackImprovement(store, { improvementId, source: "autonomous-regression" }, { stateDir, config, writeConfig });
+      await rollbackImprovement(store, { improvementId, source: "autonomous-regression" }, { stateDir, config, writeConfig, signal });
+      assertImprovementActive(signal);
       rolledBack.push(improvementId);
     } catch (error) {
+      assertImprovementActive(signal);
       await store.append({
         id: prefixedId("imp_evt"),
         type: "improvement.rollback_failed",
@@ -285,6 +321,7 @@ async function evaluateAppliedImprovements(store: any, auditStore: any, failures
         note: error instanceof Error ? error.message : String(error),
         source: "autonomous-controller"
       });
+      assertImprovementActive(signal);
     }
   }
   return rolledBack;
@@ -294,20 +331,25 @@ function failureObservationKey(event: any): string {
   return createHash("sha256").update(`${event.type}:${event.tool ?? "unknown"}:${event.message ?? event.decision ?? ""}`).digest("hex");
 }
 
-async function applyImprovement(store: any, proposal: any, { stateDir, config, settings, writeConfig }: any) {
+async function applyImprovement(store: any, proposal: any, { stateDir, config, settings, writeConfig, signal }: any) {
+  assertImprovementActive(signal);
   if (!stateDir || proposal.action?.type !== "config.set" || proposal.action.path !== "runtime.modelRetries") {
     throw new Error("autonomous improvement action is not allowlisted");
   }
   const operation = async () => {
+    assertImprovementActive(signal);
     const configPath = join(stateDir, "config.json");
     const snapshotPath = join(stateDir, "improvements", `${proposal.id}.config.json`);
+    assertImprovementActive(signal);
     mkdirSync(dirname(snapshotPath), { recursive: true, mode: 0o700 });
+    assertImprovementActive(signal);
     const original = readFileSync(configPath, "utf8");
     const currentConfig = JSON.parse(original);
     const currentValue = boundedInteger(currentConfig.runtime?.modelRetries, 2, 0, 4);
     if (currentValue !== proposal.action.previousValue) {
       throw new Error("the reliability setting changed before this improvement could be applied");
     }
+    assertImprovementActive(signal);
     writeFileSync(snapshotPath, original, { mode: 0o600 });
     const next = { ...currentConfig, runtime: { ...(currentConfig.runtime ?? {}), modelRetries: proposal.action.value } };
     if (!Number.isSafeInteger(next.runtime.modelRetries) || next.runtime.modelRetries < 0 || next.runtime.modelRetries > 4) {
@@ -315,6 +357,7 @@ async function applyImprovement(store: any, proposal: any, { stateDir, config, s
     }
     const originalConfigDigest = configDigest(original);
     const expectedTargetConfigDigest = configDigest(serializeConfig(next));
+    assertImprovementActive(signal);
     await store.append({
       id: prefixedId("imp_evt"),
       type: "improvement.applying",
@@ -327,13 +370,17 @@ async function applyImprovement(store: any, proposal: any, { stateDir, config, s
       originalConfigDigest,
       targetConfigDigest: expectedTargetConfigDigest
     });
-    let mutated = false;
+    assertImprovementActive(signal);
+    let mutationAttempted = false;
     try {
-      if (typeof writeConfig === "function") await writeConfig(next, originalConfigDigest);
-      else writeConfigAtomically(configPath, next);
-      mutated = true;
+      assertImprovementActive(signal);
+      mutationAttempted = true;
+      if (typeof writeConfig === "function") await (writeConfig as ImprovementWriteConfig)(next, originalConfigDigest, { signal });
+      else writeConfigAtomically(configPath, next, signal);
+      assertImprovementActive(signal);
       Object.assign(config, next);
       const appliedConfigDigest = configDigest(readFileSync(configPath));
+      assertImprovementActive(signal);
       const event = await store.append({
         id: prefixedId("imp_evt"), type: "improvement.applied", improvementId: proposal.id,
         decision: "applied", note: `Applied ${proposal.action.path}: ${proposal.action.previousValue} -> ${proposal.action.value}`,
@@ -342,46 +389,55 @@ async function applyImprovement(store: any, proposal: any, { stateDir, config, s
         baselineCount: proposal.evidence?.[0]?.count,
         targetConfigDigest: appliedConfigDigest
       });
+      // Once the exact config and its terminal record are both durable, keep
+      // that settlement coherent even if shutdown arrived while append was
+      // completing. A post-append abort must not roll the config back beneath
+      // an already-durable `improvement.applied` projection.
       return { improvementId: proposal.id, action: proposal.action, eventId: event.id, snapshotPath };
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       let rollbackError: unknown;
-      if (settings.rollbackOnFailure && mutated) {
+      if (settings.rollbackOnFailure && mutationAttempted) {
         try {
           if (typeof writeConfig === "function") {
             const current = readFileSync(configPath);
-            await writeConfig(JSON.parse(original), configDigest(current));
+            await (writeConfig as ImprovementWriteConfig)(JSON.parse(original), configDigest(current), {});
           } else writeConfigAtomically(configPath, JSON.parse(original));
+          for (const key of Object.keys(config)) delete config[key];
+          Object.assign(config, JSON.parse(original));
         } catch (error) {
           rollbackError = error;
         }
       }
+      if (rollbackError) {
+        throw new AggregateError([failure, rollbackError], "autonomous improvement failed and rollback also failed");
+      }
+      assertImprovementActive(signal);
       await store.append({
         id: prefixedId("imp_evt"),
         type: "improvement.failed",
         improvementId: proposal.id,
         decision: "failed",
-        note: rollbackError
-          ? `${failure.message}; automatic rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
-          : failure.message,
-        source: "autonomous-controller",
-        ...(rollbackError ? { rollbackFailed: true } : {})
+        note: failure.message,
+        source: "autonomous-controller"
       });
-      if (rollbackError) throw new AggregateError([failure, rollbackError], "autonomous improvement failed and rollback also failed");
       throw error;
     }
   };
-  return typeof writeConfig === "function" ? operation() : withStateMutationLock(stateDir, operation);
+  return typeof writeConfig === "function" ? operation() : withStateMutationLock(stateDir, operation, { signal });
 }
 
-export async function rollbackImprovement(store: any, input: any = {}, { stateDir, config, writeConfig }: any) {
+export async function rollbackImprovement(store: any, input: any = {}, { stateDir, config, writeConfig, signal }: any) {
+  assertImprovementActive(signal);
   const improvementId = cleanRequired(input.improvementId, "improve.rollback requires improvementId");
-  const applied = await findLatestAppliedImprovement(store, improvementId);
+  const applied = await findLatestAppliedImprovement(store, improvementId, signal);
+  assertImprovementActive(signal);
   if (!applied) throw new Error(`applied improvement snapshot not found: ${improvementId}`);
   const stateRoot = resolve(stateDir);
   const snapshot = resolve(String(applied.snapshotPath));
   if (relative(stateRoot, snapshot).startsWith("..")) throw new Error("improvement snapshot escapes state directory");
   const operation = async () => {
+    assertImprovementActive(signal);
     const restored = JSON.parse(readFileSync(snapshot, "utf8"));
     const configPath = join(stateRoot, "config.json");
     const current = readFileSync(configPath);
@@ -389,29 +445,39 @@ export async function rollbackImprovement(store: any, input: any = {}, { stateDi
     if (!/^[a-f0-9]{64}$/.test(expectedTargetConfigDigest) || configDigest(current) !== expectedTargetConfigDigest) {
       throw new Error("configuration changed after the improvement was applied; refusing to overwrite newer operator changes");
     }
+    assertImprovementActive(signal);
     if (typeof writeConfig === "function") {
-      await writeConfig(restored, configDigest(current));
-    } else writeConfigAtomically(configPath, restored);
+      await (writeConfig as ImprovementWriteConfig)(restored, configDigest(current), { signal });
+    } else writeConfigAtomically(configPath, restored, signal);
     for (const key of Object.keys(config)) delete config[key];
     Object.assign(config, restored);
+    // The restore crossed its atomic filesystem boundary. Finish its bounded
+    // durable settlement even if cancellation arrived while that boundary was
+    // in flight; abandoning it would leave config and improvement state split.
     const event = await store.append({ id: prefixedId("imp_evt"), type: "improvement.rolled-back", improvementId, decision: "rolled-back", note: "Restored captured configuration snapshot.", source: cleanString(input.source, "local") });
     return { type: "improvement.rolled-back", improvementId, eventId: event.id };
   };
-  return typeof writeConfig === "function" ? operation() : withStateMutationLock(stateRoot, operation);
+  return typeof writeConfig === "function" ? operation() : withStateMutationLock(stateRoot, operation, { signal });
 }
 
-async function recoverInterruptedImprovements(store: any, { stateDir, config, writeConfig }: { stateDir: string; config: any; writeConfig?: (config: any, expectedFingerprint: string) => Promise<unknown> }) {
+async function recoverInterruptedImprovements(store: any, { stateDir, config, writeConfig, signal }: { stateDir: string; config: any; writeConfig?: ImprovementWriteConfig; signal?: AbortSignal }) {
+  assertImprovementActive(signal);
   if (typeof store?.queryRecordsPage !== "function") return;
   const pending = await queryRecordPage(store, { types: ["improvement.applying"], order: "desc", limit: 50 });
+  assertImprovementActive(signal);
   for (const intent of pending.records) {
+    assertImprovementActive(signal);
     const improvementId = String(intent.improvementId || "");
     if (!improvementId || !intent.snapshotPath) continue;
     const outcomes = await queryRecordPage(store, { improvementId, types: ["improvement.applied", "improvement.failed", "improvement.recovered", "improvement.recovery_failed"], limit: 1 });
+    assertImprovementActive(signal);
     if (outcomes.records.length) continue;
     const stateRoot = resolve(stateDir);
     const snapshot = resolve(String(intent.snapshotPath));
     if (relative(stateRoot, snapshot).startsWith("..")) {
+      assertImprovementActive(signal);
       await store.append({ id: prefixedId("imp_evt"), type: "improvement.recovery_failed", improvementId, decision: "recovery_failed", note: "Interrupted improvement snapshot escaped the state directory.", source: "autonomous-recovery" });
+      assertImprovementActive(signal);
       continue;
     }
     try {
@@ -422,27 +488,35 @@ async function recoverInterruptedImprovements(store: any, { stateDir, config, wr
       const originalConfigDigest = String(intent.originalConfigDigest || "");
       const targetConfigDigest = String(intent.targetConfigDigest || "");
       if (currentDigest === targetConfigDigest && targetConfigDigest) {
+        assertImprovementActive(signal);
         if (typeof writeConfig === "function") {
-          await writeConfig(restored, currentDigest);
-        } else writeConfigAtomically(configPath, restored);
+          await writeConfig(restored, currentDigest, { signal });
+        } else writeConfigAtomically(configPath, restored, signal);
         for (const key of Object.keys(config)) delete config[key];
         Object.assign(config, restored);
+        // As above, finish settlement after a successful atomic restore. This
+        // is bounded recovery of an admitted effect, not new autonomous work.
         await store.append({ id: prefixedId("imp_evt"), type: "improvement.recovered", improvementId, decision: "recovered", note: "Rolled back an improvement whose completion record was interrupted.", source: "autonomous-recovery" });
       } else if (currentDigest === originalConfigDigest && originalConfigDigest) {
+        assertImprovementActive(signal);
         await store.append({ id: prefixedId("imp_evt"), type: "improvement.recovered", improvementId, decision: "recovered", note: "Confirmed the interrupted improvement had not been committed.", source: "autonomous-recovery" });
       } else {
+        assertImprovementActive(signal);
         await store.append({ id: prefixedId("imp_evt"), type: "improvement.recovery_failed", improvementId, decision: "recovery_failed", note: "The configuration no longer matches either the pre-change or exact target digest; refusing automatic recovery.", source: "autonomous-recovery" });
       }
     } catch (error) {
+      assertImprovementActive(signal);
       await store.append({ id: prefixedId("imp_evt"), type: "improvement.recovery_failed", improvementId, decision: "recovery_failed", note: error instanceof Error ? error.message : String(error), source: "autonomous-recovery" });
     }
   }
 }
 
-function writeConfigAtomically(path: string, value: unknown) {
+function writeConfigAtomically(path: string, value: unknown, signal?: AbortSignal) {
+  assertImprovementActive(signal);
   const temporary = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    assertImprovementActive(signal);
     renameSync(temporary, path);
   } finally {
     try { unlinkSync(temporary); } catch {}
@@ -454,10 +528,12 @@ async function readImprovement(store: any, improvementId: string) {
   return store.getCurrentImprovement(improvementId);
 }
 
-async function findLatestAppliedImprovement(store: any, improvementId: string) {
+async function findLatestAppliedImprovement(store: any, improvementId: string, signal?: AbortSignal) {
+  assertImprovementActive(signal);
   let cursor: string | undefined;
   do {
     const page = await queryRecordPage(store, { improvementId, order: "desc", limit: 200, ...(cursor ? { cursor } : {}) });
+    assertImprovementActive(signal);
     for (const record of page.records as any[]) {
       if (["rolled-back", "rollback_failed", "recovery_failed", "recovered"].includes(record.decision)) return undefined;
       if (record.decision === "applied" && record.snapshotPath) return record;

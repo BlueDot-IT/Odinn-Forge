@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, copyFileSync, createReadStream, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, mkdtemp, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
@@ -987,6 +987,22 @@ function physicalCounterfactualPath(path: string): string {
   return resolve(realpathSync(cursor), ...suffix);
 }
 
+function canonicalCounterfactualRoot(path: string): string {
+  return physicalCounterfactualPath(resolve(path));
+}
+
+function assertCounterfactualRootIdentity(path: string, label: string): string {
+  const expected = resolve(path);
+  const physical = physicalCounterfactualPath(expected);
+  if (physical !== expected) {
+    throw new OdinnRuntimeError("WORKSPACE_CONFLICT", `${label} changed physical identity`, {
+      expected,
+      physical
+    });
+  }
+  return expected;
+}
+
 function counterfactualRootsOverlap(left: string, right: string): boolean {
   const resolvedLeft = resolve(left);
   const resolvedRight = resolve(right);
@@ -1014,6 +1030,26 @@ function relativeWorkspaceComponents(root: string, candidate: string): string[] 
   return relativePath.split(sep).filter(Boolean);
 }
 
+function counterfactualPathIncluded(
+  root: string,
+  candidate: string,
+  stateRoot: string,
+  excludedComponents: ReadonlySet<string>
+): boolean {
+  const resolvedRoot = resolve(root);
+  const resolvedStateRoot = resolve(stateRoot);
+  const lexicalCandidate = resolve(candidate);
+  try {
+    if (lstatSync(lexicalCandidate).isSymbolicLink()) return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const physicalCandidate = physicalCounterfactualPath(lexicalCandidate);
+  const components = relativeWorkspaceComponents(resolvedRoot, physicalCandidate);
+  if (components.some((component) => excludedComponents.has(component))) return false;
+  return !(isWithin(resolvedRoot, resolvedStateRoot) && isWithin(resolvedStateRoot, physicalCandidate));
+}
+
 function counterfactualCopyFilter({
   sourceRoot,
   destinationRoot,
@@ -1027,27 +1063,13 @@ function counterfactualCopyFilter({
   excludedComponents: ReadonlySet<string>;
   signal?: AbortSignal;
 }) {
-  const resolvedSourceRoot = resolve(sourceRoot);
-  const resolvedDestinationRoot = resolve(destinationRoot);
-  const resolvedStateRoot = resolve(stateRoot);
-  const stateNestedInSource = isWithin(resolvedSourceRoot, resolvedStateRoot);
-  const stateNestedInDestination = isWithin(resolvedDestinationRoot, resolvedStateRoot);
+  const resolvedSourceRoot = assertCounterfactualRootIdentity(sourceRoot, "counterfactual source root");
+  const resolvedDestinationRoot = assertCounterfactualRootIdentity(destinationRoot, "counterfactual destination root");
+  const resolvedStateRoot = assertCounterfactualRootIdentity(stateRoot, "counterfactual state root");
   return (sourcePath: string, destinationPath: string): boolean => {
     assertCounterfactualActive(signal);
-    const resolvedSourcePath = resolve(sourcePath);
-    const resolvedDestinationPath = resolve(destinationPath);
-    const sourceComponents = relativeWorkspaceComponents(resolvedSourceRoot, resolvedSourcePath);
-    const destinationComponents = relativeWorkspaceComponents(resolvedDestinationRoot, resolvedDestinationPath);
-    if (sourceComponents.some((component) => excludedComponents.has(component))) return false;
-    if (destinationComponents.some((component) => excludedComponents.has(component))) return false;
-    if (stateNestedInSource && isWithin(resolvedStateRoot, resolvedSourcePath)) return false;
-    if (stateNestedInDestination && isWithin(resolvedStateRoot, resolvedDestinationPath)) return false;
-    try {
-      if (lstatSync(resolvedSourcePath).isSymbolicLink()) return false;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    return true;
+    return counterfactualPathIncluded(resolvedSourceRoot, sourcePath, resolvedStateRoot, excludedComponents)
+      && counterfactualPathIncluded(resolvedDestinationRoot, destinationPath, resolvedStateRoot, excludedComponents);
   };
 }
 
@@ -1065,6 +1087,10 @@ function counterfactualGroupRoot(sourceRoot: string, stateRoot: string, groupId:
   return resolve(counterfactualWorktreeBase(sourceRoot, stateRoot), groupId);
 }
 
+function counterfactualRecoveryRoot(sourceRoot: string, stateRoot: string): string {
+  return resolve(counterfactualWorktreeBase(sourceRoot, stateRoot), "recovery");
+}
+
 function authorizedCounterfactualCandidateRoot({
   sourceRoot: sourceRootValue,
   candidateRoot: candidateRootValue,
@@ -1076,33 +1102,40 @@ function authorizedCounterfactualCandidateRoot({
   stateRoot: string;
   groupId: string;
 }): { sourceRoot: string; candidateRoot: string } {
-  const sourceRoot = resolve(sourceRootValue);
-  const candidateRoot = resolve(candidateRootValue);
-  const authorizedGroupRoot = counterfactualGroupRoot(sourceRoot, stateRoot, groupId);
+  const sourceRoot = canonicalCounterfactualRoot(sourceRootValue);
+  const candidateRoot = canonicalCounterfactualRoot(candidateRootValue);
+  const canonicalStateRoot = canonicalCounterfactualRoot(stateRoot);
+  const authorizedGroupRoot = counterfactualGroupRoot(sourceRoot, canonicalStateRoot, groupId);
   if (candidateRoot === authorizedGroupRoot || !isWithin(authorizedGroupRoot, candidateRoot)) {
     throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "candidate workspace is not an authorized isolated branch");
   }
+  assertCounterfactualRootIdentity(sourceRoot, "counterfactual source root");
+  assertCounterfactualRootIdentity(candidateRoot, "counterfactual candidate root");
+  assertCounterfactualRootIdentity(canonicalStateRoot, "counterfactual state root");
   assertDisjointCounterfactualRoots(sourceRoot, candidateRoot);
   return { sourceRoot, candidateRoot };
 }
 
 async function copyWorkspaceTree(sourceRoot: string, destinationRoot: string, stateRoot: string, signal?: AbortSignal) {
-  assertDisjointCounterfactualRoots(sourceRoot, destinationRoot);
+  const canonicalSourceRoot = assertCounterfactualRootIdentity(sourceRoot, "counterfactual source root");
+  const canonicalDestinationRoot = assertCounterfactualRootIdentity(destinationRoot, "counterfactual destination root");
+  const canonicalStateRoot = assertCounterfactualRootIdentity(stateRoot, "counterfactual state root");
+  assertDisjointCounterfactualRoots(canonicalSourceRoot, canonicalDestinationRoot);
   const filter = counterfactualCopyFilter({
-    sourceRoot,
-    destinationRoot,
-    stateRoot,
+    sourceRoot: canonicalSourceRoot,
+    destinationRoot: canonicalDestinationRoot,
+    stateRoot: canonicalStateRoot,
     excludedComponents: COUNTERFACTUAL_GENERATED_COMPONENTS,
     signal
   });
   assertCounterfactualActive(signal);
-  await mkdir(destinationRoot, { recursive: true, mode: 0o700 });
+  await mkdir(canonicalDestinationRoot, { recursive: true, mode: 0o700 });
   assertCounterfactualActive(signal);
-  const entries = await readdir(sourceRoot, { withFileTypes: true });
+  const entries = await readdir(canonicalSourceRoot, { withFileTypes: true });
   assertCounterfactualActive(signal);
   for (const entry of entries) {
     assertCounterfactualActive(signal);
-    await cp(join(sourceRoot, entry.name), join(destinationRoot, entry.name), {
+    await cp(join(canonicalSourceRoot, entry.name), join(canonicalDestinationRoot, entry.name), {
       recursive: true,
       filter
     });
@@ -1111,22 +1144,25 @@ async function copyWorkspaceTree(sourceRoot: string, destinationRoot: string, st
 }
 
 async function copyWorkspaceRollbackBackup(sourceRoot: string, destinationRoot: string, stateRoot: string, signal?: AbortSignal) {
-  assertDisjointCounterfactualRoots(sourceRoot, destinationRoot);
+  const canonicalSourceRoot = assertCounterfactualRootIdentity(sourceRoot, "counterfactual source root");
+  const canonicalDestinationRoot = assertCounterfactualRootIdentity(destinationRoot, "counterfactual rollback root");
+  const canonicalStateRoot = assertCounterfactualRootIdentity(stateRoot, "counterfactual state root");
+  assertDisjointCounterfactualRoots(canonicalSourceRoot, canonicalDestinationRoot);
   const filter = counterfactualCopyFilter({
-    sourceRoot,
-    destinationRoot,
-    stateRoot,
+    sourceRoot: canonicalSourceRoot,
+    destinationRoot: canonicalDestinationRoot,
+    stateRoot: canonicalStateRoot,
     excludedComponents: COUNTERFACTUAL_PROTECTED_COMPONENTS,
     signal
   });
   assertCounterfactualActive(signal);
-  await mkdir(destinationRoot, { recursive: true, mode: 0o700 });
+  await mkdir(canonicalDestinationRoot, { recursive: true, mode: 0o700 });
   assertCounterfactualActive(signal);
-  const entries = await readdir(sourceRoot, { withFileTypes: true });
+  const entries = await readdir(canonicalSourceRoot, { withFileTypes: true });
   assertCounterfactualActive(signal);
   for (const entry of entries) {
     assertCounterfactualActive(signal);
-    await cp(join(sourceRoot, entry.name), join(destinationRoot, entry.name), {
+    await cp(join(canonicalSourceRoot, entry.name), join(canonicalDestinationRoot, entry.name), {
       recursive: true,
       preserveTimestamps: true,
       filter
@@ -1150,7 +1186,7 @@ function validateCounterfactualPlans(plans: unknown): AnyRecord[] {
 
 export class CounterfactualManager {
   [key: string]: any;
-  constructor({ ledger, stateDir, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.stateDir = resolve(stateDir ?? ".odinn"); this.featureFlags = featureFlags; }
+  constructor({ ledger, stateDir, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.stateDir = canonicalCounterfactualRoot(stateDir ?? ".odinn"); this.featureFlags = featureFlags; }
   async create({ sourceRunId, sourceStepId, plans = [], workspaceRoot = currentWorkingDirectory(), signal, __testOnlyAfterWorkspaceCopy }: AnyRecord = {}) {
     requireExperimental(this.featureFlags, "counterfactual", this.ledger);
     assertCounterfactualActive(signal);
@@ -1158,9 +1194,11 @@ export class CounterfactualManager {
     if (typeof sourceRunId !== "string" || !sourceRunId || typeof sourceStepId !== "string" || !sourceStepId) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual sourceRunId and sourceStepId are required");
     const sourceRun = this.ledger.getRun(sourceRunId);
     if (!sourceRun) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual source run not found", { sourceRunId });
-    const sourceRoot = resolve(workspaceRoot);
-    const expectedRoot = resolve(sourceRun.workspaceRoot);
+    const sourceRoot = canonicalCounterfactualRoot(workspaceRoot);
+    const expectedRoot = canonicalCounterfactualRoot(sourceRun.workspaceRoot);
     if (sourceRoot !== expectedRoot) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "counterfactual workspace must match the source run workspace", { expectedRoot, requestedRoot: sourceRoot });
+    assertCounterfactualRootIdentity(sourceRoot, "counterfactual source root");
+    assertCounterfactualRootIdentity(this.stateDir, "counterfactual state root");
     const groupId = `cf_${randomUUID()}`;
     const groupRoot = counterfactualGroupRoot(sourceRoot, this.stateDir, groupId);
     assertDisjointCounterfactualRoots(sourceRoot, groupRoot);
@@ -1279,7 +1317,22 @@ export class CounterfactualManager {
     this.ledger.database.db.prepare("UPDATE counterfactual_groups SET status = 'executed' WHERE id = ?").run(groupId);
     return { groupId, results };
   }
-  compare(groupId: string) { requireExperimental(this.featureFlags, "counterfactual", this.ledger); const rows = this.ledger.database.db.prepare("SELECT c.*, c.status AS candidate_status, r.status AS run_status, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId) as AnyRecord[]; return { groupId, candidates: rows.map((row: AnyRecord) => ({ ...row, status: row.candidate_status, runStatus: row.run_status, plan: parse(row.plan_json), proof: this.ledger.database.db.prepare("SELECT status, COUNT(*) count FROM assertion_results WHERE run_id = ? GROUP BY status").all(row.run_id) })) }; }
+  compare(groupId: string) {
+    requireExperimental(this.featureFlags, "counterfactual", this.ledger);
+    const group = this.ledger.database.db.prepare("SELECT status FROM counterfactual_groups WHERE id = ?").get(groupId) as AnyRecord | undefined;
+    const rows = this.ledger.database.db.prepare("SELECT c.*, c.status AS candidate_status, r.status AS run_status, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId) as AnyRecord[];
+    return {
+      groupId,
+      status: group?.status ?? "unknown",
+      candidates: rows.map((row: AnyRecord) => ({
+        ...row,
+        status: row.candidate_status,
+        runStatus: row.run_status,
+        plan: parse(row.plan_json),
+        proof: this.ledger.database.db.prepare("SELECT status, COUNT(*) count FROM assertion_results WHERE run_id = ? GROUP BY status").all(row.run_id)
+      }))
+    };
+  }
   async commit(groupId: string, runId: string, { apply = false, signal, __testOnlyAfterBackup, __testOnlyAfterActivation }: AnyRecord = {}) {
     requireExperimental(this.featureFlags, "counterfactual", this.ledger);
     assertCounterfactualActive(signal);
@@ -1294,12 +1347,19 @@ export class CounterfactualManager {
     });
     const actions = [{ action: "replace-workspace", source: candidateRoot, destination: sourceRoot }];
     if (!apply) return { groupId, runId, applied: false, actions, warning: "dry-run; pass --apply to replace the source workspace" };
+    const sourceRunId = (this.ledger.database.db.prepare("SELECT source_run_id FROM counterfactual_groups WHERE id = ?").get(groupId) as AnyRecord | undefined)?.source_run_id;
+    let recoveryDirectory: string | undefined;
     let backup: string | undefined;
     let backupReady = false;
     let activationStarted = false;
+    let retainBackup = false;
     try {
       assertCounterfactualActive(signal);
-      backup = await mkdtemp(join(tmpdir(), "odinn-counterfactual-rollback-"));
+      const recoveryRoot = counterfactualRecoveryRoot(sourceRoot, this.stateDir);
+      await mkdir(recoveryRoot, { recursive: true, mode: 0o700 });
+      assertCounterfactualActive(signal);
+      recoveryDirectory = await mkdtemp(join(recoveryRoot, `${groupId}-${runId}-`));
+      backup = join(recoveryDirectory, "workspace");
       assertCounterfactualActive(signal);
       await copyWorkspaceRollbackBackup(sourceRoot, backup, this.stateDir, signal);
       backupReady = true;
@@ -1313,7 +1373,6 @@ export class CounterfactualManager {
       assertCounterfactualActive(signal);
       await __testOnlyAfterActivation?.({ groupId, runId, backup, sourceRoot, candidateRoot });
       assertCounterfactualActive(signal);
-      const sourceRunId = (this.ledger.database.db.prepare("SELECT source_run_id FROM counterfactual_groups WHERE id = ?").get(groupId) as AnyRecord | undefined)?.source_run_id;
       const selectedAt = now();
       this.ledger.database.transaction((db: any) => {
         db.prepare("UPDATE counterfactual_candidates SET status = CASE WHEN run_id = ? THEN 'selected' ELSE 'discarded' END, selected_at = CASE WHEN run_id = ? THEN ? ELSE selected_at END WHERE group_id = ?").run(runId, runId, selectedAt, groupId);
@@ -1323,12 +1382,68 @@ export class CounterfactualManager {
       return { groupId, runId, applied: true, actions };
     } catch (error) {
       if (backup && backupReady && activationStarted) {
-        await syncWorkspace(backup, sourceRoot, { stateRoot: this.stateDir }).catch(() => undefined);
+        try {
+          await syncWorkspace(backup, sourceRoot, { stateRoot: this.stateDir });
+          await verifyCounterfactualWorkspace(backup, sourceRoot, this.stateDir);
+        } catch (rollbackError) {
+          retainBackup = true;
+          const recoveryAt = now();
+          const surfacedErrors: unknown[] = [error, rollbackError];
+          let manifestWritten = false;
+          let journaled = false;
+          try {
+            await writeFile(join(recoveryDirectory!, "recovery.json"), `${json({
+              schemaVersion: 1,
+              type: "counterfactual-recovery-required",
+              status: "recovery-required",
+              groupId,
+              runId,
+              sourceRunId,
+              sourceRoot,
+              candidateRoot,
+              recoveryBackup: backup,
+              createdAt: recoveryAt
+            })}\n`, { flag: "wx", mode: 0o600 });
+            manifestWritten = true;
+          } catch (manifestError) {
+            surfacedErrors.push(manifestError);
+          }
+          try {
+            this.ledger.database.transaction((db: any) => {
+              db.prepare("UPDATE counterfactual_candidates SET status = 'recovery-required' WHERE run_id = ?").run(runId);
+              db.prepare("UPDATE counterfactual_groups SET status = 'recovery-required' WHERE id = ?").run(groupId);
+              if (sourceRunId) this.ledger.appendEventUnsafe(db, {
+                runId: sourceRunId,
+                type: "branch-recovery-required",
+                payload: { groupId, runId, recoveryPath: recoveryDirectory, status: "recovery-required" },
+                timestamp: recoveryAt
+              });
+            });
+            journaled = true;
+          } catch (journalError) {
+            surfacedErrors.push(journalError);
+          }
+          const aggregate = new AggregateError(
+            surfacedErrors,
+            "selected branch activation failed and automatic rollback could not be verified; recovery is required"
+          ) as AggregateError & { code?: string; details?: Record<string, unknown> };
+          aggregate.code = "ROLLBACK_CONFLICT";
+          aggregate.details = {
+            groupId,
+            runId,
+            recoveryRequired: true,
+            recoveryPath: recoveryDirectory,
+            recoveryBackup: backup,
+            manifestWritten,
+            journaled
+          };
+          throw aggregate;
+        }
       }
       assertCounterfactualActive(signal);
       throw new OdinnRuntimeError("WORKSPACE_CONFLICT", `selected branch could not be applied: ${failureMessage(error)}`, { groupId, runId });
     } finally {
-      if (backup) await rm(backup, { recursive: true, force: true });
+      if (recoveryDirectory && !retainBackup) await rm(recoveryDirectory, { recursive: true, force: true });
     }
   }
   async select(groupId: string, runId: string, options: AnyRecord = {}) { const result = await this.commit(groupId, runId, options); if (!result.applied) return result; return { ...result, selected: true }; }
@@ -1343,11 +1458,14 @@ async function syncWorkspace(source: string, destination: string, {
   stateRoot: string;
   onMutationStart?: () => void;
 }) {
-  assertDisjointCounterfactualRoots(source, destination);
+  const canonicalSource = assertCounterfactualRootIdentity(source, "counterfactual synchronization source");
+  const canonicalDestination = assertCounterfactualRootIdentity(destination, "counterfactual synchronization destination");
+  const canonicalStateRoot = assertCounterfactualRootIdentity(stateRoot, "counterfactual state root");
+  assertDisjointCounterfactualRoots(canonicalSource, canonicalDestination);
   const filter = counterfactualCopyFilter({
-    sourceRoot: source,
-    destinationRoot: destination,
-    stateRoot,
+    sourceRoot: canonicalSource,
+    destinationRoot: canonicalDestination,
+    stateRoot: canonicalStateRoot,
     excludedComponents: COUNTERFACTUAL_PROTECTED_COMPONENTS,
     signal
   });
@@ -1420,9 +1538,61 @@ async function syncWorkspace(source: string, destination: string, {
     }
   };
 
-  await syncDirectory(source, destination);
+  await syncDirectory(canonicalSource, canonicalDestination);
   assertCounterfactualActive(signal);
   return { mutated: mutationStarted };
+}
+
+async function counterfactualFileDigest(path: string): Promise<string> {
+  const digest = createHash("sha256");
+  for await (const chunk of createReadStream(path)) digest.update(chunk as Buffer);
+  return digest.digest("hex");
+}
+
+async function verifyCounterfactualWorkspace(source: string, destination: string, stateRoot: string): Promise<void> {
+  const canonicalSource = assertCounterfactualRootIdentity(source, "counterfactual recovery source");
+  const canonicalDestination = assertCounterfactualRootIdentity(destination, "counterfactual recovery destination");
+  const canonicalStateRoot = assertCounterfactualRootIdentity(stateRoot, "counterfactual state root");
+  const verifyDirectory = async (sourceDirectory: string, destinationDirectory: string): Promise<void> => {
+    const sourceEntries = await readdir(sourceDirectory, { withFileTypes: true });
+    const destinationEntries = await readdir(destinationDirectory, { withFileTypes: true });
+    const managedSource = new Map<string, (typeof sourceEntries)[number]>();
+    const managedDestination = new Map<string, (typeof destinationEntries)[number]>();
+    for (const entry of sourceEntries) {
+      const sourcePath = join(sourceDirectory, entry.name);
+      if (counterfactualPathIncluded(canonicalSource, sourcePath, canonicalStateRoot, COUNTERFACTUAL_PROTECTED_COMPONENTS)) {
+        managedSource.set(entry.name, entry);
+      }
+    }
+    for (const entry of destinationEntries) {
+      if (entry.isSymbolicLink()) continue;
+      const destinationPath = join(destinationDirectory, entry.name);
+      if (counterfactualPathIncluded(canonicalDestination, destinationPath, canonicalStateRoot, COUNTERFACTUAL_PROTECTED_COMPONENTS)) {
+        managedDestination.set(entry.name, entry);
+      }
+    }
+    for (const [name, sourceEntry] of managedSource) {
+      const destinationEntry = managedDestination.get(name);
+      if (!destinationEntry) throw new Error(`counterfactual recovery verification is missing ${name}`);
+      const sourcePath = join(sourceDirectory, name);
+      const destinationPath = join(destinationDirectory, name);
+      if (sourceEntry.isDirectory()) {
+        if (!destinationEntry.isDirectory()) throw new Error(`counterfactual recovery verification found a type mismatch at ${name}`);
+        await verifyDirectory(sourcePath, destinationPath);
+      } else if (sourceEntry.isFile()) {
+        if (!destinationEntry.isFile() || await counterfactualFileDigest(sourcePath) !== await counterfactualFileDigest(destinationPath)) {
+          throw new Error(`counterfactual recovery verification found a content mismatch at ${name}`);
+        }
+      } else {
+        throw new Error(`counterfactual recovery verification found an unsupported entry at ${name}`);
+      }
+    }
+    for (const name of managedDestination.keys()) {
+      if (!managedSource.has(name)) throw new Error(`counterfactual recovery verification found an unexpected entry at ${name}`);
+    }
+  };
+
+  await verifyDirectory(canonicalSource, canonicalDestination);
 }
 
 export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = currentWorkingDirectory(), featureFlags = {}, proofOptions = {} }: AnyRecord = {}) {

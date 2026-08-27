@@ -646,12 +646,14 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
         config,
         modelConfig,
         writeConfig,
+        signal: context.signal,
         runModel: async (modelInput: any) => {
           const result = await context.runTool({
             id: `${context.request.id}:advisor`,
             tool: "model.chat",
             input: modelInput,
-            actor: "automatic-improvement"
+            actor: "automatic-improvement",
+            signal: context.signal
           });
           return result.output;
         }
@@ -670,7 +672,7 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
     ["improve.rollback", {
       capability: "improve.write",
       description: "Rollback an autonomously applied improvement to its captured configuration snapshot.",
-      execute: async (input: any) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config, writeConfig })
+      execute: async (input: any, context: any) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config, writeConfig, signal: context.signal })
     }],
     ["workspace.mutate", {
       capability: "workspace.mutate",
