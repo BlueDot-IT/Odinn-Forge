@@ -45,9 +45,33 @@ uses the SQLite backup API and excludes WAL, SHM, and notification sidecars.
 
 ```sh
 pnpm soak:audit
+pnpm state:growth
 ```
 
 The soak validates concurrent append, cursor persistence, segment rotation,
 archive and retention behavior, restart, and final chain integrity. Comparative
 audit performance evaluation belongs in
 [BlueDot-IT/agent-benchmarks](https://github.com/BlueDot-IT/agent-benchmarks).
+
+`pnpm state:growth` is the scheduled large-state acceptance lane. It grows one
+production authoritative SQLite store through 10,000, 100,000, and 1,000,000
+records. At every tier it checkpoints and closes the database, reopens it,
+verifies the exact record count and a known record, runs a SQLite integrity
+check, and samples bounded point, page, projection, and count queries. The same
+run creates a signed audit store, exports and verifies an archive, applies
+online retention only after that verification, and proves integrity again
+after restart.
+
+The acceptance budgets cap the authoritative database at 3 GiB and 3,072 bytes
+per record, process RSS at 1.5 GiB, query p95 at one second, reopen and integrity
+checks at two minutes each, and the audit database at 64 MiB. Incremental append
+throughput must remain at least 250 records per second. The command writes the
+machine-readable `dist/reports/state-growth-report.json`; the nightly workflow
+retains that report for 30 days, including when a budget fails.
+
+For a local development probe, `ODINN_STATE_GROWTH_TIERS` accepts a strictly
+ascending comma-separated subset whose final tier does not exceed 1,000,000.
+An overridden tier list is reported as a development profile and is not the
+full nightly acceptance result. `ODINN_STATE_GROWTH_BATCH_SIZE` changes the
+positive transaction batch size, and `ODINN_STATE_GROWTH_REPORT` selects the
+report path.

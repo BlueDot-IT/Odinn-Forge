@@ -59,6 +59,7 @@
     "soak:audit": "node scripts/ci/audit-soak.ts",
     "slo:measure": "node scripts/ci/slo-measurement.ts run",
     "slo:validate": "node scripts/ci/slo-measurement.ts validate",
+    "state:growth": "node scripts/ci/state-growth.ts",
     "release:preflight": "node scripts/release/preflight.ts",
     "release:package": "node scripts/release/package.ts",
     "release:checksums": "node scripts/release/checksums.ts",

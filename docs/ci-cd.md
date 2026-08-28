@@ -109,6 +109,10 @@ The release candidate is retained for seven days. A separate credential-free
 job measures and fail-closed validates all six local-runtime SLOs against the
 exact clean commit, then retains its machine-readable collector report for 30
 days. See [Exact-commit SLO acceptance](slo-acceptance.md).
+The release-candidate artifact is retained for seven days. A separate nightly
+state-growth job exercises the production SQLite store at 10,000, 100,000, and
+1,000,000 records, verifies archive-before-retention behavior, and retains its
+machine-readable acceptance report for 30 days.
 
 ### Package Integrity
 
