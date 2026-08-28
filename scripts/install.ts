@@ -576,9 +576,16 @@ async function rollback() {
     }
   }
   if (activation) {
+    // The rollback target may be a v1.0.0 installer that validates the prefix
+    // before it dispatches `finalize-launchers`; it cannot safely start while
+    // the UUID-named generation companions are still present. Run the
+    // finalizer from the newer source runtime instead. The marker still binds
+    // the activation to the older target, while the newer installer performs
+    // the final legacy-layout conversion after the caller exits.
+    const finalizerSourceMetadata = await readInstalledMetadata(current.current);
     await startDeferredLauncherFinalizer(
-      join(prefix, "versions", current.previous),
-      priorMetadata.toolchain?.distribution === "standalone",
+      join(prefix, "versions", current.current),
+      finalizerSourceMetadata.toolchain?.distribution === "standalone",
       activation
     );
   }
