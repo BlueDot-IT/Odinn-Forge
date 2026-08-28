@@ -22,11 +22,31 @@ export type AuditIntegrityStatus = {
 type CachedAuditIntegrityStatus = AuditIntegrityStatus & { headSignature: string | null };
 
 const MAX_PAGE = 10_000;
+const SQLITE_BUSY = 5;
+const SQLITE_BUSY_TIMEOUT_MS = 30_000;
+const SQLITE_BUSY_RETRY_MS = 10;
+const SQLITE_BUSY_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 const bounded = (value: unknown, fallback = 500) => {
   const parsed = Number(value ?? fallback);
   return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, MAX_PAGE) : fallback;
 };
 const ensureParent = (path: string) => mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+
+function enableWriteAheadLogging(database: DatabaseSync) {
+  const current = database.prepare("PRAGMA journal_mode").get() as Row;
+  if (String(current.journal_mode).toLowerCase() === "wal") return;
+  const deadline = Date.now() + SQLITE_BUSY_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const result = database.prepare("PRAGMA journal_mode=WAL").get() as Row;
+      if (String(result.journal_mode).toLowerCase() !== "wal") throw new Error("audit SQLite database refused WAL journal mode");
+      return;
+    } catch (error: any) {
+      if (error?.errcode !== SQLITE_BUSY || Date.now() >= deadline) throw error;
+      Atomics.wait(SQLITE_BUSY_WAIT, 0, 0, SQLITE_BUSY_RETRY_MS);
+    }
+  }
+}
 
 function unsigned(event: AuditEvent): AuditEvent {
   const copy = { ...event, data: { ...(event.data ?? {}) } };
@@ -53,7 +73,14 @@ function writeFully(descriptor: number, value: Buffer) { let offset = 0; while (
 function openDatabase(path: string) {
   ensureParent(path);
   const db = new DatabaseSync(path);
-  db.exec("PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
+  try {
+    db.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}; PRAGMA foreign_keys=ON;`);
+    enableWriteAheadLogging(db);
+    db.exec("PRAGMA synchronous=FULL;");
+  } catch (error) {
+    db.close();
+    throw error;
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS audit_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), head_sequence INTEGER NOT NULL, head_signature TEXT, current_key_id TEXT, migration_complete INTEGER NOT NULL DEFAULT 0, retained_sequence INTEGER NOT NULL DEFAULT 0, retained_signature TEXT, updated_at TEXT NOT NULL);
     INSERT OR IGNORE INTO audit_state VALUES(1,0,NULL,NULL,0,0,NULL,'1970-01-01T00:00:00.000Z');
