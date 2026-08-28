@@ -214,7 +214,12 @@ export async function updateApplication(options: UpdateCheckOptions) {
       prefix,
       "--artifact-sha256",
       expectedChecksum,
-      ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
+      // v1.0.0 cannot validate UUID-named launcher companions. Its update
+      // path must use the synchronous legacy-compatible handoff; newer
+      // callers retain the crash-safe deferred activation protocol.
+      ...(process.platform === "win32" && options.identity.applicationVersion !== "1.0.0"
+        ? ["--defer-launchers-until-pid", String(process.pid)]
+        : [])
     ]);
     switched = true;
     const installed = await readInstallState(prefix);
