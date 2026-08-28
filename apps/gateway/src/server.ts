@@ -23,6 +23,7 @@ import {
 } from "@odinn/channels";
 import { authenticationMode, isMutatingMethod, permitsGatewayTokenBootstrap, validHostHeader, validMutationOrigin } from "./security.ts";
 import { runGatewayEntrypoint } from "./bootstrap.ts";
+import { GatewayInstanceOwnership, gatewayOwnershipDirectory } from "./instance-ownership.ts";
 import { CONSOLE_CSP, readConsoleAsset, renderConsoleHtml } from "./public/console.ts";
 import { gatewayTestHooksFor } from "./testing.ts";
 import { dispatchGovernedWorkflowStep, submitDurableEventJob, waitForDurableJobTerminal } from "./durable-dispatch.ts";
@@ -871,6 +872,8 @@ export async function createGatewayServer(options: any = {}) {
   // above, then hand stores the physical root so later containment checks do
   // not mistake that platform layout for an escaped managed package.
   const state = await realpath(requestedState);
+  await ensureSecureStateDirectory(gatewayOwnershipDirectory(state));
+  const instanceOwnership = new GatewayInstanceOwnership(state);
   const config = await readConfig(state, { hosted });
   const startupSandboxConfig = normalizeSandboxConfig(config);
   let processRecoveryStartupError = false;
@@ -935,7 +938,11 @@ export async function createGatewayServer(options: any = {}) {
   const governedRegistry = createRuntimeRegistry({ workspaceRoot: root, stateDir: state, config: { ...runtimeConfig, runLedger: runtime.ledger }, approvalStore, auditStore, skillDisclosure, mcpRuntime, writeConfig: writeSelfImprovementConfig });
   const gatewayToken = await loadGatewayToken(state);
   const rawIsolatedTaskExecutor = createRuntimeIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
-  const isolatedTaskExecutor: any = (request: any, options?: { signal?: AbortSignal; job?: any }) => rawIsolatedTaskExecutor(scopeTaskRequest(request, tenantScope), options);
+  const ownershipSignal = (signal?: AbortSignal): AbortSignal => {
+    instanceOwnership.assertOwned();
+    return signal ? AbortSignal.any([signal, instanceOwnership.signal]) : instanceOwnership.signal;
+  };
+  const isolatedTaskExecutor: any = (request: any, options?: { signal?: AbortSignal; job?: any }) => rawIsolatedTaskExecutor(scopeTaskRequest(request, tenantScope), { ...options, signal: ownershipSignal(options?.signal) });
   isolatedTaskExecutor.shutdown = rawIsolatedTaskExecutor.shutdown?.bind(rawIsolatedTaskExecutor);
   const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, ...proofOptions });
   const channelResultRecords = new SqliteRecordStore(join(state, "db", "records.sqlite"));
@@ -963,7 +970,7 @@ export async function createGatewayServer(options: any = {}) {
     }
   });
   const runIsolatedTask = (request: any, options?: { signal?: AbortSignal }): Promise<any> => isolatedTaskExecutor(request, options) as Promise<any>;
-  const runGovernedTask = (request: any, options?: { signal?: AbortSignal }): Promise<any> => executeTask({ ...request, ...options, task: scopeTask(request.task, tenantScope), auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger });
+  const runGovernedTask = (request: any, options?: { signal?: AbortSignal }): Promise<any> => executeTask({ ...request, ...options, task: scopeTask(request.task, tenantScope), auditStore, policy, registry: governedRegistry, runLedger: runtime.ledger, signal: ownershipSignal(options?.signal) });
   const workflowRuntime = config.runtime?.enableDurableWorkflows === true
     ? new DurableWorkflowRuntime({
       store: new SqliteWorkflowStore(runtime.ledger.database),
@@ -993,7 +1000,7 @@ export async function createGatewayServer(options: any = {}) {
     auditStore,
     loadPlugin: channelPluginLoader
   });
-  const runControlTask = (task: any, options?: { signal?: AbortSignal }) => executeTask({ task: scopeTask(task, tenantScope), auditStore, policy, registry, runLedger: runtime.ledger, ...options });
+  const runControlTask = (task: any, options?: { signal?: AbortSignal }) => executeTask({ task: scopeTask(task, tenantScope), auditStore, policy, registry, runLedger: runtime.ledger, ...options, signal: ownershipSignal(options?.signal) });
   await supervisor.start();
   // Tokenless event-delivery recovery may submit projected jobs immediately
   // from the DurableEventIngress constructor. Complete job-store recovery
@@ -1058,7 +1065,7 @@ export async function createGatewayServer(options: any = {}) {
   const cronTimer = setInterval(runScheduledCronCycle, 30_000);
   cronTimer.unref();
   const eventHeartbeatTimer = eventIngress
-    ? setInterval(() => eventIngress.heartbeat().catch(() => undefined), 30_000)
+    ? setInterval(() => { try { instanceOwnership.assertOwned(); } catch { return; } void eventIngress.heartbeat().catch(() => undefined); }, 30_000)
     : undefined;
   eventHeartbeatTimer?.unref?.();
   const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
@@ -1817,6 +1824,7 @@ export async function createGatewayServer(options: any = {}) {
         mutationLease = mutationBarrier.admit(requestAbort.signal, `${String(request.method || "POST")} ${url.pathname}`);
       }
       if (!validHostHeader(request)) return json(response, 421, { ok: false, error: "invalid gateway Host header" });
+      instanceOwnership.assertOwned();
       if (request.method === "GET" && url.pathname === "/odinn-logo.png") {
         return image(response, 200, await readFile(join(PUBLIC_DIR, "odinn-logo.png")), "image/png");
       }
@@ -1863,7 +1871,7 @@ export async function createGatewayServer(options: any = {}) {
         authentication,
         hostedUserId: trustedHostedUserId,
         hostedTenantId: trustedHostedTenantId,
-        signal: requestAbort.signal,
+        signal: AbortSignal.any([requestAbort.signal, instanceOwnership.signal]),
       }))) return;
       if (request.method === "GET" && url.pathname === "/config") {
         const editable = await readEditableConfig(state, { hosted });
@@ -3386,6 +3394,7 @@ export async function createGatewayServer(options: any = {}) {
         try { channelResultRecords.close(); } catch (error) { shutdownError ??= error; }
         try { operatorReadStore.close(); } catch (error) { shutdownError ??= error; }
         try { runtime.ledger.close(); } catch (error) { shutdownError ??= error; }
+        try { instanceOwnership.release(); } catch (error) { shutdownError ??= error; }
         return shutdownError;
       })();
     }
@@ -3393,6 +3402,7 @@ export async function createGatewayServer(options: any = {}) {
     return server;
   };
   server.on("listening", () => {
+    try { instanceOwnership.assertOwned(); } catch { server.close(() => undefined); return; }
     const address = server.address();
     if (!address || typeof address === "string") return;
     channelSupervisor.start(`http://127.0.0.1:${address.port}`).catch(() => undefined);
@@ -3400,6 +3410,7 @@ export async function createGatewayServer(options: any = {}) {
   recordGatewayEvent(telemetry, { name: "odinn.runtime.lifecycle", attributes: { component: "gateway", operation: "startup", outcome: "ready" } });
   server.odinnAuthToken = gatewayToken;
   server.odinnTelemetryStatus = () => telemetryStatusProjection(telemetry);
+  instanceOwnership.onLost(() => { server.close(() => undefined); });
   return server;
 }
 
