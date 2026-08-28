@@ -132,9 +132,19 @@ async function install(operation: any) {
     await rm(staging, { recursive: true, force: true });
   }
   const previous = await readState();
+  const previousMetadata = previous.current
+    ? await readInstalledMetadata(previous.current)
+    : null;
+  // v1.0.0 rejects UUID-named Windows launcher companions during its own
+  // startup validation. Do not create a deferred generation while that legacy
+  // runtime is still the caller: publish the bounded stable launchers directly
+  // and let the candidate take ownership without leaving files the old CLI
+  // cannot recognize.
+  const legacyWindowsUpgrade = process.platform === "win32"
+    && previousMetadata?.version === "1.0.0";
   const activationAt = new Date().toISOString();
   const next = { schemaVersion: 1, current: versionId, currentVersion: version, currentCommit: commit, previous: previous.current && previous.current !== versionId ? previous.current : previous.previous ?? null, installedAt: activationAt, operation };
-  const deferredParentPid = deferredLauncherParentPid(operation);
+  const deferredParentPid = legacyWindowsUpgrade ? null : deferredLauncherParentPid(operation);
   const activation = deferredParentPid
     ? await prepareDeferredLauncherActivation({
       versionId,
@@ -149,7 +159,7 @@ async function install(operation: any) {
   // trampoline before publishing the activation intent. Replacing a legacy
   // active batch file with the shorter trampoline leaves its old read cursor at
   // EOF, while every later generation keeps the same direct-transfer layout.
-  await writeLaunchers(destination, distribution, activation ?? undefined);
+  await writeLaunchers(destination, distribution, activation ?? undefined, legacyWindowsUpgrade);
   if (activation) await writeLauncherActivationMarker(activation, null);
   await writeCurrentPointer(versionId, toolchain.distribution, standalone ? releaseInfo.embeddedRuntime.executableSha256 : "");
   await writeState(next);
