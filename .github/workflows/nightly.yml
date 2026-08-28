@@ -63,6 +63,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -107,3 +108,44 @@ jobs:
         with:
           name: nightly-state-growth-${{ github.run_id }}
           path: dist/reports/state-growth-report.json
+          if-no-files-found: error
+          retention-days: 30
+
+  long-soak:
+    name: Repeated restart, fault, and power-loss soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm release:package
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+      - name: Run exact-commit long soak
+        run: >-
+          node scripts/ci/long-soak.ts
+          --profile nightly
+          --duration-ms 7200000
+          --min-cycles 12
+          --cycle-interval-ms 300000
+          --audit-events 5000
+      - name: Retain long-soak evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase-f-long-soak-${{ github.sha }}
+          path: dist/reports/phase-f-long-soak/
+          if-no-files-found: error
+          retention-days: 30

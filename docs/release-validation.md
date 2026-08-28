@@ -20,6 +20,9 @@ being published.
   dedicated live-provider canary exists.
 - Gateway restart, queued-job recovery, browser-action recovery, audit
   verification, and installer rollback behave as documented.
+- The scheduled [Phase F long-duration soak](phase-f-long-soak.md) completes
+  its repeated two-hour restart, fault, power-loss, recovery, retention, and
+  rollback budgets on the exact candidate commit, with its JSON report retained.
 - The single-user gateway remains loopback-only unless the separate TLS host is
   deliberately configured.
 - No unresolved security or release-blocking defect is hidden by a green
