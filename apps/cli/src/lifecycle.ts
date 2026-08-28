@@ -214,12 +214,7 @@ export async function updateApplication(options: UpdateCheckOptions) {
       prefix,
       "--artifact-sha256",
       expectedChecksum,
-      // v1.0.0 cannot validate UUID-named launcher companions. Its update
-      // path must use the synchronous legacy-compatible handoff; newer
-      // callers retain the crash-safe deferred activation protocol.
-      ...(process.platform === "win32" && options.identity.applicationVersion !== "1.0.0"
-        ? ["--defer-launchers-until-pid", String(process.pid)]
-        : [])
+      ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
     ]);
     switched = true;
     const installed = await readInstallState(prefix);
@@ -316,14 +311,11 @@ export async function rollbackApplication(options: {
     );
   }
   const currentRoot = join(prefix, "versions", String(installed.current));
-  const legacyTarget = previousMetadata.version === "1.0.0";
   runPackageNode(currentRoot, installerEntry(currentRoot), [
     "rollback",
     "--prefix",
     prefix,
-    ...(process.platform === "win32" && !legacyTarget
-      ? ["--defer-launchers-until-pid", String(process.pid)]
-      : [])
+    ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
   ]);
   const rolledBack = await readInstallState(prefix);
   try {
@@ -340,9 +332,7 @@ export async function rollbackApplication(options: {
       "rollback",
       "--prefix",
       prefix,
-      ...(process.platform === "win32" && !legacyTarget
-        ? ["--defer-launchers-until-pid", String(process.pid)]
-        : [])
+      ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
     ]);
     throw error;
   }
