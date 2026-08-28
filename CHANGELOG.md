@@ -6,6 +6,46 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.2.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.2...v1.2.0) (2026-08-28)
+
+### Added
+
+- add one durable, restart-safe execution lifecycle across Gateway jobs,
+  workflows, events, channels, browser actions, and visible child sessions
+- add the daily-driver operator console with streaming conversation,
+  attachments, approvals, scheduling, provider selection, memory inspection,
+  searchable history, and recovery-oriented status surfaces
+- add governed delegation with bounded child budgets, cancellation,
+  interruption, reassignment, result collection, and capability intersection
+- add supported end-to-end slices for local files and Git, web and browser,
+  GitHub, Discord and Telegram, email and calendar, macOS computer control,
+  and bounded remote-node reads
+- add OpenTelemetry-compatible metrics and traces, exact SLO measurement,
+  million-record growth and retention acceptance, and the scheduled two-hour
+  restart, fault, power-loss, recovery, and rollback soak
+
+### Changed
+
+- package a digest-bound controlled Node.js runtime and native launchers so
+  standalone installs do not fall back to ambient runtimes or mutable tools
+- provision the exact reviewed Chromium build used by browser validation and
+  enforce authenticated, bounded release-asset promotion across Linux, macOS,
+  and Windows
+- fence multi-instance Gateway ownership while retaining the supported
+  single-user, loopback-first deployment boundary
+
+### Fixed
+
+- preserve admitted task obligations and visible completion budgets through
+  compaction, malformed model output, tool failure, restart, and uncertain
+  external outcomes without replaying effects
+- harden installer activation, upgrade, rollback, backup, archive extraction,
+  launcher handoff, and temporary-path handling across Linux, macOS, and
+  Windows
+- make telemetry shutdown, durable result recovery, workflow dispatch, audit
+  verification, browser recovery, and state retention fail closed under
+  interruption and concurrent ownership
+
 ## [1.1.2](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.1...v1.1.2) (2026-08-25)
 
 ### Fixed
