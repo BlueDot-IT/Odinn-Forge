@@ -6,6 +6,8 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, targetStateSchemaVersions } from "../../packages/kernel/src/state/schema-registry.ts";
 import { assertReleaseCommit } from "./commit.ts";
+import { HOSTILE_NODE_ENVIRONMENT_VARIABLES } from "./standalone-launchers.ts";
+import { sanitizedReleaseEnvironment, trustedTool } from "./trusted-tools.ts";
 
 const PLAYWRIGHT_VERSION = "1.62.1";
 
@@ -31,23 +33,12 @@ function currentCommit(): string {
   return result.stdout.trim();
 }
 
-function commandOutput(command: string, args: string[]): string {
-  const result = spawnSync(command, args, {
-    cwd: root,
-    encoding: "utf8",
-    shell: process.platform === "win32" && command.endsWith(".cmd")
-  });
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed: ${result.error?.message || result.stderr || result.stdout}`);
-  }
-  return result.stdout.trim();
-}
-
 function run(command: string, args: string[], cwd = root): void {
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf8",
-    shell: process.platform === "win32" && command.endsWith(".cmd")
+    shell: false,
+    env: sanitizedReleaseEnvironment()
   });
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(" ")} failed: ${result.error?.message || result.stderr || result.stdout}`);
@@ -150,9 +141,11 @@ const releaseInfo = {
 await writeFile(join(packageRoot, "release-info.json"), `${JSON.stringify(releaseInfo, null, 2)}\n`);
 
 const unixLauncher = (entry: string) =>
-  `#!/bin/sh\nset -eu\nSCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nROOT=$(dirname "$SCRIPT_DIR")\nexec node "$ROOT/${entry}" "$@"\n`;
-const windowsLauncher = (entry: string) =>
-  `@echo off\r\nset "ODINN_ROOT=%~dp0.."\r\nnode "%ODINN_ROOT%\\${entry.replaceAll("/", "\\")}" %*\r\n`;
+  `#!/bin/sh\nset -eu\nunset ${HOSTILE_NODE_ENVIRONMENT_VARIABLES.join(" ")}\nSCRIPT=$0\ncase "$SCRIPT" in */*) ;; *) SCRIPT=$(command -v -- "$SCRIPT") || { echo "Ódinn launcher path cannot be resolved" >&2; exit 126; };; esac\nBIN_DIR=\${SCRIPT%/*}\n[ "$BIN_DIR" != "$SCRIPT" ] || { echo "Ódinn launcher path is invalid" >&2; exit 126; }\nROOT=$(CDPATH= cd -- "$BIN_DIR/.." && pwd -P)\nexec node "$ROOT/${entry}" "$@"\n`;
+const windowsLauncher = (entry: string) => {
+  const clears = HOSTILE_NODE_ENVIRONMENT_VARIABLES.map((name) => `set "${name}="`).join("\r\n");
+  return `@echo off\r\nsetlocal DisableDelayedExpansion\r\n${clears}\r\nset "ODINN_ROOT=%~dp0.."\r\nnode "%ODINN_ROOT%\\${entry.replaceAll("/", "\\")}" %*\r\n`;
+};
 
 await mkdir(join(packageRoot, "bin"), { recursive: true });
 await writeFile(join(packageRoot, "bin", "odinn"), unixLauncher("dist/cli/index.js"), { mode: 0o755 });
@@ -185,13 +178,13 @@ if (archiveFiles.some((path) => path.endsWith(".ts") || /(^|\/)(test|tests)(\/|$
 
 const tarName = `${base}.tar.gz`;
 const zipName = `${base}.zip`;
-run("tar", ["-czf", join(output, tarName), "-C", staging, base]);
+run(trustedTool("tar"), ["-czf", join(output, tarName), "-C", staging, base]);
 if (process.platform === "win32") {
   const source = packageRoot.replaceAll("'", "''");
   const destination = join(output, zipName).replaceAll("'", "''");
-  run("powershell", ["-NoProfile", "-Command", `Compress-Archive -LiteralPath '${source}' -DestinationPath '${destination}' -Force`]);
+  run(String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, ["-NoProfile", "-NonInteractive", "-Command", `Compress-Archive -LiteralPath '${source}' -DestinationPath '${destination}' -Force`]);
 } else {
-  run("zip", ["-q", "-r", join(output, zipName), base], staging);
+  run(trustedTool("zip"), ["-q", "-r", join(output, zipName), base], staging);
 }
 
 await writeFile(

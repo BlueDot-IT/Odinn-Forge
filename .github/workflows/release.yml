@@ -11,6 +11,14 @@ on:
         description: Numeric GitHub draft release ID to verify and publish
         required: true
         type: string
+      staged_run_id:
+        description: Original release workflow run that staged the assets (required only for resume)
+        required: false
+        type: string
+      staged_artifact_id:
+        description: Immutable odinn-release-assets artifact ID from the staging run (required only for resume)
+        required: false
+        type: string
       resume_staged_assets:
         description: Resume publication from assets already staged on the verified draft release
         required: false
@@ -25,7 +33,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: "24"
   PNPM_VERSION: "10.14.0"
   RELEASE_TAG: ${{ inputs.tag }}
   RELEASE_ID: ${{ inputs.release_id }}
@@ -52,7 +59,7 @@ jobs:
           run_install: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: ${{ needs.release-policy.outputs.node_version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm release:preflight
@@ -69,20 +76,33 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_commit: ${{ steps.release.outputs.commit }}
+      node_version: ${{ steps.runtime.outputs.node_version }}
+      attestation_run_id: ${{ steps.release.outputs.attestation_run_id }}
+      release_assets_artifact_id: ${{ steps.release.outputs.release_assets_artifact_id }}
     permissions:
-      contents: write
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
+      - name: Load exact reviewed Node runtime policy
+        id: runtime
+        shell: bash
+        run: |
+          node_version="$(jq -er '.version | select(test("^24\\.[0-9]+\\.[0-9]+$"))' release/node-runtime-policy.json)"
+          echo "node_version=$node_version" >> "$GITHUB_OUTPUT"
       - name: Validate existing draft release and tag
         id: release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ env.RELEASE_ID }}
+          RESUME_STAGED_ASSETS: ${{ inputs.resume_staged_assets }}
+          STAGED_RUN_ID: ${{ inputs.staged_run_id }}
+          STAGED_ARTIFACT_ID: ${{ inputs.staged_artifact_id }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           test -n "$TAG"
@@ -96,18 +116,92 @@ jobs:
             --argjson expectedPrerelease "$expected_prerelease" \
             '(.id | tostring) == $releaseId and .tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' \
             <<<"$release"
-          echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          if [[ "$RESUME_STAGED_ASSETS" == "true" ]]; then
+            [[ "$STAGED_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$STAGED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+            attestation_run_id="$STAGED_RUN_ID"
+            release_assets_artifact_id="$STAGED_ARTIFACT_ID"
+          else
+            test -z "$STAGED_RUN_ID"
+            test -z "$STAGED_ARTIFACT_ID"
+            attestation_run_id="$GITHUB_RUN_ID"
+            release_assets_artifact_id=""
+          fi
+          staged_run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${attestation_run_id}")"
+          jq -e --argjson runId "$attestation_run_id" --arg commit "$tag_commit" --arg repository "$GITHUB_REPOSITORY" \
+            '.id == $runId and .head_sha == $commit and .head_branch == "main" and .event == "workflow_dispatch" and
+             .path == ".github/workflows/release.yml" and .repository.full_name == $repository' <<<"$staged_run"
+          if [[ "$RESUME_STAGED_ASSETS" == "true" ]]; then
+            staged_artifact="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${release_assets_artifact_id}")"
+            jq -e --argjson artifactId "$release_assets_artifact_id" --argjson runId "$attestation_run_id" --arg commit "$tag_commit" \
+              '.id == $artifactId and .name == "odinn-release-assets" and .expired == false and
+               .workflow_run.id == $runId and .workflow_run.head_sha == $commit and .workflow_run.head_branch == "main"' \
+              <<<"$staged_artifact"
+          fi
+          {
+            echo "commit=$tag_commit"
+            echo "attestation_run_id=$attestation_run_id"
+            echo "release_assets_artifact_id=$release_assets_artifact_id"
+          } >> "$GITHUB_OUTPUT"
+
+  native-launchers:
+    name: Build native launcher (${{ matrix.target }})
+    needs:
+      - release-policy
+      - verify
+    if: ${{ !inputs.resume_staged_assets }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: macos-15-large
+            target: darwin-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release-policy.outputs.release_commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ needs.release-policy.outputs.node_version }}
+      - name: Build and reproduce the host-native loader boundary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist/native-launchers
+          node scripts/release/native-launcher.ts "$TARGET" "dist/native-launchers/odinn-launcher-$TARGET.first"
+          node scripts/release/native-launcher.ts "$TARGET" "dist/native-launchers/odinn-launcher-$TARGET.second"
+          cmp "dist/native-launchers/odinn-launcher-$TARGET.first" "dist/native-launchers/odinn-launcher-$TARGET.second"
+          mv "dist/native-launchers/odinn-launcher-$TARGET.first" "dist/native-launchers/odinn-launcher-$TARGET"
+          rm "dist/native-launchers/odinn-launcher-$TARGET.second"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: odinn-native-launcher-${{ matrix.target }}
+          path: dist/native-launchers/odinn-launcher-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 1
 
   source-package:
     name: Build release assets
     needs:
       - release-policy
       - verify
+      - native-launchers
     if: ${{ !inputs.resume_staged_assets }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
       contents: read
+    outputs:
+      release_assets_artifact_id: ${{ steps.release-assets.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -123,13 +217,19 @@ jobs:
           run_install: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: ${{ needs.release-policy.outputs.node_version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm release:package
         env:
           GITHUB_SHA: ${{ env.ODINN_RELEASE_COMMIT }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: odinn-native-launcher-*
+          path: dist/native-launchers
+          merge-multiple: true
+      - run: pnpm release:package-standalone
       - run: pnpm release:soak
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
@@ -146,6 +246,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        id: release-assets
         with:
           name: odinn-release-assets
           path: dist/release/
@@ -164,24 +265,44 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    outputs:
+      release_assets_artifact_id: ${{ needs.source-package.outputs.release_assets_artifact_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           ref: ${{ needs.release-policy.outputs.release_commit }}
           persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: ${{ needs.release-policy.outputs.node_version }}
           registry-url: https://registry.npmjs.org
+          cache: pnpm
+      - name: Install secure release-validation dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: odinn-npm-package
           path: dist/npm-package
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: odinn-release-assets
+          artifact-ids: ${{ needs.source-package.outputs.release_assets_artifact_id }}
           path: release-assets
+      - name: Record immutable release artifact identity
+        shell: bash
+        env:
+          RELEASE_ASSETS_ARTIFACT_ID: ${{ needs.source-package.outputs.release_assets_artifact_id }}
+        run: |
+          [[ "$RELEASE_ASSETS_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          {
+            echo "### Staged release recovery identity"
+            echo "- Workflow run: \`$GITHUB_RUN_ID\`"
+            echo "- Actions artifact: \`$RELEASE_ASSETS_ARTIFACT_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Revalidate draft release and exact tag commit
         id: tag
         shell: bash
@@ -206,6 +327,7 @@ jobs:
         shell: bash
         env:
           EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+          ATTESTATION_RUN_ID: ${{ needs.release-policy.outputs.attestation_run_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ODINN_RELEASE_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           TAG: ${{ steps.tag.outputs.tag }}
@@ -220,7 +342,8 @@ jobs:
           fi
           mkdir -p downloaded-release-assets
           gh release download "$TAG" --dir downloaded-release-assets
-          cmp release-assets/SHA256SUMS.txt downloaded-release-assets/SHA256SUMS.txt
+          node scripts/release/verify-attested-assets.ts release-assets downloaded-release-assets \
+            "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
           node scripts/release/install-smoke.ts downloaded-release-assets
           node scripts/release/validate-prior-rollback.ts --candidate-release downloaded-release-assets
@@ -234,23 +357,43 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: macos-15-large
+            target: darwin-x64
+          - os: windows-latest
+            target: win32-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     permissions:
-      contents: write
+      actions: read
+      attestations: read
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           ref: ${{ needs.release-policy.outputs.release_commit }}
           persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: ${{ needs.release-policy.outputs.node_version }}
+          cache: pnpm
+      - name: Install secure release-validation dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Download immutable Actions release asset inventory
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ inputs.resume_staged_assets && needs.release-policy.outputs.release_assets_artifact_id || needs.stage-release-assets.outputs.release_assets_artifact_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.release-policy.outputs.attestation_run_id }}
+          path: expected-release-assets
       - name: Download exact draft-release assets
         shell: bash
         env:
@@ -259,6 +402,14 @@ jobs:
         run: |
           mkdir -p downloaded-release-assets
           gh release download "$TAG" --dir downloaded-release-assets
+      - name: Authenticate exact draft inventory and bytes
+        shell: bash
+        env:
+          ATTESTATION_RUN_ID: ${{ needs.release-policy.outputs.attestation_run_id }}
+          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+        run: |
+          node scripts/release/verify-attested-assets.ts expected-release-assets downloaded-release-assets \
+            "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
       - name: Verify downloaded checksums, metadata, SBOM, and provenance
         shell: bash
         env:
@@ -266,6 +417,8 @@ jobs:
         run: node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
       - name: Run install and recovery smoke against downloaded archives
         run: node scripts/release/install-smoke.ts downloaded-release-assets
+      - name: Run controlled-runtime standalone smoke without ambient Node use
+        run: node scripts/release/standalone-smoke.ts downloaded-release-assets ${{ matrix.target }}
       - name: Run prior baseline rollback validation against downloaded candidate
         run: node scripts/release/validate-prior-rollback.ts --candidate-release downloaded-release-assets
 
@@ -280,6 +433,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     permissions:
+      actions: read
       attestations: read
       contents: write
       id-token: write
@@ -289,20 +443,38 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.release-policy.outputs.release_commit }}
           persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        if: ${{ inputs.resume_staged_assets }}
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: ${{ needs.release-policy.outputs.node_version }}
           registry-url: https://registry.npmjs.org
+      - name: Install secure extraction dependencies for staged recovery
+        if: ${{ inputs.resume_staged_assets }}
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         if: ${{ !inputs.resume_staged_assets }}
         with:
           name: odinn-npm-package
           path: dist/npm-package
+      - name: Download immutable Actions release assets for staged recovery
+        if: ${{ inputs.resume_staged_assets }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.release-policy.outputs.release_assets_artifact_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.release-policy.outputs.attestation_run_id }}
+          path: dist/resume-actions-assets
       - name: Recover npm package from verified staged release archive
         if: ${{ inputs.resume_staged_assets }}
         shell: bash
         env:
           EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+          ATTESTATION_RUN_ID: ${{ needs.release-policy.outputs.attestation_run_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
@@ -310,11 +482,10 @@ jobs:
           test "$TAG" = "v$version"
           mkdir -p dist/resume-assets dist/npm-package
           gh release download "$TAG" --dir dist/resume-assets
-          while IFS= read -r asset; do
-            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"
-          done < <(find dist/resume-assets -maxdepth 1 -type f -print | sort)
+          node scripts/release/verify-attested-assets.ts dist/resume-actions-assets dist/resume-assets \
+            "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           ODINN_RELEASE_COMMIT="$EXPECTED_COMMIT" node scripts/release/verify-downloaded-assets.ts dist/resume-assets
-          tar -xzf "dist/resume-assets/odinn-v$version.tar.gz" -C dist/npm-package
+          node scripts/release/extract-secure-archive.ts "dist/resume-assets/odinn-v$version.tar.gz" dist/npm-package "odinn-v$version"
           package_manifest="dist/npm-package/odinn-v$version/package.json"
           release_info="dist/npm-package/odinn-v$version/release-info.json"
           PACKAGE_MANIFEST="$package_manifest" RELEASE_INFO="$release_info" EXPECTED_VERSION="$version" \
@@ -360,7 +531,8 @@ jobs:
           package="@bluedot-it/odinn@$version"
           mapfile -t package_manifests < <(find dist/npm-package -type f -name package.json -not -path '*/node_modules/*' -print)
           test "${#package_manifests[@]}" -eq 1
-          package_dir="$(dirname "${package_manifests[0]}")"
+          package_dir="${package_manifests[0]%/*}"
+          test "$package_dir" != "${package_manifests[0]}"
           test "$(node -p "require('./${package_manifests[0]}').name")" = "@bluedot-it/odinn"
           test "$(node -p "require('./${package_manifests[0]}').version")" = "$version"
           if npm view "$package" version >/dev/null 2>&1; then
@@ -381,15 +553,42 @@ jobs:
               npm publish "$package_dir" --access public --provenance
             fi
           fi
+      - name: Redownload immutable Actions release assets for promotion
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ inputs.resume_staged_assets && needs.release-policy.outputs.release_assets_artifact_id || needs.stage-release-assets.outputs.release_assets_artifact_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.release-policy.outputs.attestation_run_id }}
+          path: dist/promotion-actions-assets
       - name: Promote verified GitHub release (npm publication is already durable)
         shell: bash
         env:
+          ATTESTATION_RUN_ID: ${{ needs.release-policy.outputs.attestation_run_id }}
+          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ env.RELEASE_ID }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          is_draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
-          test "$is_draft" = "true"
-          if ! gh release edit "$TAG" --draft=false; then
+          test -n "$RELEASE_ID"
+          mkdir -p dist/promotion-draft-assets
+          gh release download "$TAG" --dir dist/promotion-draft-assets
+          node scripts/release/verify-attested-assets.ts dist/promotion-actions-assets dist/promotion-draft-assets \
+            "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          jq -e --arg releaseId "$RELEASE_ID" --arg tag "$TAG" \
+            '(.id | tostring) == $releaseId and .tag_name == $tag and .draft == true' <<<"$release"
+          if ! gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false >/dev/null; then
             echo "::error::npm publication completed or was already present, but GitHub release $TAG remains a draft; rerun this workflow with the same tag after resolving the GitHub release failure."
             exit 1
           fi
+          expected_prerelease=false
+          [[ "$TAG" == *-* ]] && expected_prerelease=true
+          published="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          jq -e --arg releaseId "$RELEASE_ID" --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
+            '(.id | tostring) == $releaseId and .tag_name == $tag and .draft == false and
+             .prerelease == $expectedPrerelease and .immutable == true' <<<"$published"
+          published_by_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          jq -e --arg releaseId "$RELEASE_ID" --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
+            '(.id | tostring) == $releaseId and .tag_name == $tag and .draft == false and
+             .prerelease == $expectedPrerelease and .immutable == true' <<<"$published_by_tag"

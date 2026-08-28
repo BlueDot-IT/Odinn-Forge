@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { extractSecureArchive } from "../../packages/kernel/src/secure-archive.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const releaseDir = join(root, "dist", "release");
@@ -164,7 +165,7 @@ const temp = await mkdtemp(join(tmpdir(), "odinn-release-soak-"));
 const workspace = join(temp, "workspace");
 const state = join(temp, "state");
 const installPrefix = join(temp, "installed");
-await run("tar", ["-xzf", archive, "-C", temp], root);
+await extractSecureArchive(archive, temp, { expectedRoot: `odinn-v${pkg.version}` });
 const packageRoot = join(temp, `odinn-v${pkg.version}`);
 const cliEntry = join(packageRoot, "dist/cli/index.js");
 const installerEntry = join(packageRoot, "dist/install/install.js");

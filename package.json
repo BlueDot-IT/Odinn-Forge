@@ -63,8 +63,10 @@
     "soak:long": "node scripts/ci/long-soak.ts",
     "release:preflight": "node scripts/release/preflight.ts",
     "release:package": "node scripts/release/package.ts",
+    "release:package-standalone": "node scripts/release/package-standalone.ts",
     "release:checksums": "node scripts/release/checksums.ts",
     "release:install-smoke": "node scripts/release/install-smoke.ts",
+    "release:standalone-smoke": "node scripts/release/standalone-smoke.ts",
     "release:rollback-smoke": "node scripts/release/validate-prior-rollback.ts",
     "release:soak": "node scripts/release/soak.ts"
   },

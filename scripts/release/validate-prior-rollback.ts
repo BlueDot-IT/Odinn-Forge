@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { extractSecureArchive } from "../../packages/kernel/src/secure-archive.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -200,17 +201,7 @@ export async function validatePriorRollback(options: {
     // Step 3: Safely extract archive into isolated temp dir
     console.log("[Step 3] Extracting baseline archive...");
     await mkdir(baselineExtractDir, { recursive: true });
-    if (baselineArchiveName.endsWith(".zip")) {
-      if (isWindows) {
-        const escArchive = baselineArchiveLocal.replaceAll("'", "''");
-        const escDest = baselineExtractDir.replaceAll("'", "''");
-        run("powershell", ["-NoProfile", "-Command", `Expand-Archive -LiteralPath '${escArchive}' -DestinationPath '${escDest}' -Force`], root);
-      } else {
-        run("unzip", ["-q", baselineArchiveLocal, "-d", baselineExtractDir], root);
-      }
-    } else {
-      run("tar", ["-xzf", baselineArchiveLocal, "-C", baselineExtractDir], root);
-    }
+    await extractSecureArchive(baselineArchiveLocal, baselineExtractDir, { expectedRoot: "odinn-v1.0.0" });
     const baselinePackageRoot = join(baselineExtractDir, "odinn-v1.0.0");
     recordOutcome(3, "Extract baseline archive safely", true);
 
@@ -285,6 +276,9 @@ export async function validatePriorRollback(options: {
     const updateData = JSON.parse(updateResult.stdout);
     if (!updateData.ok || updateData.version !== candidateVersion) {
       recordOutcome(6, "Candidate update output", false, `Update output mismatch: ${JSON.stringify(updateData)}`);
+    }
+    if (process.platform === "win32") {
+      await waitForLauncherActivation(prefix);
     }
     recordOutcome(6, "Execute candidate update from v1.0.0 binary", true);
 
@@ -432,6 +426,29 @@ export async function validatePriorRollback(options: {
   console.log(`[Step 15] Prior rollback validation PASSED. Evidence written to: ${evidenceOutputPath}`);
 
   return evidence;
+}
+
+async function waitForLauncherActivation(prefix: string) {
+  const marker = join(prefix, ".launcher-activation.json");
+  const deadline = Date.now() + 30_000;
+  let observed = false;
+  while (Date.now() < deadline) {
+    try {
+      await readFile(marker);
+      observed = true;
+    } catch (error: any) {
+      if (error?.code === "ENOENT" && observed) return;
+      if (error?.code === "ENOENT") {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        continue;
+      }
+      throw error;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  throw new Error(observed
+    ? "timed out waiting for deferred Windows launcher activation"
+    : "Windows update did not create a deferred launcher activation marker");
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {

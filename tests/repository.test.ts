@@ -254,16 +254,19 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/);
   assert.match(release, /RELEASE_ID: \$\{\{ inputs\.release_id \}\}/);
   assert.match(release, /description: Numeric GitHub draft release ID to verify and publish/);
-  assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}contents: write/m);
+  assert.match(release, /description: Original release workflow run that staged the assets \(required only for resume\)/u);
+  assert.match(release, /description: Immutable odinn-release-assets artifact ID from the staging run \(required only for resume\)/u);
+  assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}actions: read\s*\n\s{6}contents: read/m);
+  assert.match(release, /^  validate-downloaded-release:\s*[\s\S]*?^    permissions:\s*\n\s{6}actions: read\s*\n\s{6}attestations: read\s*\n\s{6}contents: read/m);
   assert.match(release, /\(\.id \| tostring\) == \$releaseId and \.tag_name == \$tag and \.draft == true and \.prerelease == \$expectedPrerelease/);
   assert.equal(
     (release.match(/gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{RELEASE_ID\}"/g) ?? []).length,
-    3,
-    "all release gates must validate the exact draft release ID"
+    5,
+    "all release gates and the post-promotion proof must read the exact release ID"
   );
   assert.equal(
     (release.match(/test -n "\$RELEASE_ID"/g) ?? []).length,
-    3,
+    4,
     "all release gates must fail closed when the release ID is absent"
   );
   assert.match(release, /persist-credentials: false/);
@@ -271,8 +274,17 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /^  verify:\s*[\s\S]*?^    needs: release-policy/m);
   assert.match(
     release,
-    /^  source-package:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- verify/m
+    /^  source-package:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- verify\s*\n\s{6}- native-launchers/m
   );
+  const nativeLaunchers = release.match(/^  native-launchers:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
+  assert.match(nativeLaunchers, /matrix:\s*\n\s+include:\s*\n\s+- os: ubuntu-latest\s*\n\s+target: linux-x64\s*\n\s+- os: macos-15-large\s*\n\s+target: darwin-x64/u);
+  assert.match(nativeLaunchers, /node scripts\/release\/native-launcher\.ts "\$TARGET" "dist\/native-launchers\/odinn-launcher-\$TARGET\.first"/u);
+  assert.match(nativeLaunchers, /cmp "dist\/native-launchers\/odinn-launcher-\$TARGET\.first" "dist\/native-launchers\/odinn-launcher-\$TARGET\.second"/u);
+  assert.match(nativeLaunchers, /name: odinn-native-launcher-\$\{\{ matrix\.target \}\}/u);
+  const sourcePackage = release.match(/^  source-package:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
+  assert.match(sourcePackage, /pattern: odinn-native-launcher-\*/u);
+  assert.match(sourcePackage, /path: dist\/native-launchers/u);
+  assert.match(sourcePackage, /merge-multiple: true/u);
   assert.match(
     release,
     /^  stage-release-assets:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- source-package/m
@@ -282,17 +294,21 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
     /^  validate-downloaded-release:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- stage-release-assets/m
   );
   assert.match(release, /name: Validate downloaded release \(\$\{\{ matrix\.os \}\}\)/u);
-  assert.match(release, /matrix:\s*\n\s+os:\s*\n\s+- ubuntu-latest\s*\n\s+- macos-latest\s*\n\s+- windows-latest/u);
+  assert.match(release, /matrix:\s*\n\s+include:\s*\n\s+- os: ubuntu-latest\s*\n\s+target: linux-x64\s*\n\s+- os: macos-15-large\s*\n\s+target: darwin-x64\s*\n\s+- os: windows-latest\s*\n\s+target: win32-x64/u);
   const stageJob = release.match(/^  stage-release-assets:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
   assert.match(stageJob, /runs-on: ubuntu-latest/u);
   assert.match(stageJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
-  assert.match(stageJob, /cmp release-assets\/SHA256SUMS\.txt downloaded-release-assets\/SHA256SUMS\.txt/u);
+  assert.match(stageJob, /verify-attested-assets\.ts release-assets downloaded-release-assets/u);
   assert.match(stageJob, /node scripts\/release\/verify-downloaded-assets\.ts downloaded-release-assets/u);
   assert.match(stageJob, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
   const validateJob = release.match(/^  validate-downloaded-release:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
+  assert.match(validateJob, /artifact-ids: \$\{\{ inputs\.resume_staged_assets && needs\.release-policy\.outputs\.release_assets_artifact_id \|\| needs\.stage-release-assets\.outputs\.release_assets_artifact_id \}\}/u);
+  assert.match(validateJob, /run-id: \$\{\{ needs\.release-policy\.outputs\.attestation_run_id \}\}/u);
   assert.match(validateJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
+  assert.match(validateJob, /verify-attested-assets\.ts expected-release-assets downloaded-release-assets/u);
   assert.match(validateJob, /node scripts\/release\/verify-downloaded-assets\.ts downloaded-release-assets/u);
   assert.match(validateJob, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
+  assert.match(validateJob, /node scripts\/release\/standalone-smoke\.ts downloaded-release-assets \$\{\{ matrix\.target \}\}/u);
   assert.doesNotMatch(release.match(/^  source-package:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /id-token: write/);
   assert.match(
     release,
@@ -311,7 +327,12 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /expected_assets=/);
   assert.match(release, /existing_assets=/);
   assert.match(release, /diff -u <\(printf '%s\\n' "\$expected_assets"\)/);
-  assert.match(release, /cmp release-assets\/SHA256SUMS\.txt downloaded-release-assets\/SHA256SUMS\.txt/);
+  assert.match(release, /attestation_run_id: \$\{\{ steps\.release\.outputs\.attestation_run_id \}\}/u);
+  assert.match(release, /release_assets_artifact_id: \$\{\{ steps\.release\.outputs\.release_assets_artifact_id \}\}/u);
+  assert.match(release, /\[\[ "\$STAGED_RUN_ID" =~ \^\[1-9\]\[0-9\]\*\$ \]\]/u);
+  assert.match(release, /\[\[ "\$STAGED_ARTIFACT_ID" =~ \^\[1-9\]\[0-9\]\*\$ \]\]/u);
+  assert.match(release, /\.id == \$artifactId and \.name == "odinn-release-assets" and \.expired == false/u);
+  assert.match(release, /\.head_sha == \$commit and \.head_branch == "main" and \.event == "workflow_dispatch"/u);
   assert.doesNotMatch(release, /--clobber/);
   assert.match(release, /release_commit: \$\{\{ steps\.release\.outputs\.commit \}\}/);
   assert.match(release, /ref: \$\{\{ needs\.release-policy\.outputs\.release_commit \}\}/);
@@ -321,6 +342,23 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
     "exact tag/release revalidation must precede npm publication"
   );
   assert.match(publishJob, /test "\$\(git rev-list -n 1 "refs\/tags\/\$TAG"\)" = "\$EXPECTED_COMMIT"/);
+  assert.match(publishJob, /verify-attested-assets\.ts dist\/resume-actions-assets dist\/resume-assets/u);
+  assert.match(publishJob, /verify-attested-assets\.ts dist\/promotion-actions-assets dist\/promotion-draft-assets/u);
+  assert.match(publishJob, /name: Redownload immutable Actions release assets for promotion[\s\S]*?artifact-ids:/u);
+  assert.ok(
+    publishJob.lastIndexOf("verify-attested-assets.ts") < publishJob.indexOf('gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false'),
+    "fresh immutable/draft byte comparison and attestation verification must immediately precede promotion"
+  );
+  assert.match(publishJob, /published="\$\(gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{RELEASE_ID\}"\)"/u);
+  assert.match(publishJob, /published_by_tag="\$\(gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/tags\/\$\{TAG\}"\)"/u);
+  assert.match(publishJob, /\.draft == false and\n\s+\.prerelease == \$expectedPrerelease and \.immutable == true/u);
+  const attestationVerifier = await read("scripts/release/verify-attested-assets.ts");
+  for (const flag of ["--repo", "--signer-workflow", "--signer-digest", "--source-digest", "--source-ref", "--deny-self-hosted-runners", "--format"]) {
+    assert.match(attestationVerifier, new RegExp(flag, "u"));
+  }
+  assert.match(attestationVerifier, /sourceRepositoryDigest !== sourceSha/u);
+  assert.match(attestationVerifier, /runInvocationURI\?\.startsWith\(invocation\)/u);
+  assert.match(attestationVerifier, /subjects\.length !== inventoryEntries\.length/u);
   assert.doesNotMatch(release, /^\s{2}workflow_call:/m);
   assert.match(preflight, /releaseTag !== expected/);
   assert.match(preflight, /tagCommit\.stdout\.trim\(\) !== headCommit\.stdout\.trim\(\)/);

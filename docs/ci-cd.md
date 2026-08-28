@@ -198,16 +198,25 @@ Manual dispatch cannot release an untagged branch. The workflow:
    dependency-audit gates.
 4. Compiles the CLI, gateway, workers, installer, and runtime packages to
    JavaScript with source maps.
-5. Assembles equivalent ZIP and tar.gz production archives with runtime
-   dependencies only.
-6. Runs the packaged restart/recovery soak against the compiled archive.
-7. Generates production-package SPDX JSON SBOMs.
-8. Generates SHA-256 checksums and verifies archive identity and contents.
-9. Runs clean install, onboarding, diagnostic, and state reopen smoke against
+5. Builds the Unix standalone entry boundary on matching Linux and macOS x64
+   runners, reproduces each native binary byte-for-byte, and transfers only
+   those exact artifacts to the packaging job. Linux uses a static PIE so
+   loader-preload variables cannot run before sanitization; macOS uses a
+   signed hardened-runtime binary. Windows retains its fixed system launcher.
+6. Assembles equivalent ZIP and tar.gz production archives with runtime
+   dependencies only. Archive entry admission uses one conservative portable
+   identity and rejects Win32 alternate streams, device aliases, trailing
+   dot/space aliases, and cross-platform case/Unicode collisions before
+   extraction.
+7. Runs the packaged restart/recovery soak against the compiled archive.
+8. Generates production-package SPDX JSON SBOMs.
+9. Generates SHA-256 checksums and verifies archive identity and contents.
+10. Runs clean install, onboarding, diagnostic, loader-preload refusal, and
+   state reopen smoke against
    exact downloaded draft-release archives across GitHub-hosted Linux, macOS,
    and Windows runners.
-10. Creates GitHub build provenance attestations.
-11. Publishes the verified assets to the GitHub release through the protected
+11. Creates GitHub build provenance attestations.
+12. Publishes the verified assets to the GitHub release through the protected
     `release` environment after all cross-platform validation passes.
 
 The workflow cannot publish from an untagged branch or a tag that disagrees with the package version.

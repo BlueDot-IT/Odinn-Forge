@@ -1,8 +1,14 @@
 # Getting started with Ódinn Forge
 
-Ódinn Forge needs Node.js 24 or newer. The downloaded release already contains
-the built application and runtime dependencies, so normal installation does
-not need pnpm, Corepack, or a source checkout.
+For Linux, macOS, and Windows x64, use the separately named **standalone**
+download. It carries the exact reviewed Node 24 LTS runtime, so normal users do
+not install Node, pnpm, Corepack, or a source checkout. The release manifest,
+SBOM, provenance, and installation metadata bind that runtime to the
+application and rollback restores them together.
+
+The generic archives and npm package remain available for advanced operators
+and require Node.js 24 or newer. Source development additionally requires pnpm.
+Platforms outside the published standalone matrix use this advanced path.
 
 For release downloads, checksum verification, privacy expectations, and
 diagnostics, start with the [user guide](user-guide.md).

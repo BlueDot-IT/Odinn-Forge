@@ -12,12 +12,42 @@ const commit = "a".repeat(40);
 
 async function fixture(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "odinn-downloaded-release-"));
-  const archives = [`odinn-v${pkg.version}.zip`, `odinn-v${pkg.version}.tar.gz`];
+  const policyBytes = await readFile(join(root, "release/node-runtime-policy.json"));
+  const policy = JSON.parse(policyBytes.toString("utf8"));
+  const policySha256 = createHash("sha256").update(policyBytes).digest("hex");
+  const standaloneTargets = Object.entries(policy.targets).map(([target, entry]: [string, any]) => ({
+    name: `odinn-v${pkg.version}-standalone-${target}.${target === "win32-x64" ? "zip" : "tar.gz"}`,
+    target,
+    policy: entry
+  }));
+  const archives = [`odinn-v${pkg.version}.zip`, `odinn-v${pkg.version}.tar.gz`, ...standaloneTargets.map((entry) => entry.name)];
   for (const name of archives) await writeFile(join(directory, name), `archive:${name}`);
   const archiveSha256 = Object.fromEntries(await Promise.all(archives.map(async (name) => [
     name,
     createHash("sha256").update(await readFile(join(directory, name))).digest("hex")
   ])));
+  const standaloneArtifacts = await Promise.all(standaloneTargets.map(async ({ name, target, policy: entry }) => ({
+    name,
+    target,
+    bytes: (await readFile(join(directory, name))).byteLength,
+    sha256: archiveSha256[name],
+    embeddedRuntime: {
+      version: policy.version,
+      target,
+      sourceUrl: `${policy.origin}/dist/v${policy.version}/${entry.archive}`,
+      archive: entry.archive,
+      archiveBytes: entry.bytes,
+      archiveSha256: entry.sha256,
+      executableBytes: entry.executableBytes,
+      executableSha256: entry.executableSha256,
+      signedManifestSha256: policy.signedManifest.sha256,
+      signedManifestCleartextSha256: policy.signedManifest.cleartextSha256,
+      signerFingerprint: policy.keyring.allowedPrimaryFingerprints[0],
+      keyringUrl: policy.keyring.url,
+      keyringSha256: policy.keyring.sha256,
+      runtimePolicySha256: policySha256
+    }
+  })));
   await writeFile(join(directory, "odinn.spdx.json"), JSON.stringify({
     spdxVersion: "SPDX-2.3",
     name: `${pkg.name}-${pkg.version}-production`,
@@ -26,6 +56,12 @@ async function fixture(): Promise<string> {
     files: [{ fileName: "bin/odinn", checksums: [{ algorithm: "SHA256", checksumValue: "b".repeat(64) }] }]
   }));
   await writeFile(join(directory, "odinn-anchore.spdx.json"), JSON.stringify({ spdxVersion: "SPDX-2.3" }));
+  await writeFile(join(directory, "odinn-standalone.spdx.json"), JSON.stringify({
+    spdxVersion: "SPDX-2.3",
+    packages: standaloneTargets.map(({ target }) => ({ SPDXID: `SPDXRef-Package-Node-${target}`, name: "Node.js", versionInfo: policy.version })),
+    files: standaloneTargets.map(({ target }, index) => ({ SPDXID: `SPDXRef-Standalone-File-${index + 1}`, fileName: `${target}/runtime/${target === "win32-x64" ? "node.exe" : "node"}` })),
+    relationships: standaloneTargets.map(({ target }) => ({ spdxElementId: "SPDXRef-Package-Odinn", relationshipType: "CONTAINS", relatedSpdxElement: `SPDXRef-Package-Node-${target}` }))
+  }));
   await writeFile(join(directory, "release-manifest.json"), JSON.stringify({
     name: pkg.name,
     distributionName: "@bluedot-it/odinn",
@@ -33,7 +69,10 @@ async function fixture(): Promise<string> {
     commit,
     distribution: "compiled",
     runtimeSha256: "c".repeat(64),
-    artifacts: archives,
+    artifacts: archives.slice(0, 2),
+    standaloneArtifacts,
+    standaloneSbom: "odinn-standalone.spdx.json",
+    nodeRuntimePolicySha256: policySha256,
     archiveSha256,
     sbom: "odinn.spdx.json",
     provenance: "release-provenance.json"
@@ -45,12 +84,16 @@ async function fixture(): Promise<string> {
     distribution: "compiled",
     runtimeSha256: "c".repeat(64),
     archiveSha256,
-    checksumFile: "SHA256SUMS.txt"
+    checksumFile: "SHA256SUMS.txt",
+    nodeRuntimePolicySha256: policySha256,
+    standaloneSbom: "odinn-standalone.spdx.json",
+    standaloneArtifacts
   }));
   const files = [
     ...archives,
     "odinn.spdx.json",
     "odinn-anchore.spdx.json",
+    "odinn-standalone.spdx.json",
     "release-manifest.json",
     "release-provenance.json"
   ].sort();
@@ -73,7 +116,7 @@ test("downloaded release verification binds checksums, SBOM, provenance, and tag
   try {
     const result = verify(directory);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /verified 6 downloaded assets/);
+    assert.match(result.stdout, /verified 10 downloaded assets/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -89,4 +132,52 @@ test("downloaded release verification rejects an asset changed after checksummin
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("release validation jobs are read-only and staged recovery uses secure extraction", async () => {
+  const workflow = await readFile(join(root, ".github/workflows/release.yml"), "utf8");
+  const releasePolicy = workflow.slice(workflow.indexOf("  release-policy:"), workflow.indexOf("  source-package:"));
+  const stagedValidation = workflow.slice(workflow.indexOf("  stage-release-assets:"), workflow.indexOf("  validate-downloaded-release:"));
+  const downloadedValidation = workflow.slice(workflow.indexOf("  validate-downloaded-release:"), workflow.indexOf("  publish-release:"));
+  const publication = workflow.slice(workflow.indexOf("  publish-release:"));
+  assert.match(releasePolicy, /permissions:\n\s+contents: read/u);
+  assert.doesNotMatch(releasePolicy, /contents: write/u);
+  assert.match(downloadedValidation, /permissions:\n(?:\s+[a-z-]+: read\n)*\s+contents: read/u);
+  assert.doesNotMatch(downloadedValidation, /contents: write/u);
+  for (const section of [stagedValidation, downloadedValidation, publication]) {
+    assert.match(section, /pnpm\/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86/u);
+    assert.match(section, /pnpm install --frozen-lockfile --ignore-scripts/u);
+  }
+  assert.match(workflow, /scripts\/release\/extract-secure-archive\.ts/u);
+  assert.match(workflow, /staged_run_id:\s*\n\s+description: Original release workflow run/u);
+  assert.match(workflow, /staged_artifact_id:\s*\n\s+description: Immutable odinn-release-assets artifact ID/u);
+  assert.match(workflow, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/runs\/\$\{attestation_run_id\}"/u);
+  assert.match(workflow, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/artifacts\/\$\{release_assets_artifact_id\}"/u);
+  assert.match(workflow, /artifact-ids: \$\{\{ inputs\.resume_staged_assets && needs\.release-policy\.outputs\.release_assets_artifact_id \|\| needs\.stage-release-assets\.outputs\.release_assets_artifact_id \}\}/u);
+  assert.ok(
+    stagedValidation.indexOf("verify-attested-assets.ts") < stagedValidation.indexOf("install-smoke.ts"),
+    "initial staging must authenticate every downloaded asset before execution"
+  );
+  assert.ok(
+    downloadedValidation.indexOf("verify-attested-assets.ts") < downloadedValidation.indexOf("standalone-smoke.ts"),
+    "every platform must authenticate every downloaded asset before execution"
+  );
+  const recovery = publication.indexOf("Recover npm package from verified staged release archive");
+  const recoveryVerification = publication.indexOf("verify-attested-assets.ts", recovery);
+  const recoveryExtraction = publication.indexOf("extract-secure-archive.ts", recovery);
+  assert.ok(recovery >= 0 && recoveryVerification > recovery && recoveryVerification < recoveryExtraction,
+    "resume must bind and compare the original Actions artifact before extraction");
+  const promotion = publication.indexOf("Promote verified GitHub release");
+  const promotionVerification = publication.indexOf("verify-attested-assets.ts", promotion);
+  const promotionMutation = publication.indexOf('gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false', promotion);
+  assert.ok(promotion >= 0 && promotionVerification > promotion && promotionVerification < promotionMutation,
+    "promotion must freshly redownload, compare, and authenticate the draft before making it public");
+  assert.ok(
+    promotionMutation < publication.indexOf('published="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"', promotion),
+    "publication must re-read the exact release after promotion"
+  );
+  assert.match(publication, /releases\/tags\/\$\{TAG\}/u);
+  assert.match(publication, /\.draft == false and\n\s+\.prerelease == \$expectedPrerelease and \.immutable == true/u);
+  assert.doesNotMatch(workflow, /tar -xzf "dist\/resume-assets/u);
+  assert.doesNotMatch(workflow, /\$\(dirname\b/u);
 });

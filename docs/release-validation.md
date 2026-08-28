@@ -109,6 +109,15 @@ Windows runners:
 2. Installs and initializes the real `v1.0.0` binary into an isolated prefix.
 3. Creates persistent state and sessions, executing tool smoke and audit checks.
 4. Upgrades to the candidate archive via the actual `v1.0.0` update command.
+   On Windows, the candidate publishes a new immutable launcher generation and
+   a fixed-layout trampoline before recording the source/target activation.
+   The installed, digest-bound runtime revalidates and seals the bound
+   launcher/pointer/state generation under the installer lock after the
+   invoking `v1.0.0` batch process exits. An
+   ordinary startup also reconciles a retained marker with that same runtime,
+   covering power loss or a failed detached finalizer without falling back to
+   ambient Node. The gate waits for the marker to retire before executing the
+   candidate, and equal generation bytes are never replaced in place.
 5. Exercises candidate state migration and creates candidate-only records.
 6. Asserts fail-closed refusal when rollback is attempted before restoring the backup.
 7. Restores the pre-migration backup via `odinn state restore`.
@@ -119,21 +128,33 @@ Windows runners:
 ## Publication sequence
 
 Create the GitHub release as a draft with the exact `vX.Y.Z` tag, then manually
-dispatch the protected **Release** workflow with that tag. Draft releases do
+dispatch the protected **Release** workflow with that tag and the draft's
+numeric release ID. Leave the staged run and artifact IDs empty for an initial
+publication. Draft releases do
 not emit the `release.created` workflow event, so the manual dispatch is
 intentional. The workflow verifies the tag commit, builds and soaks the exact
 candidate, refuses asset replacement, downloads the release assets back, and
 validates exact downloaded artifacts across GitHub-hosted Linux, macOS, and
 Windows runners before publishing npm or promoting the GitHub release. The
 hosted Linux/macOS/Windows downloaded-artifact matrix is a blocking publication
-dependency; physical-machine testing is supplemental.
+dependency; physical-machine testing is supplemental. Every validation runner
+downloads the immutable `odinn-release-assets` Actions artifact by numeric
+artifact ID, compares the draft inventory and bytes exactly, and verifies every
+asset's GitHub attestation against this repository, `release.yml`, the exact
+source commit and branch, the original workflow run, and GitHub-hosted runner
+identity before executing an archive.
 The GitHub release `prerelease` flag must match the tag: tags containing `-`
 must be prereleases, and stable tags must not be. Prerelease packages use the
 npm `next` dist-tag. If the npm version already exists, the workflow downloads
 the registry tarball and compares it byte-for-byte with the candidate before
 continuing. If GitHub promotion fails after npm publication, leave the release
 draft in place and rerun the same tag after resolving the GitHub failure; the
-workflow reports that partial-publication state explicitly. Enable GitHub
+resume dispatch must also provide the numeric original staging run ID and the
+immutable `odinn-release-assets` artifact ID recorded by that run. A missing,
+expired, replaced, or cross-run artifact fails closed. The workflow reports
+that partial-publication state explicitly. Promotion targets the exact numeric
+draft release ID, then re-reads both that ID and the exact tag and requires the
+expected prerelease flag plus GitHub's immutable published state. Enable GitHub
 immutable releases in repository administration before publishing a stable
 release; that setting cannot be established by the workflow itself.
 

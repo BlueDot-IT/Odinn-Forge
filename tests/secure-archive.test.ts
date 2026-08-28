@@ -1,0 +1,401 @@
+import assert from "node:assert/strict";
+import { gunzipSync, gzipSync } from "node:zlib";
+import { access, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { performance } from "node:perf_hooks";
+import test from "node:test";
+import { extractSecureArchive, inspectSecureArchive } from "../packages/kernel/src/secure-archive.ts";
+
+type ArchiveEntry = {
+  name: string;
+  data?: Buffer | string;
+  mode?: number;
+  type?: string;
+};
+
+test("secure extraction accepts bounded physical ZIP and tar archives", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-ok-"));
+  try {
+    for (const format of ["zip", "tar.gz"] as const) {
+      const archive = join(temporary, `package.${format}`);
+      const destination = join(temporary, `extract-${format}`);
+      const entries = [
+        { name: "pkg/package.json", data: "{}\n" },
+        { name: "pkg/dist/cli/index.js", data: "console.log('ok');\n", mode: 0o100755 }
+      ];
+      await writeFile(archive, format === "zip" ? zip(entries) : tarGzip(entries));
+      const admitted = await extractSecureArchive(archive, destination, {
+        expectedRoot: "pkg",
+        maximumExpandedBytes: 1024
+      });
+      assert.equal(admitted.length, 2);
+      assert.equal(await readFile(join(destination, "pkg", "package.json"), "utf8"), "{}\n");
+      if (process.platform !== "win32") {
+        assert.equal((await stat(join(destination, "pkg", "dist", "cli", "index.js"))).mode & 0o777, 0o755);
+      }
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("secure extraction rejects an untrusted symbolic-link destination ancestor", {
+  skip: process.platform === "win32"
+}, async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-destination-"));
+  try {
+    const physical = join(temporary, "physical");
+    const alias = join(temporary, "alias");
+    const archive = join(temporary, "package.tar.gz");
+    await mkdir(physical);
+    await symlink(physical, alias, "dir");
+    await writeFile(archive, tarGzip([{ name: "pkg/file", data: "x" }]));
+    await assert.rejects(
+      () => extractSecureArchive(archive, join(alias, "destination"), { expectedRoot: "pkg" }),
+      /must not traverse a symbolic link or reparse point/u
+    );
+    await assert.rejects(() => access(join(physical, "destination")), { code: "ENOENT" });
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("secure archive admission rejects unsafe paths and collisions before writing", async () => {
+  const malicious: Array<{ name: string; entries: ArchiveEntry[] }> = [
+    { name: "traversal", entries: [{ name: "pkg/../outside", data: "x" }] },
+    { name: "absolute", entries: [{ name: "/pkg/file", data: "x" }] },
+    { name: "drive", entries: [{ name: "C:/pkg/file", data: "x" }] },
+    { name: "backslash", entries: [{ name: "pkg\\outside", data: "x" }] },
+    { name: "alternate data stream", entries: [{ name: "pkg/file:payload", data: "x" }] },
+    { name: "trailing dot", entries: [{ name: "pkg/alias.", data: "x" }] },
+    { name: "trailing space", entries: [{ name: "pkg/alias ", data: "x" }] },
+    { name: "reserved con", entries: [{ name: "pkg/CON", data: "x" }] },
+    { name: "reserved device extension", entries: [{ name: "pkg/aux.txt", data: "x" }] },
+    { name: "reserved numbered device", entries: [{ name: "pkg/Lpt1.log", data: "x" }] },
+    { name: "reserved superscript device", entries: [{ name: "pkg/COM¹.txt", data: "x" }] },
+    { name: "Win32 wildcard", entries: [{ name: "pkg/a?b", data: "x" }] },
+    { name: "duplicate", entries: [{ name: "pkg/file", data: "x" }, { name: "pkg/file", data: "y" }] },
+    { name: "case collision", entries: [{ name: "pkg/File", data: "x" }, { name: "pkg/file", data: "y" }] },
+    { name: "unicode collision", entries: [{ name: "pkg/café", data: "x" }, { name: "pkg/cafe\u0301", data: "y" }] },
+    { name: "unicode casefold collision", entries: [{ name: "pkg/straße", data: "x" }, { name: "pkg/STRASSE", data: "y" }] },
+    { name: "alien root", entries: [{ name: "other/file", data: "x" }] },
+    { name: "file shadow", entries: [{ name: "pkg/file", data: "x" }, { name: "pkg/file/child", data: "y" }] }
+  ];
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-paths-"));
+  try {
+    for (const format of ["zip", "tar.gz"] as const) {
+      for (const fixture of malicious) {
+        const archive = join(temporary, `${fixture.name.replaceAll(" ", "-")}.${format}`);
+        const destination = join(temporary, `output-${format}-${fixture.name.replaceAll(" ", "-")}`);
+        await writeFile(archive, format === "zip" ? zip(fixture.entries) : tarGzip(fixture.entries));
+        await assert.rejects(
+          () => extractSecureArchive(archive, destination, { expectedRoot: "pkg" }),
+          /unsafe path|duplicate|colliding|unexpected top-level|non-directory|shadows/u,
+          `${format} ${fixture.name}`
+        );
+        await assert.rejects(() => access(destination), { code: "ENOENT" });
+      }
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("secure archive admission rejects adversarial long paths in bounded time and without log amplification", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-long-path-"));
+  try {
+    const archive = join(temporary, "long-path.zip");
+    await writeFile(archive, zip([{ name: `pkg/${"/".repeat(60_000)}x`, data: "x" }]));
+    const started = performance.now();
+    const error = await inspectSecureArchive(archive, { expectedRoot: "pkg" }).then(
+      () => undefined,
+      (failure: unknown) => failure
+    );
+    const elapsed = performance.now() - started;
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /unsafe path/u);
+    assert.ok(error.message.length < 512, `unsafe path error was ${error.message.length} characters`);
+    assert.ok(elapsed < 2_000, `unsafe path rejection took ${elapsed.toFixed(1)}ms`);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("GNU long-name metadata rejects adversarial NUL runs with linear scaling and bounded diagnostics", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-gnu-long-name-"));
+  try {
+    const sizes = [30_000, 60_000, 120_000];
+    const timings: number[] = [];
+    for (const size of sizes) {
+      const archive = join(temporary, `gnu-long-name-${size}.tar.gz`);
+      const adversarialName = Buffer.concat([
+        Buffer.from("pkg/", "utf8"),
+        Buffer.alloc(size, 0),
+        Buffer.from("x", "utf8")
+      ]);
+      await writeFile(archive, tarGzip([
+        { name: "././@LongLink", type: "L", data: adversarialName },
+        { name: "placeholder", data: "x" }
+      ]));
+      const started = performance.now();
+      const error = await inspectSecureArchive(archive, { expectedRoot: "pkg" }).then(
+        () => undefined,
+        (failure: unknown) => failure
+      );
+      timings.push(performance.now() - started);
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /unsafe path/u);
+      assert.ok(error.message.length < 512, `GNU long-name error was ${error.message.length} characters`);
+    }
+    const smallest = timings[0]!;
+    const largest = timings.at(-1)!;
+    assert.ok(largest < 1_500, `120K GNU long-name rejection took ${largest.toFixed(1)}ms`);
+    assert.ok(
+      largest < Math.max(1_000, smallest * 8),
+      `GNU long-name scaling was not bounded: ${timings.map((value) => value.toFixed(1)).join(", ")}ms`
+    );
+
+    const oversized = join(temporary, "gnu-long-name-oversized.tar.gz");
+    await writeFile(oversized, tarGzip([
+      { name: "././@LongLink", type: "L", data: Buffer.alloc(2 * 1024 * 1024 + 1, 0xff) },
+      { name: "placeholder", data: "x" }
+    ]));
+    await assert.rejects(
+      () => inspectSecureArchive(oversized, { expectedRoot: "pkg" }),
+      /metadata exceeds its limit/u
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("PAX metadata stays linear across valid global headers and bounds cardinality and diagnostics", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-pax-"));
+  try {
+    const sizes = [1_000, 2_000, 4_000, 8_000];
+    const timings: number[] = [];
+    for (const size of sizes) {
+      const archive = join(temporary, `global-pax-${size}.tar.gz`);
+      const entries: ArchiveEntry[] = Array.from({ length: size }, (_, index) => ({
+        name: "pax-global",
+        type: "g",
+        data: paxRecord(`vendor.odinn.key-${index}`, "value")
+      }));
+      entries.push({ name: "pkg/file", data: "ok\n" });
+      await writeFile(archive, tarGzip(entries));
+      const started = performance.now();
+      const admitted = await inspectSecureArchive(archive, { expectedRoot: "pkg" });
+      timings.push(performance.now() - started);
+      assert.deepEqual(admitted.map((entry) => entry.name), ["pkg/file"]);
+    }
+    const smallest = timings[0]!;
+    const largest = timings.at(-1)!;
+    assert.ok(largest < 10_000, `8K valid global PAX headers took ${largest.toFixed(1)}ms`);
+    assert.ok(
+      largest < Math.max(2_500, smallest * 16),
+      `global PAX scaling was not bounded: ${timings.map((value) => value.toFixed(1)).join(", ")}ms`
+    );
+
+    const duplicateKey = "k".repeat(4_096);
+    const duplicateArchive = join(temporary, "duplicate-pax-key.tar.gz");
+    await writeFile(duplicateArchive, tarGzip([
+      {
+        name: "pax-local",
+        type: "x",
+        data: Buffer.concat([paxRecord(duplicateKey, "one"), paxRecord(duplicateKey, "two")])
+      },
+      { name: "pkg/file", data: "x" }
+    ]));
+    const duplicateError = await inspectSecureArchive(duplicateArchive, { expectedRoot: "pkg" }).then(
+      () => undefined,
+      (failure: unknown) => failure
+    );
+    assert.ok(duplicateError instanceof Error);
+    assert.match(duplicateError.message, /duplicate PAX metadata/u);
+    assert.ok(duplicateError.message.length < 512, `duplicate PAX diagnostic was ${duplicateError.message.length} characters`);
+
+    const oversizedKeyArchive = join(temporary, "oversized-pax-key.tar.gz");
+    await writeFile(oversizedKeyArchive, tarGzip([
+      { name: "pax-local", type: "x", data: paxRecord("k".repeat(4_097), "value") },
+      { name: "pkg/file", data: "x" }
+    ]));
+    await assert.rejects(
+      () => inspectSecureArchive(oversizedKeyArchive, { expectedRoot: "pkg" }),
+      /oversized PAX metadata key/u
+    );
+
+    const recordLimitArchive = join(temporary, "pax-record-limit.tar.gz");
+    await writeFile(recordLimitArchive, tarGzip([
+      {
+        name: "pax-local",
+        type: "x",
+        data: Buffer.concat(Array.from({ length: 4_097 }, (_, index) => paxRecord(`k${index}`, "v")))
+      },
+      { name: "pkg/file", data: "x" }
+    ]));
+    await assert.rejects(
+      () => inspectSecureArchive(recordLimitArchive, { expectedRoot: "pkg" }),
+      /PAX metadata exceeds its record limit/u
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("secure archive admission rejects links, devices, FIFOs, and expanded-size bombs", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "odinn-secure-archive-types-"));
+  try {
+    const tarCases: Array<{ name: string; type: string }> = [
+      { name: "symlink", type: "2" },
+      { name: "hardlink", type: "1" },
+      { name: "character-device", type: "3" },
+      { name: "block-device", type: "4" },
+      { name: "fifo", type: "6" }
+    ];
+    for (const fixture of tarCases) {
+      const archive = join(temporary, `${fixture.name}.tar.gz`);
+      await writeFile(archive, tarGzip([{ name: "pkg/unsafe", type: fixture.type }]));
+      await assert.rejects(
+        () => inspectSecureArchive(archive, { expectedRoot: "pkg" }),
+        /symbolic or hard link|device, FIFO, socket/u,
+        fixture.name
+      );
+    }
+
+    const zipCases = [
+      { name: "symlink", mode: 0o120777 },
+      { name: "character-device", mode: 0o020600 },
+      { name: "fifo", mode: 0o010600 }
+    ];
+    for (const fixture of zipCases) {
+      const archive = join(temporary, `${fixture.name}.zip`);
+      await writeFile(archive, zip([{ name: "pkg/unsafe", mode: fixture.mode }]));
+      await assert.rejects(
+        () => inspectSecureArchive(archive, { expectedRoot: "pkg" }),
+        /symbolic or hard link|device, FIFO, socket/u,
+        fixture.name
+      );
+    }
+
+    for (const format of ["zip", "tar.gz"] as const) {
+      const archive = join(temporary, `bomb.${format}`);
+      const entries = [
+        { name: "pkg/one", data: Buffer.alloc(16) },
+        { name: "pkg/two", data: Buffer.alloc(16) }
+      ];
+      await writeFile(archive, format === "zip" ? zip(entries) : tarGzip(entries));
+      await assert.rejects(
+        () => inspectSecureArchive(archive, { expectedRoot: "pkg", maximumEntryBytes: 20, maximumExpandedBytes: 31 }),
+        /expanded-size limit/u
+      );
+    }
+
+    const paddedTar = join(temporary, "inflated-padding.tar.gz");
+    const admittedTar = gunzipSync(tarGzip([{ name: "pkg/file", data: "x" }]));
+    await writeFile(paddedTar, gzipSync(Buffer.concat([admittedTar, Buffer.alloc(64 * 1024)]), { level: 9, mtime: 0 }));
+    await assert.rejects(
+      () => inspectSecureArchive(paddedTar, {
+        expectedRoot: "pkg",
+        maximumEntries: 2,
+        maximumEntryBytes: 16,
+        maximumExpandedBytes: 16
+      }),
+      /inflated-stream limit/u
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+function tarGzip(entries: ArchiveEntry[]): Buffer {
+  const blocks: Buffer[] = [];
+  for (const entry of entries) {
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data ?? "");
+    const header = Buffer.alloc(512);
+    header.write(entry.name, 0, 100, "utf8");
+    writeOctal(header, 100, 8, entry.mode ?? (entry.type === "5" ? 0o755 : 0o644));
+    writeOctal(header, 108, 8, 0);
+    writeOctal(header, 116, 8, 0);
+    writeOctal(header, 124, 12, data.length);
+    writeOctal(header, 136, 12, 0);
+    header.fill(0x20, 148, 156);
+    header.write(entry.type ?? "0", 156, 1, "ascii");
+    header.write("ustar\0", 257, 6, "binary");
+    header.write("00", 263, 2, "ascii");
+    let checksum = 0;
+    for (const byte of header) checksum += byte;
+    header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148, 8, "ascii");
+    blocks.push(header, data, Buffer.alloc((512 - (data.length % 512)) % 512));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return gzipSync(Buffer.concat(blocks), { level: 9, mtime: 0 });
+}
+
+function writeOctal(buffer: Buffer, offset: number, length: number, value: number): void {
+  buffer.write(`${value.toString(8).padStart(length - 1, "0")}\0`, offset, length, "ascii");
+}
+
+function paxRecord(key: string, value: string): Buffer {
+  const body = ` ${key}=${value}\n`;
+  let length = Buffer.byteLength(body, "utf8") + 1;
+  for (;;) {
+    const next = Buffer.byteLength(String(length), "ascii") + Buffer.byteLength(body, "utf8");
+    if (next === length) return Buffer.from(`${length}${body}`, "utf8");
+    length = next;
+  }
+}
+
+function zip(entries: ArchiveEntry[]): Buffer {
+  const local: Buffer[] = [];
+  const central: Buffer[] = [];
+  let localOffset = 0;
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name, "utf8");
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data ?? "");
+    const crc = crc32(data);
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0x800, 6);
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(data.length, 18);
+    localHeader.writeUInt32LE(data.length, 22);
+    localHeader.writeUInt16LE(name.length, 26);
+    local.push(localHeader, name, data);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE((3 << 8) | 20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0x800, 8);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(data.length, 20);
+    centralHeader.writeUInt32LE(data.length, 24);
+    centralHeader.writeUInt16LE(name.length, 28);
+    centralHeader.writeUInt32LE(((entry.mode ?? 0o100644) << 16) >>> 0, 38);
+    centralHeader.writeUInt32LE(localOffset, 42);
+    central.push(centralHeader, name);
+    localOffset += localHeader.length + name.length + data.length;
+  }
+  const centralBytes = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralBytes.length, 12);
+  end.writeUInt32LE(localOffset, 16);
+  return Buffer.concat([...local, centralBytes, end]);
+}
+
+const CRC_TABLE = Array.from({ length: 256 }, (_, value) => {
+  let crc = value;
+  for (let bit = 0; bit < 8; bit += 1) crc = (crc & 1) !== 0 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  return crc >>> 0;
+});
+
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = CRC_TABLE[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "version": "24.19.0",
+  "origin": "https://nodejs.org",
+  "signedManifest": {
+    "path": "SHASUMS256.txt.asc",
+    "bytes": 3245,
+    "sha256": "88c7160b8d81c81bbbba7e3bd0bba88917b1e6a2e47e092044f43894a09ceb83",
+    "cleartextSha256": "34b6cad58e954a2d5a68f7ec6a17e86b3860d58b5478709f09444c92716f633f"
+  },
+  "keyring": {
+    "url": "https://raw.githubusercontent.com/nodejs/release-keys/890d535527789c9ebccdccdafd708f60dbd56786/gpg-only-active-keys/pubring.kbx",
+    "bytes": 24268,
+    "sha256": "8e6f89521a0694e445f42decd022f48369c634f1b5bcb5975135b69c88629ae8",
+    "allowedPrimaryFingerprints": [
+      "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+      "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7",
+      "CC68F5A3106FF448322E48ED27F5E38D5B0A215F",
+      "8FCCA13FEF1D0C2E91008E09770F7A9A5AE15600",
+      "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4",
+      "C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C",
+      "108F52B48DB57BB0CC439B2997B01419BD92F80A",
+      "655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD",
+      "A363A499291CBBC940DD62E41F10027AF002F8B0"
+    ]
+  },
+  "targets": {
+    "linux-x64": {
+      "archive": "node-v24.19.0-linux-x64.tar.xz",
+      "bytes": 31633904,
+      "sha256": "14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647",
+      "nodePath": "bin/node",
+      "executableBytes": 125989464,
+      "executableSha256": "bc17c508ffeed0ec622934f9b7fa72f8e78da65350e63c3eceb56fa688aa5e12"
+    },
+    "darwin-x64": {
+      "archive": "node-v24.19.0-darwin-x64.tar.gz",
+      "bytes": 53439583,
+      "sha256": "d1b5e999db158c62fe8f7267a4476b035d8bd93b1a605bac24a3f0dd166e3316",
+      "nodePath": "bin/node",
+      "executableBytes": 123666640,
+      "executableSha256": "1052eb9c7d6c60a79b968e09f75af55a73462b0f6dff0964336d63b5e13eb63c"
+    },
+    "win32-x64": {
+      "archive": "node-v24.19.0-win-x64.zip",
+      "bytes": 37304352,
+      "sha256": "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73",
+      "nodePath": "node.exe",
+      "executableBytes": 92825416,
+      "executableSha256": "3602f2bb1a10f2cbab4c36886218a33c1ab3db87290e73b033c46c77147d0237"
+    }
+  }
+}
