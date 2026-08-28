@@ -212,7 +212,6 @@ test("ordinary Windows startup reconciles a power-loss activation with the candi
       .find((name) => /^odinn\.[0-9a-f-]{36}\.cmd$/iu.test(name));
     assert.ok(generationName);
     const generationPath = join(fixture.prefix, "bin", generationName);
-    const generationBefore = await lstat(generationPath);
     const generationBytes = await readFile(generationPath, "utf8");
     const powershellIndex = generationBytes.indexOf("C:\\Windows\\System32\\WindowsPowerShell");
     assert.ok(powershellIndex > 0);
@@ -267,10 +266,7 @@ Export-ModuleMember -Function Get-FileHash
     const settled = JSON.parse(await readFile(join(fixture.prefix, "install-state.json"), "utf8"));
     assert.equal(settled.currentVersion, "1.0.0");
     assert.equal((await readFile(join(fixture.prefix, "current"), "utf8")).split(/\r?\n/u)[0], settled.current);
-    const generationAfter = await lstat(generationPath);
-    if (generationBefore.ino !== 0 && generationAfter.ino !== 0) {
-      assert.equal(generationAfter.ino, generationBefore.ino, "equal generation bytes must preserve the physical file");
-    }
+    await assert.rejects(() => lstat(generationPath), { code: "ENOENT" });
   } finally {
     waitingParent.kill();
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 750));
