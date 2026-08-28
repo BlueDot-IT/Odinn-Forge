@@ -1147,7 +1147,7 @@ async function createStandaloneRelease(
   const artifactBytes = await readFile(artifact);
   const artifactSha256 = createHash("sha256").update(artifactBytes).digest("hex");
   const archiveSha256ByName: Record<string, string> = {};
-  const standaloneArtifacts = ["darwin-x64", "linux-x64", "win32-x64"].map((matrixTarget, index) => {
+  const standaloneArtifacts = ["darwin-x64", "darwin-arm64", "linux-x64", "win32-x64"].map((matrixTarget, index) => {
     const name = `odinn-v${version}-standalone-${matrixTarget}.${matrixTarget === "win32-x64" ? "zip" : "tar.gz"}`;
     const selected = matrixTarget === target;
     const sha256 = selected ? artifactSha256 : String(index + 3).repeat(64);
