@@ -43,7 +43,7 @@ test("SQLite audit run queries reach records beyond the legacy operator window",
 test("SQLite audit append serializes independent writer processes", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "odinn-audit-processes-")); t.after(() => rm(root, { recursive: true, force: true })); const path = join(root, "audit.sqlite"); const keys = join(root, "keys.json"); const worker = fileURLToPath(new URL("../scripts/ci/audit-soak-worker.ts", import.meta.url));
   const run = (id: number) => new Promise<void>((resolve, reject) => { const child = spawn(process.execPath, [worker, path, keys, String(id), "25"], { stdio: ["ignore", "ignore", "pipe"] }); let error = ""; child.stderr.on("data", (chunk) => { error += chunk; }); child.on("error", reject); child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(error))); });
-  await Promise.all([run(1), run(2), run(3), run(4)]); const store = new SqliteAuditStore(path, { keyringPath: keys }); assert.equal((await store.readAll()).length, 100); assert.equal((await store.verifyIntegrity({ allowUnsigned: false })).valid, true); store.close();
+  await Promise.all([run(1), run(2), run(3), run(4)]); const store = new SqliteAuditStore(path, { keyringPath: keys }); assert.equal((await store.readAll()).length, 100); assert.equal((await store.verifyIntegrity({ allowUnsigned: false })).valid, true); assert.equal((store.db.prepare("PRAGMA journal_mode").get() as any).journal_mode, "wal"); assert.equal((store.db.prepare("PRAGMA busy_timeout").get() as any).timeout, 30_000); store.close();
 });
 
 test("subscriber cursor is monotonic and cross-instance notifications wake bounded drains", async (t) => {
