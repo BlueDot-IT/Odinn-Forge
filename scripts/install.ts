@@ -1012,7 +1012,8 @@ function installedWindowsTrampoline(generationName: string): string {
   }
   // CALL is required for reliable batch-to-batch transfer; explicitly return
   // the nested launcher's status to the original console.
-  return `@echo off\r\ncall "%~dp0${generationName}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
+  const batchCall = "call ";
+  return `@echo off\r\n${batchCall}"%~dp0${generationName}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
 }
 
 async function assertSafeWindowsTrampolineReplacement(
