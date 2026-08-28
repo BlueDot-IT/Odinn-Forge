@@ -89,8 +89,7 @@ test("Rune Key admits an exact Discord approval continuation once without exposi
   const exactExecutionInput = {
     accountId: input.accountId,
     channelId: input.channelId,
-    content: input.content,
-    capabilityToken: input.capabilityToken
+    content: input.content
   };
   const options = {
     auditStore,
@@ -111,7 +110,7 @@ test("Rune Key admits an exact Discord approval continuation once without exposi
   const persisted = await readFile(approvalPath, "utf8");
   assert.equal(persisted.includes(issued.token), false);
   assert.equal(JSON.stringify(approvalStore.list()).includes(issued.token), false);
-  assert.match(persisted, /"capabilityToken": "\[redacted\]"/u);
+  assert.equal(persisted.includes("capabilityToken"), false);
 
   const approvalId = first.output.approvalId as string;
   assert.ok(approvalStore.claim(approvalId));
@@ -317,6 +316,7 @@ test("Rune Key admits an exact process approval continuation while rejecting mis
   assert.deepEqual(second.output, { exitCode: 0, command: "/bin/true" });
   assert.equal(dispatches, 1);
   assert.equal(dispatchedProcessInput?.confirmed, "exact-process-input");
+  assert.equal("capabilityToken" in (dispatchedProcessInput ?? {}), false);
   assert.equal(runtime.capabilities.list(runId)[0].status, "consumed");
   assert.deepEqual(runtime.ledger.listExecutionAttempts(runId).map((attempt: any) => attempt.state), ["completed"]);
 

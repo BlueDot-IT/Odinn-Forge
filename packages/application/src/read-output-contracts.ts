@@ -444,6 +444,16 @@ export interface RemoteNodeReadDiagnosticV1 {
   readonly tlsVerificationRequired: true;
 }
 
+export interface ComputerDiagnosticV1 {
+  readonly status: "disabled" | "invalid" | "unavailable" | "configured";
+  readonly enabled: boolean;
+  readonly backend: "macos-local";
+  readonly reason?: "configuration-invalid" | "platform-unsupported" | "system-tools-unavailable";
+  readonly target?: Readonly<{ nodeId: string; displayId: string }>;
+  readonly permissions?: string;
+  readonly secretsExcluded: true;
+}
+
 /** Versioned, explicitly redacted diagnostics read model. */
 export interface DiagnosticsReportV1 {
   readonly ok: boolean;
@@ -464,6 +474,7 @@ export interface DiagnosticsReportV1 {
   readonly processRecovery: ProcessRecoveryDiagnosticV1;
   readonly githubRead?: GitHubReadDiagnosticV1;
   readonly microsoftGraphRead?: MicrosoftGraphReadDiagnosticV1;
+  readonly computer?: ComputerDiagnosticV1;
   readonly telemetry?: TelemetryStatusSummaryV1;
   readonly remoteNodeRead?: RemoteNodeReadDiagnosticV1;
   readonly state: DiagnosticStateSummaryV1;
@@ -526,6 +537,9 @@ function allowKnownReadContractSensitiveField({
   }
   if (key === "secretReferences" && path === "diagnostics report.sandbox.configured") {
     return Number.isSafeInteger(value) && Number(value) >= 0;
+  }
+  if (key === "secretsExcluded" && path === "diagnostics report.computer") {
+    return value === true;
   }
   return key === "secretsExcludedFromDiagnostics"
     && path === "diagnostics report.state"
@@ -636,7 +650,7 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
   object(
     input,
     "diagnostics report",
-    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "microsoftGraphRead", "telemetry", "remoteNodeRead", "state"],
+    ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserEngine", "browserRecovery", "jobs", "sandbox", "processRecovery", "githubRead", "microsoftGraphRead", "computer", "telemetry", "remoteNodeRead", "state"],
     ["ok", "command", "version", "commit", "platform", "providerMode", "coreAdvanced", "experimental", "channels", "audit", "approvals", "browserRecovery", "jobs", "sandbox", "processRecovery", "state"]
   );
   bool(input.ok, "diagnostics report.ok");
@@ -682,6 +696,25 @@ function assertDiagnosticsReportV1(input: JsonObject): DiagnosticsReportV1 {
     bool(graph.emailEnabled, "diagnostics report.microsoftGraphRead.emailEnabled"); bool(graph.calendarEnabled, "diagnostics report.microsoftGraphRead.calendarEnabled");
     literal(graph.endpoint, "diagnostics report.microsoftGraphRead.endpoint", "graph.microsoft.com"); literal(graph.readOnly, "diagnostics report.microsoftGraphRead.readOnly", true); literal(graph.mutationsAvailable, "diagnostics report.microsoftGraphRead.mutationsAvailable", false); literal(graph.redirectsAllowed, "diagnostics report.microsoftGraphRead.redirectsAllowed", false);
     if (![0, 1].includes(Number(graph.accountCount))) throw new ApplicationContractValidationError("diagnostics report.microsoftGraphRead.accountCount must be 0 or 1");
+  }
+  if (input.computer !== undefined) {
+    const computer = object(input.computer, "diagnostics report.computer", ["status", "enabled", "backend", "reason", "target", "permissions", "secretsExcluded"], ["status", "enabled", "backend", "secretsExcluded"]);
+    oneOf(computer.status, "diagnostics report.computer.status", ["disabled", "invalid", "unavailable", "configured"]);
+    bool(computer.enabled, "diagnostics report.computer.enabled");
+    literal(computer.backend, "diagnostics report.computer.backend", "macos-local");
+    if (computer.reason !== undefined) oneOf(computer.reason, "diagnostics report.computer.reason", ["configuration-invalid", "platform-unsupported", "system-tools-unavailable"]);
+    if (computer.target !== undefined) {
+      const target = object(computer.target, "diagnostics report.computer.target", ["nodeId", "displayId"]);
+      text(target.nodeId, "diagnostics report.computer.target.nodeId");
+      text(target.displayId, "diagnostics report.computer.target.displayId");
+    }
+    optionalText(computer.permissions, "diagnostics report.computer.permissions");
+    literal(computer.secretsExcluded, "diagnostics report.computer.secretsExcluded", true);
+    const coherent = (computer.status === "disabled" && computer.enabled === false && computer.reason === undefined && computer.target === undefined)
+      || (computer.status === "invalid" && computer.enabled === false && computer.reason === "configuration-invalid" && computer.target === undefined)
+      || (computer.status === "unavailable" && computer.enabled === true && ["platform-unsupported", "system-tools-unavailable"].includes(String(computer.reason)) && computer.target === undefined)
+      || (computer.status === "configured" && computer.enabled === true && computer.reason === undefined && computer.target !== undefined && computer.permissions !== undefined);
+    if (!coherent) throw new ApplicationContractValidationError("diagnostics report.computer fields are inconsistent");
   }
   if (input.telemetry !== undefined) validateTelemetryStatus(input.telemetry, "diagnostics report.telemetry");
   if (input.remoteNodeRead !== undefined) {

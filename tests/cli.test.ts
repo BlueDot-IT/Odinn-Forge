@@ -21,6 +21,7 @@ test("CLI advanced help exposes documented safety controls", () => {
     "doctor [--state .odinn]",
     "sessions [--limit 20] [--state .odinn]",
     "config self-improvement set",
+    "config computer enable",
     "--interval-ms <ms>",
     "--max-changes <count>",
     "--workspace <directory>",
@@ -615,6 +616,48 @@ test("CLI exposes explicit security posture controls", async () => {
   assert.equal(restore.status, 0, restore.stderr || restore.stdout);
   assert.equal(JSON.parse(await readFile(join(state, "config.json"), "utf8")).policy.security.browser.requireApproval, true);
   assert.doesNotMatch(restore.stderr, /impact confirmation required/i);
+});
+
+test("CLI computer onboarding is explicit, least-privilege, and safely diagnosed", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-computer-"));
+  const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
+
+  const refused = spawnSync("node", ["apps/cli/src/cli.ts", "config", "computer", "enable", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /impact confirmation required for desktop-mutation/u);
+
+  const enabled = spawnSync("node", [
+    "apps/cli/src/cli.ts", "config", "computer", "enable",
+    "--node-id", "studio", "--display-id", "display-2", "--confirm-impact", "--state", state
+  ], { cwd: root, encoding: "utf8" });
+  assert.equal(enabled.status, 0, enabled.stderr || enabled.stdout);
+  const enabledOutput = JSON.parse(enabled.stdout);
+  assert.equal(enabledOutput.computer.backend, "macos-local");
+  assert.equal(enabledOutput.diagnostic.status, process.platform === "darwin" ? "configured" : "unavailable");
+  const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
+  assert.deepEqual(config.integrations.computer, { enabled: true, backend: "macos-local", nodeId: "studio", displayId: "display-2" });
+  assert.ok(config.policy.allowedCapabilities.includes("computer.read"));
+  assert.ok(config.policy.allowedCapabilities.includes("computer.mutate"));
+  assert.equal("executable" in config.integrations.computer, false);
+  assert.equal("secret" in config.integrations.computer, false);
+
+  const show = spawnSync("node", ["apps/cli/src/cli.ts", "config", "computer", "show", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(show.status, 0, show.stderr || show.stdout);
+  assert.doesNotMatch(show.stdout, new RegExp(state.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const doctor = spawnSync("node", ["apps/cli/src/cli.ts", "doctor", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(doctor.status, 0, doctor.stderr || doctor.stdout);
+  const diagnostic = JSON.parse(doctor.stdout).computer;
+  assert.equal(diagnostic.enabled, true);
+  assert.equal(diagnostic.secretsExcluded, true);
+  if (process.platform !== "darwin") assert.deepEqual(diagnostic, { status: "unavailable", enabled: true, backend: "macos-local", reason: "platform-unsupported", secretsExcluded: true });
+
+  const disabled = spawnSync("node", ["apps/cli/src/cli.ts", "config", "computer", "disable", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(disabled.status, 0, disabled.stderr || disabled.stdout);
+  const after = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
+  assert.equal(after.integrations.computer.enabled, false);
+  assert.equal(after.policy.allowedCapabilities.includes("computer.read"), false);
+  assert.equal(after.policy.allowedCapabilities.includes("computer.mutate"), false);
 });
 
 test("CLI status preserves its stable JSON contract through the application boundary", async () => {

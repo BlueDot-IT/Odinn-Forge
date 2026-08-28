@@ -1,6 +1,6 @@
 # Odinn Forge plugin system
 
-_Status: design baseline plus the first shipped host-capability seam._
+_Status: design baseline plus shipped browser, macOS computer-control, and read-only provider seams._
 
 This document defines the boundary for plugins that give Ódinn Forge access to
 the browser, a local desktop, or external services such as email. The browser
@@ -8,6 +8,10 @@ host-capability seam, conditional `computer.screen` node-host contract,
 conditional read-only email provider contract, and authenticated two-tool
 remote-node read contract are shipped; computer mutation and a concrete email
 provider remain design targets until their adapters and security tests land.
+host-capability seam, disabled-by-default local macOS `computer.screen` and
+`computer.act` adapter, conditional read-only email provider contract, and
+authenticated two-tool remote-node read contract are shipped. Other desktop
+platforms and email mutation remain later slices.
 
 ## Decision summary
 
@@ -182,12 +186,14 @@ host contract exposes two tools:
 - `computer.act` — click, type, key, pointer, scroll, and bounded wait.
 
 The shipped `computer.screen` contract uses `computer.read` and becomes
-available only when the host supplies a paired, target-bound node provider. It
-does not include an OS capture backend or pairing UI. `computer.act` must:
+available only when the operator explicitly enables a paired, target-bound
+provider. The concrete local macOS backend is configured through
+`odinn config computer`; it invokes only fixed, root-owned Apple system
+executables and accepts no driver path or shell from configuration or model
+input. `computer.act`:
 
 1. bind coordinates to the exact frame ID returned by `computer.screen`;
-2. route through a paired host/node broker rather than an arbitrary child
-   process;
+2. route through the paired provider rather than an arbitrary child process;
 3. require explicit approval for input actions by default;
 4. return an after-action frame or a categorical uncertain-outcome result;
 5. never accept a raw driver path, shell command, or ambient desktop session
@@ -197,7 +203,10 @@ The provider target and pairing generation are host-owned resource bindings,
 not model-selected input. Live pixels may be returned to the requesting model,
 but durable audit/ledger projections retain only frame metadata and an image
 digest; completed-run replay cannot recreate the pixels. Registry activation
-also requires explicit `enableComputerScreen` opt-in.
+also requires explicit configuration, `computer.read` and `computer.mutate`
+policy grants, and an exact impact confirmation. On macOS, Screen Recording
+and Accessibility permissions remain operating-system gates. Linux and
+Windows return a path-free unavailable diagnostic.
 
 This follows the useful OpenClaw split between a model-facing computer tool,
 screen capture, and a dangerous node-host command while keeping Forge's
@@ -313,12 +322,12 @@ The following are non-negotiable for every plugin:
 2. **Browser adapter seam (shipped):** model the current browser manager as a
    host-capability provider and prove registry/approval/recovery behavior is
    unchanged.
-3. **Computer read path (contract shipped):** add a paired-node screen broker
-   and `computer.screen` only. Validate frame identity, image bounds, cleanup,
-   and operator status. Forge activates the tool only when that provider is
-   supplied; it does not use ambient desktop access as a fallback.
-4. **Computer mutation path:** add `computer.act` with approval, after-frame,
-   timeout, and needs-review recovery semantics.
+3. **Computer read path (shipped for local macOS):** the paired screen provider
+   validates frame identity, image bounds, cleanup, executable trust, and
+   operator status. Forge never uses an ambient or configured driver fallback.
+4. **Computer mutation path (shipped for local macOS):** `computer.act` uses
+   exact approval, after-frame capture, timeout, cancellation, and durable
+   `needs-review` recovery semantics. Other platforms remain unavailable.
 5. **Email/calendar read path (shipped, experimental):** the Microsoft Graph
    adapter provides one-account, credential-reference-only, bounded reads
    without sending mail or mutating calendars. Live tenant behavior remains

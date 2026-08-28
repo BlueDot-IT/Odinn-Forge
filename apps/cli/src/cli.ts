@@ -10,7 +10,7 @@ import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateOperatorIdentifierV1, validateOperatorSnapshotResponseV1, validateRuntimeSecuritySummaryV1, type CliStatusSnapshotV1, type DiagnosticsReportV1, type OperatorSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, diagnoseGitHubReadIntegration, diagnoseMicrosoftGraphReadIntegration, diagnoseRemoteNodeReadIntegration, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeMicrosoftGraphReadConfig, normalizeModelConfig, normalizeRemoteNodeReadConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeChromiumEngine, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteOperatorReadStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, diagnoseGitHubReadIntegration, diagnoseMacOSComputerIntegration, diagnoseMicrosoftGraphReadIntegration, diagnoseRemoteNodeReadIntegration, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeMacOSComputerConfig, normalizeMicrosoftGraphReadConfig, normalizeModelConfig, normalizeRemoteNodeReadConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeChromiumEngine, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteOperatorReadStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { createCliReadCommandContext } from "./application-context.ts";
@@ -144,6 +144,13 @@ const DANGEROUS_IMPACT_SUMMARIES = Object.freeze({
     approvals: "The browser approval gate, stale-snapshot checks, recovery journal, and egress policy remain active. An interrupted action blocks subsequent mutations until resolved.",
     rollback: "Odinn can block and document uncertain outcomes, but it cannot guarantee reversal of remote changes, purchases, messages, or other external effects.",
     audit: "The audit journal and browser-recovery journal retain the action decision and recovery record; prompts, cookies, and tokens are not included in the summary."
+  },
+  "desktop-mutation": {
+    title: "Local macOS desktop control impact summary",
+    authority: "Allows Odinn to capture the explicitly configured local macOS display and send bounded click, pointer, scroll, keyboard, and text actions through fixed Apple system executables.",
+    approvals: "Every desktop mutation remains bound to the exact captured frame and requires an exact approval. Stale frames, rotated pairings, unresolved outcomes, unsupported platforms, and untrusted executables fail closed.",
+    rollback: "Disable the computer integration to remove future authority. Odinn can quarantine uncertain actions for operator resolution, but it cannot reverse input already delivered to another application.",
+    audit: "Audit and recovery records retain categorical action, target, frame digests, and outcome state; screenshots, typed text, key values, and pixels are excluded from durable projections."
   },
   "experimental-replay": {
     title: "Experimental replay and restore impact summary",
@@ -409,6 +416,9 @@ function usage() {
   odinn config integration enable|disable|remove microsoft-graph [--confirm-impact] [--state .odinn]
   odinn config security show [--state .odinn]
   odinn config security set --surface web|browser [--enabled true|false] [--allow-private-network true|false] [--allowed-domains a,b] [--blocked-domains a,b] [--require-approval true|false] [--confirm-impact] [--state .odinn]
+  odinn config computer show [--state .odinn]
+  odinn config computer enable [--node-id <id>] [--display-id <id>] --confirm-impact [--state .odinn]
+  odinn config computer disable [--state .odinn]
   odinn config experimental show [--state .odinn]
   odinn config experimental enable|disable <feature> [--confirm-impact] [--state .odinn]
   odinn experimental help [proof|sentinel|capabilities|rewind|capsules|counterfactual|darwin|self-improvement]
@@ -1536,6 +1546,7 @@ async function readDoctorDiagnostics(args: any): Promise<DiagnosticsReportV1> {
     githubRead: diagnoseGitHubReadIntegration(config?.integrations?.github ?? {}),
     microsoftGraphRead: diagnoseMicrosoftGraphReadIntegration(config?.integrations?.microsoftGraph ?? {}),
     remoteNodeRead: diagnoseRemoteNodeReadIntegration(config?.integrations?.remoteNode ?? {}),
+    computer: diagnoseMacOSComputerIntegration(config?.integrations?.computer),
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: !isPhysicalPathInside(invocationRoot(), state), secretsExcludedFromDiagnostics: true }
   };
 }
@@ -1805,11 +1816,41 @@ function providerVerificationTimeoutMs(requested = "") {
 
 async function configCommand(args: any) {
   const [section, subcommand, ...rest] = args;
-  if (!["provider", "model", "channel", "integration", "security", "experimental", "self-improvement"].includes(section)) {
-    throw new Error("config requires provider, model, channel, integration, security, experimental, or self-improvement");
+  if (!["provider", "model", "channel", "integration", "security", "experimental", "self-improvement", "computer"].includes(section)) {
+    throw new Error("config requires provider, model, channel, integration, security, experimental, self-improvement, or computer");
   }
   const state = stateDir(rest);
   const config = await readConfig(state);
+  if (section === "computer") {
+    if (config.integrations !== undefined && (!config.integrations || typeof config.integrations !== "object" || Array.isArray(config.integrations))) {
+      throw new Error("config integrations must be an object");
+    }
+    const current = normalizeMacOSComputerConfig(config.integrations?.computer);
+    if (subcommand === "show" || !subcommand) {
+      await printJson({ computer: current, diagnostic: diagnoseMacOSComputerIntegration(current) });
+      return;
+    }
+    if (subcommand !== "enable" && subcommand !== "disable") throw new Error("config computer requires show, enable, or disable");
+    if (subcommand === "enable") requireImpactConfirmation(rest, "desktop-mutation");
+    const computer = normalizeMacOSComputerConfig({
+      enabled: subcommand === "enable",
+      backend: "macos-local",
+      nodeId: option(rest, "--node-id", current.nodeId),
+      displayId: option(rest, "--display-id", current.displayId)
+    });
+    config.integrations = { ...(config.integrations ?? {}), computer };
+    const currentPolicy = createDefaultPolicy(config.policy);
+    const desktopCapabilities = new Set(["computer.read", "computer.mutate"]);
+    config.policy = createDefaultPolicy({
+      ...currentPolicy,
+      allowedCapabilities: subcommand === "enable"
+        ? [...new Set([...currentPolicy.allowedCapabilities, ...desktopCapabilities])]
+        : currentPolicy.allowedCapabilities.filter((capability) => !desktopCapabilities.has(capability))
+    });
+    await saveConfig(state, config);
+    await printJson({ ok: true, computer, diagnostic: diagnoseMacOSComputerIntegration(computer) });
+    return;
+  }
   if (section === "channel") {
     config.channels ??= {};
     if (subcommand === "list" || !subcommand) {

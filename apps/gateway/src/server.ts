@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, diagnoseGitHubReadIntegration, diagnoseMicrosoftGraphReadIntegration, diagnoseRemoteNodeReadIntegration, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isLiveOnlyAutomationTool, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeGitHubReadConfig, normalizeMicrosoftGraphReadConfig, normalizeMcpConfiguration, normalizeModelConfig, normalizeRemoteNodeReadConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, projectDurableToolInput, ProjectContextService, probeChromiumEngine, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, diagnoseGitHubReadIntegration, diagnoseMacOSComputerIntegration, diagnoseMicrosoftGraphReadIntegration, diagnoseRemoteNodeReadIntegration, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isLiveOnlyAutomationTool, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeGitHubReadConfig, normalizeMacOSComputerConfig, normalizeMicrosoftGraphReadConfig, normalizeMcpConfiguration, normalizeModelConfig, normalizeRemoteNodeReadConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, projectDurableToolInput, ProjectContextService, probeChromiumEngine, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -50,6 +50,11 @@ const SKILL_DISCOVERY_MAX_BYTES = MAX_BOUNDED_UTF8_BYTES;
 const PUBLIC_DIR = fileURLToPath(new URL(compiledRuntime ? "./public/" : "../public/", import.meta.url));
 const PACKAGE_FILE = fileURLToPath(new URL(compiledRuntime ? "../../package.json" : "../../../package.json", import.meta.url));
 const INSTALL_METADATA_FILE = fileURLToPath(new URL(compiledRuntime ? "../../install-metadata.json" : "../../../install-metadata.json", import.meta.url));
+const DURABLE_EXECUTION_TOOLS = new Set(["process.exec", "agent.delegate", "mcp.invoke", "computer.act"]);
+
+export function requiresGatewayDurableExecution(tool: unknown): boolean {
+  return typeof tool === "string" && DURABLE_EXECUTION_TOOLS.has(tool);
+}
 
 async function productVersion() {
   try {
@@ -1168,7 +1173,13 @@ export async function createGatewayServer(options: any = {}) {
     ? approvalStore.revokeAsync(id, { signal })
     : Promise.resolve(approvalStore.revoke(id, { signal }));
 
-  const recoverGatewayApprovalContinuation = async (id: string, pending: any, linkedTask: Record<string, unknown> | undefined, signal?: AbortSignal) => {
+  const recoverGatewayApprovalContinuation = async (
+    id: string,
+    pending: any,
+    linkedTask: Record<string, unknown> | undefined,
+    signal?: AbortSignal,
+    capabilityToken?: string
+  ) => {
     const recovered = await recoverGatewayApproval(id, signal);
     const runId = String(pending?.runId ?? "");
     const tool = String(pending?.tool ?? "");
@@ -1192,7 +1203,10 @@ export async function createGatewayServer(options: any = {}) {
     return {
       runId,
       tool,
-      input: input as Record<string, unknown>,
+      input: {
+        ...input as Record<string, unknown>,
+        ...(capabilityToken ? { capabilityToken } : {})
+      },
       actor: recoveredActor || linkedActor || "local"
     };
   };
@@ -1217,7 +1231,7 @@ export async function createGatewayServer(options: any = {}) {
         const requestSignal = signal;
         let result: unknown;
         try {
-          result = await supervisor.runApproval(linkedJob.id, async ({ signal: approvalSignal, job, markDispatched }) => {
+          result = await supervisor.runApproval(linkedJob.id, async ({ signal: approvalSignal, job, markDispatched, capabilityToken }) => {
             claimedLinkedJob = job;
             const signal = requestSignal
               ? AbortSignal.any([requestSignal, approvalSignal])
@@ -1246,7 +1260,7 @@ export async function createGatewayServer(options: any = {}) {
             const linkedTask = job.payload?.task && typeof job.payload.task === "object" && !Array.isArray(job.payload.task)
               ? job.payload.task as Record<string, unknown>
               : undefined;
-            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask, signal);
+            const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask, signal, capabilityToken);
             markDispatched();
             await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
             assertGatewayRequestActive(signal);
@@ -1291,7 +1305,7 @@ export async function createGatewayServer(options: any = {}) {
       const result = await isolatedTaskExecutor({
         approvalId: id,
         approvalRunId: continuation.runId,
-        durableExecution: continuation.tool === "process.exec" || continuation.tool === "mcp.invoke",
+        durableExecution: requiresGatewayDurableExecution(continuation.tool),
         task: {
           id: continuation.runId,
           tool: continuation.tool,
@@ -1647,7 +1661,7 @@ export async function createGatewayServer(options: any = {}) {
     const id = channelExecutionKey ?? (body.id || idempotencyKey || undefined);
     const requestHash = hashRequest(delegation ? { ...body, delegation } : body);
     const scopedPayloadBase = scopedJobPayload({
-      durableExecution: task.tool === "process.exec" || task.tool === "agent.delegate" || task.tool === "mcp.invoke",
+      durableExecution: requiresGatewayDurableExecution(task.tool),
       ...(parentCapabilities ? { parentCapabilities } : {}),
       ...(delegation ? { delegation } : {}),
       ...(typeof body.executionKey === "string" ? { executionKey: body.executionKey } : {}),
@@ -3749,6 +3763,9 @@ function validateHostedProviderConfig(config: any) {
   }
   if (config?.integrations?.remoteNode?.enabled === true) {
     throw new GatewayError(400, "multi-user host does not allow shared remote node credentials");
+  if (config?.integrations?.computer?.enabled === true) {
+    throw new GatewayError(400, "multi-user host does not allow shared local computer control");
+  }
   }
   for (const [name, provider] of Object.entries(config?.providers ?? {}) as Array<[string, any]>) {
     const auth = provider?.auth && typeof provider.auth === "object" && !Array.isArray(provider.auth) ? provider.auth : {};
@@ -3886,6 +3903,10 @@ function validateGatewayConfig(config: any) {
     if (config.integrations.remoteNode !== undefined) {
       try { normalizeRemoteNodeReadConfig(config.integrations.remoteNode); }
       catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.integrations.remoteNode is invalid"); }
+    }
+    if (config.integrations.computer !== undefined) {
+      try { normalizeMacOSComputerConfig(config.integrations.computer); }
+      catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.integrations.computer is invalid"); }
     }
   }
   try { normalizeMcpConfiguration(config.mcp); }
@@ -4688,6 +4709,7 @@ async function diagnostics({ state, workspaceRoot, config, featureFlags, auditSt
     microsoftGraphRead: diagnoseMicrosoftGraphReadIntegration(config?.integrations?.microsoftGraph ?? {}),
     ...(telemetry ? { telemetry: telemetryStatusProjection(telemetry) } : {}),
     remoteNodeRead: diagnoseRemoteNodeReadIntegration(config?.integrations?.remoteNode ?? {}),
+    computer: diagnoseMacOSComputerIntegration(config?.integrations?.computer),
     state: { ownerOnly, runtimeStateOutsideSourceCheckout: !isPhysicalPathInside(workspaceRoot, state), secretsExcludedFromDiagnostics: true }
   };
 }

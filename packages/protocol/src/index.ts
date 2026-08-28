@@ -94,7 +94,8 @@ const EMAIL_TOOLS = new Set(["email.accounts", "email.search", "email.read", "em
 const CALENDAR_TOOLS = new Set(["calendar.calendars", "calendar.events", "calendar.read"]);
 const GITHUB_TOOLS = new Set(["github.repository", "github.issue", "github.pull-request", "github.checks"]);
 const REMOTE_NODE_TOOLS = new Set(["node.status", "node.diagnostics"]);
-const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", ...EMAIL_TOOLS, ...CALENDAR_TOOLS, ...GITHUB_TOOLS, ...REMOTE_NODE_TOOLS]);
+const COMPUTER_TOOLS = new Set(["computer.screen", "computer.act", "computer.recovery.status", "computer.recovery.resolve"]);
+const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", "computer.act", ...EMAIL_TOOLS, ...CALENDAR_TOOLS, ...GITHUB_TOOLS, ...REMOTE_NODE_TOOLS]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);
@@ -167,6 +168,7 @@ export function projectDurableToolInput(toolName: string, input: unknown): unkno
   if (REMOTE_NODE_TOOLS.has(toolName)) return projectRemoteNodeInput(toolName, input);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailInput(input);
   if (CALENDAR_TOOLS.has(toolName)) return projectCalendarInput(toolName, input);
+  if (COMPUTER_TOOLS.has(toolName)) return projectComputerInput(toolName, input);
   if (toolName.startsWith("git.")) return projectGitInput(input);
   if (!isWorkspaceContentTool(toolName) || !input || typeof input !== "object" || Array.isArray(input)) return input;
   const projected = { ...(input as JsonObject) };
@@ -223,8 +225,8 @@ export function projectDurableToolOutput(toolName: string, output: unknown): unk
   if (REMOTE_NODE_TOOLS.has(toolName)) return projectRemoteNodeOutput(toolName, output);
   if (EMAIL_TOOLS.has(toolName)) return projectEmailOutput(toolName, output);
   if (CALENDAR_TOOLS.has(toolName)) return projectCalendarOutput(toolName, output);
+  if (COMPUTER_TOOLS.has(toolName)) return projectComputerOutput(toolName, output);
   if (toolName.startsWith("git.")) return projectGitOutput(toolName, output);
-  if (REPLAY_UNAVAILABLE_TOOLS.has(toolName)) return projectComputerScreenOutput(output);
   if (!toolName.startsWith("workspace.") || !output || typeof output !== "object" || Array.isArray(output)) return output;
   const record = output as JsonObject;
   if (toolName === "workspace.read" || toolName === "workspace.readText") {
@@ -350,7 +352,56 @@ function projectGitOutput(toolName: string, output: unknown): JsonObject {
   return { ...common, commitCount: Array.isArray(record.commits) ? record.commits.length : 0 };
 }
 
-function projectComputerScreenOutput(value: unknown): unknown {
+function boundedComputerString(value: unknown, maximum: number): string | undefined {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= maximum
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? value
+    : undefined;
+}
+
+function digestComputerField(projected: JsonObject, source: JsonObject, sourceKey: string, digestKey = `${sourceKey}Digest`): void {
+  const value = boundedComputerString(source[sourceKey], 4_096);
+  if (value === undefined) return;
+  projected[digestKey] = sha256Reference(value);
+  projected[`${sourceKey}Bytes`] = Buffer.byteLength(value, "utf8");
+}
+
+function projectComputerInput(toolName: string, value: unknown): JsonObject {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const source = value as JsonObject;
+  if (toolName === "computer.screen" || toolName === "computer.recovery.status") return {};
+  if (toolName === "computer.recovery.resolve") {
+    const projected: JsonObject = {};
+    digestComputerField(projected, source, "recoveryId");
+    if (source.outcome === "confirmed-applied" || source.outcome === "confirmed-not-applied") projected.outcome = source.outcome;
+    return projected;
+  }
+  const projected: JsonObject = {};
+  digestComputerField(projected, source, "frameId");
+  const action = source.action;
+  if (typeof action !== "string") return projected;
+  projected.action = action;
+  if (action === "click" || action === "move") {
+    if (Number.isSafeInteger(source.x)) projected.x = source.x;
+    if (Number.isSafeInteger(source.y)) projected.y = source.y;
+    if (action === "click" && ["left", "middle", "right"].includes(String(source.button))) projected.button = source.button;
+  } else if (action === "type") {
+    digestComputerField(projected, source, "text");
+    if (typeof source.sensitive === "boolean") projected.sensitive = source.sensitive;
+  } else if (action === "key") {
+    digestComputerField(projected, source, "key");
+  } else if (action === "scroll") {
+    if (Number.isSafeInteger(source.deltaX)) projected.deltaX = source.deltaX;
+    if (Number.isSafeInteger(source.deltaY)) projected.deltaY = source.deltaY;
+  } else if (action === "wait" && Number.isSafeInteger(source.durationMs)) {
+    projected.durationMs = source.durationMs;
+  }
+  return projected;
+}
+
+function projectComputerScreenOutput(value: unknown): JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { type: "computer.screen", contentUnavailableOnReplay: true };
   const record = value as JsonObject;
   const target = record.target && typeof record.target === "object" && !Array.isArray(record.target) ? record.target as JsonObject : {};
@@ -372,6 +423,38 @@ function projectComputerScreenOutput(value: unknown): unknown {
     projected.imageDigest = sha256Reference(record.imageBase64);
     projected.imageBytes = Buffer.byteLength(record.imageBase64, "base64");
   }
+  return projected;
+}
+
+function projectComputerOutput(toolName: string, value: unknown): JsonObject {
+  if (toolName === "computer.screen") return projectComputerScreenOutput(value);
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+  if (toolName === "computer.act") {
+    const projected: JsonObject = { type: "computer.act", contentUnavailableOnReplay: true };
+    if (source.status === "completed" || source.status === "needs-review") projected.status = source.status;
+    if (["click", "type", "key", "move", "scroll", "wait"].includes(String(source.action))) projected.action = source.action;
+    digestComputerField(projected, source, "beforeFrameId");
+    if (source.status === "completed" && source.afterFrame !== undefined) projected.afterFrame = projectComputerScreenOutput(source.afterFrame);
+    if (source.status === "needs-review") {
+      digestComputerField(projected, source, "recoveryId");
+      if (["cancelled-after-dispatch", "timeout", "transport-lost", "provider-uncertain"].includes(String(source.reason))) projected.reason = source.reason;
+    }
+    return projected;
+  }
+  if (toolName === "computer.recovery.status") {
+    const projected: JsonObject = { type: toolName, unresolved: source.unresolved === true };
+    if (source.unresolved === true) {
+      digestComputerField(projected, source, "recoveryId");
+      digestComputerField(projected, source, "frameId");
+      if (["click", "type", "key", "move", "scroll", "wait"].includes(String(source.action))) projected.action = source.action;
+      if (["cancelled-after-dispatch", "timeout", "transport-lost", "provider-uncertain"].includes(String(source.reason))) projected.reason = source.reason;
+    }
+    return projected;
+  }
+  const projected: JsonObject = { type: "computer.recovery.resolve" };
+  if (source.status === "resolved") projected.status = "resolved";
+  digestComputerField(projected, source, "recoveryId");
+  if (source.outcome === "confirmed-applied" || source.outcome === "confirmed-not-applied") projected.outcome = source.outcome;
   return projected;
 }
 

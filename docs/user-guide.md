@@ -23,7 +23,7 @@ Odinn Forge v1 supports this local, single-user workflow:
 
 - Linux, macOS, or Windows with Node.js 24 or newer.
 - One local operator using the loopback gateway at `127.0.0.1`.
-- Public web reading, an isolated browser profile, scoped durable memory, audited tools, projects, sessions, goals, and cron jobs. The console can register and inspect declarative Agent SDK packages and build integrity-checked Skill SDK packages; both install disabled, and registration and discovery do not execute or activate them.
+- Public web reading, an isolated browser profile, scoped durable memory, audited tools, projects, sessions, goals, and cron jobs. A disabled-by-default [local macOS computer-control](computer-control.md) slice is available with separate operating-system permissions, explicit capability grants, exact approvals, and recovery. The console can register and inspect declarative Agent SDK packages and build integrity-checked Skill SDK packages; both install disabled, and registration and discovery do not execute or activate them.
 - Explicit approval for browser mutations and other external side effects.
 - Core advanced **Runemark** (run verification), **Gatewatch** (policy safety),
   **Norn Restore** (restore points), and **Raven Route** (model routing)
@@ -221,6 +221,9 @@ version, provider mode without credentials, experimental flags, audit status,
 pending approvals, path-free Chromium candidate and configuration state,
 browser recovery, job counts, and optional path-free GitHub and Microsoft Graph
 read health, and credential-safe remote-node readiness counts. A
+browser recovery, job counts, optional path-free GitHub and Microsoft Graph
+read health, credential-safe remote-node readiness counts, and path-free local
+macOS computer-control status. A
 configured `ODINN_CHROMIUM_PATH` is reported as unverified without dereferencing
 or executing it; browser execution performs
 the normal policy-bound validation only when a browser tool is requested. If no

@@ -83,6 +83,7 @@ export interface JobExecutionContext {
 }
 
 export interface ApprovalExecutionContext extends JobExecutionContext {
+  capabilityToken?: string;
   markDispatched(): void;
 }
 
@@ -372,6 +373,7 @@ export class JobSupervisor {
       }
       throw settlementError;
     } finally {
+      this.volatilePayloads.delete(id);
       this.finishApproval(id, active);
     }
   }
@@ -405,7 +407,10 @@ export class JobSupervisor {
         }
       });
       throwIfJobMutationAborted(options.signal);
-      if (!claimed) throw new Error(`runtime job ${id} is no longer awaiting approval`);
+      if (!claimed) {
+        this.volatilePayloads.delete(id);
+        throw new Error(`runtime job ${id} is no longer awaiting approval`);
+      }
       const leaseToken = typeof claimed.dispatchLease?.token === "string" ? claimed.dispatchLease.token : undefined;
       if (!leaseToken) throw new Error(`runtime job ${id} approval claim did not return its dispatch lease`);
       active.approval!.leaseToken = leaseToken;
@@ -439,6 +444,16 @@ export class JobSupervisor {
   async runApproval<T>(id: string, continuation: (context: ApprovalExecutionContext) => Promise<T>): Promise<T> {
     const job = await this.beginApproval(id);
     const active = this.active.get(id);
+    const volatilePayload = this.volatilePayloads.get(id);
+    const volatileTask = volatilePayload?.task && typeof volatilePayload.task === "object" && !Array.isArray(volatilePayload.task)
+      ? volatilePayload.task as JsonObject
+      : undefined;
+    const volatileInput = volatileTask?.input && typeof volatileTask.input === "object" && !Array.isArray(volatileTask.input)
+      ? volatileTask.input as JsonObject
+      : undefined;
+    const capabilityToken = typeof volatileInput?.capabilityToken === "string" && volatileInput.capabilityToken
+      ? volatileInput.capabilityToken
+      : undefined;
     const expectedLeaseToken = typeof job.dispatchLease?.token === "string" ? job.dispatchLease.token : "";
     if (!active?.approval || active.approval.leaseToken !== expectedLeaseToken) {
       throw new Error(`runtime job ${id} approval claim lease is no longer owned by this continuation`);
@@ -454,7 +469,12 @@ export class JobSupervisor {
       if (active.controller.signal.aborted) {
         throw active.controller.signal.reason ?? new Error("approval continuation aborted before dispatch");
       }
-      result = await continuation({ signal: active.controller.signal, job, markDispatched });
+      result = await continuation({
+        signal: active.controller.signal,
+        job,
+        markDispatched,
+        ...(capabilityToken ? { capabilityToken } : {})
+      });
     } catch (error) {
       await this.settleApproval(id, { error, expectedLeaseToken });
       throw error;
@@ -549,6 +569,7 @@ export class JobSupervisor {
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     for (const active of this.active.values()) active.controller.abort(new Error("supervisor shutting down"));
     await Promise.allSettled(Array.from(this.active.values(), (active) => active.promise));
+    this.volatilePayloads.clear();
   }
 
   private run(job: JobRecord): Promise<void> {
@@ -641,7 +662,7 @@ export class JobSupervisor {
         this.active.delete(job.id);
         try {
           const current = await this.store.get(job.id);
-          if (current?.status !== "queued") this.volatilePayloads.delete(job.id);
+          if (current?.status !== "queued" && current?.status !== "awaiting-approval") this.volatilePayloads.delete(job.id);
         } catch {
           this.volatilePayloads.delete(job.id);
         }
