@@ -34,6 +34,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @odinn/kernel exec playwright-core install --with-deps chromium
       - run: pnpm release:preflight
       - run: pnpm check
       - run: pnpm test:integration
