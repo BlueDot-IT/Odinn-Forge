@@ -75,6 +75,7 @@ async function startGateway(packageRoot: string, workspace: string, state: strin
   const child = spawn(process.execPath, [join(packageRoot, "dist/gateway/server.js")], {
     cwd: workspace,
     env: { ...process.env, ...env, INIT_CWD: workspace, ODINN_STATE_DIR: state, ODINN_PORT: "0", ODINN_HOST: "127.0.0.1" },
+    detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"]
   });
   let output = "";
@@ -102,9 +103,15 @@ async function startGateway(packageRoot: string, workspace: string, state: strin
   throw new Error(`packaged gateway did not bind: ${errorOutput || output || "no output"}`);
 }
 
-async function stopGateway(gateway: any) {
-  if (gateway.child.exitCode === null) gateway.child.kill("SIGTERM");
-  await new Promise((resolveClose) => gateway.child.once("close", resolveClose));
+async function stopGateway(gateway: any, signal: NodeJS.Signals = "SIGTERM") {
+  if (gateway.child.exitCode !== null) return;
+  const closed = new Promise((resolveClose) => gateway.child.once("close", resolveClose));
+  if (process.platform !== "win32" && typeof gateway.child.pid === "number") {
+    process.kill(-gateway.child.pid, signal);
+  } else {
+    gateway.child.kill(signal);
+  }
+  await closed;
 }
 
 async function gatewayRequest(gateway: any, path: string, init: any = {}) {
@@ -216,6 +223,7 @@ try {
   });
 
   providerMode = "timeout";
+  const providerRequestsBeforeInterruption = providerRequests;
   const queuedJob = await record("queue-work", async () => {
     const result = await gatewayRequest(gateway, "/jobs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: "soak-interrupted-job", timeoutMs: 30_000, task: { tool: "model.chat", input: { timeoutMs: 30_000, retries: 0, messages: [{ role: "user", content: "interrupt this queued operation" }] } } }) });
     if (result.response.status !== 202 || !result.body.job?.id) throw new Error("gateway did not queue the soak job");
@@ -226,16 +234,39 @@ try {
     }
     throw new Error("queued soak job never reached running state");
   });
-  await stopGateway(gateway);
+  const interruptionSignal: NodeJS.Signals = process.env.ODINN_SOAK_POWER_LOSS === "1"
+    ? "SIGKILL"
+    : "SIGTERM";
+  await record(
+    interruptionSignal === "SIGKILL" ? "queue-power-loss" : "queue-stop",
+    () => stopGateway(gateway, interruptionSignal),
+    () => ({ signal: interruptionSignal })
+  );
   providerMode = "normal";
-  gateway = await record("queue-stop-restart-recovery", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
+  gateway = await record("queue-interruption-restart-recovery", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
   await record("recovered-job-state", async () => {
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    let lastStatus = "unknown";
+    // A hard process loss cannot release the durable execution lease. Wait
+    // through the supervisor's minimum 120-second lease window so restart
+    // recovery, rather than an artificial test hook, owns the transition.
+    const maximumAttempts = interruptionSignal === "SIGKILL" ? 1_500 : 50;
+    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
       const result = await gatewayRequest(gateway, `/jobs/${encodeURIComponent(queuedJob.jobId)}`);
-      if (result.body.status === "needs-review") return { recoveredJobs: 1, recoveryStatus: result.body.status };
+      lastStatus = typeof result.body.status === "string" ? result.body.status : "missing";
+      const providerAttempts = providerRequests - providerRequestsBeforeInterruption;
+      if (result.body.status === "needs-review") {
+        if (providerAttempts > 1) throw new Error("uncertain power-loss recovery replayed the provider request");
+        return { recoveredJobs: 1, recoveryStatus: result.body.status, providerAttempts, retrySafeReplay: false };
+      }
+      if (result.body.status === "completed") {
+        if (interruptionSignal !== "SIGKILL" || providerAttempts < 1 || providerAttempts > 2) {
+          throw new Error("completed power-loss recovery exceeded the bounded retry-safe provider-attempt budget");
+        }
+        return { recoveredJobs: 1, recoveryStatus: result.body.status, providerAttempts, retrySafeReplay: providerAttempts === 2 };
+      }
       await delay(100);
     }
-    throw new Error("interrupted job did not enter needs-review after restart");
+    throw new Error(`interrupted job did not enter needs-review after restart (last status: ${lastStatus})`);
   });
 
   await writeFile(join(state, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, id: "soak-browser-transaction", status: "unknown" })}\n`, { mode: 0o600 });
@@ -290,11 +321,11 @@ try {
     if (!smoke.includes("ODINN_POST_ROLLBACK_OK")) throw new Error("post-rollback deterministic smoke failed");
     return { rollbackVerified: true, postRollbackOnboarding: true, postRollbackSmoke: true };
   });
-  const report = { schemaVersion: 1, package: pkg.name, version: pkg.version, commit: manifest.commit, archive: basename(archive), durationMs: Date.now() - startedAt, restartCount: steps.filter((step) => step.name.includes("restart")).length, recoveredJobs: steps.find((step) => step.name === "recovered-job-state")?.recoveredJobs ?? 0, unresolvedApprovals: steps.find((step) => step.name === "browser-interruption-recovery-block")?.unresolvedApprovals ?? 0, auditVerification: steps.find((step) => step.name === "audit-integrity-and-persisted-output")?.auditVerification ?? false, browserRecoveryBlocked: steps.find((step) => step.name === "browser-interruption-recovery-block")?.browserRecoveryBlocked ?? false, rollbackVerified: steps.find((step) => step.name === "installer-upgrade-rollback")?.rollbackVerified ?? false, finalState: "passed", steps };
+  const report = { schemaVersion: 1, package: pkg.name, version: pkg.version, commit: manifest.commit, archive: basename(archive), durationMs: Date.now() - startedAt, restartCount: steps.filter((step) => step.name.includes("restart")).length, powerLossCount: steps.filter((step) => step.name === "queue-power-loss").length, recoveredJobs: steps.find((step) => step.name === "recovered-job-state")?.recoveredJobs ?? 0, powerLossRecoveryStatus: steps.find((step) => step.name === "recovered-job-state")?.recoveryStatus ?? "missing", powerLossProviderAttempts: steps.find((step) => step.name === "recovered-job-state")?.providerAttempts ?? 0, unresolvedApprovals: steps.find((step) => step.name === "browser-interruption-recovery-block")?.unresolvedApprovals ?? 0, auditVerification: steps.find((step) => step.name === "audit-integrity-and-persisted-output")?.auditVerification ?? false, browserRecoveryBlocked: steps.find((step) => step.name === "browser-interruption-recovery-block")?.browserRecoveryBlocked ?? false, rollbackVerified: steps.find((step) => step.name === "installer-upgrade-rollback")?.rollbackVerified ?? false, finalState: "passed", steps };
   await writeFile(join(releaseDir, "soak-report.json"), `${JSON.stringify(report, null, 2)}\n`);
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {
-  const report = { schemaVersion: 1, package: pkg.name, version: pkg.version, commit: manifest.commit, archive: basename(archive), durationMs: Date.now() - startedAt, restartCount: steps.filter((step) => step.name.includes("restart")).length, recoveredJobs: steps.find((step) => step.name === "recovered-job-state")?.recoveredJobs ?? 0, unresolvedApprovals: 0, auditVerification: false, browserRecoveryBlocked: false, rollbackVerified: false, finalState: "failed", steps };
+  const report = { schemaVersion: 1, package: pkg.name, version: pkg.version, commit: manifest.commit, archive: basename(archive), durationMs: Date.now() - startedAt, restartCount: steps.filter((step) => step.name.includes("restart")).length, powerLossCount: steps.filter((step) => step.name === "queue-power-loss").length, recoveredJobs: steps.find((step) => step.name === "recovered-job-state")?.recoveredJobs ?? 0, unresolvedApprovals: 0, auditVerification: false, browserRecoveryBlocked: false, rollbackVerified: false, finalState: "failed", steps };
   await writeFile(join(releaseDir, "soak-report.json"), `${JSON.stringify(report, null, 2)}\n`);
   throw error;
 } finally {

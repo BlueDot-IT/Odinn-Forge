@@ -113,6 +113,11 @@ The release-candidate artifact is retained for seven days. A separate nightly
 state-growth job exercises the production SQLite store at 10,000, 100,000, and
 1,000,000 records, verifies archive-before-retention behavior, and retains its
 machine-readable acceptance report for 30 days.
+The independent Phase F long-soak job repeatedly exercises compiled restart,
+fault, process-power-loss, recovery, audit retention, and rollback cycles for
+two hours. Its exact-commit machine-readable evidence is retained for 30 days,
+including on failure. See [Phase F long-duration soak](phase-f-long-soak.md).
+Other nightly release-candidate artifacts are retained for seven days.
 
 ### Package Integrity
 
