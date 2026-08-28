@@ -1010,10 +1010,9 @@ function installedWindowsTrampoline(generationName: string): string {
   if (!WINDOWS_LAUNCHER_GENERATION_NAME.test(generationName)) {
     throw new Error("Windows launcher generation name is invalid");
   }
-  // Batch-to-batch transfer preserves the generation's exit status without
-  // CALL. CALL reparses %* and can turn a caller-controlled argument into a
-  // second environment expansion (and then batch metacharacter execution).
-  return `@echo off\r\n"%~dp0${generationName}" %*\r\n`;
+  // CALL is required for reliable batch-to-batch transfer; explicitly return
+  // the nested launcher's status to the original console.
+  return `@echo off\r\ncall "%~dp0${generationName}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
 }
 
 async function assertSafeWindowsTrampolineReplacement(
@@ -1024,9 +1023,7 @@ async function assertSafeWindowsTrampolineReplacement(
   try {
     const metadata = await requirePhysicalFile(path, "installed Windows launcher trampoline");
     const existing = await readFile(path, "utf8");
-    const currentTrampoline = /^@echo off\r?\n"%~dp0(?:odinn|odinn-gateway)\.[0-9a-f-]{36}\.cmd" %\*\r?\n$/iu.test(existing);
-    const legacyCallTrampoline = /^@echo off\r?\ncall "%~dp0(?:odinn|odinn-gateway)\.[0-9a-f-]{36}\.cmd" %\*\r?\nexit \/b %ERRORLEVEL%\r?\n$/iu.test(existing);
-    const versionedTrampoline = currentTrampoline || legacyCallTrampoline;
+    const versionedTrampoline = /^@echo off\r?\ncall "%~dp0(?:odinn|odinn-gateway)\.[0-9a-f-]{36}\.cmd" %\*\r?\nexit \/b %ERRORLEVEL%\r?\n$/iu.test(existing);
     // The authenticated applying marker proves the prior owner has exited and
     // permits repair of a physically truncated trampoline after power loss.
     // Initial activation still refuses a replacement that could strand an
