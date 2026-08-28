@@ -238,13 +238,14 @@ function Get-FileHash {
 Export-ModuleMember -Function Get-FileHash
 `);
     const launcherPath = join(fixture.prefix, "bin", "odinn.cmd");
-    // cmd.exe requires the outer doubled quotes when /c receives a quoted
-    // batch-file path; without them it leaves the path quotes in the command
-    // token and reports the launcher itself as unrecognized on Windows.
-    const launched = spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `""${launcherPath}" --version"`], {
+    // Pass CALL and the quoted batch path as separate verbatim Windows
+    // arguments. The /s doubled-quote form is reinterpreted literally by the
+    // Node child-process quoting layer on hosted Windows runners.
+    const launched = spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/c", "call", `"${launcherPath}"`, "--version"], {
       cwd: fixture.prefix,
       encoding: "utf8",
       shell: false,
+      windowsVerbatimArguments: true,
       env: {
         ...process.env,
         PATH: `${fakeBin};${process.env.PATH ?? ""}`,
