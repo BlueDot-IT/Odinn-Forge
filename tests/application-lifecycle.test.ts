@@ -270,7 +270,7 @@ Export-ModuleMember -Function Get-FileHash
   } finally {
     waitingParent.kill();
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 750));
-    await rm(fixture.temporary, { recursive: true, force: true });
+    await rm(fixture.temporary, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
   }
 });
 
