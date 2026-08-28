@@ -311,11 +311,12 @@ export async function rollbackApplication(options: {
     );
   }
   const currentRoot = join(prefix, "versions", String(installed.current));
+  const legacySynchronousRollback = process.platform === "win32" && previousMetadata.version === "1.0.0";
   runPackageNode(currentRoot, installerEntry(currentRoot), [
     "rollback",
     "--prefix",
     prefix,
-    ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
+    ...(process.platform === "win32" && !legacySynchronousRollback ? ["--defer-launchers-until-pid", String(process.pid)] : [])
   ]);
   const rolledBack = await readInstallState(prefix);
   try {
@@ -332,7 +333,7 @@ export async function rollbackApplication(options: {
       "rollback",
       "--prefix",
       prefix,
-      ...(process.platform === "win32" ? ["--defer-launchers-until-pid", String(process.pid)] : [])
+      ...(process.platform === "win32" && !legacySynchronousRollback ? ["--defer-launchers-until-pid", String(process.pid)] : [])
     ]);
     throw error;
   }
