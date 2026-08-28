@@ -108,9 +108,11 @@ operating-system isolation.
    delegation remains denied by default.
 5. **Lifecycle and operations:** ✅ bounded suspension, membership-scoped
    administration, and verified sensitive-state-excluding backups are
-   implemented. Add tenant create/delete/export/restore/migrate workflows,
-   fair scheduling, durable metering, multi-instance leases, and
-   tenant-labelled observability.
+   implemented. Single-active Gateway ownership now uses a durable
+   owner/host/epoch lease with fail-closed concurrent startup, stale-owner
+   takeover, and old-owner fencing. Add tenant create/delete/export/restore/
+   migrate workflows, fair scheduling, durable metering, active-active
+   coordination, and tenant-labelled observability.
 6. **Isolation hardening:** use per-tenant secret storage and OS-user,
    container, or VM boundaries before claiming support for mutually hostile
    tenants. The current host is application-level isolation only.

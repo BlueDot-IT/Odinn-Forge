@@ -54,6 +54,8 @@ and [v1 compatibility policy](v1-compatibility.md) define support boundaries.
 - [Runtime ledger](runtime-ledger.md) — structured runtime records.
 - [Gateway Protocol v2](gateway-protocol-v2.md) — protocol schema and client
   behavior.
+- [Gateway instance ownership and failover](gateway-instance-ownership.md) —
+  single-active state-root leases, epoch fencing, and controlled takeover.
 - [Provider capability metadata](provider-capability-metadata.md) — provider
   capability contracts.
 - [SQLite/FTS5 memory candidate index](sqlite-memory-index.md) — indexed memory
