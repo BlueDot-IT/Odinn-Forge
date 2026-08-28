@@ -238,7 +238,7 @@ function Get-FileHash {
 Export-ModuleMember -Function Get-FileHash
 `);
     const launcherPath = join(fixture.prefix, "bin", "odinn.cmd");
-    const launched = spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `"${launcherPath}" --version`], {
+    const launched = spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `call "${launcherPath}" --version`], {
       cwd: fixture.prefix,
       encoding: "utf8",
       shell: false,
