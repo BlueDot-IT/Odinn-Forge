@@ -23,6 +23,50 @@ import { sanitizedReleaseEnvironment, trustedTool, type TrustedToolName } from "
 
 const root = join(import.meta.dirname, "..");
 
+test("macOS launcher verification accepts only zero-padded code-signature regions", () => {
+  const launcher = hardenedDarwinLauncher(64);
+  assert.doesNotThrow(() => verifyNativeLauncher(launcher, "darwin-x64"));
+
+  const nonzeroPadding = Buffer.from(launcher);
+  nonzeroPadding[nonzeroPadding.length - 1] = 1;
+  assert.throws(
+    () => verifyNativeLauncher(nonzeroPadding, "darwin-x64"),
+    /malformed embedded code signature/u
+  );
+
+  const oversizedSuperblob = Buffer.from(launcher);
+  oversizedSuperblob.writeUInt32BE(65, 48 + 4);
+  assert.throws(
+    () => verifyNativeLauncher(oversizedSuperblob, "darwin-x64"),
+    /malformed embedded code signature/u
+  );
+});
+
+function hardenedDarwinLauncher(signatureBytes: number): Buffer {
+  const signatureOffset = 48;
+  const superblobBytes = 44;
+  const launcher = Buffer.alloc(signatureOffset + signatureBytes);
+  launcher.writeUInt32LE(0xfeedfacf, 0);
+  launcher.writeUInt32LE(0x01000007, 4);
+  launcher.writeUInt32LE(2, 12);
+  launcher.writeUInt32LE(1, 16);
+  launcher.writeUInt32LE(16, 20);
+  launcher.writeUInt32LE(0x20_0000, 24);
+  launcher.writeUInt32LE(0x1d, 32);
+  launcher.writeUInt32LE(16, 36);
+  launcher.writeUInt32LE(signatureOffset, 40);
+  launcher.writeUInt32LE(signatureBytes, 44);
+  launcher.writeUInt32BE(0xfade0cc0, signatureOffset);
+  launcher.writeUInt32BE(superblobBytes, signatureOffset + 4);
+  launcher.writeUInt32BE(1, signatureOffset + 8);
+  launcher.writeUInt32BE(0, signatureOffset + 12);
+  launcher.writeUInt32BE(20, signatureOffset + 16);
+  launcher.writeUInt32BE(0xfade0c02, signatureOffset + 20);
+  launcher.writeUInt32BE(24, signatureOffset + 24);
+  launcher.writeUInt32BE(0x1_0000, signatureOffset + 32);
+  return launcher;
+}
+
 test("packaged and installed launchers remove hostile TLS settings and ignore PATH tool substitutions", {
   skip: process.platform !== "linux"
 }, async () => {
