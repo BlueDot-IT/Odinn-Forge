@@ -276,6 +276,11 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /persist-credentials: false/);
   assert.doesNotMatch(release.match(/^  release-policy:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "", /^\s+needs:/m);
   assert.match(release, /^  verify:\s*[\s\S]*?^    needs: release-policy/m);
+  const verifyJob = release.match(/^  verify:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
+  const verifyBrowserInstall = verifyJob.indexOf("pnpm --filter @odinn/kernel exec playwright-core install --with-deps chromium");
+  const verifyCheck = verifyJob.indexOf("pnpm check");
+  assert.ok(verifyBrowserInstall >= 0 && verifyCheck > verifyBrowserInstall, "release verification must install pinned Chromium before pnpm check");
+  assert.match(verifyJob, /GITHUB_SHA: \$\{\{ env\.ODINN_RELEASE_COMMIT \}\}/u);
   assert.match(
     release,
     /^  source-package:\s*[\s\S]*?^    needs:\s*\n\s{6}- release-policy\s*\n\s{6}- verify\s*\n\s{6}- native-launchers/m

@@ -62,10 +62,14 @@ jobs:
           node-version: ${{ needs.release-policy.outputs.node_version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Install pinned Chromium for console regressions
+        run: pnpm --filter @odinn/kernel exec playwright-core install --with-deps chromium
       - run: pnpm release:preflight
         env:
           ODINN_RELEASE_TAG: ${{ env.RELEASE_TAG }}
       - run: pnpm check
+        env:
+          GITHUB_SHA: ${{ env.ODINN_RELEASE_COMMIT }}
       - run: pnpm test:integration
       - run: pnpm test:invariants
       - run: pnpm smoke:inference
