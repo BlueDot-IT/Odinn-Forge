@@ -134,14 +134,17 @@ test("downloaded release verification rejects an asset changed after checksummin
   }
 });
 
-test("release validation jobs are read-only and staged recovery uses secure extraction", async () => {
+test("release validation permissions stay scoped and staged recovery uses secure extraction", async () => {
   const workflow = await readFile(join(root, ".github/workflows/release.yml"), "utf8");
   const releasePolicy = workflow.slice(workflow.indexOf("  release-policy:"), workflow.indexOf("  source-package:"));
   const stagedValidation = workflow.slice(workflow.indexOf("  stage-release-assets:"), workflow.indexOf("  validate-downloaded-release:"));
   const downloadedValidation = workflow.slice(workflow.indexOf("  validate-downloaded-release:"), workflow.indexOf("  publish-release:"));
   const publication = workflow.slice(workflow.indexOf("  publish-release:"));
-  assert.match(releasePolicy, /permissions:\n\s+contents: read/u);
-  assert.doesNotMatch(releasePolicy, /contents: write/u);
+  assert.match(
+    releasePolicy,
+    /permissions:\n\s+actions: read\n(?:\s+#[^\n]*\n){2}\s+contents: write/u,
+    "only draft-release inspection receives push-level contents access"
+  );
   assert.match(downloadedValidation, /permissions:\n(?:\s+[a-z-]+: read\n)*\s+contents: read/u);
   assert.doesNotMatch(downloadedValidation, /contents: write/u);
   for (const section of [stagedValidation, downloadedValidation, publication]) {

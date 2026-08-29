@@ -256,7 +256,11 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /description: Numeric GitHub draft release ID to verify and publish/);
   assert.match(release, /description: Original release workflow run that staged the assets \(required only for resume\)/u);
   assert.match(release, /description: Immutable odinn-release-assets artifact ID from the staging run \(required only for resume\)/u);
-  assert.match(release, /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}actions: read\s*\n\s{6}contents: read/m);
+  assert.match(
+    release,
+    /^  release-policy:\s*[\s\S]*?^    permissions:\s*\n\s{6}actions: read\s*\n(?:\s{6}#[^\n]*\n){2}\s{6}contents: write/m,
+    "draft-release inspection must use push-level contents access while publication remains environment-gated"
+  );
   assert.match(release, /^  validate-downloaded-release:\s*[\s\S]*?^    permissions:\s*\n\s{6}actions: read\s*\n\s{6}attestations: read\s*\n\s{6}contents: read/m);
   assert.match(release, /\(\.id \| tostring\) == \$releaseId and \.tag_name == \$tag and \.draft == true and \.prerelease == \$expectedPrerelease/);
   assert.equal(
