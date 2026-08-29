@@ -163,7 +163,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x64
-          - os: macos-15-large
+          - os: macos-15-intel
             target: darwin-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
@@ -367,7 +367,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x64
-          - os: macos-15-large
+          - os: macos-15-intel
             target: darwin-x64
           - os: windows-latest
             target: win32-x64
