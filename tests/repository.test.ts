@@ -336,7 +336,9 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /\[\[ "\$STAGED_RUN_ID" =~ \^\[1-9\]\[0-9\]\*\$ \]\]/u);
   assert.match(release, /\[\[ "\$STAGED_ARTIFACT_ID" =~ \^\[1-9\]\[0-9\]\*\$ \]\]/u);
   assert.match(release, /\.id == \$artifactId and \.name == "odinn-release-assets" and \.expired == false/u);
-  assert.match(release, /\.head_sha == \$commit and \.head_branch == "main" and \.event == "workflow_dispatch"/u);
+  assert.match(release, /\.head_branch == "main" and \.event == "workflow_dispatch"/u);
+  assert.match(release, /workflow_commit="\$\(jq -er '\.head_sha \| select\(test\("\^\[0-9a-f\]\{40\}\$"\)\)'/u);
+  assert.match(release, /\.workflow_run\.head_sha == \$workflowCommit/u);
   assert.doesNotMatch(release, /--clobber/);
   assert.match(release, /release_commit: \$\{\{ steps\.release\.outputs\.commit \}\}/);
   assert.match(release, /ref: \$\{\{ needs\.release-policy\.outputs\.release_commit \}\}/);
