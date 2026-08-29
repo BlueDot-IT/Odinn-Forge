@@ -69,7 +69,7 @@ jobs:
           ODINN_RELEASE_TAG: ${{ env.RELEASE_TAG }}
       - run: pnpm check
         env:
-          GITHUB_SHA: ${{ env.ODINN_RELEASE_COMMIT }}
+          ODINN_SLO_EXPECTED_SHA: ${{ env.ODINN_RELEASE_COMMIT }}
       - run: pnpm test:integration
       - run: pnpm test:invariants
       - run: pnpm smoke:inference
