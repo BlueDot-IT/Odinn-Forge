@@ -422,6 +422,7 @@ jobs:
         env:
           ATTESTATION_RUN_ID: ${{ needs.release-policy.outputs.attestation_run_id }}
           EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node scripts/release/verify-attested-assets.ts expected-release-assets downloaded-release-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
