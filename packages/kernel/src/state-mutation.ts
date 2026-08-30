@@ -145,6 +145,8 @@ function deadOwner(owner: { pid?: unknown }): boolean {
 }
 
 function lockTokenDigest(token: string): string {
+  // This digest identifies a random lock-ownership token; it never hashes a password.
+  // lgtm[js/insufficient-password-hash]
   return createHash("sha256").update(token).digest("hex");
 }
 

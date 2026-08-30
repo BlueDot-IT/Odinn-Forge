@@ -60,8 +60,7 @@ function contained(root: string, target: string) {
 }
 
 function canonicalEqual(left: string, right: string) {
-  const normalize = (value: string) => resolve(value).replace(/[\\/]+$/u, "");
-  return normalize(left) === normalize(right);
+  return resolve(left) === resolve(right);
 }
 
 function identity(metadata: BigIntStats): FileIdentity {

@@ -100,7 +100,7 @@ test("agent graph view renders bounded durable child-session projections", () =>
   assert.equal(canReassignAgentGraph("needs-review"), true);
   const selectedRow = renderAgentGraphRow(graph, true, Date.parse("2026-01-01T00:01:00.000Z"));
   const unselectedRow = renderAgentGraphRow(graph, false, Date.parse("2026-01-01T00:01:00.000Z"));
-  assert.doesNotMatch(selectedRow, /<script>/u);
+  assert.doesNotMatch(selectedRow, /<script>/iu);
   assert.match(selectedRow, /1\/1/u);
   assert.match(selectedRow, /aria-current="true"/u);
   assert.match(unselectedRow, /aria-current="false"/u);
