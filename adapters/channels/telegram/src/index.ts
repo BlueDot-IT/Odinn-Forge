@@ -325,10 +325,8 @@ export function normalizeTelegramUpdate(value: unknown, accountId = "default", {
   const command = new RegExp(`^/${escapeRegExp(nativeCommandName)}(?:@${escapeRegExp(botUsername ?? "")})?\\s*`, "iu");
   const isCommand = command.test(textValue);
   if (!direct && requireMention && !isCommand && !repliedToBot && !mention?.test(textValue)) return undefined;
-  const text = textValue
-    .replace(command, "")
-    .replace(mention ?? /$^/u, "")
-    .trim();
+  const withoutCommand = textValue.replace(command, "");
+  const text = (mention ? withoutCommand.replace(mention, "") : withoutCommand).trim();
   const updateId = telegramUpdateId(update);
   return {
     id: String(numericId(message.message_id)),

@@ -680,6 +680,8 @@ async function installHumanKeyboardEvidence(context: any) {
         || (["BUTTON", "A", "SUMMARY"].includes(target?.tagName ?? "") ? target?.textContent?.trim().replace(/\s+/gu, " ").slice(0, 80) : "")
         || "";
       let evidence: unknown[] = [];
+      // The value is non-sensitive UI navigation evidence, not credential material.
+      // lgtm[js/clear-text-storage-of-sensitive-data]
       try { evidence = JSON.parse(sessionStorage.getItem(storageKey) || "[]"); } catch {}
       evidence.push({
         key: event.key === " " ? "Space" : event.key,

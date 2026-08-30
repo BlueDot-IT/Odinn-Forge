@@ -51,7 +51,32 @@ const SECRET_KEYS = new Set([
 ]);
 const SECRET_ASSIGNMENT = /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|capability(?:[_-]?token)?|token|authorization|cookie|credentials?|password(?:[_-]?hash)?|passwd|secret|client[_-]?secret|bot[_-]?(?:secret|token)|private[_-]?key)\s*([:=])\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/giu;
 const URL_CREDENTIAL = /(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/giu;
-const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/gu;
+const PRIVATE_KEY_BEGIN = "-----BEGIN ";
+const PRIVATE_KEY_SUFFIX = "PRIVATE KEY-----";
+
+function redactPrivateKeyBlocks(value: string): string {
+  let cursor = 0;
+  let result = "";
+  for (;;) {
+    const begin = value.indexOf(PRIVATE_KEY_BEGIN, cursor);
+    if (begin < 0) return result + value.slice(cursor);
+    const labelStart = begin + PRIVATE_KEY_BEGIN.length;
+    const labelEnd = value.indexOf(PRIVATE_KEY_SUFFIX, labelStart);
+    if (labelEnd < 0) return result + value.slice(cursor);
+    const label = value.slice(labelStart, labelEnd);
+    const validLabel = label === "" || (label.endsWith(" ") && [...label].every((character) => character === " " || (character >= "A" && character <= "Z") || (character >= "0" && character <= "9")));
+    if (!validLabel) {
+      result += value.slice(cursor, labelStart);
+      cursor = labelStart;
+      continue;
+    }
+    const endMarker = `-----END ${label}${PRIVATE_KEY_SUFFIX}`;
+    const end = value.indexOf(endMarker, labelEnd + PRIVATE_KEY_SUFFIX.length);
+    if (end < 0) return result + value.slice(cursor);
+    result += value.slice(cursor, begin) + REDACTED;
+    cursor = end + endMarker.length;
+  }
+}
 const SECRET_VALUES = [
   /\bBearer\s+[A-Za-z0-9._~+\/-]+/giu,
   /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/giu,
@@ -1086,8 +1111,7 @@ function redactDurableNode(value: unknown, state: DurableRedactionContext & { de
   if (state.depth > 8) return "[redacted-depth]";
   if (isSecretKey(state.key)) return REDACTED;
   if (typeof value === "string") {
-    let redacted = value
-      .replace(PRIVATE_KEY_BLOCK, REDACTED)
+    let redacted = redactPrivateKeyBlocks(value)
       .replace(URL_CREDENTIAL, `$1${REDACTED}@`);
     for (const pattern of SECRET_VALUES) redacted = redacted.replace(pattern, REDACTED);
     return redacted.replace(SECRET_ASSIGNMENT, `$1$2${REDACTED}`).slice(0, 100_000);

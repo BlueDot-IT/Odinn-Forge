@@ -80,7 +80,7 @@ function stable(value: unknown): string {
 }
 
 function inline(value: string): string {
-  return value.replace(/\|/gu, "\\|").replace(/`/gu, "'").replace(/[\r\n]+/gu, " ").trim();
+  return value.replace(/\\/gu, "\\\\").replace(/\|/gu, "\\|").replace(/`/gu, "'").replace(/[\r\n]+/gu, " ").trim();
 }
 
 function runtimeName(id: string): string {
