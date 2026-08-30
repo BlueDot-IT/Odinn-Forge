@@ -408,7 +408,7 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           mkdir -p downloaded-release-assets
-          gh release download "$TAG" --dir downloaded-release-assets
+          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" downloaded-release-assets
       - name: Authenticate exact draft inventory and bytes
         shell: bash
         env:
