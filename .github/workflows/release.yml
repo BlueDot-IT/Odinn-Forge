@@ -348,7 +348,7 @@ jobs:
             diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$existing_assets")
           fi
           mkdir -p downloaded-release-assets
-          gh release download "$TAG" --dir downloaded-release-assets
+          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" downloaded-release-assets
           node scripts/release/verify-attested-assets.ts release-assets downloaded-release-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
@@ -488,7 +488,7 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           test "$TAG" = "v$version"
           mkdir -p dist/resume-assets dist/npm-package
-          gh release download "$TAG" --dir dist/resume-assets
+          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" dist/resume-assets
           node scripts/release/verify-attested-assets.ts dist/resume-actions-assets dist/resume-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           ODINN_RELEASE_COMMIT="$EXPECTED_COMMIT" node scripts/release/verify-downloaded-assets.ts dist/resume-assets
@@ -579,7 +579,7 @@ jobs:
         run: |
           test -n "$RELEASE_ID"
           mkdir -p dist/promotion-draft-assets
-          gh release download "$TAG" --dir dist/promotion-draft-assets
+          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" dist/promotion-draft-assets
           node scripts/release/verify-attested-assets.ts dist/promotion-actions-assets dist/promotion-draft-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
