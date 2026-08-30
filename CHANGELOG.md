@@ -6,6 +6,13 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.2.1](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.2.0...v1.2.1) (2026-08-30)
+
+### Fixed
+
+- validate and promote the immutable Actions-staged release assets while
+  binding resumed release provenance to the exact dispatched workflow ref
+
 ## [1.2.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.2...v1.2.0) (2026-08-28)
 
 ### Added
