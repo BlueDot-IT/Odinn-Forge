@@ -134,9 +134,10 @@ jobs:
             release_assets_artifact_id=""
           fi
           staged_run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${attestation_run_id}")"
-          jq -e --argjson runId "$attestation_run_id" --arg repository "$GITHUB_REPOSITORY" \
-            '.id == $runId and .head_branch == "main" and .event == "workflow_dispatch" and
-             .path == ".github/workflows/release.yml" and .repository.full_name == $repository' <<<"$staged_run"
+          jq -e --argjson runId "$attestation_run_id" --arg repository "$GITHUB_REPOSITORY" --arg workflowRef "$GITHUB_REF_NAME" \
+            '.id == $runId and .event == "workflow_dispatch" and
+             .path == ".github/workflows/release.yml" and .repository.full_name == $repository and
+             .head_branch == $workflowRef' <<<"$staged_run"
           workflow_commit="$(jq -er '.head_sha | select(test("^[0-9a-f]{40}$"))' <<<"$staged_run")"
           if [[ "$RESUME_STAGED_ASSETS" == "true" ]]; then
             staged_artifact="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${release_assets_artifact_id}")"
@@ -348,7 +349,11 @@ jobs:
             diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$existing_assets")
           fi
           mkdir -p downloaded-release-assets
-          gh release download "$TAG" --dir downloaded-release-assets
+          for asset_path in release-assets/*; do
+            asset_name="${asset_path##*/}"
+            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
+            cp "$asset_path" "downloaded-release-assets/${asset_name}"
+          done
           node scripts/release/verify-attested-assets.ts release-assets downloaded-release-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
@@ -408,12 +413,17 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           mkdir -p downloaded-release-assets
-          gh release download "$TAG" --dir downloaded-release-assets
+          for asset_path in expected-release-assets/*; do
+            asset_name="${asset_path##*/}"
+            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
+            cp "$asset_path" "downloaded-release-assets/${asset_name}"
+          done
       - name: Authenticate exact draft inventory and bytes
         shell: bash
         env:
           ATTESTATION_RUN_ID: ${{ needs.release-policy.outputs.attestation_run_id }}
           EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node scripts/release/verify-attested-assets.ts expected-release-assets downloaded-release-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
@@ -488,7 +498,11 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           test "$TAG" = "v$version"
           mkdir -p dist/resume-assets dist/npm-package
-          gh release download "$TAG" --dir dist/resume-assets
+          for asset_path in dist/resume-actions-assets/*; do
+            asset_name="${asset_path##*/}"
+            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
+            cp "$asset_path" "dist/resume-assets/${asset_name}"
+          done
           node scripts/release/verify-attested-assets.ts dist/resume-actions-assets dist/resume-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           ODINN_RELEASE_COMMIT="$EXPECTED_COMMIT" node scripts/release/verify-downloaded-assets.ts dist/resume-assets
@@ -579,7 +593,11 @@ jobs:
         run: |
           test -n "$RELEASE_ID"
           mkdir -p dist/promotion-draft-assets
-          gh release download "$TAG" --dir dist/promotion-draft-assets
+          for asset_path in dist/promotion-actions-assets/*; do
+            asset_name="${asset_path##*/}"
+            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
+            cp "$asset_path" "dist/promotion-draft-assets/${asset_name}"
+          done
           node scripts/release/verify-attested-assets.ts dist/promotion-actions-assets dist/promotion-draft-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"

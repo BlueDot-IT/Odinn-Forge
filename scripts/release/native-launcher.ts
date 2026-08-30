@@ -49,7 +49,7 @@ export async function buildNativeLauncher(target: NativeLauncherTarget, destinat
       "-arch",
       "x86_64",
       "-mmacosx-version-min=13.0",
-      "-Wl,-dead_strip,-no_uuid"
+      "-Wl,-dead_strip,-no_uuid,-sectcreate,__RESTRICT,__restrict,/dev/null"
     ]);
     run(trustedTool("codesign"), [
       "--force",

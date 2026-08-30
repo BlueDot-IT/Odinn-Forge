@@ -306,14 +306,16 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /matrix:\s*\n\s+include:\s*\n\s+- os: ubuntu-latest\s*\n\s+target: linux-x64\s*\n\s+- os: macos-15-intel\s*\n\s+target: darwin-x64\s*\n\s+- os: windows-latest\s*\n\s+target: win32-x64/u);
   const stageJob = release.match(/^  stage-release-assets:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
   assert.match(stageJob, /runs-on: ubuntu-latest/u);
-  assert.match(stageJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
+  assert.match(stageJob, /for asset_path in release-assets\/\*;/u);
+  assert.doesNotMatch(stageJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
   assert.match(stageJob, /verify-attested-assets\.ts release-assets downloaded-release-assets/u);
   assert.match(stageJob, /node scripts\/release\/verify-downloaded-assets\.ts downloaded-release-assets/u);
   assert.match(stageJob, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
   const validateJob = release.match(/^  validate-downloaded-release:[\s\S]*?(?=^  [a-z])/m)?.[0] ?? "";
   assert.match(validateJob, /artifact-ids: \$\{\{ inputs\.resume_staged_assets && needs\.release-policy\.outputs\.release_assets_artifact_id \|\| needs\.stage-release-assets\.outputs\.release_assets_artifact_id \}\}/u);
   assert.match(validateJob, /run-id: \$\{\{ needs\.release-policy\.outputs\.attestation_run_id \}\}/u);
-  assert.match(validateJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
+  assert.match(validateJob, /for asset_path in expected-release-assets\/\*;/u);
+  assert.doesNotMatch(validateJob, /gh release download "\$TAG" --dir downloaded-release-assets/u);
   assert.match(validateJob, /verify-attested-assets\.ts expected-release-assets downloaded-release-assets/u);
   assert.match(validateJob, /node scripts\/release\/verify-downloaded-assets\.ts downloaded-release-assets/u);
   assert.match(validateJob, /node scripts\/release\/install-smoke\.ts downloaded-release-assets/u);
@@ -341,7 +343,8 @@ test("draft GitHub releases hand npm publication to the protected workflow", asy
   assert.match(release, /\[\[ "\$STAGED_RUN_ID" =~ \^\[1-9\]\[0-9\]\*\$ \]\]/u);
   assert.match(release, /\[\[ "\$STAGED_ARTIFACT_ID" =~ \^\[1-9\]\[0-9\]\*\$ \]\]/u);
   assert.match(release, /\.id == \$artifactId and \.name == "odinn-release-assets" and \.expired == false/u);
-  assert.match(release, /\.head_branch == "main" and \.event == "workflow_dispatch"/u);
+  assert.match(release, /--arg workflowRef "\$GITHUB_REF_NAME"/u);
+  assert.match(release, /\.event == "workflow_dispatch"[\s\S]*?\.head_branch == \$workflowRef/u);
   assert.match(release, /workflow_commit="\$\(jq -er '\.head_sha \| select\(test\("\^\[0-9a-f\]\{40\}\$"\)\)'/u);
   assert.match(release, /\.workflow_run\.head_sha == \$workflowCommit/u);
   assert.doesNotMatch(release, /--clobber/);

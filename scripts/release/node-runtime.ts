@@ -42,7 +42,12 @@ function assertBoundedInteger(value: unknown, maximum: number, label: string): a
 }
 
 export async function runtimePolicySha256(root: string): Promise<string> {
-  return digest(await readFile(join(root, "release/node-runtime-policy.json")));
+  // Git may materialize tracked JSON with CRLF on Windows.  The reviewed
+  // policy identity is over its portable LF representation so the release
+  // manifest is reproducible across runners.
+  const policy = (await readFile(join(root, "release/node-runtime-policy.json"), "utf8"))
+    .replace(/\r\n/gu, "\n");
+  return digest(policy);
 }
 
 export async function readRuntimePolicy(root: string): Promise<RuntimePolicy> {
