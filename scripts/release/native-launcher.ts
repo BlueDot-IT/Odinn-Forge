@@ -138,9 +138,15 @@ function verifyHardenedDarwinLauncher(bytes: Buffer): void {
 }
 
 function verifyHardenedCodeSignature(signature: Buffer): void {
-  if (signature.length < 12 || signature.readUInt32BE(0) !== 0xfade0cc0 || signature.readUInt32BE(4) !== signature.length) {
+  if (signature.length < 12 || signature.readUInt32BE(0) !== 0xfade0cc0) {
     throw new Error("macOS native launcher has a malformed embedded code signature");
   }
+  const declaredLength = signature.readUInt32BE(4);
+  if (declaredLength < 12 || declaredLength > signature.length
+    || signature.subarray(declaredLength).some((byte) => byte !== 0)) {
+    throw new Error("macOS native launcher has a malformed embedded code signature");
+  }
+  signature = signature.subarray(0, declaredLength);
   const count = signature.readUInt32BE(8);
   if (count === 0 || 12 + count * 8 > signature.length) throw new Error("macOS native launcher has an empty embedded code signature");
   let hardenedCodeDirectory = false;
