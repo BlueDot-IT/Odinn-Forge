@@ -348,7 +348,13 @@ jobs:
             diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$existing_assets")
           fi
           mkdir -p downloaded-release-assets
-          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" downloaded-release-assets
+          asset_list="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
+          [[ -n "$asset_list" ]] || { echo 'draft release has no assets' >&2; exit 1; }
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid asset id" >&2; exit 1; }
+            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "downloaded-release-assets/${asset_name}"
+          done <<< "$asset_list"
           node scripts/release/verify-attested-assets.ts release-assets downloaded-release-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
@@ -408,7 +414,13 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           mkdir -p downloaded-release-assets
-          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" downloaded-release-assets
+          asset_list="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
+          [[ -n "$asset_list" ]] || { echo 'draft release has no assets' >&2; exit 1; }
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid asset id" >&2; exit 1; }
+            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "downloaded-release-assets/${asset_name}"
+          done <<< "$asset_list"
       - name: Authenticate exact draft inventory and bytes
         shell: bash
         env:
@@ -488,7 +500,13 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           test "$TAG" = "v$version"
           mkdir -p dist/resume-assets dist/npm-package
-          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" dist/resume-assets
+          asset_list="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
+          [[ -n "$asset_list" ]] || { echo 'draft release has no assets' >&2; exit 1; }
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid asset id" >&2; exit 1; }
+            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "dist/resume-assets/${asset_name}"
+          done <<< "$asset_list"
           node scripts/release/verify-attested-assets.ts dist/resume-actions-assets dist/resume-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           ODINN_RELEASE_COMMIT="$EXPECTED_COMMIT" node scripts/release/verify-downloaded-assets.ts dist/resume-assets
@@ -579,7 +597,13 @@ jobs:
         run: |
           test -n "$RELEASE_ID"
           mkdir -p dist/promotion-draft-assets
-          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" dist/promotion-draft-assets
+          asset_list="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
+          [[ -n "$asset_list" ]] || { echo 'draft release has no assets' >&2; exit 1; }
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid asset id" >&2; exit 1; }
+            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "dist/promotion-draft-assets/${asset_name}"
+          done <<< "$asset_list"
           node scripts/release/verify-attested-assets.ts dist/promotion-actions-assets dist/promotion-draft-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
