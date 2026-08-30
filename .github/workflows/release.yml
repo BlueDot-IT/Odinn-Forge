@@ -134,10 +134,10 @@ jobs:
             release_assets_artifact_id=""
           fi
           staged_run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${attestation_run_id}")"
-          jq -e --argjson runId "$attestation_run_id" --arg repository "$GITHUB_REPOSITORY" --arg tagCommit "$tag_commit" \
+          jq -e --argjson runId "$attestation_run_id" --arg repository "$GITHUB_REPOSITORY" --arg workflowRef "$GITHUB_REF_NAME" \
             '.id == $runId and .event == "workflow_dispatch" and
              .path == ".github/workflows/release.yml" and .repository.full_name == $repository and
-             .head_sha == $tagCommit' <<<"$staged_run"
+             .head_branch == $workflowRef' <<<"$staged_run"
           workflow_commit="$(jq -er '.head_sha | select(test("^[0-9a-f]{40}$"))' <<<"$staged_run")"
           if [[ "$RESUME_STAGED_ASSETS" == "true" ]]; then
             staged_artifact="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${release_assets_artifact_id}")"
