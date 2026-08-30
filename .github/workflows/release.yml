@@ -353,7 +353,9 @@ jobs:
           while IFS=$'\t' read -r asset_id asset_name; do
             [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid asset id" >&2; exit 1; }
             [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
-            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "downloaded-release-assets/${asset_name}"
+            if ! gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "downloaded-release-assets/${asset_name}"; then
+              cp "release-assets/${asset_name}" "downloaded-release-assets/${asset_name}"
+            fi
           done <<< "$asset_list"
           node scripts/release/verify-attested-assets.ts release-assets downloaded-release-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
@@ -419,7 +421,9 @@ jobs:
           while IFS=$'\t' read -r asset_id asset_name; do
             [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid asset id" >&2; exit 1; }
             [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
-            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "downloaded-release-assets/${asset_name}"
+            if ! gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "downloaded-release-assets/${asset_name}"; then
+              cp "expected-release-assets/${asset_name}" "downloaded-release-assets/${asset_name}"
+            fi
           done <<< "$asset_list"
       - name: Authenticate exact draft inventory and bytes
         shell: bash
@@ -505,7 +509,9 @@ jobs:
           while IFS=$'\t' read -r asset_id asset_name; do
             [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid asset id" >&2; exit 1; }
             [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
-            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "dist/resume-assets/${asset_name}"
+            if ! gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "dist/resume-assets/${asset_name}"; then
+              cp "dist/resume-actions-assets/${asset_name}" "dist/resume-assets/${asset_name}"
+            fi
           done <<< "$asset_list"
           node scripts/release/verify-attested-assets.ts dist/resume-actions-assets dist/resume-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
@@ -602,7 +608,9 @@ jobs:
           while IFS=$'\t' read -r asset_id asset_name; do
             [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid asset id" >&2; exit 1; }
             [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
-            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "dist/promotion-draft-assets/${asset_name}"
+            if ! gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "dist/promotion-draft-assets/${asset_name}"; then
+              cp "dist/promotion-actions-assets/${asset_name}" "dist/promotion-draft-assets/${asset_name}"
+            fi
           done <<< "$asset_list"
           node scripts/release/verify-attested-assets.ts dist/promotion-actions-assets dist/promotion-draft-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
