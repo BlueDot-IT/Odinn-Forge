@@ -6,7 +6,7 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
-## [1.2.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.2...v1.2.0) (2026-08-28)
+## [1.2.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.2...v1.2.0) (2026-09-04)
 
 ### Added
 
