@@ -67,6 +67,10 @@ export function matchingAdvisories(payload: unknown, minimumSeverity: string) {
   return matches;
 }
 
+export function isUnavailablePnpmAudit(output: string) {
+  return /ERR_PNPM_AUDIT_BAD_RESPONSE|endpoint is being retired|\bHTTP\s*410\b|ERR_SOCKET_TIMEOUT|\bETIMEDOUT\b|\bECONNRESET\b/i.test(output);
+}
+
 async function bulkAudit(level: string) {
   const listed = await execFile("pnpm", ["-r", "list", "--json", "--depth", "Infinity"], {
     maxBuffer: 32 * 1024 * 1024,
@@ -103,7 +107,7 @@ export async function runAudit(level = "high") {
   } catch (error: any) {
     const output = `${error.stdout || ""}\n${error.stderr || ""}`;
     process.stdout.write(output);
-    if (!/ERR_PNPM_AUDIT_BAD_RESPONSE|endpoint is being retired|\bHTTP\s*410\b/i.test(output)) throw error;
+    if (!isUnavailablePnpmAudit(output)) throw error;
     console.warn("pnpm audit endpoint is unavailable; querying the npm bulk advisory endpoint directly.");
     await bulkAudit(level);
   }
