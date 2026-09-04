@@ -154,24 +154,13 @@ visible workflow failures; they are not converted into successful runs.
 
 ### Codex Security remediation
 
-The event-facing Odinn Maintainer workflow also calls a separate, immutable
-reusable remediation workflow every day at 05:41 UTC. This path scans only the
-trusted `main` branch. The ordinary six-hour reconciliation sweep is routed to
-the target-discovery jobs, while the daily security schedule is routed only to
-the remediation job.
-
-The caller grants `actions: write`, `contents: write`, and
-`pull-requests: write` so the reusable workflow can publish a bounded repair
-branch, open a draft pull request, and explicitly dispatch CI. The ChatGPT OAuth
-record is passed as a workflow secret. Inside the pinned maintainer workflow,
-scan and patch steps receive OAuth without a repository write credential; the
-later publication step receives the caller-scoped GitHub token without OAuth.
-
-Publication is fail-closed. The candidate must remain bound to the scanned
-default-branch revision, satisfy affected-path and diff-size limits, and pass
-the complete Forge check suite before publication. The workflow creates only a
-draft pull request and never merges it. Maintainer review and protected-branch
-requirements remain mandatory.
+Automated credential-bearing security remediation is not enabled. The former
+scheduled reusable-workflow caller was removed because its successor control
+plane had not completed the required reviewed comparison and controlled
+non-production credential trial. Security scanning remains in the repository's
+ordinary security workflows; remediation requires an independently reviewed
+pull request until a replacement control plane satisfies that acceptance
+contract.
 
 ### Version preparation
 

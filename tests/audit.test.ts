@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { collectPackageVersions, matchingAdvisories } from "../scripts/ci/audit.ts";
+import {
+  collectPackageVersions,
+  isUnavailablePnpmAudit,
+  matchingAdvisories
+} from "../scripts/ci/audit.ts";
 
 test("bulk advisory inventory collects unique transitive package versions", () => {
   const inventory = collectPackageVersions([{ devDependencies: {
@@ -17,4 +21,11 @@ test("bulk advisory evaluation enforces the requested severity threshold", () =>
   };
   assert.deepEqual(matchingAdvisories(payload, "high").map((item) => item.package), ["gamma"]);
   assert.throws(() => matchingAdvisories({ alpha: [{ severity: "mystery" }] }, "high"), /unknown severity/);
+});
+
+test("audit transport outages use the independent fail-closed bulk endpoint", () => {
+  for (const outage of ["ERR_SOCKET_TIMEOUT", "ETIMEDOUT", "ECONNRESET", "HTTP 410"]) {
+    assert.equal(isUnavailablePnpmAudit(outage), true);
+  }
+  assert.equal(isUnavailablePnpmAudit("3 high severity vulnerabilities"), false);
 });

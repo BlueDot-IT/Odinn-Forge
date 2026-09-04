@@ -6,14 +6,7 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## [Unreleased]
 
-## [1.2.1](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.2.0...v1.2.1) (2026-08-30)
-
-### Fixed
-
-- validate and promote the immutable Actions-staged release assets while
-  binding resumed release provenance to the exact dispatched workflow ref
-
-## [1.2.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.2...v1.2.0) (2026-08-28)
+## [1.2.0](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.2...v1.2.0) (2026-09-04)
 
 ### Added
 
@@ -52,6 +45,8 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 - make telemetry shutdown, durable result recovery, workflow dispatch, audit
   verification, browser recovery, and state retention fail closed under
   interruption and concurrent ownership
+- validate and promote immutable Actions-staged release assets while binding
+  resumed release provenance to the exact dispatched workflow ref
 
 ## [1.1.2](https://github.com/BlueDot-IT/Odinn-Forge/compare/v1.1.1...v1.1.2) (2026-08-25)
 

@@ -96,10 +96,6 @@ test("required quality lanes provision the pinned browser before console regress
 test("routine dependency groups exclude runtime and Node typing migrations", async () => {
   const dependabot = await read(".github/dependabot.yml");
   assert.match(dependabot, /npm-minor-and-patch:[\s\S]*exclude-patterns: \["@types\/node", "playwright-core"\]/u);
-  assert.match(
-    dependabot,
-    /github-actions:[\s\S]*exclude-patterns:[\s\S]*BlueDot-IT\/odinn-maintainer\/\.github\/workflows\/codex-security-remediation\.yml/u
-  );
   assert.match(dependabot, /dependency-name: "@types\/node"[\s\S]*version-update:semver-major/u);
   assert.match(dependabot, /dependency-name: typescript[\s\S]*version-update:semver-major/u);
 });
@@ -644,38 +640,21 @@ test("maintainer reconciliation serializes the exact target across every trigger
   assert.match(ciDocs, /re-fetches the complete live target state/u);
 });
 
-test("daily Codex remediation is isolated, pinned, and draft-only", async () => {
+test("unvalidated credential-bearing remediation is disabled", async () => {
   const dispatcher = await read(".github/workflows/odinn-maintainer.yml");
   const ciDocs = await read("docs/ci-cd.md");
-  const remediationSha = "0c5f7b0dea200979ea96107b6856ed3dc5e7bcc0";
 
   assert.deepEqual(
     [...dispatcher.matchAll(/^\s+- cron: "([^"]+)"$/gmu)].map((match) => match[1]),
-    ["17 */6 * * *", "41 5 * * *"],
+    ["17 */6 * * *"],
   );
   assert.match(
     dispatcher,
     /discover:[\s\S]*?if: github\.event_name != 'schedule' \|\| github\.event\.schedule == '17 \*\/6 \* \* \*'/u,
   );
-  assert.match(
-    dispatcher,
-    /remediate-security:[\s\S]*?if: github\.event_name == 'schedule' && github\.event\.schedule == '41 5 \* \* \*'/u,
-  );
-  assert.match(
-    dispatcher,
-    new RegExp(
-      `uses: BlueDot-IT/odinn-maintainer/\\.github/workflows/codex-security-remediation\\.yml@${remediationSha}`,
-      "u",
-    ),
-  );
-  assert.match(
-    dispatcher,
-    /remediate-security:[\s\S]*?permissions:\s*\n\s+actions: write\s*\n\s+contents: write\s*\n\s+pull-requests: write/u,
-  );
-  assert.match(dispatcher, /target_ref: main/u);
-  assert.match(dispatcher, /oauth_json: \$\{\{ secrets\.ODINN_OPENAI_OAUTH_JSON \}\}/u);
-  assert.match(ciDocs, /creates only a\s+draft pull request and never merges it/u);
-  assert.match(ciDocs, /scan and patch steps receive OAuth without a repository write credential/u);
+  assert.doesNotMatch(dispatcher, /codex-security-remediation/u);
+  assert.doesNotMatch(dispatcher, /remediate-security/u);
+  assert.match(ciDocs, /Automated credential-bearing security remediation is not enabled/u);
 });
 
 test("maintainer actions pin exact reviewed commits", async () => {
