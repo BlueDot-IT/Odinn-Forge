@@ -62,7 +62,7 @@ jobs:
       contents: read
       pull-requests: write
     env:
-      NODE_VERSION: "24"
+      NODE_VERSION: "24.19.0"
       PNPM_VERSION: "10.14.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      NODE_VERSION: "24"
+      NODE_VERSION: "24.19.0"
       PNPM_VERSION: "10.14.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
