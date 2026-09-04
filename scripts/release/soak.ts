@@ -243,6 +243,9 @@ try {
     () => stopGateway(gateway, interruptionSignal),
     () => ({ signal: interruptionSignal })
   );
+  // A hard loss cannot release the gateway ownership lease. Exercise the
+  // production takeover boundary after lease expiry instead of weakening it.
+  if (interruptionSignal === "SIGKILL") await delay(30_100);
   providerMode = "normal";
   gateway = await record("queue-interruption-restart-recovery", () => startGateway(packageRoot, workspace, state, { [providerCredentialEnv]: "odinn-soak-key" }), () => ({ bound: true }));
   await record("recovered-job-state", async () => {

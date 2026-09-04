@@ -104,6 +104,7 @@ test("nightly workflow retains exact-commit long-soak evidence on failure", asyn
   assert.match(workflow, /phase-f-long-soak-\$\{\{ github\.sha \}\}/u);
   assert.match(releaseSoak, /ODINN_SOAK_POWER_LOSS/u);
   assert.match(releaseSoak, /"SIGKILL"/u);
+  assert.match(releaseSoak, /if \(interruptionSignal === "SIGKILL"\) await delay\(30_100\)/u);
   assert.match(documentation, /not an\s+alias for the one-shot release soak/u);
   assert.match(documentation, /exact 40-character source commit/u);
 });

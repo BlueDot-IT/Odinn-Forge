@@ -44,11 +44,6 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
-        # The reusable remediation workflow executes with write authority and
-        # receives an OAuth secret. Its pinned commit must be reviewed as a
-        # dedicated control-plane change, not hidden inside routine actions.
-        exclude-patterns:
-          - "BlueDot-IT/odinn-maintainer/.github/workflows/codex-security-remediation.yml"
 
   - package-ecosystem: docker
     directory: /
