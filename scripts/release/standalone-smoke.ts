@@ -17,13 +17,25 @@ if (target !== hostTarget) throw new Error(`standalone smoke target ${target} re
 const extension = target === "win32-x64" ? "zip" : "tar.gz";
 const archive = join(releaseDir, `odinn-v${pkg.version}-standalone-${target}.${extension}`);
 const temporary = await mkdtemp(join(tmpdir(), "odinn standalone ünicode "));
+function windowsCommandArg(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+function runCommand(command: string, args: string[], cwd: string, env: Record<string, string>) {
+  if (process.platform === "win32" && command.toLowerCase().endsWith(".cmd")) {
+    const commandLine = ["call", windowsCommandArg(command), ...args.map(windowsCommandArg)].join(" ");
+    return spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", commandLine], {
+      cwd, encoding: "utf8", env: { ...process.env, ...env }, shell: false
+    });
+  }
+  return spawnSync(command, args, { cwd, encoding: "utf8", env: { ...process.env, ...env }, shell: false });
+}
 function run(command: string, args: string[], cwd: string, env: Record<string, string> = {}): string {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", env: { ...process.env, ...env }, shell: process.platform === "win32" && command.endsWith(".cmd") });
+  const result = runCommand(command, args, cwd, env);
   if (result.status !== 0) throw new Error(`${command} failed (${result.status}): ${result.stderr || result.stdout || result.error?.message}`);
   return result.stdout;
 }
 function runFailure(command: string, args: string[], cwd: string, env: Record<string, string> = {}): string {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", env: { ...process.env, ...env }, shell: process.platform === "win32" && command.endsWith(".cmd") });
+  const result = runCommand(command, args, cwd, env);
   if (result.status === 0) throw new Error(`${command} unexpectedly succeeded`);
   return `${result.stderr || result.stdout || result.error?.message}`;
 }
