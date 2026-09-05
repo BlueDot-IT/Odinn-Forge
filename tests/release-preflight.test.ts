@@ -57,6 +57,7 @@ function runPreflight(cwd: string, env: Record<string, string> = {}) {
     env: {
       ...process.env,
       CI: "true",
+      GITHUB_EVENT_NAME: "",
       ...env
     }
   });
@@ -104,7 +105,7 @@ test("release preflight passes for untagged prerelease version", async () => {
   }
 });
 
-test("pull request events do NOT bypass the stale version check", async () => {
+test("pull request events allow release validation ahead of an existing tag", async () => {
   const dir = await setupTestRepo("1.2.3-rc.1");
   try {
     spawnSync("git", ["tag", "-a", "v1.2.3-rc.1", "-m", "tag v1.2.3-rc.1"], { cwd: dir });
@@ -114,8 +115,8 @@ test("pull request events do NOT bypass the stale version check", async () => {
     spawnSync("git", ["commit", "-m", "PR commit"], { cwd: dir });
 
     const res = runPreflight(dir, { GITHUB_EVENT_NAME: "pull_request" });
-    assert.equal(res.status, 1, "Preflight must fail on PR when reusing published tag");
-    assert.match(res.stderr, /development HEAD is ahead of published v1\.2\.3-rc\.1; bump the package version before building/);
+    assert.equal(res.status, 0, `Expected 0 but got error: ${res.stderr}`);
+    assert.match(res.stdout, /"ready": true/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

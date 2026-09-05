@@ -954,7 +954,7 @@ async function writeLaunchers(
   await atomicLauncher(join(bin, "odinn-gateway.cmd"), gatewayTrampoline, 0o600);
 }
 
-function installedUnixLauncher(compiledEntry: string, sourceEntry: string, hostileNodeEnvironment: string, nativeBoundary: boolean): string {
+function legacyInstalledUnixLauncher(compiledEntry: string, sourceEntry: string, hostileNodeEnvironment: string, nativeBoundary: boolean): string {
   const digestCommand = process.platform === "darwin"
     ? 'ACTUAL=$(/usr/bin/shasum -a 256 "$NODE"); ACTUAL=${ACTUAL%% *}'
     : 'ACTUAL=$(/usr/bin/sha256sum "$NODE"); ACTUAL=${ACTUAL%% *}';
@@ -962,6 +962,14 @@ function installedUnixLauncher(compiledEntry: string, sourceEntry: string, hosti
     ? `[ "\${ODINN_NATIVE_BOUNDARY-}" = "1" ] || { echo "Ódinn native runtime boundary was bypassed" >&2; exit 126; }\nunset ODINN_NATIVE_BOUNDARY\n`
     : "#!/bin/sh\n";
   return `${boundary}set -eu\nPREFIX=${shellQuote(prefix)}\nunset ${hostileNodeEnvironment}\n{ IFS= read -r CURRENT; IFS= read -r DISTRIBUTION; IFS= read -r RUNTIME_SHA256; } < "$PREFIX/current"\ncase "$CURRENT" in ''|*[!A-Za-z0-9._-]*) echo "Ódinn current pointer is invalid" >&2; exit 126;; esac\ncase "$DISTRIBUTION" in\n  standalone)\n    case "$RUNTIME_SHA256" in *[!a-f0-9]*|'') echo "Ódinn embedded runtime digest is invalid" >&2; exit 126;; esac\n    [ "${RUNTIME_SHA256.length}" -eq 64 ] || { echo "Ódinn embedded runtime digest is invalid" >&2; exit 126; }\n    ROOT="$PREFIX/versions/$CURRENT"; NODE="$ROOT/runtime/node"\n    for PHYSICAL in "$PREFIX" "$PREFIX/versions" "$ROOT" "$ROOT/runtime" "$NODE"; do [ ! -L "$PHYSICAL" ] || { echo "Ódinn embedded runtime path is linked" >&2; exit 126; }; done\n    [ -f "$NODE" ] && [ -x "$NODE" ] || { echo "Ódinn embedded runtime is missing or not executable" >&2; exit 126; }\n    PHYSICAL_ROOT=$(CDPATH= cd -- "$ROOT/runtime" && pwd -P)\n    [ "$PHYSICAL_ROOT" = "$ROOT/runtime" ] || { echo "Ódinn embedded runtime path is not physical" >&2; exit 126; }\n    ${digestCommand}\n    [ "$ACTUAL" = "$RUNTIME_SHA256" ] || { echo "Ódinn embedded runtime digest mismatch" >&2; exit 126; }\n    exec "$NODE" "$ROOT/${compiledEntry}" "$@";;\n  compiled) exec node "$PREFIX/versions/$CURRENT/${compiledEntry}" "$@";;\n  source) exec node "$PREFIX/versions/$CURRENT/${sourceEntry}" "$@";;\n  *) echo "Ódinn current distribution is invalid" >&2; exit 126;;\nesac\n`;
+}
+
+function installedUnixLauncher(compiledEntry: string, sourceEntry: string, hostileNodeEnvironment: string, nativeBoundary: boolean): string {
+  const script = legacyInstalledUnixLauncher(compiledEntry, sourceEntry, hostileNodeEnvironment, nativeBoundary);
+  return script.replace(
+    'PHYSICAL_ROOT=$(CDPATH= cd -- "$ROOT/runtime" && pwd -P)\n    [ "$PHYSICAL_ROOT" = "$ROOT/runtime" ]',
+    'PHYSICAL_ROOT=$(CDPATH= cd -- "$ROOT" && pwd -P)\n    PHYSICAL_RUNTIME=$(CDPATH= cd -- "$ROOT/runtime" && pwd -P)\n    [ "$PHYSICAL_RUNTIME" = "$PHYSICAL_ROOT/runtime" ]'
+  );
 }
 
 function installedWindowsLauncher(

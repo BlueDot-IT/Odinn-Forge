@@ -42,7 +42,12 @@ const packageTagCommit = spawnSync("git", ["rev-list", "-n", "1", `refs/tags/${p
 const headCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" });
 if (headCommit.status !== 0) throw new Error("release preflight: could not resolve HEAD");
 
-if (!releaseTag && packageTagCommit.status === 0 && packageTagCommit.stdout.trim().length > 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
+// Pull requests are validation candidates, not published development builds.
+// They must be allowed to exercise release packaging for the version currently
+// under release repair; exact tag/commit identity remains enforced whenever a
+// release tag is supplied by the release workflow.
+const isPullRequestValidation = process.env.GITHUB_EVENT_NAME === "pull_request";
+if (!releaseTag && !isPullRequestValidation && packageTagCommit.status === 0 && packageTagCommit.stdout.trim().length > 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
   throw new Error(`release preflight: development HEAD is ahead of published ${packageTag}; bump the package version before building`);
 }
 if (releaseTag) {
