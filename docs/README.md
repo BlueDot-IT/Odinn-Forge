@@ -134,10 +134,13 @@ v1 compatibility policy before treating any interface as stable.
 These documents record planning or acceptance work. Read each document's own
 status and date before using it as current product evidence.
 
+- [2.0.0 operator-fleet roadmap](v2.0.0-roadmap.md) — multi-machine,
+  tenant-isolated execution, phased delivery, and release gates; separate from
+  the current 1.2.0 release repair.
 - [Stabilization plan](stabilization-plan.md)
 - [1.1 release scope](v1.1-release-scope.md)
-- [Post-1.1 roadmap](post-1.1-roadmap.md) — triage-backed stabilization and
-  future multi-tenant structure.
+- [Historical post-1.1 roadmap](post-1.1-roadmap.md) — the earlier stabilization
+  and tenancy planning record; forward sequencing now lives in the 2.0.0 roadmap.
 - [v0.4.0 user acceptance record](uat/v0.4.0-uat.md)
 - [UAT findings proof log](uat/logs/uat-findings.md)
 

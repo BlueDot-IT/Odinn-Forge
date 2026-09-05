@@ -1,5 +1,12 @@
 # Post-1.1 roadmap
 
+> Historical planning snapshot. The release-candidate descriptions and open
+> gates below describe the 1.1 planning period, not current release status.
+> The [2.0.0 roadmap](v2.0.0-roadmap.md) now owns forward feature sequencing.
+> Current release work repairs 1.2.0; it does not move to a 1.2.1 release.
+
+## Historical context
+
 This roadmap separates post-1.1 work from the active 1.1 release candidate. It
 does not promote experimental surfaces to stable or override the current
 release freeze.
