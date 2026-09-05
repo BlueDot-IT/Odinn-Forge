@@ -57,6 +57,7 @@ function runPreflight(cwd: string, env: Record<string, string> = {}) {
     env: {
       ...process.env,
       CI: "true",
+      GITHUB_EVENT_NAME: "",
       ...env
     }
   });
