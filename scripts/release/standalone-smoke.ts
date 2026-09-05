@@ -22,9 +22,14 @@ function windowsCommandArg(value: string): string {
 }
 function runCommand(command: string, args: string[], cwd: string, env: Record<string, string>) {
   if (process.platform === "win32" && command.toLowerCase().endsWith(".cmd")) {
-    const commandLine = ["call", windowsCommandArg(command), ...args.map(windowsCommandArg)].join(" ");
-    return spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", commandLine], {
-      cwd, encoding: "utf8", env: { ...process.env, ...env }, shell: false
+    // Pass the command and its arguments as separate argv entries. Combining a
+    // pre-quoted command line into the final /c argument causes Node's Windows
+    // argv quoting to escape the quotes, leaving literal \" characters for
+    // cmd.exe (and making paths containing spaces fail to launch).
+    return spawnSync(process.env.ComSpec ?? "cmd.exe", [
+      "/d", "/c", "call", windowsCommandArg(command), ...args.map(windowsCommandArg)
+    ], {
+      cwd, encoding: "utf8", env: { ...process.env, ...env }, shell: false, windowsVerbatimArguments: true
     });
   }
   return spawnSync(command, args, { cwd, encoding: "utf8", env: { ...process.env, ...env }, shell: false });

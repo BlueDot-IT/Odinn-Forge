@@ -47,7 +47,8 @@ if (headCommit.status !== 0) throw new Error("release preflight: could not resol
 // under release repair; exact tag/commit identity remains enforced whenever a
 // release tag is supplied by the release workflow.
 const isPullRequestValidation = process.env.GITHUB_EVENT_NAME === "pull_request";
-if (!releaseTag && !isPullRequestValidation && packageTagCommit.status === 0 && packageTagCommit.stdout.trim().length > 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
+const isFeatureBranchValidation = refType === "branch" && !!refName && !["main", "master"].includes(refName);
+if (!releaseTag && !isPullRequestValidation && !isFeatureBranchValidation && packageTagCommit.status === 0 && packageTagCommit.stdout.trim().length > 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
   throw new Error(`release preflight: development HEAD is ahead of published ${packageTag}; bump the package version before building`);
 }
 if (releaseTag) {

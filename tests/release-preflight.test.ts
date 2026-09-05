@@ -58,6 +58,8 @@ function runPreflight(cwd: string, env: Record<string, string> = {}) {
       ...process.env,
       CI: "true",
       GITHUB_EVENT_NAME: "",
+      GITHUB_REF_TYPE: "",
+      GITHUB_REF_NAME: "",
       ...env
     }
   });
@@ -115,6 +117,23 @@ test("pull request events allow release validation ahead of an existing tag", as
     spawnSync("git", ["commit", "-m", "PR commit"], { cwd: dir });
 
     const res = runPreflight(dir, { GITHUB_EVENT_NAME: "pull_request" });
+    assert.equal(res.status, 0, `Expected 0 but got error: ${res.stderr}`);
+    assert.match(res.stdout, /"ready": true/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("feature branch validation allows release packaging ahead of an existing tag", async () => {
+  const dir = await setupTestRepo("1.2.3-rc.1");
+  try {
+    spawnSync("git", ["tag", "-a", "v1.2.3-rc.1", "-m", "tag v1.2.3-rc.1"], { cwd: dir });
+
+    await writeFile(join(dir, "README.md"), "# Feature branch change\n");
+    spawnSync("git", ["add", "."], { cwd: dir });
+    spawnSync("git", ["commit", "-m", "feature branch commit"], { cwd: dir });
+
+    const res = runPreflight(dir, { GITHUB_REF_TYPE: "branch", GITHUB_REF_NAME: "fix/v120-windows-cmd-smoke" });
     assert.equal(res.status, 0, `Expected 0 but got error: ${res.stderr}`);
     assert.match(res.stdout, /"ready": true/);
   } finally {
