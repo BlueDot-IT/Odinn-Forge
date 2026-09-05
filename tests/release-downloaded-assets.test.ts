@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -137,16 +137,30 @@ test("downloaded release verification rejects an asset changed after checksummin
 test("release validation permissions stay scoped and staged recovery uses secure extraction", async () => {
   const workflow = await readFile(join(root, ".github/workflows/release.yml"), "utf8");
   const releasePolicy = workflow.slice(workflow.indexOf("  release-policy:"), workflow.indexOf("  source-package:"));
-  const stagedValidation = workflow.slice(workflow.indexOf("  stage-release-assets:"), workflow.indexOf("  validate-downloaded-release:"));
+  const stagedValidation = workflow.slice(workflow.indexOf("  stage-release-assets:"), workflow.indexOf("  authenticate-draft-release:"));
+  const draftAuthentication = workflow.slice(workflow.indexOf("  authenticate-draft-release:"), workflow.indexOf("  validate-downloaded-release:"));
   const downloadedValidation = workflow.slice(workflow.indexOf("  validate-downloaded-release:"), workflow.indexOf("  publish-release:"));
   const publication = workflow.slice(workflow.indexOf("  publish-release:"));
   assert.match(
     releasePolicy,
     /permissions:\n\s+actions: read\n(?:\s+#[^\n]*\n){2}\s+contents: write/u,
-    "only draft-release inspection receives push-level contents access"
+    "draft-release inspection requires push-level contents access"
   );
   assert.match(downloadedValidation, /permissions:\n(?:\s+[a-z-]+: read\n)*\s+contents: read/u);
   assert.doesNotMatch(downloadedValidation, /contents: write/u);
+  assert.match(draftAuthentication, /permissions:\n\s+actions: read\n\s+attestations: read\n\s+#[^\n]*\n\s+contents: write/u);
+  assert.doesNotMatch(draftAuthentication, /(?:actions|attestations|id-token): write/u);
+  assert.doesNotMatch(draftAuthentication, /(?:install-smoke|standalone-smoke|extract-secure-archive|validate-prior-rollback)\.(?:ts|js)|npm publish|pnpm install/u,
+    "the write-capable draft-authentication job must not execute or extract release archives");
+  assert.match(draftAuthentication, /needs:\n\s+- release-policy\n\s+- stage-release-assets/u);
+  assert.match(draftAuthentication, /always\(\) && needs\.release-policy\.result == 'success' && \(inputs\.resume_staged_assets \|\| needs\.stage-release-assets\.result == 'success'\)/u);
+  for (const section of [downloadedValidation, publication]) {
+    assert.match(section, /^      - authenticate-draft-release$/mu);
+    assert.match(section, /needs\.authenticate-draft-release\.result == 'success'/u,
+      "both platform execution and publication must fail closed on draft-authentication failure");
+  }
+  assert.doesNotMatch(downloadedValidation, /download-draft-assets\.sh|gh release download/u,
+    "read-only platform runners consume the original authenticated immutable artifact");
   for (const section of [stagedValidation, downloadedValidation, publication]) {
     assert.match(section, /pnpm\/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86/u);
     assert.match(section, /pnpm install --frozen-lockfile --ignore-scripts/u);
@@ -165,16 +179,34 @@ test("release validation permissions stay scoped and staged recovery uses secure
     downloadedValidation.indexOf("verify-attested-assets.ts") < downloadedValidation.indexOf("standalone-smoke.ts"),
     "every platform must authenticate every downloaded asset before execution"
   );
+  for (const section of [stagedValidation, draftAuthentication]) {
+    const download = section.indexOf('bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" downloaded-release-assets');
+    const authentication = section.indexOf("verify-attested-assets.ts");
+    assert.ok(download >= 0 && download < authentication,
+      "staging and independent authentication must read actual numeric-ID draft assets before comparison");
+    assert.doesNotMatch(section, /cp "\$asset_path"/u,
+      "copying the expected artifact cannot stand in for actual draft authentication");
+  }
+  assert.match(draftAuthentication, /artifact-ids: \$\{\{ inputs\.resume_staged_assets && needs\.release-policy\.outputs\.release_assets_artifact_id \|\| needs\.stage-release-assets\.outputs\.release_assets_artifact_id \}\}/u);
+  assert.match(draftAuthentication, /run-id: \$\{\{ needs\.release-policy\.outputs\.attestation_run_id \}\}/u);
+  assert.match(draftAuthentication, /"\$GITHUB_REPOSITORY" "\$EXPECTED_COMMIT" "\$ATTESTATION_RUN_ID"/u);
   const recovery = publication.indexOf("Recover npm package from verified staged release archive");
   const recoveryVerification = publication.indexOf("verify-attested-assets.ts", recovery);
   const recoveryExtraction = publication.indexOf("extract-secure-archive.ts", recovery);
   assert.ok(recovery >= 0 && recoveryVerification > recovery && recoveryVerification < recoveryExtraction,
     "resume must bind and compare the original Actions artifact before extraction");
+  const recoveryDownload = publication.indexOf('bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" dist/resume-assets', recovery);
+  assert.ok(recoveryDownload > recovery && recoveryDownload < recoveryVerification,
+    "npm recovery must download actual draft bytes before authentication and extraction");
   const promotion = publication.indexOf("Promote verified GitHub release");
   const promotionVerification = publication.indexOf("verify-attested-assets.ts", promotion);
   const promotionMutation = publication.indexOf('gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false', promotion);
   assert.ok(promotion >= 0 && promotionVerification > promotion && promotionVerification < promotionMutation,
     "promotion must freshly redownload, compare, and authenticate the draft before making it public");
+  const promotionDownload = publication.indexOf('bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" dist/promotion-draft-assets', promotion);
+  assert.ok(promotionDownload > promotion && promotionDownload < promotionVerification,
+    "promotion must fetch the exact numeric-ID draft again after platform validation");
+  assert.doesNotMatch(publication, /cp "\$asset_path"/u);
   assert.ok(
     promotionMutation < publication.indexOf('published="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"', promotion),
     "publication must re-read the exact release after promotion"
@@ -183,4 +215,65 @@ test("release validation permissions stay scoped and staged recovery uses secure
   assert.match(publication, /\.draft == false and\n\s+\.prerelease == \$expectedPrerelease and \.immutable == true/u);
   assert.doesNotMatch(workflow, /tar -xzf "dist\/resume-assets/u);
   assert.doesNotMatch(workflow, /\$\(dirname\b/u);
+});
+
+test("standalone workflow overlay uses the pinned descendant commit without changing candidate identity", async () => {
+  const workflow = await readFile(join(root, ".github/workflows/release.yml"), "utf8");
+  const overlay = workflow.slice(workflow.indexOf("      - name: Load exact reviewed standalone validation harness"),
+    workflow.indexOf("      - name: Run controlled-runtime standalone smoke"));
+  assert.match(overlay, /WORKFLOW_SHA: \$\{\{ github\.workflow_sha \}\}/u);
+  assert.match(overlay, /EXPECTED_COMMIT: \$\{\{ needs\.release-policy\.outputs\.release_commit \}\}/u);
+  const script = overlay.split("        run: |\n")[1]?.replace(/^          /gmu, "");
+  assert.ok(script, "the workflow must expose the reviewed harness-loading script");
+  const directory = await mkdtemp(join(tmpdir(), "odinn-harness-overlay-"));
+  const harnessPath = join(directory, "scripts/release/standalone-smoke.ts");
+  const candidateHarness = "// candidate validation harness\n";
+  const reviewedHarness = "// reviewed validation harness\n";
+  const summaryPath = join(directory, "validation-summary.md");
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  const runOverlay = (candidateSha: string, workflowSha: string) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", script], {
+    cwd: directory,
+    encoding: "utf8",
+    env: { ...process.env, EXPECTED_COMMIT: candidateSha, WORKFLOW_SHA: workflowSha, GITHUB_STEP_SUMMARY: summaryPath }
+  });
+  try {
+    await mkdir(join(directory, "scripts/release"), { recursive: true });
+    git("init", "--quiet", "--initial-branch=main");
+    git("config", "user.name", "Release validation test");
+    git("config", "user.email", "release-test@example.invalid");
+    git("config", "core.autocrlf", "false");
+    await writeFile(harnessPath, "// previous candidate\n");
+    await writeFile(join(directory, "runtime-identity.json"), '{"identity":"candidate-runtime"}\n');
+    git("add", ".");
+    git("commit", "--quiet", "-m", "previous candidate");
+    const previousSha = git("rev-parse", "HEAD");
+    await writeFile(harnessPath, candidateHarness);
+    git("commit", "--quiet", "-am", "tagged candidate");
+    const candidateSha = git("rev-parse", "HEAD");
+    await writeFile(harnessPath, reviewedHarness);
+    git("commit", "--quiet", "-am", "reviewed harness");
+    const workflowSha = git("rev-parse", "HEAD");
+    await writeFile(harnessPath, "// later mutable main must not be loaded\n");
+    git("commit", "--quiet", "-am", "later main");
+    git("checkout", "--quiet", "--detach", candidateSha);
+    const result = runOverlay(candidateSha, workflowSha);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(await readFile(harnessPath, "utf8"), reviewedHarness);
+    assert.equal(git("rev-parse", "HEAD"), candidateSha);
+    assert.equal(git("diff", "--name-only"), "scripts/release/standalone-smoke.ts");
+    const summary = await readFile(summaryPath, "utf8");
+    for (const identity of [candidateSha, workflowSha, createHash("sha256").update(reviewedHarness).digest("hex")]) {
+      assert.ok(summary.includes(identity), "validation evidence must retain both commits and the exact harness digest");
+    }
+    await writeFile(harnessPath, candidateHarness);
+    assert.notEqual(runOverlay(candidateSha, previousSha).status, 0,
+      "a harness commit that does not descend from the candidate must fail closed");
+    assert.equal(await readFile(harnessPath, "utf8"), candidateHarness);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

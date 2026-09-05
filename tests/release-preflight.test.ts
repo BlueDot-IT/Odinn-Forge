@@ -58,6 +58,10 @@ function runPreflight(cwd: string, env: Record<string, string> = {}) {
       ...process.env,
       CI: "true",
       GITHUB_EVENT_NAME: "",
+      GITHUB_REF_TYPE: "",
+      GITHUB_REF_NAME: "",
+      ODINN_RELEASE_TAG: "",
+      ODINN_RELEASE_VALIDATION_ONLY: "",
       ...env
     }
   });
@@ -117,6 +121,32 @@ test("pull request events allow release validation ahead of an existing tag", as
     const res = runPreflight(dir, { GITHUB_EVENT_NAME: "pull_request" });
     assert.equal(res.status, 0, `Expected 0 but got error: ${res.stderr}`);
     assert.match(res.stdout, /"ready": true/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("explicit CI validation permits main packaging without changing release identity", async () => {
+  const dir = await setupTestRepo("1.2.3-rc.1");
+  try {
+    spawnSync("git", ["tag", "-a", "v1.2.3-rc.1", "-m", "tag v1.2.3-rc.1"], { cwd: dir });
+
+    await writeFile(join(dir, "README.md"), "# Feature branch change\n");
+    spawnSync("git", ["add", "."], { cwd: dir });
+    spawnSync("git", ["commit", "-m", "feature branch commit"], { cwd: dir });
+
+    const context = { GITHUB_REF_TYPE: "branch", GITHUB_REF_NAME: "main", ODINN_RELEASE_VALIDATION_ONLY: "1" };
+    const res = runPreflight(dir, context);
+    assert.equal(res.status, 0, `Expected 0 but got error: ${res.stderr}`);
+    assert.match(res.stdout, /"ready": true/);
+
+    const tagged = runPreflight(dir, { ...context, ODINN_RELEASE_TAG: "v1.2.3-rc.1" });
+    assert.equal(tagged.status, 1);
+    assert.match(tagged.stderr, /checked-out commit is not v1\.2\.3-rc\.1/);
+
+    const local = runPreflight(dir, { ...context, CI: "false" });
+    assert.equal(local.status, 1);
+    assert.match(local.stderr, /development HEAD is ahead of published/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

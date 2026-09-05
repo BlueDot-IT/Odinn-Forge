@@ -10,9 +10,11 @@ being published.
 - The package is built from the intended commit and its archive checksums,
   SBOM, and provenance are available.
 - Platform support is covered by both ordinary CI and the automated
-  GitHub-hosted Linux, macOS, and Windows release matrix. Validating exact
-  downloaded draft-release assets on all three platforms is a blocking
-  publication dependency. Maintainer-owned physical clean machines and personal
+  GitHub-hosted Linux, macOS, and Windows release matrix. An independent
+  authentication job downloads the actual draft assets and proves their exact
+  equality to the immutable Actions inventory before the read-only matrix
+  executes those same bytes on all three platforms. Both gates are blocking
+  publication dependencies. Maintainer-owned physical clean machines and personal
   live-provider accounts are supplemental testing, not release prerequisites.
 - A configured provider can complete a real model request without exposing
   credentials in output or diagnostics. Synthetic or local protocol-provider
@@ -53,6 +55,12 @@ pnpm storage:drill
 The packager archives `HEAD`, not uncommitted working-tree changes. Run the
 soak before checksums so its report is included in the final checksum set. If
 an artifact changes afterward, regenerate the checksums and rerun verification.
+
+Ordinary validation workflows explicitly set `ODINN_RELEASE_VALIDATION_ONLY=1`
+with `CI=true` so later harness changes can be tested without moving the
+existing candidate tag or changing its version. This opt-in is not accepted
+outside CI, is never set by the Release workflow, and cannot override the
+exact tag/version/commit checks when `ODINN_RELEASE_TAG` is supplied.
 
 The archive verifier rejects JavaScript that imports or resolves TypeScript
 runtime sources. Playwright 1.62 retains one Vite-generated
@@ -137,12 +145,27 @@ candidate, refuses asset replacement, downloads the release assets back, and
 validates exact downloaded artifacts across GitHub-hosted Linux, macOS, and
 Windows runners before publishing npm or promoting the GitHub release. The
 hosted Linux/macOS/Windows downloaded-artifact matrix is a blocking publication
-dependency; physical-machine testing is supplemental. Every validation runner
-downloads the immutable `odinn-release-assets` Actions artifact by numeric
-artifact ID, compares the draft inventory and bytes exactly, and verifies every
-asset's GitHub attestation against this repository, `release.yml`, the exact
-source commit and branch, the original workflow run, and GitHub-hosted runner
-identity before executing an archive.
+dependency; physical-machine testing is supplemental. A separate authentication
+job uses the numeric release and asset IDs to download the actual draft assets,
+compares their inventory and bytes with the original immutable
+`odinn-release-assets` Actions artifact, and verifies every asset's GitHub
+attestation against this repository, `release.yml`, the exact source commit and
+branch, the original workflow run, and GitHub-hosted runner identity. Draft
+downloads require push-level contents access; this job never executes archives.
+Only after that gate succeeds does each read-only validation runner download
+the same original Actions artifact by numeric artifact ID, reauthenticate its
+inventory and provenance, and execute its verified bytes. Initial staging,
+resumed npm recovery, and final GitHub promotion also download the actual draft
+bytes and compare them before proceeding; copying an Actions artifact is not
+treated as a fresh draft download.
+
+The standalone smoke harness alone is loaded from the immutable commit that
+supplied the dispatched workflow (`github.workflow_sha`). The tagged candidate
+must be an ancestor of that reviewed workflow commit. The validation summary
+records both commits and the harness file's SHA-256. All runtime imports,
+packaged assets, source metadata, and original attestations remain bound to the
+unchanged candidate tag. This permits a reviewed harness-only repair to resume
+an existing candidate without rebuilding assets or moving its tag.
 The GitHub release `prerelease` flag must match the tag: tags containing `-`
 must be prereleases, and stable tags must not be. Prerelease packages use the
 npm `next` dist-tag. If the npm version already exists, the workflow downloads

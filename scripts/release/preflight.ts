@@ -47,7 +47,10 @@ if (headCommit.status !== 0) throw new Error("release preflight: could not resol
 // under release repair; exact tag/commit identity remains enforced whenever a
 // release tag is supplied by the release workflow.
 const isPullRequestValidation = process.env.GITHUB_EVENT_NAME === "pull_request";
-if (!releaseTag && !isPullRequestValidation && packageTagCommit.status === 0 && packageTagCommit.stdout.trim().length > 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
+// Read-only CI may validate a later harness repair without moving an existing
+// release tag. This opt-in never relaxes the explicit tag checks below.
+const isCiValidation = process.env.CI === "true" && process.env.ODINN_RELEASE_VALIDATION_ONLY === "1";
+if (!releaseTag && !isPullRequestValidation && !isCiValidation && packageTagCommit.status === 0 && packageTagCommit.stdout.trim().length > 0 && packageTagCommit.stdout.trim() !== headCommit.stdout.trim()) {
   throw new Error(`release preflight: development HEAD is ahead of published ${packageTag}; bump the package version before building`);
 }
 if (releaseTag) {

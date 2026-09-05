@@ -348,24 +348,69 @@ jobs:
           else
             diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$existing_assets")
           fi
-          mkdir -p downloaded-release-assets
-          for asset_path in release-assets/*; do
-            asset_name="${asset_path##*/}"
-            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
-            cp "$asset_path" "downloaded-release-assets/${asset_name}"
-          done
+          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" downloaded-release-assets
           node scripts/release/verify-attested-assets.ts release-assets downloaded-release-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
           node scripts/release/install-smoke.ts downloaded-release-assets
           node scripts/release/validate-prior-rollback.ts --candidate-release downloaded-release-assets
 
+  authenticate-draft-release:
+    name: Authenticate actual draft release without archive execution
+    needs:
+      - release-policy
+      - stage-release-assets
+    if: ${{ always() && needs.release-policy.result == 'success' && (inputs.resume_staged_assets || needs.stage-release-assets.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: read
+      # Draft GETs need push-level contents access; this job never executes assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release-policy.outputs.release_commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ needs.release-policy.outputs.node_version }}
+      - name: Download original immutable Actions release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ inputs.resume_staged_assets && needs.release-policy.outputs.release_assets_artifact_id || needs.stage-release-assets.outputs.release_assets_artifact_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.release-policy.outputs.attestation_run_id }}
+          path: expected-release-assets
+      - name: Download and authenticate actual numeric-ID draft assets
+        shell: bash
+        env:
+          ATTESTATION_RUN_ID: ${{ needs.release-policy.outputs.attestation_run_id }}
+          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test "$(git rev-list -n 1 "refs/tags/$TAG")" = "$EXPECTED_COMMIT"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          expected_prerelease=false
+          [[ "$TAG" == *-* ]] && expected_prerelease=true
+          jq -e --arg releaseId "$RELEASE_ID" --arg tag "$TAG" --argjson expectedPrerelease "$expected_prerelease" \
+            '(.id | tostring) == $releaseId and .tag_name == $tag and .draft == true and .prerelease == $expectedPrerelease' <<<"$release"
+          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" downloaded-release-assets
+          node scripts/release/verify-attested-assets.ts expected-release-assets downloaded-release-assets \
+            "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
+
   validate-downloaded-release:
     name: Validate downloaded release (${{ matrix.os }})
     needs:
       - release-policy
       - stage-release-assets
-    if: ${{ always() && needs.release-policy.result == 'success' && (inputs.resume_staged_assets || needs.stage-release-assets.result == 'success') }}
+      - authenticate-draft-release
+    if: ${{ always() && needs.release-policy.result == 'success' && needs.authenticate-draft-release.result == 'success' && (inputs.resume_staged_assets || needs.stage-release-assets.result == 'success') }}
     strategy:
       fail-fast: false
       matrix:
@@ -406,11 +451,8 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ needs.release-policy.outputs.attestation_run_id }}
           path: expected-release-assets
-      - name: Download exact draft-release assets
+      - name: Prepare authenticated immutable asset execution copy
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ env.RELEASE_TAG }}
         run: |
           mkdir -p downloaded-release-assets
           for asset_path in expected-release-assets/*; do
@@ -418,7 +460,7 @@ jobs:
             [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
             cp "$asset_path" "downloaded-release-assets/${asset_name}"
           done
-      - name: Authenticate exact draft inventory and bytes
+      - name: Reauthenticate original immutable asset inventory and provenance
         shell: bash
         env:
           ATTESTATION_RUN_ID: ${{ needs.release-policy.outputs.attestation_run_id }}
@@ -434,6 +476,23 @@ jobs:
         run: node scripts/release/verify-downloaded-assets.ts downloaded-release-assets
       - name: Run install and recovery smoke against downloaded archives
         run: node scripts/release/install-smoke.ts downloaded-release-assets
+      - name: Load exact reviewed standalone validation harness
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.release-policy.outputs.release_commit }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          git merge-base --is-ancestor "$EXPECTED_COMMIT" "$WORKFLOW_SHA"
+          git show "$WORKFLOW_SHA:scripts/release/standalone-smoke.ts" > scripts/release/standalone-smoke.ts
+          harness_sha256="$(node --input-type=module -e 'import { createHash } from "node:crypto"; import { readFileSync } from "node:fs"; console.log(createHash("sha256").update(readFileSync("scripts/release/standalone-smoke.ts")).digest("hex"));')"
+          {
+            echo "### Standalone validation identity"
+            echo "- Candidate source: \`$EXPECTED_COMMIT\`"
+            echo "- Reviewed harness commit: \`$WORKFLOW_SHA\`"
+            echo "- Standalone harness SHA-256: \`$harness_sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Run controlled-runtime standalone smoke without ambient Node use
         run: node scripts/release/standalone-smoke.ts downloaded-release-assets ${{ matrix.target }}
       - name: Run prior baseline rollback validation against downloaded candidate
@@ -445,8 +504,9 @@ jobs:
       - release-policy
       - source-package
       - stage-release-assets
+      - authenticate-draft-release
       - validate-downloaded-release
-    if: ${{ always() && needs.release-policy.result == 'success' && needs.validate-downloaded-release.result == 'success' && (inputs.resume_staged_assets || (needs.source-package.result == 'success' && needs.stage-release-assets.result == 'success')) }}
+    if: ${{ always() && needs.release-policy.result == 'success' && needs.authenticate-draft-release.result == 'success' && needs.validate-downloaded-release.result == 'success' && (inputs.resume_staged_assets || (needs.source-package.result == 'success' && needs.stage-release-assets.result == 'success')) }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -497,12 +557,8 @@ jobs:
         run: |
           version="$(node -p "require('./package.json').version")"
           test "$TAG" = "v$version"
-          mkdir -p dist/resume-assets dist/npm-package
-          for asset_path in dist/resume-actions-assets/*; do
-            asset_name="${asset_path##*/}"
-            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
-            cp "$asset_path" "dist/resume-assets/${asset_name}"
-          done
+          mkdir -p dist/npm-package
+          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" dist/resume-assets
           node scripts/release/verify-attested-assets.ts dist/resume-actions-assets dist/resume-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           ODINN_RELEASE_COMMIT="$EXPECTED_COMMIT" node scripts/release/verify-downloaded-assets.ts dist/resume-assets
@@ -592,12 +648,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           test -n "$RELEASE_ID"
-          mkdir -p dist/promotion-draft-assets
-          for asset_path in dist/promotion-actions-assets/*; do
-            asset_name="${asset_path##*/}"
-            [[ "$asset_name" != */* && "$asset_name" != "." && "$asset_name" != ".." ]] || { echo "unsafe asset name" >&2; exit 1; }
-            cp "$asset_path" "dist/promotion-draft-assets/${asset_name}"
-          done
+          bash scripts/release/download-draft-assets.sh "$GITHUB_REPOSITORY" "$RELEASE_ID" dist/promotion-draft-assets
           node scripts/release/verify-attested-assets.ts dist/promotion-actions-assets dist/promotion-draft-assets \
             "$GITHUB_REPOSITORY" "$EXPECTED_COMMIT" "$ATTESTATION_RUN_ID"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
