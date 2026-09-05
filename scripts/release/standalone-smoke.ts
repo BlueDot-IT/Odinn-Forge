@@ -41,8 +41,10 @@ function run(command: string, args: string[], cwd: string, env: Record<string, s
 }
 function runFailure(command: string, args: string[], cwd: string, env: Record<string, string> = {}): string {
   const result = runCommand(command, args, cwd, env);
-  if (result.status === 0) throw new Error(`${command} unexpectedly succeeded`);
-  return `${result.stderr || result.stdout || result.error?.message}`;
+  if (result.error || result.status !== 126) {
+    throw new Error(`${command} did not refuse the runtime with exit 126 (${result.status}): ${result.stderr || result.stdout || result.error?.message}`);
+  }
+  return `${result.stderr}\n${result.stdout}`;
 }
 try {
   const standaloneRoot = `odinn-v${pkg.version}-standalone-${target}`;
@@ -102,7 +104,10 @@ __attribute__((constructor)) static void mark_loader(void) {
   const missingRuntime = `${packagedRuntime}.missing`;
   await rename(packagedRuntime, missingRuntime);
   const missing = runFailure(launcher, ["--version"], packageRoot, hostileEnvironment);
-  if (!/missing|not executable/i.test(missing)) throw new Error("standalone launcher did not fail closed for a missing runtime");
+  const missingDiagnostic = process.platform === "win32"
+    ? /embedded runtime identity check failed/i
+    : /missing|not executable/i;
+  if (!missingDiagnostic.test(missing)) throw new Error("standalone launcher did not fail closed for a missing runtime");
   await rename(missingRuntime, packagedRuntime);
   const prefix = join(temporary, "installed ünicode");
   if (process.platform === "win32") run(join(packageRoot, "install", "install.cmd"), ["--prefix", prefix], packageRoot, hostileEnvironment);
