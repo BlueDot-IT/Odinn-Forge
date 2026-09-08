@@ -2026,3 +2026,18 @@
 .bar-height-163 { height: 163px; }
 .bar-height-164 { height: 164px; }
 .bar-height-165 { height: 165px; }
+
+/* Plugin setup shares the console's panels while keeping long identity data contained. */
+#view-plugins .plugin-card { display: flex; flex-direction: column; gap: .65rem; width: 100%; text-align: left; color: inherit; background: var(--panel, transparent); }
+#view-plugins .plugin-card.selected { outline: 2px solid var(--accent, #7183d9); outline-offset: -2px; }
+#view-plugins pre { max-width: 100%; max-height: 28rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+#view-plugins [hidden] { display: none !important; }
+#view-plugins .field input[type="file"] { max-width: 100%; }
+#view-plugins .stack > label, #view-plugins .item > label { display: flex; align-items: center; gap: .5rem; }
+#view-plugins input[type="checkbox"] { flex: 0 0 auto; width: 1rem; height: 1rem; }
+#view-plugins #plugin-message:not(:empty) { padding: .75rem; border: 1px solid currentColor; border-radius: .65rem; }
+#view-plugins .oc-page { padding: 24px; min-width: 0; }
+#view-plugins .agent-layout { grid-template-columns: minmax(220px, .7fr) minmax(0, 1.5fr); }
+#view-plugins .plugin-card .item-line { align-items: flex-start; flex-wrap: wrap; }
+@media (max-width: 900px) { #view-plugins .agent-layout { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 640px) { #view-plugins .oc-page { padding: 12px; } }

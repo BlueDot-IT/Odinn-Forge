@@ -5,6 +5,7 @@ import { cwd as currentWorkingDirectory } from "node:process";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
 import { redact } from "./run-ledger.ts";
 import { materializeSandboxBundle } from "./sandbox-bundle.ts";
+import { createPluginServiceBroker } from "./plugin-service-broker.ts";
 import { OciSandboxBackend, SandboxBackendRefusalError, SandboxExecutionError, compileSandboxProfile, detectOciBackend, validateDigestPinnedOciImage, type OciCapabilityProbe, type SandboxExecutionResult, type SandboxInteractiveSession } from "./sandbox-backend.ts";
 import { normalizeSandboxConfig, type SandboxConfig, type SandboxConfigInput } from "./sandbox-config.ts";
 import { withStateMutationLock } from "./state-mutation.ts";
@@ -17,7 +18,7 @@ const MAX_EXTENSION_OUTPUT_BYTES = 1_000_000;
 
 type ExtensionType = "tool" | "skill" | "mcp";
 type ExtensionSandbox = "unconfined-process" | "container" | "none";
-interface ExtensionManifest extends JsonObject {
+export interface ExtensionManifest extends JsonObject {
   schemaVersion: number; installId: string; id: string; version: string; name: string;
   type: ExtensionType; entrypoint: string; capabilities: string[]; sandbox: ExtensionSandbox;
   source: string; provenance: string; digest: string; contentDigest: string;
@@ -25,26 +26,49 @@ interface ExtensionManifest extends JsonObject {
   integrity: string; permissions: JsonObject; installedAt?: string; enabled?: boolean;
   trusted?: boolean; grants?: string[]; rollbackId?: string; enabledAt?: string;
   disabledAt?: string; disabledReason?: string; rolledBackAt?: string;
+  lifecycleRevision?: number;
 }
 interface ExtensionState { schemaVersion: number; extensions: Record<string, ExtensionManifest>; history: Record<string, ExtensionManifest[]> }
-interface InstallOptions { source?: string; provenance?: string }
-interface EnableOptions { grants?: string[]; trust?: boolean; allowUnsafeSandbox?: boolean }
+export interface ExtensionMutationOptions {
+  /** null means that no installed record may exist. Checked while holding the state lock. */
+  expectedIdentityFingerprint?: string | null;
+  signal?: AbortSignal;
+  beforeCommit?: (change: ExtensionMutationChange) => void | Promise<void>;
+  afterCommit?: (change: ExtensionMutationChange) => void | Promise<void>;
+}
+export interface ExtensionMutationChange { previous?: ExtensionManifest; next?: ExtensionManifest }
+interface InstallOptions extends ExtensionMutationOptions { source?: string; provenance?: string }
+interface EnableOptions extends ExtensionMutationOptions { grants?: string[]; trust?: boolean; allowUnsafeSandbox?: boolean }
 type StateMutation<T> = (state: ExtensionState) => T | Promise<T>;
 type NodeError = Error & { code?: string };
 
 export function extensionIdentityFingerprint(extension: any): string {
-  return createHash("sha256").update(JSON.stringify({
+  return createHash("sha256").update(JSON.stringify(stableExtensionIdentityValue({
     id: extension?.id ?? "",
     type: extension?.type ?? "",
+    sandbox: extension?.sandbox ?? "",
     installId: extension?.installId ?? "",
     version: extension?.version ?? "",
     bundleDigest: extension?.bundleDigest ?? "",
     containerImage: extension?.containerImage ?? "",
     entrypoint: extension?.entrypoint ?? "",
     bundleRoot: extension?.bundleRoot ?? "",
+    contentDigest: extension?.contentDigest ?? "",
+    source: extension?.source ?? "",
+    provenance: extension?.provenance ?? "",
+    permissions: extension?.permissions ?? {},
+    enabled: extension?.enabled === true,
+    trusted: extension?.trusted === true,
+    lifecycleRevision: extension?.lifecycleRevision ?? 0,
     capabilities: Array.isArray(extension?.capabilities) ? [...extension.capabilities].sort() : [],
     grants: Array.isArray(extension?.grants) ? [...extension.grants].sort() : []
-  })).digest("hex");
+  }))).digest("hex");
+}
+
+function stableExtensionIdentityValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableExtensionIdentityValue);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, stableExtensionIdentityValue(entry)]));
+  return value;
 }
 
 interface ExtensionRuntime {
@@ -54,6 +78,7 @@ interface ExtensionRuntime {
   actor?: string; policy?: any; capabilityToken?: string;
   /** The enclosing governed MCP tool already consumed its capability at admission. */
   authorizedByAdmission?: boolean;
+  effectiveCapabilities?: readonly string[];
 }
 interface ExtensionExecutorOptions { workspaceRoot?: string; defaultTimeoutMs?: number; config?: SandboxConfigInput }
 type McpMethod = "tools/list" | "tools/call";
@@ -89,14 +114,14 @@ export class ExtensionRegistry {
 
   async get(id: string) {
     const state = await this.readState();
-    return state.extensions[id];
+    return Object.hasOwn(state.extensions, id) ? state.extensions[id] : undefined;
   }
 
-  async install(input: unknown, { source = "local", provenance = "user-reviewed" }: InstallOptions = {}) {
+  async install(input: unknown, { source = "local", provenance = "user-reviewed", ...options }: InstallOptions = {}) {
     const manifest = normalizeManifest(input, { source, provenance });
-    return this.mutate((state) => {
-      const current = state.extensions[manifest.id];
-      if (current) state.history[manifest.id] = [...(state.history[manifest.id] ?? []), current].slice(-10);
+    return this.mutateExtension(manifest.id, options, (state) => {
+      const current = ownExtension(state, manifest.id);
+      if (current) state.history[manifest.id] = [...extensionHistory(state, manifest.id), current].slice(-10);
       state.extensions[manifest.id] = {
         ...manifest,
         installedAt: new Date().toISOString(),
@@ -109,9 +134,9 @@ export class ExtensionRegistry {
     });
   }
 
-  async enable(id: string, { grants = [], trust = false, allowUnsafeSandbox = false }: EnableOptions = {}) {
-    return this.mutate((state) => {
-      const extension = state.extensions[id];
+  async enable(id: string, { grants = [], trust = false, allowUnsafeSandbox = false, ...options }: EnableOptions = {}) {
+    return this.mutateExtension(id, options, (state) => {
+      const extension = ownExtension(state, id);
       if (!extension) throw new Error(`extension not found: ${id}`);
       if (!extension.trusted && trust !== true) throw new Error(`extension is untrusted: ${id}; review provenance before enabling`);
       const integrityDigest = extension.sandbox === "container" ? extension.bundleDigest : extension.contentDigest;
@@ -125,24 +150,84 @@ export class ExtensionRegistry {
     });
   }
 
-  async disable(id: string, reason = "operator disabled") {
-    return this.mutate((state) => {
-      const extension = state.extensions[id];
+  async disable(id: string, reason = "operator disabled", options: ExtensionMutationOptions = {}) {
+    return this.mutateExtension(id, options, (state) => {
+      const extension = ownExtension(state, id);
       if (!extension) throw new Error(`extension not found: ${id}`);
       state.extensions[id] = { ...extension, enabled: false, disabledAt: new Date().toISOString(), disabledReason: reason };
       return state.extensions[id];
     });
   }
 
-  async rollback(id: string) {
-    return this.mutate((state) => {
-      const history = state.history[id] ?? [];
+  async rollback(id: string, options: ExtensionMutationOptions = {}) {
+    return this.mutateExtension(id, options, (state) => {
+      const history = extensionHistory(state, id);
       const previous = history.pop();
       if (!previous) throw new Error(`no rollback version available: ${id}`);
       state.history[id] = history;
       state.extensions[id] = { ...previous, enabled: false, trusted: false, grants: [], rolledBackAt: new Date().toISOString() };
       return state.extensions[id];
     });
+  }
+
+  async configurePermissions(id: string, permissions: JsonObject, options: ExtensionMutationOptions = {}) {
+    const replacement = structuredClone(permissions);
+    return this.mutateExtension(id, options, (state) => {
+      const extension = ownExtension(state, id);
+      if (!extension) throw new Error(`extension not found: ${id}`);
+      state.extensions[id] = { ...extension, permissions: replacement, enabled: false, trusted: false, grants: [], disabledAt: new Date().toISOString(), disabledReason: "permissions changed; review required" };
+      return state.extensions[id];
+    });
+  }
+
+  async review(id: string, options: ExtensionMutationOptions = {}) {
+    return this.mutateExtension(id, options, (state) => {
+      const extension = ownExtension(state, id);
+      if (!extension) throw new Error(`extension not found: ${id}`);
+      state.extensions[id] = { ...extension, trusted: true, enabled: false };
+      return state.extensions[id];
+    });
+  }
+
+  async grant(id: string, grants: string[], options: ExtensionMutationOptions = {}) {
+    return this.mutateExtension(id, options, (state) => {
+      const extension = ownExtension(state, id);
+      if (!extension) throw new Error(`extension not found: ${id}`);
+      if (!Array.isArray(grants) || grants.some((grant) => !extension.capabilities.includes(grant))) throw new Error(`extension grant exceeds manifest capabilities: ${id}`);
+      state.extensions[id] = { ...extension, grants: [...new Set(grants)].sort(), trusted: false, enabled: false, disabledReason: "grants changed; review required" };
+      return state.extensions[id];
+    });
+  }
+
+  async remove(id: string, options: ExtensionMutationOptions = {}) {
+    return this.mutateExtension(id, options, (state) => {
+      if (!ownExtension(state, id)) throw new Error(`extension not found: ${id}`);
+      delete state.extensions[id];
+      delete state.history[id];
+      return { id, removed: true as const, userDataPreserved: true as const };
+    });
+  }
+
+  private async mutateExtension<T>(id: string, options: ExtensionMutationOptions, operation: StateMutation<T>): Promise<T> {
+    let change: ExtensionMutationChange;
+    return this.mutate(async (state) => {
+      const previous = ownExtension(state, id);
+      if (options.expectedIdentityFingerprint !== undefined) {
+        const actual = previous ? extensionIdentityFingerprint(previous) : null;
+        if (actual !== options.expectedIdentityFingerprint) {
+          const error = new Error(`extension identity precondition failed: ${id}; refresh the installed record and review the current identity`);
+          Object.assign(error, { code: "PLUGIN_PRECONDITION_FAILED", status: 409 });
+          throw error;
+        }
+      }
+      const result = await operation(state);
+      const next = ownExtension(state, id);
+      if (next) next.lifecycleRevision = (previous?.lifecycleRevision ?? 0) + 1;
+      change = { ...(previous ? { previous: structuredClone(previous) } : {}), ...(next ? { next: structuredClone(next) } : {}) };
+      throwIfExtensionMutationAborted(options.signal);
+      await options.beforeCommit?.(change);
+      return result;
+    }, { signal: options.signal, afterCommit: () => options.afterCommit?.(change) });
   }
 
   async readState(): Promise<ExtensionState> {
@@ -156,22 +241,46 @@ export class ExtensionRegistry {
     }
   }
 
-  async mutate<T>(fn: StateMutation<T>): Promise<T> {
+  async mutate<T>(fn: StateMutation<T>, options: { signal?: AbortSignal; afterCommit?: () => void | Promise<void> } = {}): Promise<T> {
     const operation = this.writeChain.then(() => withStateMutationLock(dirname(this.path), async () => {
+      throwIfExtensionMutationAborted(options.signal);
       const state = await this.readState();
       const result = await fn(state);
+      throwIfExtensionMutationAborted(options.signal);
       await mkdir(dirname(this.path), { recursive: true });
       const temporary = join(dirname(this.path), `.${this.path.split(/[\\/]/).pop()}.${process.pid}.${Date.now()}.tmp`);
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+      throwIfExtensionMutationAborted(options.signal);
       await rename(temporary, this.path);
+      await options.afterCommit?.();
       return result;
-    }));
+    }, { signal: options.signal }));
     this.writeChain = operation.catch(() => undefined);
     return operation;
   }
 }
 
+function throwIfExtensionMutationAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("extension lifecycle operation aborted");
+}
+
+function ownExtension(state: ExtensionState, id: string): ExtensionManifest | undefined {
+  return Object.hasOwn(state.extensions, id) ? state.extensions[id] : undefined;
+}
+
+function extensionHistory(state: ExtensionState, id: string): ExtensionManifest[] {
+  return Object.hasOwn(state.history, id) ? state.history[id]! : [];
+}
+
 export class ExtensionExecutor {
+  #active = new Map<string, Set<{ controller: AbortController; settlement: Promise<unknown> }>>();
+
+  async invalidate(id: string): Promise<void> {
+    const active = [...(this.#active.get(id) ?? [])];
+    for (const call of active) call.controller.abort();
+    await Promise.allSettled(active.map((call) => call.settlement));
+  }
+
   readonly registry: ExtensionRegistry;
   readonly workspaceRoot: string;
   readonly defaultTimeoutMs: number;
@@ -185,11 +294,29 @@ export class ExtensionExecutor {
     this.sandboxConfig = normalizeSandboxConfig(config);
   }
 
-  async invoke(id: string, input: JsonObject = {}, { capability, timeoutMs = this.defaultTimeoutMs, runtime, capabilityToken, signal, mcpMethod, onDispatchAuthorized, expectedIdentityFingerprint }: InvokeOptions = {}) {
+  async invoke(id: string, input: JsonObject = {}, options: InvokeOptions = {}) {
+    const controller = new AbortController();
+    const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+    const settlement = this.#invoke(id, input, { ...options, signal });
+    const call = { controller, settlement };
+    const active = this.#active.get(id) ?? new Set();
+    active.add(call);
+    this.#active.set(id, active);
+    try { return await settlement; }
+    finally { active.delete(call); if (!active.size) this.#active.delete(id); }
+  }
+
+  async #invoke(id: string, input: JsonObject = {}, { capability, timeoutMs = this.defaultTimeoutMs, runtime, capabilityToken, signal, mcpMethod, onDispatchAuthorized, expectedIdentityFingerprint }: InvokeOptions = {}) {
     const extension = await this.registry.get(id);
     if (!extension) throw new Error(`extension not found: ${id}`);
     if (expectedIdentityFingerprint && extensionIdentityFingerprint(extension) !== expectedIdentityFingerprint) throw new Error(`extension manifest changed before governed execution: ${id}`);
     if (!extension.enabled || !extension.trusted) throw new Error(`extension is not enabled and trusted: ${id}`);
+    const identity = extensionIdentityFingerprint(extension);
+    const assertAuthority = async () => {
+      if (signal?.aborted) throw new Error("extension execution was cancelled");
+      const current = await this.registry.get(id);
+      if (!current?.enabled || !current.trusted || extensionIdentityFingerprint(current) !== identity) throw new Error("extension authority changed before execution");
+    };
     if (!["unconfined-process", "container"].includes(extension.sandbox)) throw new Error(`extension sandbox is not executable by this adapter: ${extension.sandbox}`);
     const requested = String(capability || extension.capabilities[0] || "").trim();
     if (!requested || !(extension.grants ?? []).includes(requested)) throw new Error(`extension capability is not granted: ${requested || "unspecified"}`);
@@ -219,7 +346,14 @@ export class ExtensionExecutor {
       : { type: "odinn.call", id: `call_${randomUUID()}`, input, capability: requested };
     if (!runtime) throw new Error("extension execution requires the audited runtime boundary");
     const snapshot = await createExtensionExecutionSnapshot(extension, entrypoint, bundleRoot, runtime.runLedger.stateDir, signal);
-    return invokeThroughRuntime({
+    const serviceBroker = mcpMethod === "tools/call" && runtime.authorizedByAdmission === true
+      ? createPluginServiceBroker({ extension, assertAuthority, effectiveCapabilities: runtime.effectiveCapabilities ?? [], signal,
+          onEvent: async ({ phase, ...data }) => {
+            await runtime.auditStore.append({ at: new Date().toISOString(), runId: runtime.runId, actor: runtime.actor ?? "plugin", type: `plugin.service.${phase}`, tool: "mcp.invoke", capability: "network.access", decision: "allow", data: { extensionId: id, extensionFingerprint: identity, ...data } });
+          }
+        })
+      : undefined;
+    const output = await invokeThroughRuntime({
       id,
       input,
       requested,
@@ -234,8 +368,15 @@ export class ExtensionExecutor {
       sealedBundleDigest: snapshot.sealedBundleDigest,
       signal,
       mcpMethod,
-      onDispatchAuthorized
-    });
+      onDispatchAuthorized: async (evidence) => {
+        await assertAuthority();
+        await onDispatchAuthorized?.(evidence);
+        await assertAuthority();
+      },
+      serviceBroker
+    }).finally(async () => { await serviceBroker?.settle(); });
+    await assertAuthority();
+    return output;
   }
 }
 
@@ -251,8 +392,8 @@ async function createExtensionExecutionSnapshot(extension: ExtensionManifest, en
 }
 
 type ExtensionRequestSequence = ExtensionRequest | readonly ExtensionRequest[];
-interface RuntimeInvocation { id: string; input: JsonObject; requested: string; extension: ExtensionManifest; entrypoint: string; bundleRoot: string; request: ExtensionRequestSequence; protocol: "mcp-jsonl" | "odinn-jsonl"; timeoutMs: number; runtime: ExtensionRuntime; sandboxConfig: SandboxConfig; sealedBundleDigest?: string; signal?: AbortSignal; mcpMethod?: McpMethod; onDispatchAuthorized?: (evidence: JsonObject) => void | Promise<void> }
-async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime, sandboxConfig, sealedBundleDigest, signal, mcpMethod, onDispatchAuthorized }: RuntimeInvocation) {
+interface RuntimeInvocation { id: string; input: JsonObject; requested: string; extension: ExtensionManifest; entrypoint: string; bundleRoot: string; request: ExtensionRequestSequence; protocol: "mcp-jsonl" | "odinn-jsonl"; timeoutMs: number; runtime: ExtensionRuntime; sandboxConfig: SandboxConfig; sealedBundleDigest?: string; signal?: AbortSignal; mcpMethod?: McpMethod; onDispatchAuthorized?: (evidence: JsonObject) => void | Promise<void>; serviceBroker?: ReturnType<typeof createPluginServiceBroker> }
+async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime, sandboxConfig, sealedBundleDigest, signal, mcpMethod, onDispatchAuthorized, serviceBroker }: RuntimeInvocation) {
   const ledger = runtime.runLedger;
   const auditStore = runtime.auditStore;
   if (!ledger || !auditStore) throw new Error("extension runtime enforcement requires runLedger and auditStore");
@@ -281,7 +422,7 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
     const output = await runContainerExtension(extension, entrypoint, bundleRoot, request, { timeoutMs, protocol, sandboxConfig, signal, stateDir: ledger.stateDir }, async (phase, evidence) => {
       sandboxEvidence = { ...sandboxEvidence, ...evidence, sealedBundleDigest };
       await append({ type: `sandbox.${phase}`, decision: "allow", data: { ...evidence, sealedBundleDigest } });
-    }, onDispatchAuthorized);
+    }, onDispatchAuthorized, serviceBroker);
     const durableOutput = extension.type === "mcp" ? summarizeMcpExtensionOutput(output) : redact(output);
     await append({ type: "task.completed", decision: "allow", data: { output: durableOutput, ...(sandboxEvidence ? { sandbox: sandboxEvidence } : {}) } });
     ledger.finishTool({ runId, stepId: ledgerStep.stepId, output: durableOutput, status: "succeeded" });
@@ -302,7 +443,8 @@ async function runContainerExtension(
   request: ExtensionRequestSequence,
   { timeoutMs, protocol, sandboxConfig, signal, stateDir }: Pick<ProcessOptions, "timeoutMs" | "protocol"> & { sandboxConfig: SandboxConfig; signal?: AbortSignal; stateDir: string },
   auditSandbox: (phase: "prepared" | "dispatch-authorized" | "settled", evidence: JsonObject) => Promise<void>,
-  onDispatchAuthorized?: (evidence: JsonObject) => void | Promise<void>
+  onDispatchAuthorized?: (evidence: JsonObject) => void | Promise<void>,
+  serviceBroker?: ReturnType<typeof createPluginServiceBroker>
 ) {
   const relativeEntrypoint = relative(bundleRoot, entrypoint).replaceAll("\\", "/");
   if (!relativeEntrypoint || relativeEntrypoint.startsWith("..")) throw new Error("extension entrypoint must remain inside its immutable bundle");
@@ -317,8 +459,7 @@ async function runContainerExtension(
     network: "denied",
     argv: ["node", `/extension/${relativeEntrypoint}`],
     cwd: "/extension",
-    // Secret and environment brokers are separate enforcement surfaces. Until
-    // they are active, extensions receive no operator environment values.
+    // Service access is brokered over stdio; plugins never receive host credentials.
     environment: {},
     mounts: [{ source: bundleRoot, target: "/extension", access: "read-only" }],
     limits: {
@@ -343,6 +484,7 @@ async function runContainerExtension(
     limits: profile.limits
   });
   const requests = Array.isArray(request) ? request : [request];
+  const brokerRequests = new Set<string>();
   const interactive = protocol === "mcp-jsonl" && Array.isArray(request)
     ? async (session: SandboxInteractiveSession) => {
         await session.write(`${JSON.stringify(requests[0])}\n`);
@@ -352,10 +494,25 @@ async function runContainerExtension(
         if (!initialize || typeof initialize !== "object" || Array.isArray(initialize) || initialize.jsonrpc !== "2.0" || initialize.id !== requests[0]!.id || initialize.error || !initialize.result || typeof initialize.result !== "object" || typeof initialize.result.protocolVersion !== "string" || !MCP_PROTOCOL_VERSIONS.has(initialize.result.protocolVersion)) throw mcpProtocolError();
         await session.write(`${JSON.stringify(requests[1])}\n`);
         await session.write(`${JSON.stringify(requests[2])}\n`);
-        const callLine = await session.readLine();
-        let call: ProcessResponse;
-        try { call = JSON.parse(callLine); } catch { throw mcpProtocolError(); }
-        if (!call || typeof call !== "object" || Array.isArray(call) || call.jsonrpc !== "2.0" || call.id !== requests[2]!.id) throw mcpProtocolError();
+        while (true) {
+          const callLine = await session.readLine();
+          let call: ProcessResponse;
+          try { call = JSON.parse(callLine); } catch { throw mcpProtocolError(); }
+          if (!call || typeof call !== "object" || Array.isArray(call) || call.jsonrpc !== "2.0") throw mcpProtocolError();
+          if (call.method === "odinn/service.request") {
+            if (!serviceBroker || typeof call.id !== "string" || !/^service-[a-zA-Z0-9-]{1,48}$/u.test(call.id) || brokerRequests.has(call.id) || brokerRequests.size >= 8 || Object.keys(call).some((key) => !["jsonrpc", "id", "method", "params"].includes(key))) throw mcpProtocolError();
+            brokerRequests.add(call.id);
+            try {
+              const result = await serviceBroker(call.params);
+              await session.write(`${JSON.stringify({ jsonrpc: "2.0", id: call.id, result })}\n`);
+            } catch {
+              await session.write(`${JSON.stringify({ jsonrpc: "2.0", id: call.id, error: { code: -32001, message: "Plugin service request refused or unavailable" } })}\n`);
+            }
+            continue;
+          }
+          if (call.id !== requests[2]!.id || call.method !== undefined) throw mcpProtocolError();
+          break;
+        }
       }
     : undefined;
   let execution: SandboxExecutionResult;
@@ -383,6 +540,7 @@ async function runContainerExtension(
     try { parsed = JSON.parse(line); } catch { throw protocol === "mcp-jsonl" ? mcpProtocolError() : new Error("extension returned invalid JSON"); }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw protocol === "mcp-jsonl" ? mcpProtocolError() : new Error("extension returned an invalid response");
     if (protocol === "mcp-jsonl" && (parsed.jsonrpc !== "2.0" || !Object.hasOwn(parsed, "id"))) throw mcpProtocolError();
+    if (protocol === "mcp-jsonl" && parsed.method === "odinn/service.request" && typeof parsed.id === "string" && brokerRequests.delete(parsed.id)) continue;
     responses.push(parsed);
   }
   if (protocol === "mcp-jsonl") {
@@ -496,7 +654,7 @@ export async function digestExtensionBundle(root: string) {
   return createHash("sha256").update(entries.map((entry) => `${entry.path}\0${entry.digest}\n`).join(""), "utf8").digest("hex");
 }
 
-function normalizeManifest(input: unknown, { source, provenance }: Required<InstallOptions>): ExtensionManifest {
+function normalizeManifest(input: unknown, { source, provenance }: { source: string; provenance: string }): ExtensionManifest {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("extension manifest must be an object");
   const value = input as JsonObject;
   const id = String(value.id ?? "").trim();
@@ -526,7 +684,7 @@ function normalizeManifest(input: unknown, { source, provenance }: Required<Inst
     bundleDigest: String(value.bundleDigest ?? "").trim().toLowerCase(),
     containerImage: sandbox === "container" ? validateOciImageReference(value.containerImage) : String(value.containerImage ?? ""),
     integrity: value.bundleDigest ? "bundle-verified" : value.contentDigest ? "content-verified" : "metadata-only",
-    permissions: value.permissions && typeof value.permissions === "object" && !Array.isArray(value.permissions) ? value.permissions as JsonObject : {}
+    permissions: value.permissions && typeof value.permissions === "object" && !Array.isArray(value.permissions) ? structuredClone(value.permissions as JsonObject) : {}
   };
   return normalized;
 }

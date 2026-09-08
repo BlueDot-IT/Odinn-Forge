@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { ensureSecureStateTree, FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
+import { FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
 import { inspectAuthoritativeRecordSchema, inspectExistingSqliteAuditSchema, inspectExistingSqliteSchema, SqliteAuditStore } from "@odinn/store-sqlite";
 import { STATE_MIGRATIONS, type StateMigrationDefinition, type StateMigrationResult } from "./migrations/index.ts";
 import { STATE_SCHEMA_MINIMUM_APPLICATION_VERSION, STATE_SCHEMA_OWNERS, STATE_SCHEMA_TARGETS, targetStateSchemaVersions, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
@@ -10,6 +10,7 @@ import { withStateMutationLock } from "../state-mutation.ts";
 import { auditFilenameFromConfig } from "./audit-path.ts";
 import { relocateLegacyBrowserProfiles } from "../browser-profile-state.ts";
 import { quarantineLegacyLiveOnlyAutomationState } from "./live-only-automation.ts";
+import { removeManagedStateTree, secureStateTree } from "./state-tree.ts";
 
 const MARKER_SCHEMA_VERSION = 1;
 const MANIFEST_FILENAME = "state-schema.json";
@@ -334,7 +335,7 @@ async function applyStateMigrationPlanUnlocked(
   await relocateLegacyBrowserProfiles(plan.stateRoot);
   await mkdir(dirname(plan.backupLocation!), { recursive: true, mode: 0o700 });
   await cp(plan.stateRoot, plan.backupLocation!, { recursive: true, force: false, errorOnExist: true });
-  await secureTree(dirname(plan.backupLocation!));
+  await secureStateTree(dirname(plan.backupLocation!), plan.backupLocation!);
   await validatePhysicalTree(plan.backupLocation!);
   await writeMarker(markerFile, marker);
   await options.onPhase?.("backup-created");
@@ -383,7 +384,7 @@ async function applyStateMigrationPlanUnlocked(
   }
   const activeAudit = await verifyAuditIntegrity(plan.stateRoot);
   if (!activeAudit.valid) throw new Error("activated state failed audit integrity verification");
-  await ensureSecureStateTree(plan.stateRoot);
+  await secureTree(plan.stateRoot);
   if (!await isOwnerOnlyPath(plan.stateRoot)) throw new Error("activated state failed owner-only permission verification");
   const report: StateMigrationReport = {
     schemaVersion: 1,
@@ -402,7 +403,7 @@ async function applyStateMigrationPlanUnlocked(
     recoveredInterruptedMigration: options.recoveredInterruptedMigration
   };
   await appendHistory(plan.stateRoot, report);
-  await rm(displacedPath, { recursive: true, force: true });
+  await removeManagedStateTree(displacedPath, plan.stateRoot);
   await rm(markerFile, { force: true });
   return report;
 }
@@ -422,8 +423,8 @@ async function recoverInterruptedStateMigrationUnlocked(stateRoot: string): Prom
         const inspection = await inspectStateSchemas(stateRoot);
         if (inspection.healthy && inspection.surfaces.every((surface) => surface.currentVersion === surface.targetVersion)) {
           await appendRecoveryHistory(stateRoot, marker);
-          if (displacedExists) await rm(marker.displacedPath, { recursive: true, force: true });
-          if (stagingExists) await rm(marker.stagingPath, { recursive: true, force: true });
+          if (displacedExists) await removeManagedStateTree(marker.displacedPath, stateRoot);
+          if (stagingExists) await removeManagedStateTree(marker.stagingPath, stateRoot);
           await rm(markerFile, { force: true });
           return true;
         }
@@ -441,7 +442,7 @@ async function recoverInterruptedStateMigrationUnlocked(stateRoot: string): Prom
     }
   }
 
-  if (stagingExists) await rm(marker.stagingPath, { recursive: true, force: true });
+  if (stagingExists) await removeManagedStateTree(marker.stagingPath, stateRoot);
   await rm(markerFile, { force: true });
   await validatePhysicalTree(stateRoot);
   return true;
@@ -803,7 +804,7 @@ async function validatePhysicalTree(root: string): Promise<void> {
 }
 
 async function secureTree(root: string): Promise<void> {
-  await ensureSecureStateTree(root);
+  await secureStateTree(root);
 }
 
 async function readJson(path: string): Promise<{ present: false } | { present: true; value: Record<string, unknown> | unknown[] }> {

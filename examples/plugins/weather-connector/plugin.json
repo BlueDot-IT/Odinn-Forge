@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "sdkVersion": "1.0",
+  "id": "weather-connector",
+  "version": "0.1.0",
+  "name": "weather-connector connector",
+  "description": "Read current temperature through Forge's approved Open-Meteo service broker.",
+  "kind": "connector",
+  "runtime": "oci-mcp-stdio",
+  "transport": "mcp-jsonrpc-stdio",
+  "tools": [
+    {
+      "name": "weather-connector.current",
+      "description": "Read current temperature at latitude/longitude.",
+      "capabilities": [
+        "mcp.invoke",
+        "network.access"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90
+          },
+          "longitude": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180
+          }
+        },
+        "required": [
+          "latitude",
+          "longitude"
+        ],
+        "additionalProperties": false
+      },
+      "effects": [
+        "read",
+        "network"
+      ],
+      "requiresApproval": false,
+      "retrySafe": true
+    }
+  ],
+  "egress": {
+    "protocol": "https",
+    "hosts": [
+      "api.open-meteo.com"
+    ],
+    "port": 443
+  },
+  "secrets": [],
+  "services": [
+    {
+      "id": "open-meteo",
+      "origin": "https://api.open-meteo.com",
+      "paths": [
+        "/v1/forecast"
+      ],
+      "queryKeys": [
+        "latitude",
+        "longitude",
+        "current"
+      ]
+    }
+  ],
+  "containerImage": "node:24.19.0-bookworm@sha256:4196d66a565c6f195728d9952f161f4adfe2ad753052a08b7ec7f1c5a6bda42b",
+  "entrypoint": "server.mjs"
+}

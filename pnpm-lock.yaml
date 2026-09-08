@@ -158,6 +158,9 @@ importers:
       '@odinn/channels':
         specifier: workspace:*
         version: link:../channels
+      '@odinn/plugin-sdk':
+        specifier: workspace:*
+        version: link:../plugin-sdk
       '@odinn/policy':
         specifier: workspace:*
         version: link:../policy
@@ -176,6 +179,8 @@ importers:
       playwright-core:
         specifier: 1.62.1
         version: 1.62.1
+
+  packages/plugin-sdk: {}
 
   packages/policy: {}
 

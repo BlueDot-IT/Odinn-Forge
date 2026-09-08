@@ -120,7 +120,7 @@ const CALENDAR_TOOLS = new Set(["calendar.calendars", "calendar.events", "calend
 const GITHUB_TOOLS = new Set(["github.repository", "github.issue", "github.pull-request", "github.checks"]);
 const REMOTE_NODE_TOOLS = new Set(["node.status", "node.diagnostics"]);
 const COMPUTER_TOOLS = new Set(["computer.screen", "computer.act", "computer.recovery.status", "computer.recovery.resolve"]);
-const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", "computer.act", ...EMAIL_TOOLS, ...CALENDAR_TOOLS, ...GITHUB_TOOLS, ...REMOTE_NODE_TOOLS]);
+const REPLAY_UNAVAILABLE_TOOLS = new Set(["computer.screen", "computer.act", ...EMAIL_TOOLS, ...CALENDAR_TOOLS, ...GITHUB_TOOLS, ...REMOTE_NODE_TOOLS, ...MCP_INVOKE_TOOLS]);
 
 export function isWorkspaceContentTool(toolName: unknown): boolean {
   return typeof toolName === "string" && WORKSPACE_CONTENT_TOOLS.has(toolName);

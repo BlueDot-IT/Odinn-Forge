@@ -1,4 +1,5 @@
 import { $ } from "./dom.ts";
+import { mountPluginView } from "./views/plugins.ts";
 import { api, streamApi } from "./api.ts";
 import { state } from "./state.ts";
 import { renderChatMessages as renderChatMessagesView, suggestedChatTitle as suggestedChatTitleView } from "./views/chat.ts";
@@ -11,6 +12,8 @@ import { cloneConfig as cloneStructuredConfig, configLines as structuredConfigLi
 import { auditFacetLabel as typedAuditFacetLabel } from "./views/audit.ts";
 import { composeMessageWithLocalAttachments, readLocalTextAttachmentBatch, renderLocalAttachmentList } from "./components/local-attachments.ts";
 import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, isAgentGraphActive, renderAgentGraphDetail, renderAgentGraphRow } from "./views/agent-graphs.ts";
+
+    const pluginView = mountPluginView({ api, onError: (message) => showOutput(message) });
 
     let chatAttachments = [];
 
@@ -298,6 +301,7 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
       }
       if (name === "cron") refreshCron().catch((error) => showOutput(error.message));
       if (name === "agents") refreshAgents().catch((error) => showOutput(error.message));
+      if (name === "plugins") pluginView.refresh().catch((error) => showOutput(error.message));
       if (name === "skills") refreshSkills().catch((error) => showOutput(error.message));
       if (name === "automatic-improvements" || name.startsWith("lab-")) refreshExperiments().catch((error) => showOutput(error.message));
       if (name === "projects") refreshProjects().catch((error) => showOutput(error.message));

@@ -3,14 +3,14 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
+import { access, chmod, copyFile, cp, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { APPLICATION_CONTRACT_VERSION, createDiagnosticsReadUseCase, createSessionListUseCase, createStatusReadUseCase, normalizeSessionListLimit, validateOperatorIdentifierV1, validateOperatorSnapshotResponseV1, validateRuntimeSecuritySummaryV1, type CliStatusSnapshotV1, type DiagnosticsReportV1, type OperatorSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, diagnoseGitHubReadIntegration, diagnoseMacOSComputerIntegration, diagnoseMicrosoftGraphReadIntegration, diagnoseRemoteNodeReadIntegration, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeMacOSComputerConfig, normalizeMicrosoftGraphReadConfig, normalizeModelConfig, normalizeRemoteNodeReadConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeChromiumEngine, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteOperatorReadStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { ADVANCED_FEATURE_BRANDS, applyEnvironmentValues, assertPhysicalDirectory, CheckpointCoordinator, configuredCredentialEnvironmentKeys, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, closeBrowserManagers, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, createStateBackup, diagnoseGitHubReadIntegration, diagnoseMacOSComputerIntegration, diagnoseMicrosoftGraphReadIntegration, diagnoseRemoteNodeReadIntegration, ensureMainAgent, ensureSecureStateDirectory, ensureStateCompatibility, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, fetchCatalogPlugin, fetchPluginPackage, inspectPluginPackageArchive, inspectPluginPackageDirectory, loadPluginCatalog, packPluginPackage, PluginLifecycleService, scaffoldPlugin, inspectStateBackup, isAllowedCredentialEnvironmentKey, isOwnerOnlyPath, isPhysicalPathInside, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeMacOSComputerConfig, normalizeMicrosoftGraphReadConfig, normalizeModelConfig, normalizeRemoteNodeReadConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, planStateMigration, previewExecutionAdmission, probeChromiumEngine, probeOciBackend, providerSupport, ProofVerifier, PROVIDER_PRESETS, readEnvironmentFiles, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, restoreStateBackup, runPlan, runTask, sanitizedChildEnvironment, saveOAuthToken, SqliteJobStore, SqliteOperatorReadStore, SqliteWorkflowStore, stateLifecycleStatus, summarizeSandboxRisk, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { capabilitiesForTool, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { createCliReadCommandContext } from "./application-context.ts";
@@ -242,6 +242,9 @@ async function main() {
         force: hasFlag(args, "--force")
       }));
       break;
+    case "plugin":
+      await pluginCommand(args);
+      break;
     case "extension":
     case "extensions":
     case "tool":
@@ -346,6 +349,7 @@ Get started:
 
 Common commands:
   odinn status                      Check configuration and runtime health
+  odinn plugin help                 Build, install, and manage third-party plugins
   odinn operator snapshot           Inspect every operator control plane
   odinn operator action <action>    Apply a governed operator action
   odinn sessions                    List chats
@@ -362,6 +366,7 @@ Support: the local single-user workflow is the stable v1 target. Advanced servic
 
 function requiresStateCompatibilityCheck(currentCommand: string | undefined, currentArgs: string[]): boolean {
   if (!currentCommand || ["--version", "-V", "help", "--help", "-h"].includes(currentCommand)) return false;
+  if (currentCommand === "plugin" && ["help", "--help", "scaffold", "validate", "inspect", "pack", "catalog", "list", "status", "info", "doctor", "discover", "invoke", "approvals", "approve"].includes(currentArgs[0] || "status")) return false;
   if (currentCommand === "config" && currentArgs[0] === "provider" && currentArgs[1] === "catalog") return false;
   if (["update", "rollback", "restore", "uninstall", "doctor"].includes(currentCommand)) return false;
   return !(currentCommand === "state" && ["migrate", "restore", "import", "status"].includes(currentArgs[0]));
@@ -3075,6 +3080,141 @@ async function memory(args: any) {
     default:
       throw new Error("memory requires subcommand: remember, search, recall, browse, open, compact, correct, or curate");
   }
+}
+
+async function pluginCommand(args: any) {
+  const [subcommand = "status", ...rest] = args;
+  const required = (name: string): string => {
+    const value = option(rest, name);
+    if (!value) throw new Error(`plugin ${subcommand} requires ${name}`);
+    return String(value);
+  };
+  if (subcommand === "help" || subcommand === "--help") {
+    console.log(`Plugin authoring: scaffold --id ID [--output DIR] [--image DIGEST_PINNED_IMAGE]
+  validate|inspect --input PATH [--digest SHA256]
+  pack --input DIR --output PACKAGE.odinn-plugin.zip
+Catalog: catalog --catalog PATH_OR_HTTPS [--id ID] [--version VERSION]
+Install: install --input PACKAGE_OR_HTTPS [--digest SHA256]
+  install --catalog PATH_OR_HTTPS --id ID --version VERSION
+Lifecycle: list|status|info --id ID|doctor [--id ID]
+  configure --id ID --bindings-json '{"service":{"enabled":true}}' --identity FINGERPRINT
+  review|grant|enable|disable|rollback|uninstall --id ID --identity FINGERPRINT
+  grant --id ID --grant CAPABILITY[,CAPABILITY] --identity FINGERPRINT
+  update --input PACKAGE --identity FINGERPRINT
+Run via the local gateway: discover --id ID
+  invoke --id ID --tool NAME --input-json '{}' [--gateway-url URL]
+  approvals [--id ID]
+  approve --approval ID --confirm
+All lifecycle identity values come from plugin info. Install/update/rollback reset review and access.
+Credentials: configure accepts opaque env:NAME references only; never put secret values in arguments.
+Runtime prerequisites: runtime.enableMcp, sandbox.process.enabled, and a locally available pinned OCI image.
+Invocation uses a durable job and exact one-time approval. Live service results are not replayable.
+See docs/plugins.md for the complete author-to-operator workflow.`);
+    return;
+  }
+  if (subcommand === "scaffold") {
+    const root = resolveInvocationPath(option(rest, "--output", "plugin"));
+    await printJson({ manifest: await scaffoldPlugin(root, required("--id"), option(rest, "--image")), path: root });
+    return;
+  }
+  if (subcommand === "validate" || subcommand === "inspect") {
+    const input = resolveInvocationPath(required("--input"));
+    await printJson((await statPath(input)).isDirectory() ? await inspectPluginPackageDirectory(input) : await inspectPluginPackageArchive(input, option(rest, "--digest")));
+    return;
+  }
+  if (subcommand === "pack") {
+    const source = resolveInvocationPath(option(rest, "--input", "."));
+    await printJson(await packPluginPackage(source, resolveInvocationPath(option(rest, "--output", `${basename(source)}.odinn-plugin.zip`))));
+    return;
+  }
+  if (subcommand === "catalog") {
+    const source = required("--catalog");
+    const catalog = await loadPluginCatalog(source.startsWith("https://") ? source : resolveInvocationPath(source));
+    const id = option(rest, "--id");
+    const version = option(rest, "--version");
+    await printJson({ ...catalog, plugins: catalog.plugins.filter((item: any) => (!id || item.id === id) && (!version || item.version === version)), publisherVerification: "not-verified" });
+    return;
+  }
+  const post = (path: string, body: unknown) => operatorGatewayRequest(rest, path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  if (subcommand === "discover" || subcommand === "invoke") {
+    const id = required("--id");
+    const discovery = await post(`/plugins/${encodeURIComponent(id)}/discover`, { refresh: hasFlag(rest, "--refresh") });
+    const snapshot = discovery.output ?? discovery;
+    if (subcommand === "discover") { await printJson(discovery); return; }
+    if (snapshot.type !== "mcp.discovery") throw new Error("plugin discovery did not produce a usable snapshot; inspect its policy and runtime prerequisites");
+    const toolName = required("--tool");
+    const tool = snapshot.tools.find((item: any) => item.name === toolName);
+    if (!tool) throw new Error("requested plugin tool is not in the current discovery snapshot");
+    const inputFile = option(rest, "--input-file");
+    const argumentsValue = JSON.parse(inputFile ? await readFile(resolveInvocationPath(inputFile), "utf8") : option(rest, "--input-json", "{}"));
+    if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) throw new Error("plugin tool arguments must be a JSON object");
+    await printJson({ ...await post("/jobs", { task: { tool: "mcp.invoke", input: {
+      serverId: id, generation: snapshot.generation, snapshotFingerprint: snapshot.fingerprint,
+      extensionFingerprint: snapshot.extensionFingerprint, toolName, toolSchemaFingerprint: tool.schemaFingerprint,
+      arguments: argumentsValue
+    } } }), next: "Review with odinn plugin approvals; continue with odinn plugin approve --approval ID --confirm. The approval response contains the live result." });
+    return;
+  }
+  if (subcommand === "approvals") {
+    const values = await operatorGatewayRequest(rest, "/approvals");
+    const approvals = Array.isArray(values) ? values : values.approvals ?? [];
+    const id = option(rest, "--id");
+    await printJson({ approvals: approvals.filter((approval: any) => approval.tool === "mcp.invoke" && (!id || approval.input?.serverId === id || approval.resource?.serverId === id || approval.effect?.server === id)) });
+    return;
+  }
+  if (subcommand === "approve") {
+    if (!hasFlag(rest, "--confirm")) throw new Error("plugin approve requires --confirm after reviewing the exact pending request with plugin approvals");
+    const approvalId = required("--approval");
+    const pending = await operatorGatewayRequest(rest, "/approvals");
+    const approvals = Array.isArray(pending) ? pending : pending.approvals ?? [];
+    if (!approvals.some((approval: any) => approval.id === approvalId && approval.tool === "mcp.invoke")) throw new Error("pending plugin approval not found");
+    await printJson(await post(`/approvals/${encodeURIComponent(approvalId)}/approve`, {}));
+    return;
+  }
+  const state = stateDir(rest);
+  const config = await readConfig(state);
+  const readonly = ["status", "list", "info", "doctor"].includes(subcommand);
+  if (!readonly) {
+    await ensureConfig(state);
+    await ensureStateCompatibility(state, applicationIdentity());
+  }
+  const auditStore = readonly ? undefined : createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  const plugins = new PluginLifecycleService({ stateDir: state, workspaceRoot: invocationRoot(), config, auditStore });
+  try {
+    if (subcommand === "status" || subcommand === "list") {
+      await printJson({ plugins: await plugins.list(), supportedRuntime: "oci-mcp-stdio" });
+    } else if (subcommand === "info") {
+      const plugin = await plugins.get(required("--id"));
+      if (!plugin) throw new Error("plugin not found");
+      await printJson(plugin);
+    } else if (subcommand === "doctor") {
+      await printJson({ checks: await plugins.doctor(option(rest, "--id")), supportedRuntime: "oci-mcp-stdio" });
+    } else if (subcommand === "install" || subcommand === "update") {
+      const expectedIdentityFingerprint = subcommand === "update" ? required("--identity") : undefined;
+      const catalogSource = option(rest, "--catalog");
+      const source = catalogSource ? undefined : required("--input");
+      const expectedDigest = option(rest, "--digest");
+      const install = (archivePath: string, digest = expectedDigest) => plugins.install(archivePath, { expectedDigest: digest, expectedIdentityFingerprint, actor: "cli" });
+      if (catalogSource || source?.startsWith("https://")) {
+        const temporary = await mkdtemp(join(tmpdir(), "odinn-plugin-download-"));
+        try {
+          const output = join(temporary, "package.odinn-plugin.zip");
+          const artifact = catalogSource
+            ? await fetchCatalogPlugin(await loadPluginCatalog(catalogSource.startsWith("https://") ? catalogSource : resolveInvocationPath(catalogSource)), required("--id"), required("--version"), output)
+            : await fetchPluginPackage(source!, required("--digest"), output);
+          await printJson(await install(output, artifact.digest));
+        } finally { await rm(temporary, { recursive: true, force: true }); }
+      } else await printJson(await install(resolveInvocationPath(source!)));
+    } else {
+      const action = subcommand === "uninstall" ? "remove" : subcommand === "trust" ? "review" : subcommand;
+      if (!["configure", "review", "grant", "enable", "disable", "rollback", "remove"].includes(action)) throw new Error("unknown plugin command; use odinn plugin help");
+      const id = required("--id");
+      const expectedIdentityFingerprint = action === "disable" ? option(rest, "--identity") : required("--identity");
+      const grants = option(rest, "--grant") === undefined ? undefined : splitCsv(option(rest, "--grant"));
+      const serviceBindings = action === "configure" ? JSON.parse(required("--bindings-json")) : undefined;
+      await printJson(await plugins.transition({ id, action, expectedIdentityFingerprint, grants, serviceBindings } as any, { actor: "cli" }));
+    }
+  } finally { auditStore?.close(); }
 }
 
 async function extensionCommand(args: any) {

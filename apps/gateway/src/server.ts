@@ -7,7 +7,8 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { cwd as currentWorkingDirectory } from "node:process";
 import { fileURLToPath } from "node:url";
 import { OPERATOR_SCHEDULE_SCHEMA_VERSION, OPERATOR_SNAPSHOT_CHANGED_CODE, createDiagnosticsReadUseCase, createOperatorSnapshotReadUseCase, createSessionListUseCase, createStatusReadUseCase, projectOperatorScheduleEnvelopeV1, validateGatewayChannelDiagnosticsV1, validateOperatorIdentifierV1, validatePendingApprovalSummariesV1, validateRuntimeSecuritySummaryV1, type DiagnosticsReportV1, type GatewayStatusSnapshotV1, type OperatorSurfaceV1 } from "@odinn/application";
-import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, diagnoseGitHubReadIntegration, diagnoseMacOSComputerIntegration, diagnoseMicrosoftGraphReadIntegration, diagnoseRemoteNodeReadIntegration, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isLiveOnlyAutomationTool, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeGitHubReadConfig, normalizeMacOSComputerConfig, normalizeMicrosoftGraphReadConfig, normalizeMcpConfiguration, normalizeModelConfig, normalizeRemoteNodeReadConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, projectDurableToolInput, ProjectContextService, probeChromiumEngine, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { AGENT_GRAPH_TOOL, AGENT_SDK_VERSION, AgentRegistryStore, CORE_ADVANCED_FEATURES, DEFAULT_SANDBOX_CONFIG, assertHostedSandboxConfig, CheckpointCoordinator, createApprovalStore, createAuditStore, createDifferentiatedRuntime, createGovernedMcpRuntime, diagnoseGitHubReadIntegration, diagnoseMacOSComputerIntegration, diagnoseMicrosoftGraphReadIntegration, diagnoseRemoteNodeReadIntegration, DurableEventIngress, DurableWorkflowRuntime, ensureMainAgent, ensureStateCompatibility, ExtensionExecutor, ExtensionRegistry, inspectOperatorRecovery, isAllowedCredentialEnvironmentKey, isLiveOnlyAutomationTool, isPhysicalPathInside, JobSupervisor, listConfiguredModels, MAX_BOUNDED_UTF8_BYTES, normalizeExperimentalFlags, normalizeGitHubReadConfig, normalizeMacOSComputerConfig, normalizeMicrosoftGraphReadConfig, normalizeMcpConfiguration, normalizeModelConfig, normalizeRemoteNodeReadConfig, normalizeSandboxConfig, normalizeSelfImprovementConfig, oauthTokenPath, operatorActionNames, previewExecutionAdmission, projectDurableToolInput, ProjectContextService, probeChromiumEngine, probeOciBackend, providerSupport, PROVIDER_PRESETS, provisionRuntimeAgent, ProofVerifier, ProgressiveSkillDisclosure, PluginLifecycleService, readApprovalSummaries, readUtf8Prefix, reconcileProcessRecovery, reconcileSandboxRecovery, resolveConfiguredOciBackend, runTask as executeTask, SkillLifecycleService, SkillPackageStore, SqliteOperatorReadStore, SqliteRecordStore, SqliteJobStore, SqliteWorkflowStore, summarizeSandboxRisk, toolSafetyDescriptor, validateAgentManifest, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { handlePluginRoute } from "./plugin-routes.ts";
 import { CAPABILITY_REGISTRY, CAPABILITY_REGISTRY_VERSION, assertCapabilityIds, createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { createRuntimeIsolatedTaskExecutor, createRuntimeRegistry } from "@odinn/runtime";
 import { ensureSecureStateDirectory, isOwnerOnlyPath } from "@odinn/store-file";
@@ -1001,6 +1002,16 @@ export async function createGatewayServer(options: any = {}) {
     loadPlugin: channelPluginLoader
   });
   const runControlTask = (task: any, options?: { signal?: AbortSignal }) => executeTask({ task: scopeTask(task, tenantScope), auditStore, policy, registry, runLedger: runtime.ledger, ...options, signal: ownershipSignal(options?.signal) });
+  // MCP discovery identity belongs to this governed runtime. Keep its exact
+  // approval continuation here; the third-party executable remains OCI-contained.
+  const runApprovedMcpTask = (approvalId: string, continuation: any, signal?: AbortSignal, parentCapabilities?: unknown) => executeTask({
+    task: scopeTask({ id: continuation.runId, tool: continuation.tool, input: continuation.input, actor: continuation.actor, reason: "explicit user approval" }, tenantScope),
+    trustedApprovalId: approvalId, trustedApprovalRunId: continuation.runId,
+    trustedRecovery: true, durableExecution: true, deferExecutionSettlement: true,
+    ...(parentCapabilities === undefined ? {} : { parentCapabilities }),
+    auditStore, approvalStore, policy, registry: governedRegistry, runLedger: runtime.ledger,
+    signal: ownershipSignal(signal)
+  });
   await supervisor.start();
   // Tokenless event-delivery recovery may submit projected jobs immediately
   // from the DurableEventIngress constructor. Complete job-store recovery
@@ -1268,9 +1279,14 @@ export async function createGatewayServer(options: any = {}) {
               ? job.payload.task as Record<string, unknown>
               : undefined;
             const continuation = await recoverGatewayApprovalContinuation(id, pending, linkedTask, signal, capabilityToken);
+            if (continuation.tool === "mcp.invoke" && linkedTask?.tool !== "mcp.invoke") {
+              await revokeGatewayApproval(id, signal);
+              throw new GatewayError(409, "plugin approval must originate from a direct durable plugin job; request a new run");
+            }
             markDispatched();
             await testHooks?.afterApprovalDispatchStarted?.({ approvalId: id, jobId: job.id, signal });
             assertGatewayRequestActive(signal);
+            if (continuation.tool === "mcp.invoke") return runApprovedMcpTask(id, continuation, signal, job.payload?.parentCapabilities);
             return isolatedTaskExecutor({
               approvalId: id,
               approvalRunId: continuation.runId,
@@ -1307,6 +1323,10 @@ export async function createGatewayServer(options: any = {}) {
               : undefined
           })
         };
+      }
+      if (pending.tool === "mcp.invoke") {
+        await revokeGatewayApproval(id, signal);
+        throw new GatewayError(409, "plugin approval must originate from a direct durable plugin job; request a new run");
       }
       const continuation = await recoverGatewayApprovalContinuation(id, pending, undefined, signal);
       const result = await isolatedTaskExecutor({
@@ -1972,6 +1992,17 @@ export async function createGatewayServer(options: any = {}) {
         }));
         return json(response, 200, { ok: true, agent });
       }
+      const pluginReply = await handlePluginRoute({
+        method: request.method || "GET", url, workspaceRoot: root, hosted, bodyLimitBytes: requestMaxBytes,
+        lifecycle: new PluginLifecycleService({
+          workspaceRoot: root, stateDir: state, registry: extensionRegistry,
+          config, auditStore, onInvalidate: async (id) => { await mcpRuntime?.invalidatePlugin(id); }
+        }),
+        readBody: () => readJson(request, { maxBytes: requestMaxBytes }),
+        mutate: runRequestMutation,
+        discover: runRequestControlTask
+      });
+      if (pluginReply) return json(response, pluginReply.status, pluginReply.body);
       if (request.method === "GET" && url.pathname === "/skills") {
         const [managed, files, extensions] = await Promise.all([skillLifecycle.inspect(), discoverSkills(root, state), extensionRegistry.list()]);
         return json(response, 200, {

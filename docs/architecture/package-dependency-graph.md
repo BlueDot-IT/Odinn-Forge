@@ -256,3 +256,5 @@ checks are platform-neutral.
   slices move behind `@odinn/application`, old app-to-kernel edges should be
   removed from the allowlist in the same change that removes the imports and
   manifest entries.
+
+- `@odinn/plugin-sdk` is the public, kernel-independent author contract package; kernel may consume its validated declarations.

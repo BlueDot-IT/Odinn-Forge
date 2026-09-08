@@ -69,6 +69,7 @@
           <button data-view="tasks" data-title="Tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Tasks</span></button>
           <button data-view="delegation" data-title="Delegation" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Delegation</span><span class="badge" id="nav-delegation-attention">0</span></button>
           <button data-view="agents" data-title="Agent SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agent SDK · Experimental</span></button>
+          <button data-view="plugins" data-title="Plugins" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Plugins</span></button>
           <button data-view="skills" data-title="Skills SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skills SDK · Experimental</span></button>
           <button data-view="automatic-improvements" data-title="Automatic improvements" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></span><span class="nav-label">Automatic improvements</span></button>
           <details class="nav-labs">
@@ -700,6 +701,25 @@
               <div class="row"><button id="validate-agent" value="default" type="submit">Save agent</button></div>
             </form>
           </dialog>
+        </div>
+      </section>
+
+      <section id="view-plugins" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Third-party connections</div><h1>Plugins</h1><p>Add tools from external developers. Inspect each package, choose its access, then decide when it may run.</p></div><div class="row"><span class="chip" id="plugin-installed-count">0 installed</span><button id="plugin-refresh" class="secondary" type="button">Refresh plugins</button></div></div>
+          <p id="plugin-message" role="status" aria-live="polite"></p>
+          <p id="plugin-local-owner" class="config-help" hidden>Third-party plugins are available only in the local-owner gateway. Hosted tenant access is not supported.</p>
+          <div class="panel stack" id="plugin-install-panel">
+            <div class="panel-head"><div><h2>Find a plugin</h2><p class="muted">Choose a packaged plugin or browse a catalog from a source you know.</p></div></div>
+            <div class="grid-2">
+              <div class="stack"><div class="field"><label for="plugin-file">Plugin package (.odinn-plugin.zip)</label><input id="plugin-file" type="file" accept=".zip,application/zip"><span class="muted" id="plugin-upload-limit"></span></div><div class="field"><label for="plugin-package-path">Or a package path inside this workspace</label><input id="plugin-package-path" placeholder="packages/weather.odinn-plugin.zip"></div><button id="plugin-inspect" type="button" class="secondary">Inspect package</button></div>
+              <div class="stack"><div class="field"><label for="plugin-catalog-source">Catalog URL or workspace path</label><input id="plugin-catalog-source" placeholder="https://publisher.example/catalog.json"></div><button id="plugin-catalog-browse" type="button" class="secondary">Browse catalog</button><p class="muted">Catalog descriptions are supplied by publishers. Checksums verify package contents, not publisher identity.</p><div class="list" id="plugin-catalog-list"></div></div>
+            </div>
+            <div id="plugin-preview" class="stack" hidden><h3 id="plugin-preview-title"></h3><p id="plugin-preview-description"></p><details><summary>Contents and requested access</summary><pre id="plugin-preview-data"></pre></details><p class="muted">Installation does not run plugin code or grant access.</p><button id="plugin-install" type="button">Install disabled</button></div>
+          </div>
+          <div class="agent-layout"><div class="panel stack"><h2>Installed</h2><div id="plugin-list" class="list"></div></div><div class="panel stack" id="plugin-detail"><div class="empty-state"><strong>Select a plugin</strong><span>Its setup and access will appear here.</span></div></div></div>
+          <div class="panel stack" id="plugin-tools" hidden><h2>Use this plugin</h2><p class="muted">Each run is checked by policy and requires a one-time approval.</p><form id="plugin-run-form" class="stack"><div class="field"><label for="plugin-tool">Tool</label><select id="plugin-tool"></select></div><div class="grid-2" id="plugin-tool-fields"></div><button id="plugin-run" type="submit">Request run</button></form></div>
+          <div class="panel stack"><div class="panel-head"><h2>Run approvals and live result</h2><button id="plugin-refresh-pending" class="secondary" type="button">Refresh approvals</button></div><p id="plugin-job-status" class="muted">Plugin calls use the normal task and approval system.</p><div id="plugin-approvals"></div><pre id="plugin-result">Live service results appear here after approval. They are not saved for replay.</pre><button id="plugin-clear-result" class="secondary" type="button">Clear live result</button></div>
         </div>
       </section>
 

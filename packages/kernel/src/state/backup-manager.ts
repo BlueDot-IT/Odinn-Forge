@@ -2,11 +2,12 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { backup as backupSqlite, DatabaseSync } from "node:sqlite";
-import { ensureSecureStateTree, FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
+import { FileAuditStore, isOwnerOnlyPath } from "@odinn/store-file";
 import { SqliteAuditStore } from "@odinn/store-sqlite";
 import { withStateMutationLock } from "../state-mutation.ts";
 import { inspectStateSchemas, type StateInspection } from "./migration-manager.ts";
 import { STATE_SCHEMA_TARGETS, type StateSchemaVersions, type StateSurface } from "./schema-registry.ts";
+import { removeManagedStateTree, secureStateTree } from "./state-tree.ts";
 
 const BACKUP_MANIFEST = "backup-manifest.json";
 const BACKUP_SCHEMA_VERSION = 1;
@@ -165,7 +166,7 @@ async function createStateBackupUnlocked(
     await rename(staging, destination);
     return { ok: true, operation: "backup", destination, manifest };
   } catch (error) {
-    await rm(staging, { recursive: true, force: true });
+    await removeManagedStateTree(staging, destination);
     throw error;
   }
 }
@@ -273,9 +274,9 @@ async function restoreStateBackupUnlocked(
         sourceCommit: source.manifest.sourceApplication.commit,
         sourceSchemas: source.manifest.stateSchemas
       });
-      await ensureSecureStateTree(stateRoot);
+      await secureTree(stateRoot);
       if (!await isOwnerOnlyPath(stateRoot)) throw new Error("activated restore failed owner-only permission verification");
-      if (stateExists) await rm(displaced, { recursive: true, force: true });
+      if (stateExists) await removeManagedStateTree(displaced, stateRoot);
       return {
         ok: true,
         operation: "restore",
@@ -295,7 +296,7 @@ async function restoreStateBackupUnlocked(
       throw error;
     }
   } catch (error) {
-    if (await exists(staging)) await rm(staging, { recursive: true, force: true });
+    if (await exists(staging)) await removeManagedStateTree(staging, stateRoot);
     throw error;
   }
 }
@@ -663,7 +664,7 @@ async function validatePhysicalTree(root: string, label: string): Promise<void> 
 }
 
 async function secureTree(root: string): Promise<void> {
-  await ensureSecureStateTree(root);
+  await secureStateTree(root);
 }
 
 async function ensurePhysicalParent(directory: string, label: string): Promise<void> {

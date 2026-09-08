@@ -1,0 +1,30 @@
+{
+  "name": "@odinn/plugin-sdk",
+  "version": "1.0.0",
+  "description": "Public authoring contracts for Odinn Forge OCI MCP connectors",
+  "type": "module",
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js",
+      "default": "./lib/index.js"
+    }
+  },
+  "types": "./lib/index.d.ts",
+  "bin": {
+    "odinn-plugin": "./lib/cli.js"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.check.json"
+  },
+  "license": "MIT"
+}

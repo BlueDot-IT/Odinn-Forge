@@ -11,6 +11,9 @@
     "./automation-primitives": "./src/automation-primitives.ts",
     "./mcp-host": "./src/mcp-host.ts",
     "./mcp-runtime": "./src/mcp-runtime.ts",
+    "./plugin-lifecycle": "./src/plugin-lifecycle.ts",
+    "./plugin-registry": "./src/plugin-registry.ts",
+    "./plugin-packages": "./src/plugin-packages.ts",
     "./workflows": "./src/workflows.ts",
     "./event-ingress": "./src/event-ingress.ts",
     "./project-context": "./src/project-context.ts",
@@ -26,6 +29,7 @@
   "dependencies": {
     "@odinn/channels": "workspace:*",
     "@odinn/policy": "workspace:*",
+    "@odinn/plugin-sdk": "workspace:*",
     "@odinn/protocol": "workspace:*",
     "@odinn/store-file": "workspace:*",
     "@odinn/store-sqlite": "workspace:*",

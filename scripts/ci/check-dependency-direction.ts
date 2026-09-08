@@ -37,11 +37,13 @@ export const WORKSPACE_DEPENDENCY_GRAPH = {
   ],
   "@odinn/kernel": [
     "@odinn/channels",
+    "@odinn/plugin-sdk",
     "@odinn/policy",
     "@odinn/protocol",
     "@odinn/store-file",
     "@odinn/store-sqlite",
   ],
+  "@odinn/plugin-sdk": [],
   "@odinn/policy": [],
   "@odinn/protocol": [],
   "@odinn/runtime": ["@odinn/channel-discord", "@odinn/kernel"],

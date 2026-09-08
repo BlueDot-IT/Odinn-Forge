@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validatePluginManifest } from "@odinn/plugin-sdk";
 import { ExtensionExecutor, ExtensionRegistry, extensionIdentityFingerprint } from "./extensions.ts";
 import {
   createCachedMcpHost,
@@ -52,6 +53,7 @@ export type McpRuntimeContext = {
   trustedApprovalRunId?: string;
   durableExecution?: boolean;
   effectiveCapabilities?: readonly string[];
+  parentCapabilities?: readonly string[];
   manifestFingerprint?: string;
 };
 
@@ -216,6 +218,19 @@ function bindingHash(prefix: string, context: McpRuntimeContext, requestDigest: 
   return digest({ prefix, runId: context.request?.id ?? "unknown", attemptId: context.admission?.attemptId ?? "unknown", requestDigest });
 }
 
+/** The admitted MCP wrapper owns execution; service rights are additional host-policy restrictions. */
+function admittedPluginCapabilities(context: McpRuntimeContext): readonly string[] {
+  const base = (context.effectiveCapabilities ?? []).filter((capability) => (capability === "mcp.invoke" || capability === "mcp.discover") && (!context.parentCapabilities || context.parentCapabilities.includes(capability)));
+  if (!base.includes("mcp.invoke")) return base;
+  const policy = context.policy as { allowedCapabilities?: unknown; scopedCapabilities?: unknown } | undefined;
+  const allowed = Array.isArray(policy?.allowedCapabilities) ? policy.allowedCapabilities : [];
+  const scoped = Array.isArray(policy?.scopedCapabilities) ? policy.scopedCapabilities : [];
+  return [...base, ...["network.access", "secret.reference.use"].filter((capability) =>
+    (!context.parentCapabilities || context.parentCapabilities.includes(capability))
+    && (allowed.includes(capability) || scoped.some((grant) => grant?.tool === "mcp.invoke" && grant?.capability === capability))
+  )];
+}
+
 export class GovernedMcpRuntime {
   readonly enabled: boolean;
   readonly extensionRegistry: ExtensionRegistry;
@@ -230,6 +245,8 @@ export class GovernedMcpRuntime {
   #discoveryContexts = new Map<string, McpRuntimeContext>();
   #results = new Map<string, unknown>();
   #closed = false;
+  #pluginServers = new Map<string, McpServerConfig>();
+  #retiredHosts = new Map<string, CachedMcpHost[]>();
 
   constructor(options: GovernedMcpRuntimeOptions) {
     if (!options.extensionRegistry || !options.extensionExecutor) throw new Error("GovernedMcpRuntime requires the trusted extension boundary");
@@ -245,7 +262,7 @@ export class GovernedMcpRuntime {
   status(): McpRuntimeStatus {
     return Object.freeze({
       enabled: this.enabled,
-      servers: Object.freeze([...this.servers.values()].map((server) => Object.freeze({
+      servers: Object.freeze([...this.servers.values(), ...this.#pluginServers.values()].map((server) => Object.freeze({
         serverId: server.serverId,
         extensionId: server.extensionId,
         configuredEnabled: server.enabled,
@@ -257,9 +274,11 @@ export class GovernedMcpRuntime {
 
   async discover(input: { serverId?: unknown; refresh?: unknown }, context?: McpRuntimeContext): Promise<JsonObject> {
     this.#assertOpen();
-    const server = this.#configuredServer(input?.serverId);
+    const server = await this.#configuredServer(input?.serverId);
     const executionContext = requestContext(context, { auditStore: this.#auditStore, runLedger: this.#runLedger });
-    await this.#assertManifest(server, "mcp.discover");
+    const extension = await this.#assertManifest(server, "mcp.discover");
+    const observed = this.#manifestFingerprints.get(server.serverId);
+    if (observed && observed !== manifestFingerprint(extension)) await this.invalidatePlugin(server.extensionId);
     const host = this.#host(server);
     const refresh = input?.refresh === true;
     this.#discoveryContexts.set(server.serverId, executionContext);
@@ -282,7 +301,7 @@ export class GovernedMcpRuntime {
     timeoutMs?: unknown;
   }, context?: McpRuntimeContext): Promise<JsonObject> {
     this.#assertOpen();
-    const server = this.#configuredServer(input?.serverId);
+    const server = await this.#configuredServer(input?.serverId);
     const executionContext = requestContext(context, { auditStore: this.#auditStore, runLedger: this.#runLedger });
     const extension = await this.#assertManifest(server, "mcp.invoke");
     const extensionFingerprint = manifestFingerprint(extension);
@@ -331,16 +350,40 @@ export class GovernedMcpRuntime {
     this.#results.clear();
   }
 
+  async invalidatePlugin(id: string): Promise<void> {
+    const servers = [...this.servers.values(), ...this.#pluginServers.values()].filter((server) => server.extensionId === id);
+    const hosts = [...(this.#retiredHosts.get(id) ?? []), ...servers.flatMap((server) => {
+      const host = this.#hosts.get(server.serverId);
+      this.#hosts.delete(server.serverId);
+      this.#manifestFingerprints.delete(server.serverId);
+      this.#pluginServers.delete(server.serverId);
+      return host ? [host] : [];
+    })];
+    this.#retiredHosts.set(id, hosts);
+    const results = await Promise.allSettled([this.extensionExecutor.invalidate?.(id), ...hosts.map((host) => host.shutdown())]);
+    if (results.some((result) => result.status === "rejected" || (result.value && (result.value.pendingPhysicalCalls > 0 || result.value.discoveryPhysicallyPending)))) throw runtimeError("MCP_CLEANUP_UNCERTAIN", "plugin is fenced but active runtime cleanup remains uncertain");
+    this.#retiredHosts.delete(id);
+  }
+
   #assertOpen(): void {
     if (this.#closed) throw runtimeError("MCP_RUNTIME_CLOSED", "MCP runtime is closed");
     if (!this.enabled) throw runtimeError("MCP_DISABLED", "MCP activation is disabled");
   }
 
-  #configuredServer(value: unknown): McpServerConfig {
+  async #configuredServer(value: unknown): Promise<McpServerConfig> {
     if (typeof value !== "string" || !SERVER_ID.test(value)) throw runtimeError("MCP_SERVER_INVALID", "MCP serverId is invalid");
-    const server = this.servers.get(value);
-    if (!server) throw runtimeError("MCP_SERVER_NOT_CONFIGURED", "MCP server is not configured");
+    let server = this.servers.get(value);
+    if (!server) {
+      const extension = await this.extensionRegistry.get(value);
+      if (!extension?.permissions?.plugin) throw runtimeError("MCP_SERVER_NOT_CONFIGURED", "MCP server is not configured");
+      if (!this.#pluginServers.has(value) && this.#pluginServers.size + this.servers.size >= MAX_SERVERS) throw runtimeError("MCP_SERVER_LIMIT", "MCP server limit reached");
+      server = normalizeServer({ extensionId: value, enabled: extension.enabled === true }, value);
+      this.#pluginServers.set(value, server);
+    }
     if (!server.enabled) throw runtimeError("MCP_SERVER_DISABLED", "MCP server is disabled");
+    const retired = this.#retiredHosts.get(server.extensionId);
+    if (retired?.some((host) => host.status().physicalCalls > 0 || host.status().discoveryPhysicallyPending)) throw runtimeError("MCP_CLEANUP_UNCERTAIN", "previous plugin execution is still physically pending");
+    if (retired) this.#retiredHosts.delete(server.extensionId);
     return server;
   }
 
@@ -395,6 +438,11 @@ export class GovernedMcpRuntime {
       throw runtimeError("MCP_DISCOVERY_FAILED", "MCP tools/list failed");
     }
     const tools = mcpTools(output);
+    if (extension.permissions?.plugin) {
+      const manifest = validatePluginManifest(extension.permissions.plugin.manifest);
+      const declared = manifest.tools.map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema })).sort((a, b) => a.name.localeCompare(b.name));
+      if (digest([...tools].sort((a, b) => a.name.localeCompare(b.name))) !== digest(declared)) throw runtimeError("MCP_PLUGIN_SCHEMA_CHANGED", "plugin discovery does not match the reviewed package tool schemas");
+    }
     const generation = (this.#hosts.get(server.serverId)?.snapshot()?.generation ?? 0) + 1;
     const extensionFingerprint = manifestFingerprint(extension);
     this.#manifestFingerprints.set(server.serverId, extensionFingerprint);
@@ -419,6 +467,16 @@ export class GovernedMcpRuntime {
       throw runtimeError("MCP_EXTENSION_CHANGED", "configured MCP executable changed during dispatch");
     }
     const runtime = this.#extensionRuntime(context);
+    if (extension.permissions?.plugin) {
+      const manifest = validatePluginManifest(extension.permissions.plugin.manifest);
+      const tool = manifest.tools.find((item) => item.name === request.toolName);
+      const effective = admittedPluginCapabilities(context);
+      if (!tool || tool.capabilities.some((capability) => !extension.grants.includes(capability) || !effective.includes(capability))) {
+        await this.#appendAudit(context, "plugin.policy.denied", { extensionId: extension.id, extensionFingerprint: expectedIdentityFingerprint, errorCode: "MCP_CAPABILITY_NOT_GRANTED" });
+        throw runtimeError("MCP_CAPABILITY_NOT_GRANTED", "plugin tool requires all reviewed capabilities in the effective host policy");
+      }
+      await this.#appendAudit(context, "plugin.policy.allowed", { extensionId: extension.id, extensionFingerprint: expectedIdentityFingerprint, effectiveCapabilities: effective });
+    }
     const refs = {
       authorizationRef: `authorization:${bindingHash("authorization", context, request.requestDigest)}`,
       auditRef: `audit:${bindingHash("audit", context, request.requestDigest)}`
@@ -537,7 +595,8 @@ export class GovernedMcpRuntime {
       policy: context.policy,
       workspaceRoot: context.runLedger.workspaceRoot,
       featureFlags: context.runLedger.featureFlags,
-      authorizedByAdmission: true
+      authorizedByAdmission: true,
+      effectiveCapabilities: admittedPluginCapabilities(context)
     };
   }
 

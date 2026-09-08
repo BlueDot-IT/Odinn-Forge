@@ -1,17 +1,46 @@
 # Odinn Forge plugin system
 
-_Status: design baseline plus shipped browser, macOS computer-control, and read-only provider seams._
+_Implementation: public SDK 1.0 authoring/packages, shared audited lifecycle,
+local catalogs, CLI/console setup, and constrained OCI/MCP service execution._
 
-This document defines the boundary for plugins that give Ódinn Forge access to
-the browser, a local desktop, or external services such as email. The browser
-host-capability seam, conditional `computer.screen` node-host contract,
-conditional read-only email provider contract, and authenticated two-tool
-remote-node read contract are shipped; computer mutation and a concrete email
-provider remain design targets until their adapters and security tests land.
-host-capability seam, disabled-by-default local macOS `computer.screen` and
-`computer.act` adapter, conditional read-only email provider contract, and
-authenticated two-tool remote-node read contract are shipped. Other desktop
-platforms and email mutation remain later slices.
+## Supported third-party workflow
+
+The public authoring package is `@odinn/plugin-sdk`, independently packable
+with generated JavaScript and declarations. Third-party code uses the
+`oci-mcp-stdio` connector contract, a verified portable archive, and a
+host-managed service broker. It never imports the trusted kernel to register
+in-process tools. The SDK/package contract is distinct from the internal
+host-adapter manifests illustrated later in this document.
+
+`PluginLifecycleService` translates a verified archive into the existing
+`ExtensionRegistry`. CLI and gateway share install, service configuration,
+capability grants, provenance review, enable/disable, update, rollback, and
+uninstall. Mutations are locked, audited, and checked against the caller's
+expected installed identity. There is no separate authority-bearing
+`plugins.json` registry.
+
+The console's **Plugins** page supports local archive inspection, pinned
+catalog packages, guided service/access review, readiness checks, lifecycle
+controls, and tool use. Its invocation path is the normal durable `/jobs`
+service with an exact one-time approval continuation; discovery uses the same
+host admission boundary. Live service content is returned to the active
+operator, not presented as durable job replay.
+
+The host broker restricts service reads to reviewed HTTPS origins, exact
+paths, and declared query keys, with credentials resolved from protected
+host-owned references. Plugin containers remain on a denied network and
+receive no host credential environment. Catalog checksums do not establish
+publisher identity. Catalog inspection and installation do not execute code.
+
+This slice is local-owner only. Hosted tenant access, arbitrary remote HTTP
+MCP, unrestricted third-party host adapters, and a public hosted marketplace
+are not part of this contract. The SDK is packable; npm publication and product
+deployment are separate release actions. See [the operator/author guide](../plugins.md)
+and [completion evidence boundaries](../plans/plugin-system-completion.md).
+
+The remaining sections document the broader architecture and trusted
+first-party seams; their illustrative internal manifests are not public SDK
+package manifests.
 
 ## Decision summary
 
@@ -104,7 +133,7 @@ The existing `ExtensionRegistry` is the lifecycle and integrity primitive for
 `mcp` and `skill`. A future host-capability/provider SDK must not bypass it for
 installed third-party code.
 
-## Manifest and tool contract
+## Internal host-adapter manifest and tool contract
 
 The manifest is metadata. It is read during catalog, setup, and doctor flows;
 those flows must not execute plugin runtime code.
@@ -334,9 +363,26 @@ The following are non-negotiable for every plugin:
    provider-dependent.
 6. **Email mutation path:** add drafts and send only after the provider's
    idempotency and uncertain-outcome behavior have live-tested evidence.
-7. **Third-party connector path:** expose the narrow provider/MCP contract to
-   external authors after the host adapter and secret broker have contract
-   tests. No arbitrary in-process plugin loading before that gate.
+7. **Third-party connector path (implemented):** public SDK 1.0 packages,
+   host-brokered service reads, and CLI/console lifecycle share the existing
+   extension and governed execution boundaries. Arbitrary in-process plugin
+   loading remains unsupported.
+
+## Third-party connector implementation
+
+The public SDK, portable archive tooling, and local/public-HTTPS catalogs are
+implemented alongside an execution-backed lifecycle service. Installation and
+package inspection do not execute code. MCP tool discovery **does execute**
+the reviewed package inside its denied-network OCI container, under normal
+admission, capability, integrity, and runtime gates.
+
+The weather connector in `examples/plugins/weather-connector` performs real
+Open-Meteo reads through the host broker without credentials. The CLI and
+console use pinned discovery, durable jobs, and exact approval continuation.
+See [the operator/author guide](../plugins.md) for supported commands and
+[the completion record](../plans/plugin-system-completion.md) for evidence
+boundaries. Hosted tenant plugin access, HTTP MCP, arbitrary in-process
+JavaScript, and a central hosted marketplace remain unsupported.
 
 ## Explicit non-goals for this tranche
 

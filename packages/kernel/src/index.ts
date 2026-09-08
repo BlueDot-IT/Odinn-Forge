@@ -71,6 +71,12 @@ export { ProcessSupervisor, ProcessRecoveryError, createProcessExecutionDescript
 export type { ProcessExecutionDescriptor, ProcessExecutionSession, ProcessRecoveryAdapter, ProcessRecoveryPhase, ProcessRecoveryRecord, ProcessPresence, ProcessSupervisorOptions } from "./process-supervisor.ts";
 export { ExtensionRegistry, ExtensionExecutor, extensionIdentityFingerprint, resolveConfiguredOciBackend } from "./extensions.ts";
 export { PLUGIN_CONTRACT_SCHEMA_VERSION, pluginIdentityFingerprint, validatePluginManifest } from "./plugin-contracts.ts";
+export { inspectPluginPackageArchive, inspectPluginPackageDirectory, packPluginPackage, scaffoldPlugin } from "./plugin-packages.ts";
+export { PluginRegistry } from "./plugin-registry.ts";
+export { loadPluginCatalog, fetchPluginPackage, fetchCatalogPlugin, assertPluginCatalogUrl } from "./plugin-catalog.ts";
+export { PluginLifecycleService, PluginLifecycleError, normalizeServiceBindings } from "./plugin-lifecycle.ts";
+export type { PluginRecord, InstalledPluginMetadata } from "./plugin-registry.ts";
+export type { PluginLifecycleContext, PluginMutationOptions, PluginInstallOptions, PluginLifecycleTransition, PluginLifecycleOptions, PluginDoctorReport, PluginDoctorCheck } from "./plugin-lifecycle.ts";
 export type { PluginKind, PluginManifest, PluginRuntime, PluginToolContract, PluginToolIdempotency } from "./plugin-contracts.ts";
 export { captureComputerScreen, inspectComputerRecovery, normalizeComputerActionInput, performComputerAction, resolveComputerRecovery } from "./computer.ts";
 export type { ComputerActRequest, ComputerActResult, ComputerAction, ComputerActionInput, ComputerControlProvider, ComputerRecoveryResolution, ComputerRecoveryStatus, ComputerScreenCaptureRequest, ComputerScreenProvider, ComputerScreenResult, ComputerScreenTarget } from "./computer.ts";
@@ -912,7 +918,8 @@ export function createBuiltInRegistry({ workspaceRoot = currentWorkingDirectory(
           auditStore: context.auditStore,
           runLedger: context.runLedger,
           signal: context.signal,
-          effectiveCapabilities: context.effectiveCapabilities
+          effectiveCapabilities: context.effectiveCapabilities,
+          parentCapabilities: context.parentCapabilities
         });
       }
     });
@@ -1424,7 +1431,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, defaultAg
         break;
       }
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(nested.output) });
-      if (isEmailTool(call.name) || isCalendarTool(call.name)) {
+      if (isEmailTool(call.name) || isCalendarTool(call.name) || call.name === "mcp.invoke") {
         liveOnlyProviderReadUsed = true;
         messages.push({
           role: "system",
@@ -2557,6 +2564,10 @@ async function executeTaskThroughAdmission({
         const nestedRequest = nestedTask && typeof nestedTask === "object"
           ? Object.fromEntries(Object.entries(nestedTask).filter(([key]) => key !== "executionAttemptId" && key !== "agentExecutionBinding"))
           : nestedTask;
+        const nestedParentCapabilities = nestedTask.parentCapabilities ?? admittedParentCapabilities;
+        if (admittedParentCapabilities && nestedParentCapabilities && assertCapabilityIds(nestedParentCapabilities, "nested parentCapabilities").some((capability) => !admittedParentCapabilities.includes(capability))) {
+          throw new Error("nested tool capability ceiling cannot exceed its admitted parent");
+        }
         return runTask({
           task: { ...nestedRequest, actor: nestedTask.actor ?? request.actor },
           auditStore,
@@ -2573,7 +2584,7 @@ async function executeTaskThroughAdmission({
           durableExecution,
           allowNestedAgentExecution: nestedTask.allowNestedAgentExecution ?? allowNestedAgentExecution,
           agentExecutionBinding: nestedAgentExecutionBinding,
-          parentCapabilities: nestedTask.parentCapabilities,
+          parentCapabilities: nestedParentCapabilities,
           executionAttemptId: nestedExecutionAttemptId
         });
       }

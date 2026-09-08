@@ -192,11 +192,21 @@ platform-dependent.
 
 ### Extension manifests and packages
 
-Extension manifests, Skill SDK packages, Agent SDK packages, third-party
-packages, and MCP packages are experimental interfaces for v1. Registration or
-discovery does not grant trust or execute code. Validation, integrity review,
-explicit enablement, capability grants, and policy enforcement still fail
-closed.
+The public `@odinn/plugin-sdk` authoring contract is explicitly versioned as
+SDK 1.0. It covers the supported connector manifest, portable package format,
+and constrained host-broker protocol for OCI-contained MCP JSON-RPC stdio.
+The SDK is independently packable; source availability is not a claim that
+its npm release has been published. See [Third-party plugins](plugins.md).
+
+Raw extension manifests, internal host-capability/provider adapter seams,
+Skill SDK packages, and Agent SDK packages remain experimental interfaces.
+They are not interchangeable with the public plugin SDK. Arbitrary remote
+HTTP MCP and hosted-tenant plugin access are not supported.
+
+Package inspection and installation do not execute code. Tool discovery does
+execute the reviewed package within the governed OCI boundary, but never
+grants trust or capabilities. Integrity review, exact identity preconditions,
+explicit enablement, capability grants, and policy enforcement fail closed.
 
 All repository packages and application packages currently marked `private`
 are internal implementation details. They are not stable public SDKs merely
@@ -213,8 +223,10 @@ implementation and availability decision, not a public-SDK compatibility
 promise.
 
 Saga Archive, Rune Key, Worldtree Paths, Agent SDK packages, Skill SDK
-packages, third-party extensions, MCP packages, multi-user hosting, and
-unconfined process execution are optional experimental interfaces. The
+packages, raw third-party extension manifests, legacy MCP configuration,
+multi-user hosting, and unconfined process execution are optional experimental
+interfaces. The separately versioned public plugin authoring contract above
+is narrower than these experimental host integration seams. The
 existing Capsule, Capability Token, and Counterfactual technical identifiers
 remain compatible. These surfaces remain outside normal v1 compatibility and
 migration guarantees.

@@ -173,7 +173,10 @@ function mergeScopedCapabilityGrants(migrated: readonly CapabilityGrant[], confi
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new PolicyError("scoped capability grants must be objects");
       const tool = String((value as Record<string, unknown>).tool ?? "").trim();
       const capabilities = assertCapabilityIds([(value as Record<string, unknown>).capability], "scoped capability grant");
-      if (!tool || !capabilitiesForTool(tool).includes(capabilities[0]!)) throw new PolicyError(`scoped capability grant does not match trusted tool declaration: ${tool}`);
+      // MCP service rights are optional, host-known restrictions: granting them
+      // never makes them mandatory for network-denied local MCP bundles.
+      const optionalMcpServiceRight = tool === "mcp.invoke" && ["network.access", "secret.reference.use"].includes(capabilities[0]!);
+      if (!tool || (!capabilitiesForTool(tool).includes(capabilities[0]!) && !optionalMcpServiceRight)) throw new PolicyError(`scoped capability grant does not match trusted tool declaration: ${tool}`);
       const grant = Object.freeze({ tool, capability: capabilities[0]! });
       grants.set(`${tool}\0${grant.capability}`, grant);
     }
