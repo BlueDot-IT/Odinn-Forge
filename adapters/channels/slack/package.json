@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@odinn/channels": "workspace:*",
-    "@slack/bolt": "5.0.0",
+    "@slack/bolt": "5.1.0",
     "undici": "7.29.0"
   }
 }
