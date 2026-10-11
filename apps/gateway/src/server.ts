@@ -3763,6 +3763,12 @@ function isPrivateHostedProviderUrl(value: string) {
 function validateHostedProviderConfig(config: any) {
   try { assertHostedSandboxConfig(config); }
   catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "hosted sandbox configuration is invalid"); }
+  if (config?.experimental?.proof === true) {
+    throw new GatewayError(400, "multi-user host does not allow tenants to enable Proof");
+  }
+  if (Array.isArray(config?.proof?.allowedCommands) && config.proof.allowedCommands.length > 0) {
+    throw new GatewayError(400, "multi-user host does not allow tenant-controlled Proof commands");
+  }
   if (Object.values(config?.channels ?? {}).some((channel: any) => channel?.enabled === true)) {
     throw new GatewayError(400, "multi-user host does not allow messaging channels");
   }
