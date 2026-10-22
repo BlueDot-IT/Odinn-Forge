@@ -33,7 +33,7 @@ and subject to the normal review and security requirements.
 
 Requirements:
 
-- Node.js 24 or newer
+- Node.js 24.22.1 or newer
 - Corepack
 - Git
 

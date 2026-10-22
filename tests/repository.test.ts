@@ -24,7 +24,7 @@ test("package metadata names Odinn Forge and pins the toolchain", async () => {
   assert.match(pkg.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
   assert.equal(pkg.bin.odinn, "./apps/cli/src/cli.ts");
   assert.match(pkg.packageManager, /^pnpm@\d+\.\d+\.\d+$/);
-  assert.equal(pkg.engines.node, ">=24.0.0");
+  assert.equal(pkg.engines.node, ">=24.22.1");
   const changelog = await read("CHANGELOG.md");
   assert.ok(
     changelog.includes(`## [${pkg.version}](`) || changelog.includes(pkg.version),

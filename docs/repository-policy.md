@@ -6,7 +6,7 @@ Requirements:
 
 - GitHub CLI (`gh`)
 - Authentication as a repository administrator
-- Node.js 24 or newer
+- Node.js 24.22.1 or newer
 
 Run:
 

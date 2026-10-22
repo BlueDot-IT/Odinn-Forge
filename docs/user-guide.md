@@ -50,7 +50,7 @@ Odinn Forge v1 supports this local, single-user workflow:
 
 - Linux x64, macOS x64, or Windows x64 with the standalone release; Node.js is
   embedded and verified. Advanced generic-package installs and unsupported
-  standalone targets require Node.js 24 or newer.
+  standalone targets require Node.js 24.22.1 or newer.
 - One local operator using the loopback gateway at `127.0.0.1`.
 - Public web reading, an isolated browser profile, scoped durable memory, audited tools, projects, sessions, goals, and cron jobs. A disabled-by-default [local macOS computer-control](computer-control.md) slice is available with separate operating-system permissions, explicit capability grants, exact approvals, and recovery. The console can register and inspect declarative Agent SDK packages and build integrity-checked Skill SDK packages; both install disabled, and registration and discovery do not execute or activate them.
 - Explicit approval for browser mutations and other external side effects.
