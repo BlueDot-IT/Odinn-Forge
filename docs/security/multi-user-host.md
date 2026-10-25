@@ -97,3 +97,5 @@ The host persists a versioned control plane containing users, tenants, membershi
 This is application-level tenant separation. It is not a sandbox for mutually hostile users running arbitrary local code. Deploy mutually untrusted tenants under separate operating-system users, containers, or machines. Do not share workspace roots between tenants.
 
 Hosted tenant gateways accept only the built-in public provider endpoints and credential environment names. Custom provider URLs, private/local endpoints, CLI providers, custom OAuth endpoints, GitHub reads, and remote-node reads are rejected because a tenant-selected endpoint must never receive a shared host credential or become an SSRF primitive. Use a separate OS/container deployment when a private or custom provider or authenticated node is required.
+
+Hosted tenants cannot enable the experimental Proof runner or provide a Proof command allowlist. Configuration requests that set `experimental.proof` to `true` or supply non-empty `proof.allowedCommands` are rejected with HTTP 400. These controls require local operator authority and are not delegated by a tenant membership or role.
