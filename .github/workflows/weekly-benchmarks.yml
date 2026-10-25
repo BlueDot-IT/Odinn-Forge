@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: "24.15.0"
+  NODE_VERSION: "24.22.1"
   PNPM_VERSION: "10.14.0"
   BENCHMARK_COMMIT: 8ad91f0b9e396c88cf10e56687630539ce10bcd1
   ODINN_VERSION: "1.1.1"

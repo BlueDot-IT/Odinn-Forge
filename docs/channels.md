@@ -6,7 +6,7 @@ credential-redacted diagnostics, durable session binding, audit projection,
 and no-replay recovery behavior are maintained interfaces. Live network,
 account, quota, permission, and provider behavior remains provider-dependent.
 
-The shared channel plugin interface and the Slack, Microsoft Teams, and
+The shared channel plugin interface and the Slack and
 WhatsApp adapters remain experimental. Future adapters register a
 `ChannelPlugin` and implement the shared `ChannelAdapter` contract rather than
 duplicating account, conversation, lifecycle, or policy logic.
@@ -288,35 +288,25 @@ reactions, files, Block Kit buttons, edits/deletion, slash-command ingress,
 and credential-safe `auth.test` health probes. Bot and
 subtype events are rejected before routing.
 
-## Configure Microsoft Teams
+## Microsoft Teams removed
 
-Teams uses the official Bot Framework `CloudAdapter`. It requires an externally
-reachable HTTPS route terminating at:
+The Microsoft Teams messaging integration and its Bot Framework SDK have been
+removed because their dependency chain has unresolved security vulnerabilities.
+Existing Teams accounts are never started, even if their saved configuration
+says `enabled: true`. The gateway reports them as disabled with a removal notice;
+other channel types continue to work. New Teams accounts cannot be added or enabled.
 
-```text
-/channels/webhook/teams/<account-name>
-```
-
-The route is exempt from Ódinn control-plane bearer authentication because Bot
-Framework performs its own JWT validation. It is still isolated from every
-other gateway route. Put the app password in `--token-env`, the application ID
-in `--app-id-env`, and optionally restrict a single-tenant bot with
-`--tenant-id-env`.
+Remove an old account in the console or with:
 
 ```sh
-odinn config channel add teams work \
-  --token-env ODINN_TEAMS_APP_PASSWORD \
-  --app-id-env ODINN_TEAMS_APP_ID \
-  --tenant-id-env ODINN_TEAMS_TENANT_ID \
-  --allowlist teams:AAD_USER_OR_CONVERSATION_ID \
-  --require-mention true
-odinn config channel enable work
+odinn config channel remove <account-name>
 ```
 
-Teams supports personal chats, channels, reply chains, attachments, typing,
-suggested-action buttons, and edits/deletion. Conversation
-references are learned only from authenticated inbound activities; proactive
-delivery cannot escape into an unknown conversation.
+Startup does not rewrite your configuration or delete conversation history or
+bindings. Saving an unrelated console edit retains an old Teams entry only as a
+disabled record until you remove it. Direct configuration API writes must remove
+Teams entries or set `enabled: false`. Do not restore the vulnerable SDK to
+reactivate Teams.
 
 ## Configure WhatsApp Business
 
@@ -347,5 +337,5 @@ and interactive reply buttons. It does not claim unsupported message editing
 or arbitrary group-chat behavior. The Graph API version is explicit in
 configuration so operators can advance it deliberately.
 
-For Teams and WhatsApp, expose only the exact webhook path through a trusted
+For WhatsApp, expose only the exact webhook path through a trusted
 TLS reverse proxy. Keep the console and all control-plane routes private.
