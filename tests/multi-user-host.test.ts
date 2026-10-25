@@ -544,7 +544,7 @@ test("multi-user host bounds unique-ID throttle persistence and applies per-IP a
   }
 });
 
-test("multi-user host rejects tenant-controlled provider destinations and credentials", async () => {
+test("multi-user host rejects tenant-controlled operator authority, provider destinations, and credentials", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-host-provider-policy-"));
   const workspace = await mkdtemp(join(tmpdir(), "odinn-provider-policy-user-"));
   const password = await hashPassword("provider-policy-password-long");
@@ -569,6 +569,28 @@ test("multi-user host rejects tenant-controlled provider destinations and creden
         fingerprint: current.fingerprint
       })
     });
+
+    const proofFeature = await fetch(`${base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie, origin: publicOrigin },
+      body: JSON.stringify({
+        config: { ...current.config, experimental: { ...current.config.experimental, proof: true } },
+        fingerprint: current.fingerprint
+      })
+    });
+    assert.equal(proofFeature.status, 400);
+    assert.match((await proofFeature.json()).error, /does not allow tenants to enable Proof/);
+
+    const proofCommand = await fetch(`${base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie, origin: publicOrigin },
+      body: JSON.stringify({
+        config: { ...current.config, proof: { allowedCommands: [["/bin/sh", "-c", "id"]] } },
+        fingerprint: current.fingerprint
+      })
+    });
+    assert.equal(proofCommand.status, 400);
+    assert.match((await proofCommand.json()).error, /does not allow tenant-controlled Proof commands/);
 
     const privateEndpoint = await save({ type: "openai-compatible", baseUrl: "http://127.0.0.1:4000/v1", apiKeyEnv: "OPENAI_API_KEY", models: ["model"] });
     assert.equal(privateEndpoint.status, 400);
