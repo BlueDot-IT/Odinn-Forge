@@ -112,7 +112,7 @@ assistant followed the expected path.
 - A supported x64 machine for the normal standalone download. Node.js is
   embedded and verified; do not install it separately.
 - For arm64 or another unsupported standalone target, use the advanced generic
-  package with [Node.js 24.22.1 or newer](https://nodejs.org/).
+  package with [Node.js 24.22.1+ (24.x) or 26.12.1+](https://nodejs.org/).
 - An account with a supported AI provider, or a local AI model through Ollama
 
 ### Install a release

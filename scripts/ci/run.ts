@@ -137,7 +137,7 @@ async function runWorkspaceScript(script: any) {
 
 async function typecheck() {
   const rootPackage = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-  if (rootPackage.engines?.node !== ">=24.22.1") fail(["package.json: engines.node must remain >=24.22.1"]);
+  if (rootPackage.engines?.node !== "^24.22.1 || >=26.12.1") fail(["package.json: engines.node must remain ^24.22.1 || >=26.12.1"]);
   if (await workspacePackageCount()) await runWorkspaceScript("typecheck");
   for (const config of ["tsconfig.tools.json"]) {
     const tools = runPnpm(["exec", "tsc", "-p", config]);

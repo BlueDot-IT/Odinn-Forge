@@ -7,7 +7,7 @@ SBOM, provenance, and installation metadata bind that runtime to the
 application and rollback restores them together.
 
 The generic archives and npm package remain available for advanced operators
-and require Node.js 24.22.1 or newer. Source development additionally requires pnpm.
+and require Node.js 24.22.1+ (24.x) or 26.12.1+. Source development additionally requires pnpm.
 Platforms outside the published standalone matrix use this advanced path.
 
 For release downloads, checksum verification, privacy expectations, and
