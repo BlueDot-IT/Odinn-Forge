@@ -3806,7 +3806,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
   const path = join(state, "config.json");
   try {
     const config = JSON.parse(await readFile(path, "utf8"));
-    validateGatewayConfig(config);
+    validateGatewayConfig(config, { allowRemovedChannels: true });
     if (hosted) validateHostedProviderConfig(config);
     await chmod(path, 0o600);
     return config;
@@ -3815,7 +3815,7 @@ async function readConfig(state: any, { hosted = false }: any = {}) {
     return withStateMutationLock(state, async () => {
       try {
         const existing = JSON.parse(await readFile(path, "utf8"));
-        validateGatewayConfig(existing);
+        validateGatewayConfig(existing, { allowRemovedChannels: true });
         if (hosted) validateHostedProviderConfig(existing);
         await chmod(path, 0o600);
         return existing;
@@ -3878,7 +3878,7 @@ function validateDiscordGuildConfig(value: any, label: string) {
   }
 }
 
-function validateGatewayConfig(config: any) {
+function validateGatewayConfig(config: any, { allowRemovedChannels = false } = {}) {
   assertConfigObject(config);
   try { normalizeSandboxConfig(config); }
   catch (error) { throw new GatewayError(400, error instanceof Error ? error.message : "config.sandbox is invalid"); }
@@ -3934,8 +3934,12 @@ function validateGatewayConfig(config: any) {
       ]) {
         if (channel[key] !== undefined && typeof channel[key] !== "string") throw new GatewayError(400, `config.channels.${name}.${key} must be a string`);
       }
-      if (channel.type !== undefined && !["telegram", "discord", "slack", "teams", "whatsapp"].includes(channel.type)) {
-        throw new GatewayError(400, `config.channels.${name}.type must be telegram, discord, slack, teams, or whatsapp`);
+      if (channel.type === "teams") {
+        if (!allowRemovedChannels && channel.enabled !== false) {
+          throw new GatewayError(400, "Microsoft Teams integration has been removed; remove this account or keep it disabled");
+        }
+      } else if (channel.type !== undefined && !["telegram", "discord", "slack", "whatsapp"].includes(channel.type)) {
+        throw new GatewayError(400, `config.channels.${name}.type must be telegram, discord, slack, or whatsapp`);
       }
       for (const key of ["requireMention", "nativeCommands", "nativeCommandEphemeral"]) {
         assertOptionalConfigBoolean(channel, key, `config.channels.${name}`);
@@ -4207,7 +4211,7 @@ async function readEditableConfig(state: string, { hosted = false }: any = {}) {
   } catch {
     throw new GatewayError(409, "config.json is not valid JSON");
   }
-  validateGatewayConfig(config);
+  validateGatewayConfig(config, { allowRemovedChannels: true });
   if (hosted) validateHostedProviderConfig(config);
   return { config, fingerprint: configFingerprint(contents) };
 }
@@ -4408,14 +4412,27 @@ async function loadChannelPlugin(type: string) {
     case "telegram": return (await import("@odinn/channel-telegram")).telegramChannelPlugin;
     case "discord": return (await import("@odinn/channel-discord")).discordChannelPlugin;
     case "slack": return (await import("@odinn/channel-slack")).slackChannelPlugin;
-    case "teams": return (await import("@odinn/channel-teams")).teamsChannelPlugin;
     case "whatsapp": return (await import("@odinn/channel-whatsapp")).whatsappChannelPlugin;
     default: throw new Error(`unsupported channel plugin: ${type}`);
   }
 }
 
 async function createChannelSupervisor({ config, state, gatewayToken, requestMaxBytes, auditStore, loadPlugin }: any) {
-  const configuredEntries = Object.entries(config.channels ?? {});
+  // Keep legacy accounts visible for removal, but never load an adapter or credentials.
+  const entries = Object.entries(config.channels ?? {});
+  const removedChannels = entries.filter(([, value]: any) => value?.type === "teams").map(([name]) => ({
+    name,
+    type: "teams",
+    enabled: false,
+    running: false,
+    state: "stopped",
+    credentialConfigured: false,
+    credentialPresent: false,
+    allowlistEntries: 0,
+    capabilities: { chatTypes: [] },
+    error: "Microsoft Teams integration has been removed; remove this account from configuration"
+  }));
+  const configuredEntries = entries.filter(([, value]: any) => value?.type !== "teams");
   const configuredTypes = [...new Set(configuredEntries.map(([, value]: any) => String(value?.type ?? "telegram")))];
   const plugins = new ChannelPluginRegistry(await Promise.all(configuredTypes.map(loadPlugin)));
   const dedupe = new FileChannelDedupeStore(join(state, "channel-dedupe.json"));
@@ -4442,7 +4459,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
   let started = false;
   return {
     status() {
-      return validateGatewayChannelDiagnosticsV1(configured.map((channel) => {
+      return validateGatewayChannelDiagnosticsV1([...configured.map((channel) => {
         const credentials = channelCredentialStatus(channel.config);
         return {
           name: channel.name,
@@ -4461,7 +4478,7 @@ async function createChannelSupervisor({ config, state, gatewayToken, requestMax
           latencyMs: channel.status.latencyMs,
           details: channel.status.details
         };
-      }));
+      }), ...removedChannels]);
     },
     async handleWebhook(request: any, response: any, url: URL) {
       const webhook = webhooks.get(url.pathname);

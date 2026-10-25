@@ -54,7 +54,7 @@ have separate support boundaries.
 Discord and Telegram are supported local single-user integration slices with
 environment-only credentials, explicit inbound policies, safe diagnostics,
 durable session binding, and no-replay recovery. Their live services remain
-provider-dependent. Slack, Microsoft Teams, WhatsApp Business, and the shared
+provider-dependent. Slack, WhatsApp Business, and the shared
 channel plugin interface remain experimental; see
 [`docs/channels.md`](docs/channels.md).
 

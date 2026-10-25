@@ -233,7 +233,7 @@ test("stable channel state is schema-owned and production capabilities remain tr
   for (const filename of ["channel-bindings.json", "channel-dedupe.json"]) {
     assert.match(migration, new RegExp(filename.replace(".", "\\."), "u"));
   }
-  for (const adapter of ["telegram", "discord", "slack", "teams"]) {
+  for (const adapter of ["telegram", "discord", "slack"]) {
     assert.doesNotMatch(await read(`adapters/channels/${adapter}/src/index.ts`), /streaming:\s*true/u, adapter);
   }
   const channels = await read("docs/channels.md");

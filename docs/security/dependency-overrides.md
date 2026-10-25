@@ -13,13 +13,12 @@ against loopback responses with excessive content encodings and compressed
 request bodies with trailing malformed bytes. It also verifies subsequent
 ordinary requests remain functional.
 
-## Outstanding upstream compatibility gaps (2026-10-25)
+## Microsoft Teams dependency removal (2026-10-25)
 
-The full audit still reports Zod and MSAL Node in the optional Teams dependency
-tree. Bot Framework 4.23.3 requires Zod 3 and calls `.nonstrict()`, which patched
-Zod 4.6.6 and newer no longer provide. Azure Identity's latest 4.14.0 manifest
-still requires MSAL Node 6, while the advisory fixes start at 7.1.0. Do not force
-these major-version overrides merely to turn the audit green: use a supported
-upstream dependency update or separately reviewed compatibility migration.
-These unresolved findings remain merge-blocking; this HTTP refresh is not a
-claim that the complete dependency tree is clear.
+The Microsoft Teams messaging adapter and its Bot Framework SDK are removed.
+This eliminates the incompatible Zod 3 and MSAL Node dependency chains instead
+of forcing unsupported major-version overrides. The normal high-severity audit
+remains mandatory. Slack, Discord, Telegram, and WhatsApp remain available.
+
+See [channel migration instructions](../channels.md#microsoft-teams-removed) for
+handling existing Teams account records without deleting conversation history.

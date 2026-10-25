@@ -24,7 +24,6 @@ dependencies, but may not depend on another Odinn workspace package.
 | `@odinn/channels` | Shared transport-neutral channel contracts and persisted channel state | `@odinn/store-file` |
 | `@odinn/channel-discord` | Discord adapter | `@odinn/channels` |
 | `@odinn/channel-slack` | Slack adapter | `@odinn/channels` |
-| `@odinn/channel-teams` | Teams adapter | `@odinn/channels` |
 | `@odinn/channel-telegram` | Telegram adapter | `@odinn/channels` |
 | `@odinn/channel-whatsapp` | WhatsApp adapter | `@odinn/channels` |
 | `@odinn/kernel` | Policy-authoritative domain/runtime service facade | `@odinn/channels`, `@odinn/policy`, `@odinn/protocol`, `@odinn/store-file`, `@odinn/store-sqlite` |
