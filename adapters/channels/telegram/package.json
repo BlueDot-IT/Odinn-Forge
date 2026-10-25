@@ -11,6 +11,6 @@
   },
   "dependencies": {
     "@odinn/channels": "workspace:*",
-    "grammy": "1.45.1"
+    "grammy": "1.46.0"
   }
 }

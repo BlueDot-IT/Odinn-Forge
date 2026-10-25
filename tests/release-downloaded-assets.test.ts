@@ -162,7 +162,7 @@ test("release validation permissions stay scoped and staged recovery uses secure
   assert.doesNotMatch(downloadedValidation, /download-draft-assets\.sh|gh release download/u,
     "read-only platform runners consume the original authenticated immutable artifact");
   for (const section of [stagedValidation, downloadedValidation, publication]) {
-    assert.match(section, /pnpm\/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86/u);
+    assert.match(section, /pnpm\/action-setup@ea17c68df8912ef543352723c149a84f56e3d413/u);
     assert.match(section, /pnpm install --frozen-lockfile --ignore-scripts/u);
   }
   assert.match(workflow, /scripts\/release\/extract-secure-archive\.ts/u);

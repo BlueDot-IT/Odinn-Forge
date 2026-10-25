@@ -288,6 +288,10 @@ reactions, files, Block Kit buttons, edits/deletion, slash-command ingress,
 and credential-safe `auth.test` health probes. Bot and
 subtype events are rejected before routing.
 
+The pinned Bolt 5.1 SDK also limits HTTP receiver request bodies to 4 MiB.
+Odinn uses Socket Mode by default; this limit does not change its Socket Mode
+configuration or channel allowlists.
+
 ## Microsoft Teams removed
 
 The Microsoft Teams messaging integration and its Bot Framework SDK have been
