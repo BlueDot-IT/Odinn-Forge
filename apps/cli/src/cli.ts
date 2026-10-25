@@ -447,7 +447,7 @@ function usage() {
   odinn extension run --id <id> --input-json <json> [--capability <capability>] [--capability-token <token>] [--state .odinn]
   odinn config model default <provider:model> [--state .odinn]
   odinn config model list [--state .odinn]
-  odinn config channel add telegram|discord|slack|teams|whatsapp <name> --token-env <ENV_NAME> --allowlist <channel:user-or-chat-id,...> [--app-token-env <ENV>] [--app-id-env <ENV>] [--tenant-id-env <ENV>] [--app-secret-env <ENV>] [--verify-token-env <ENV>] [--phone-number-id <id>] [--api-version v23.0] [--model <provider:model>] [--history-limit 40] [--require-mention true|false] [--dm-policy disabled|allowlist|open] [--group-policy disabled|allowlist|open] [--allow-bots false|mentions|true] [--native-commands true|false] [--native-command-name odinn] [--state .odinn]
+  odinn config channel add telegram|discord|slack|whatsapp <name> --token-env <ENV_NAME> --allowlist <channel:user-or-chat-id,...> [--app-token-env <ENV>] [--app-secret-env <ENV>] [--verify-token-env <ENV>] [--phone-number-id <id>] [--api-version v23.0] [--model <provider:model>] [--history-limit 40] [--require-mention true|false] [--dm-policy disabled|allowlist|open] [--group-policy disabled|allowlist|open] [--allow-bots false|mentions|true] [--native-commands true|false] [--native-command-name odinn] [--state .odinn]
   odinn config channel list [--state .odinn]
   odinn config channel enable|disable|remove <name> [--state .odinn]
   odinn status [--state .odinn]
@@ -1372,7 +1372,7 @@ function summarizeChannelConfig(config: any) {
   return Object.entries(config.channels ?? {}).map(([name, value]: any) => ({
     name,
     type: value.type ?? "telegram",
-    enabled: value.enabled === true,
+    enabled: value.type !== "teams" && value.enabled === true,
     credentialConfigured: Boolean(value.tokenEnv),
     credentialPresent: Boolean(value.tokenEnv && process.env[value.tokenEnv]),
     tokenEnv: value.tokenEnv ?? "",
@@ -1382,7 +1382,7 @@ function summarizeChannelConfig(config: any) {
     dmPolicy: value.type === "discord" ? value.dmPolicy ?? "allowlist" : undefined,
     groupPolicy: value.type === "discord" ? value.groupPolicy ?? "allowlist" : undefined,
     allowBots: value.type === "discord" ? value.allowBots ?? false : undefined,
-    nativeCommands: value.nativeCommands === true,
+    nativeCommands: value.type !== "teams" && value.nativeCommands === true,
     nativeCommandName: value.nativeCommandName ?? "odinn",
     defaultModel: value.defaultModel ?? ""
   }));
@@ -1860,8 +1860,8 @@ async function configCommand(args: any) {
     if (subcommand === "add") {
       const type = rest[0];
       const name = rest[1];
-      if (!["telegram", "discord", "slack", "teams", "whatsapp"].includes(type) || !name) {
-        throw new Error("config channel add requires telegram|discord|slack|teams|whatsapp <name>");
+      if (!["telegram", "discord", "slack", "whatsapp"].includes(type) || !name) {
+        throw new Error("config channel add requires telegram|discord|slack|whatsapp <name>");
       }
       if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name)) throw new Error("channel name contains unsupported characters");
       const tokenEnv = option(rest, "--token-env", "");
@@ -1882,8 +1882,6 @@ async function configCommand(args: any) {
       const allowBotsChoice = parseChoice(option(rest, "--allow-bots", "false"), "--allow-bots", ["false", "mentions", "true"]);
       const environmentOptions = Object.fromEntries([
         ["appTokenEnv", "--app-token-env"],
-        ["appIdEnv", "--app-id-env"],
-        ["tenantIdEnv", "--tenant-id-env"],
         ["appSecretEnv", "--app-secret-env"],
         ["verifyTokenEnv", "--verify-token-env"]
       ].flatMap(([key, flag]) => {
@@ -1919,6 +1917,7 @@ async function configCommand(args: any) {
       const name = rest[0];
       if (!name || !config.channels[name]) throw new Error(`channel not found: ${name || "(missing)"}`);
       if (subcommand === "enable") {
+        if (config.channels[name].type === "teams") throw new Error("Microsoft Teams integration has been removed; remove this account from configuration");
         const open = config.channels[name].dmPolicy === "open" || config.channels[name].groupPolicy === "open";
         const scopedGuild = Object.keys(config.channels[name].guilds ?? {}).length > 0;
         if (!config.channels[name].allowlist?.length && !open && !scopedGuild) {

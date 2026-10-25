@@ -1262,16 +1262,20 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
     }
 
     function renderChannelForm(name, channel = {}) {
+      if (channel.type === "teams") {
+        return `<article class="config-card" data-channel-card data-removed-channel data-original-name="${escapeHtml(name)}">
+          <div class="config-card-head"><div><h3>Microsoft Teams removed</h3><p>This integration is no longer available. This account is disabled; other messaging channels are unaffected.</p></div><button class="danger-button" data-remove-channel type="button">Remove channel</button></div>
+          <div class="field"><label>Channel name</label><input data-channel-field="name" value="${escapeHtml(name)}" readonly></div>
+        </article>`;
+      }
       return `
         <article class="config-card" data-channel-card data-original-name="${escapeHtml(name)}">
           <div class="config-card-head"><div><h3>Messaging channel</h3><p>Only allowlisted user or conversation identifiers can reach this bot.</p></div><button class="danger-button" data-remove-channel type="button">Remove channel</button></div>
           <div class="grid-2">
             <div class="field"><label>Channel name</label><input data-channel-field="name" value="${escapeHtml(name)}" placeholder="personal" autocomplete="off"></div>
-            <div class="field"><label>Type</label><select data-channel-field="type">${renderOptions(["telegram", "discord", "slack", "teams", "whatsapp"], channel.type || "telegram")}</select></div>
+            <div class="field"><label>Type</label><select data-channel-field="type">${renderOptions(["telegram", "discord", "slack", "whatsapp"], channel.type || "telegram")}</select></div>
             <div class="field"><label>Bot token environment variable</label><input data-channel-field="tokenEnv" value="${escapeHtml(channel.tokenEnv || "")}" placeholder="ODINN_TELEGRAM_BOT_TOKEN" autocomplete="off"></div>
             <div class="field"><label>Slack app token environment</label><input data-channel-field="appTokenEnv" value="${escapeHtml(channel.appTokenEnv || "")}" placeholder="ODINN_SLACK_APP_TOKEN" autocomplete="off"></div>
-            <div class="field"><label>Teams app ID environment</label><input data-channel-field="appIdEnv" value="${escapeHtml(channel.appIdEnv || "")}" placeholder="ODINN_TEAMS_APP_ID" autocomplete="off"></div>
-            <div class="field"><label>Teams tenant ID environment</label><input data-channel-field="tenantIdEnv" value="${escapeHtml(channel.tenantIdEnv || "")}" placeholder="ODINN_TEAMS_TENANT_ID" autocomplete="off"></div>
             <div class="field"><label>WhatsApp app secret environment</label><input data-channel-field="appSecretEnv" value="${escapeHtml(channel.appSecretEnv || "")}" placeholder="ODINN_WHATSAPP_APP_SECRET" autocomplete="off"></div>
             <div class="field"><label>WhatsApp verify token environment</label><input data-channel-field="verifyTokenEnv" value="${escapeHtml(channel.verifyTokenEnv || "")}" placeholder="ODINN_WHATSAPP_VERIFY_TOKEN" autocomplete="off"></div>
             <div class="field"><label>WhatsApp phone number ID</label><input data-channel-field="phoneNumberId" value="${escapeHtml(channel.phoneNumberId || "")}" autocomplete="off"></div>
@@ -1425,6 +1429,10 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
         const name = card.querySelector('[data-channel-field="name"]').value.trim();
         if (!name) throw new Error("Every messaging channel needs a name.");
         if (channels[name]) throw new Error("Messaging channel names must be unique: " + name);
+        if (card.hasAttribute("data-removed-channel")) {
+          channels[name] = { ...config.channels[name], enabled: false };
+          continue;
+        }
         let guilds;
         try {
           guilds = JSON.parse(card.querySelector('[data-channel-field="guilds"]').value || "{}");
@@ -1445,8 +1453,6 @@ import { agentGraphStatusClass, agentGraphStatusLabel, canReassignAgentGraph, is
           ...(Object.keys(guilds).length ? { guilds } : {}),
           tokenEnv: card.querySelector('[data-channel-field="tokenEnv"]').value.trim(),
           appTokenEnv: card.querySelector('[data-channel-field="appTokenEnv"]').value.trim(),
-          appIdEnv: card.querySelector('[data-channel-field="appIdEnv"]').value.trim(),
-          tenantIdEnv: card.querySelector('[data-channel-field="tenantIdEnv"]').value.trim(),
           appSecretEnv: card.querySelector('[data-channel-field="appSecretEnv"]').value.trim(),
           verifyTokenEnv: card.querySelector('[data-channel-field="verifyTokenEnv"]').value.trim(),
           phoneNumberId: card.querySelector('[data-channel-field="phoneNumberId"]').value.trim(),

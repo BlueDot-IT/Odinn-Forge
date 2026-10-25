@@ -14,7 +14,6 @@
     "@odinn/application": "workspace:*",
     "@odinn/channel-discord": "workspace:*",
     "@odinn/channel-slack": "workspace:*",
-    "@odinn/channel-teams": "workspace:*",
     "@odinn/channel-telegram": "workspace:*",
     "@odinn/channel-whatsapp": "workspace:*",
     "@odinn/channels": "workspace:*",

@@ -107,7 +107,7 @@ const productionPackage = {
     odinn: "bin/odinn.js",
     "odinn-gateway": "bin/odinn-gateway.js"
   },
-  engines: { node: ">=24.22.1" },
+  engines: { node: "^24.22.1 || >=26.12.1" },
   dependencies: { "playwright-core": PLAYWRIGHT_VERSION },
   license: pkg.license,
   repository: {
@@ -133,7 +133,7 @@ const releaseInfo = {
   version: pkg.version,
   commit,
   distribution: "compiled",
-  node: ">=24.22.1",
+  node: "^24.22.1 || >=26.12.1",
   runtimeSha256,
   stateSchemas,
   minimumApplicationVersionForTargetState: STATE_SCHEMA_MINIMUM_APPLICATION_VERSION

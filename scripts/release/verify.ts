@@ -191,7 +191,7 @@ for (const extension of ["zip", "tar.gz"]) {
     const recognizedPackageName = archivedPackage.name === "odinn" || archivedPackage.name === "@bluedot-it/odinn";
     if (!recognizedPackageName
       || archivedPackage.version !== pkg.version
-      || archivedPackage.engines?.node !== ">=24.22.1"
+      || archivedPackage.engines?.node !== "^24.22.1 || >=26.12.1"
       || archivedPackage.dependencies?.["playwright-core"] !== PLAYWRIGHT_VERSION) {
       throw new Error(`archive production metadata mismatch in ${basename(archive)}`);
     }
