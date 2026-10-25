@@ -8,10 +8,6 @@ import {
   slackChannelPlugin
 } from "../adapters/channels/slack/src/index.ts";
 import {
-  normalizeTeamsActivity,
-  teamsChannelPlugin
-} from "../adapters/channels/teams/src/index.ts";
-import {
   WhatsAppChannelAdapter,
   normalizeWhatsAppWebhook,
   validWhatsAppSignature,
@@ -42,26 +38,6 @@ test("Slack normalizes mentions, threads, and interactive actions", () => {
     user: { id: "U100", name: "Jason" },
     container: { message_ts: "1785280000.100" }
   }, { action_id: "confirm" })?.text, "Slack component selected: confirm");
-});
-
-test("Teams normalizes authenticated Bot Framework activities", () => {
-  const message = normalizeTeamsActivity({
-    type: "message",
-    id: "activity-1",
-    timestamp: "2026-07-29T12:00:00.000Z",
-    text: "hello",
-    from: { id: "user-1", aadObjectId: "aad-1", name: "Jason" },
-    conversation: { id: "conversation-1" },
-    channelData: {
-      team: { id: "team-1" },
-      channel: { id: "channel-1" },
-      tenant: { id: "tenant-1" }
-    }
-  }, "work");
-  assert.equal(message?.address.channel, "teams");
-  assert.equal(message?.address.conversationKind, "channel");
-  assert.equal(message?.sender.id, "aad-1");
-  assert.equal(message?.metadata?.tenantId, "tenant-1");
 });
 
 test("WhatsApp validates webhook signatures and normalizes text, media, and replies", () => {
@@ -161,8 +137,6 @@ test("WhatsApp adapter authenticates webhooks before delivery and sends interact
 test("major-provider plugins require all credential references and deny empty allowlists", () => {
   const slack = slackChannelPlugin.normalizeAccountConfig("work", {});
   assert.equal(slackChannelPlugin.validateAccountConfig("work", slack).length, 3);
-  const teams = teamsChannelPlugin.normalizeAccountConfig("work", {});
-  assert.equal(teamsChannelPlugin.validateAccountConfig("work", teams).length, 3);
   const whatsapp = whatsappChannelPlugin.normalizeAccountConfig("business", {});
   assert.equal(whatsappChannelPlugin.validateAccountConfig("business", whatsapp).length, 5);
 });

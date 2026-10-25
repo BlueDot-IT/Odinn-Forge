@@ -44,7 +44,7 @@ test("production package contains compiled runtime files and no workspace instal
   const productionPackage = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
   assert.equal(productionPackage.name, "@bluedot-it/odinn");
   assert.equal(productionPackage.private, false);
-  assert.equal(productionPackage.engines.node, ">=24.0.0");
+  assert.equal(productionPackage.engines.node, "^24.22.1 || >=26.12.1");
   assert.deepEqual(productionPackage.dependencies, { "playwright-core": "1.62.1" });
   assert.equal(productionPackage.devDependencies, undefined);
   assert.equal(productionPackage.packageManager, undefined);
